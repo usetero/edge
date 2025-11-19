@@ -187,6 +187,7 @@ pub fn inspectResponse(
     }
 
     try stdout.writeAll("╚═══════════════════════════════════════════════════════════════════════════\n");
+    try stdout.flush();
 }
 
 fn formatTimestamp(timestamp: i64) ![24]u8 {

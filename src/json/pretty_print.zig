@@ -101,10 +101,9 @@ fn writeEscapedString(writer: anytype, s: []const u8) !void {
 test "prettyPrint - simple object" {
     const json = "{\"name\":\"Alice\",\"age\":30}";
 
-    var buffer: [512]u8 = undefined;
-    var bufferedWriter = std.io.Writer.fixed(&buffer);
-    try prettyPrint(&bufferedWriter, json, std.testing.allocator);
-    try bufferedWriter.flush();
+    var bufferedWriter = std.io.Writer.Allocating.init(std.testing.allocator);
+    defer bufferedWriter.deinit();
+    try prettyPrint(&bufferedWriter.writer, json, std.testing.allocator);
     const expected =
         \\{
         \\  "name": "Alice",
@@ -112,16 +111,15 @@ test "prettyPrint - simple object" {
         \\}
         \\
     ;
-    try std.testing.expectEqualStrings(expected, &buffer);
+    try std.testing.expectEqualStrings(expected, bufferedWriter.written());
 }
 
 test "prettyPrint - nested object" {
     const json = "{\"user\":{\"name\":\"Bob\"},\"active\":true}";
 
-    var buffer: [512]u8 = undefined;
-    var bufferedWriter = std.io.Writer.fixed(&buffer);
-    try prettyPrint(&bufferedWriter, json, std.testing.allocator);
-    try bufferedWriter.flush();
+    var bufferedWriter = std.io.Writer.Allocating.init(std.testing.allocator);
+    defer bufferedWriter.deinit();
+    try prettyPrint(&bufferedWriter.writer, json, std.testing.allocator);
     const expected =
         \\{
         \\  "user": {
@@ -131,5 +129,5 @@ test "prettyPrint - nested object" {
         \\}
         \\
     ;
-    try std.testing.expectEqualStrings(expected, &buffer);
+    try std.testing.expectEqualStrings(expected, bufferedWriter.written());
 }
