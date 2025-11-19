@@ -19,8 +19,7 @@ pub const ProxyConfig = struct {
     // Network config
     listen_address: [4]u8,
     listen_port: u16,
-    upstream_address: [4]u8,
-    upstream_port: u16,
+    upstream_url: []const u8, // Now supports full URLs like "http://example.com:8080"
 
     // Threading config
     max_concurrent_connections: u32,
@@ -42,8 +41,7 @@ pub const ProxyConfig = struct {
         return .{
             .listen_address = .{ 127, 0, 0, 1 },
             .listen_port = 8080,
-            .upstream_address = .{ 127, 0, 0, 1 },
-            .upstream_port = 80,
+            .upstream_url = "http://127.0.0.1:80",
             .max_concurrent_connections = 1024,
             .thread_pool_size = 16,
             .enable_http1 = true,

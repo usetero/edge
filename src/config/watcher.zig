@@ -32,6 +32,8 @@ pub const ConfigManager = struct {
         }
 
         const config = self.current.load(.acquire);
+        // Free the upstream_url string that was allocated in the parser
+        self.allocator.free(config.upstream_url);
         self.allocator.destroy(config);
         self.allocator.free(self.config_path);
     }

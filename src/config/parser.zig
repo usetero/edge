@@ -36,7 +36,7 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !*ProxyCo
             continue;
         }, " \t\"");
 
-        try parseKeyValue(&config, key, value, line_num);
+        try parseKeyValue(allocator, &config, key, value, line_num);
     }
 
     const config_ptr = try allocator.create(ProxyConfig);
@@ -44,15 +44,14 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !*ProxyCo
     return config_ptr;
 }
 
-fn parseKeyValue(config: *ProxyConfig, key: []const u8, value: []const u8, line_num: usize) !void {
+fn parseKeyValue(allocator: std.mem.Allocator, config: *ProxyConfig, key: []const u8, value: []const u8, line_num: usize) !void {
     if (std.mem.eql(u8, key, "listen_address")) {
         config.listen_address = try parseIpv4(value);
     } else if (std.mem.eql(u8, key, "listen_port")) {
         config.listen_port = try std.fmt.parseInt(u16, value, 10);
-    } else if (std.mem.eql(u8, key, "upstream_address")) {
-        config.upstream_address = try parseIpv4(value);
-    } else if (std.mem.eql(u8, key, "upstream_port")) {
-        config.upstream_port = try std.fmt.parseInt(u16, value, 10);
+    } else if (std.mem.eql(u8, key, "upstream_url")) {
+        // Allocate and copy the upstream URL
+        config.upstream_url = try allocator.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "max_concurrent_connections")) {
         config.max_concurrent_connections = try std.fmt.parseInt(u32, value, 10);
     } else if (std.mem.eql(u8, key, "thread_pool_size")) {

@@ -5,9 +5,9 @@ listen_address=127.0.0.1
 listen_port=8080
 
 # Upstream destination
-# Example: httpbin.org (93.184.216.34 is example.com)
-upstream_address=127.0.0.1
-upstream_port=8081
+# Supports full URLs with scheme, host, and port
+# Examples: http://127.0.0.1:8081, http://httpbin.org, https://api.example.com:443
+upstream_url=https://agent-http-intake.logs.us5.datadoghq.com
 
 # Threading Configuration
 max_concurrent_connections=1024
