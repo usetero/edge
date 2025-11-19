@@ -1,10 +1,62 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const config_types = @import("../config/types.zig");
+const filter_mod = @import("../core/filter.zig");
 
 const ProxyContext = struct {
-    allocator: std.mem.Allocator,
     config: *const std.atomic.Value(*const config_types.ProxyConfig),
+    filter: *const filter_mod.FilterEvaluator,
+
+    pub fn dispatch(self: *ProxyContext, action: httpz.Action(*ProxyContext), req: *httpz.Request, res: *httpz.Response) !void {
+        // Our custom dispatch lets us add a log + timing for every request
+        // httpz supports middlewares, but in many cases, having a dispatch is good
+        // enough and is much more straightforward.
+
+        std.log.info("{s} {s} -> ({} bytes)", .{
+            @tagName(req.method),
+            req.url.path,
+            req.body_len,
+        });
+        var start = try std.time.Timer.start();
+        if (res.body.len == 0) {
+            try action(self, req, res);
+            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+            return;
+        }
+
+        const filter_result = self.filter.evaluate(res.body, .log) catch |err| {
+            std.log.warn("Filter evaluation failed: {}", .{err});
+            // On error, default to keeping the response
+            // Call the handler to process the request
+            try action(self, req, res);
+            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+            return;
+        };
+
+        switch (filter_result) {
+            .drop => {
+                std.log.debug("{s} {s} DROPPED by filter ({} bytes)", .{
+                    @tagName(req.method),
+                    req.url.path,
+                    res.body.len,
+                });
+                // Clear the response and return 204 No Content
+                res.status = 204;
+                res.body = "";
+            },
+            .keep => {
+                std.log.debug("{s} {s} PASSED filter ({} bytes)", .{
+                    @tagName(req.method),
+                    req.url.path,
+                    res.body.len,
+                });
+                // Call the handler to process the request
+                try action(self, req, res);
+            },
+        }
+
+        std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+    }
 };
 
 pub const HttpzProxyServer = struct {
@@ -15,11 +67,12 @@ pub const HttpzProxyServer = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         config: *const std.atomic.Value(*const config_types.ProxyConfig),
+        filter: *const filter_mod.FilterEvaluator,
     ) !HttpzProxyServer {
         const ctx = try allocator.create(ProxyContext);
         ctx.* = .{
-            .allocator = allocator,
             .config = config,
+            .filter = filter,
         };
 
         const current_config = config.load(.acquire);
@@ -74,7 +127,7 @@ pub const HttpzProxyServer = struct {
         });
 
         // Create HTTP client for upstream request
-        var client = std.http.Client{ .allocator = ctx.allocator };
+        var client = std.http.Client{ .allocator = req.arena };
         defer client.deinit();
 
         // Build full upstream URL by combining base URL with request path and query string
@@ -132,8 +185,8 @@ pub const HttpzProxyServer = struct {
         }
 
         // Allocate array for headers
-        const headers_to_forward = try ctx.allocator.alloc(std.http.Header, header_count);
-        defer ctx.allocator.free(headers_to_forward);
+        const headers_to_forward = try req.arena.alloc(std.http.Header, header_count);
+        defer req.arena.free(headers_to_forward);
 
         // Copy headers to array
         var idx: usize = 0;

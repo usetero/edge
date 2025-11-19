@@ -1,0 +1,31 @@
+{
+  "listen_address": "127.0.0.1",
+  "listen_port": 8080,
+  "upstream_url": "https://agent-http-intake.logs.us5.datadoghq.com",
+  "log_level": "info",
+  "pretty_print_json": true,
+  "max_body_size": 1048576,
+  "policies": [
+    {
+      "name": "drop-debug-logs",
+      "policy_type": "filter",
+      "telemetry_type": "log",
+      "regexes": ["debug", "trace"],
+      "action": "drop"
+    },
+    {
+      "name": "keep-error-logs",
+      "policy_type": "filter",
+      "telemetry_type": "log",
+      "regexes": ["error", "critical", "fatal"],
+      "action": "keep"
+    },
+    {
+      "name": "drop-test-metrics",
+      "policy_type": "filter",
+      "telemetry_type": "metric",
+      "regexes": ["test\\."],
+      "action": "drop"
+    }
+  ]
+}

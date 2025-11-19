@@ -32,6 +32,17 @@ pub const ConfigManager = struct {
         }
 
         const config = self.current.load(.acquire);
+
+        // Free policy resources
+        for (config.policies) |policy| {
+            self.allocator.free(policy.name);
+            for (policy.regexes) |regex| {
+                self.allocator.free(regex);
+            }
+            self.allocator.free(policy.regexes);
+        }
+        self.allocator.free(config.policies);
+
         // Free the upstream_url string that was allocated in the parser
         self.allocator.free(config.upstream_url);
         self.allocator.destroy(config);

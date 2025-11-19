@@ -4,6 +4,7 @@ const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
 const config_watcher = @import("config/watcher.zig");
 const httpz_server = @import("proxy/httpz_server.zig");
+const filter_mod = @import("core/filter.zig");
 
 /// Global server instance for signal handler
 var server_instance: ?*httpz_server.HttpzProxyServer = null;
@@ -48,7 +49,7 @@ pub fn main() !void {
 
     _ = args.next(); // Skip program name
 
-    const config_path = args.next() orelse "config.txt";
+    const config_path = args.next() orelse "config.json";
 
     std.log.info("Tero Edge HTTP Proxy starting...", .{});
     std.log.info("Configuration file: {s}", .{config_path});
@@ -66,8 +67,16 @@ pub fn main() !void {
         initial_config.listen_port,
     });
     std.log.info("Upstream URL: {s}", .{initial_config.upstream_url});
-    std.log.info("HTTP/1.1: {s}", .{if (initial_config.enable_http1) "enabled" else "disabled"});
-    std.log.info("HTTP/2: {s}", .{if (initial_config.enable_http2) "enabled" else "disabled"});
+
+    // Create filter evaluator from config policies
+    var filter_evaluator = filter_mod.FilterEvaluator.init(allocator);
+    defer filter_evaluator.deinit();
+
+    // Load policies from config into filter
+    for (initial_config.policies) |policy| {
+        try filter_evaluator.addPolicy(policy);
+    }
+    std.log.info("Loaded {} policies", .{filter_evaluator.policyCount()});
 
     // Install signal handlers
     installShutdownHandlers();
@@ -83,6 +92,7 @@ pub fn main() !void {
     var proxy = try httpz_server.HttpzProxyServer.init(
         allocator,
         &config_manager.current,
+        &filter_evaluator,
     );
     defer proxy.deinit();
 
