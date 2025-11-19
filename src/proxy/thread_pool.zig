@@ -106,9 +106,6 @@ pub const ThreadPool = struct {
 
             // Check shutdown first
             const is_shutdown = pool.shutdown.load(.seq_cst);
-            if (iterations % 1000 == 0) {
-                std.log.info("Worker thread {}: iteration {}, shutdown={}", .{ thread_id, iterations, is_shutdown });
-            }
             if (is_shutdown) {
                 std.log.info("Worker thread {}: shutdown flag detected, breaking", .{thread_id});
                 break;

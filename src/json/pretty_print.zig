@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn prettyPrint(writer: anytype, json_text: []const u8, allocator: std.mem.Allocator) !void {
+pub fn prettyPrint(writer: std.io.Writer, json_text: []const u8, allocator: std.mem.Allocator) !void {
     // Parse JSON
     const parsed = std.json.parseFromSlice(
         std.json.Value,
@@ -98,10 +98,10 @@ fn writeEscapedString(writer: anytype, s: []const u8) !void {
 
 test "prettyPrint - simple object" {
     const json = "{\"name\":\"Alice\",\"age\":30}";
-    var buffer = std.ArrayList(u8).init(std.testing.allocator);
-    defer buffer.deinit();
-
-    try prettyPrint(buffer.writer(), json, std.testing.allocator);
+    var buffer: [1024]u8 = undefined;
+    const stdout_writer = std.fs.File.stdout().writer(&buffer);
+    const writer = std.io.Writer.buffered(&stdout_writer);
+    try prettyPrint(writer, json, std.testing.allocator);
 
     const expected =
         \\{
