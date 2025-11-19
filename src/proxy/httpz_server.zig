@@ -1,6 +1,7 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const config_types = @import("../config/types.zig");
+const json = @import("../json/pretty_print.zig");
 
 const ProxyContext = struct {
     allocator: std.mem.Allocator,
@@ -100,7 +101,14 @@ pub const HttpzProxyServer = struct {
 
         // Create and send upstream request
         var upstream_req = try client.request(method, uri, .{});
-        try upstream_req.sendBodiless();
+        if (req.body_buffer) |body| {
+            switch (method) {
+                .POST, .PUT, .PATCH => try upstream_req.sendBodyComplete(body.data),
+                else => try upstream_req.sendBodiless(),
+            }
+        } else {
+            try upstream_req.sendBodiless();
+        }
         var upstream_res = try upstream_req.receiveHead(&.{});
 
         // IMPORTANT: Process headers BEFORE reading the body
