@@ -1,4 +1,18 @@
 ---
+# Conventional PR Title Workflow
+#
+# Why this exists:
+# We use conventional commit format (feat:, fix:, chore:, etc.) for our PR titles.
+# This keeps our git history clean and helps generate changelogs automatically.
+#
+# What it does:
+# - Checks that your PR title follows conventional commit format
+# - Examples: "feat: add user auth", "fix: resolve memory leak", "chore: update deps"
+# - Runs on every PR to master
+#
+# If it fails:
+# Just edit your PR title to match the format. The check will re-run automatically.
+#
 # DO NOT EDIT: Managed by Terraform at https://github.com/usetero/infrastructure
 name: conventional-pr
 "on":
