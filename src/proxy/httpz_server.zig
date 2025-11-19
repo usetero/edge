@@ -1,7 +1,6 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const config_types = @import("../config/types.zig");
-const json = @import("../json/pretty_print.zig");
 
 const ProxyContext = struct {
     allocator: std.mem.Allocator,
@@ -76,14 +75,33 @@ pub const HttpzProxyServer = struct {
 
         // Create HTTP client for upstream request
         var client = std.http.Client{ .allocator = ctx.allocator };
+        defer client.deinit();
 
-        // Build full upstream URL by combining base URL with request path
-        var url_buffer: [1024]u8 = undefined;
-        const upstream_url = try std.fmt.bufPrint(&url_buffer, "{s}{s}{s}", .{
-            current_config.upstream_url,
-            if (std.mem.endsWith(u8, current_config.upstream_url, "/")) "" else if (req.url.path[0] == '/') "" else "/",
-            req.url.path,
-        });
+        // Build full upstream URL by combining base URL with request path and query string
+        var url_buffer: [2048]u8 = undefined;
+        const upstream_url = blk: {
+            var fbs = std.io.fixedBufferStream(&url_buffer);
+            const writer = fbs.writer();
+
+            // Write base URL
+            try writer.writeAll(current_config.upstream_url);
+
+            // Add separator if needed
+            if (!std.mem.endsWith(u8, current_config.upstream_url, "/") and req.url.path[0] != '/') {
+                try writer.writeAll("/");
+            }
+
+            // Write path
+            try writer.writeAll(req.url.path);
+
+            // Forward query string if present
+            if (req.url.query.len > 0) {
+                try writer.writeAll("?");
+                try writer.writeAll(req.url.query);
+            }
+
+            break :blk fbs.getWritten();
+        };
 
         const uri = try std.Uri.parse(upstream_url);
 
@@ -99,8 +117,49 @@ pub const HttpzProxyServer = struct {
             else => .GET,
         };
 
-        // Create and send upstream request
-        var upstream_req = try client.request(method, uri, .{});
+        // Build headers array for upstream request
+        // Count how many headers we need to forward
+        var header_count: usize = 0;
+        var count_it = req.headers.iterator();
+        while (count_it.next()) |header| {
+            const name = header.key;
+            // Skip headers that the HTTP client sets automatically
+            if (std.mem.eql(u8, name, "host")) continue;
+            if (std.mem.eql(u8, name, "connection")) continue;
+            if (std.mem.eql(u8, name, "content-length")) continue;
+            if (std.mem.eql(u8, name, "transfer-encoding")) continue;
+            header_count += 1;
+        }
+
+        // Allocate array for headers
+        const headers_to_forward = try ctx.allocator.alloc(std.http.Header, header_count);
+        defer ctx.allocator.free(headers_to_forward);
+
+        // Copy headers to array
+        var idx: usize = 0;
+        var copy_it = req.headers.iterator();
+        while (copy_it.next()) |header| {
+            const name = header.key;
+            // Skip headers that the HTTP client sets automatically
+            if (std.mem.eql(u8, name, "host")) continue;
+            if (std.mem.eql(u8, name, "connection")) continue;
+            if (std.mem.eql(u8, name, "content-length")) continue;
+            if (std.mem.eql(u8, name, "transfer-encoding")) continue;
+
+            headers_to_forward[idx] = .{
+                .name = name,
+                .value = header.value,
+            };
+            idx += 1;
+        }
+
+        // Create upstream request with forwarded headers
+        var upstream_req = try client.request(method, uri, .{
+            .extra_headers = headers_to_forward,
+        });
+        defer upstream_req.deinit();
+
+        // Send request with body if present and method supports it
         if (req.body_buffer) |body| {
             switch (method) {
                 .POST, .PUT, .PATCH => try upstream_req.sendBodyComplete(body.data),
@@ -109,6 +168,7 @@ pub const HttpzProxyServer = struct {
         } else {
             try upstream_req.sendBodiless();
         }
+
         var upstream_res = try upstream_req.receiveHead(&.{});
 
         // IMPORTANT: Process headers BEFORE reading the body
@@ -169,9 +229,5 @@ pub const HttpzProxyServer = struct {
             res.status,
             body.len,
         });
-
-        // Explicitly close the upstream connection before returning
-        upstream_req.deinit();
-        client.deinit();
     }
 };
