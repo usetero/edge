@@ -1,6 +1,7 @@
 const std = @import("std");
 
-pub fn prettyPrint(writer: anytype, json_text: []const u8, allocator: std.mem.Allocator) !void {
+// prettyPrint prints a JSON value to the given writer in a pretty format. It is up to the caller to flush the writer.
+pub fn prettyPrint(writer: *std.io.Writer, json_text: []const u8, allocator: std.mem.Allocator) !void {
     // Parse JSON
     const parsed = std.json.parseFromSlice(
         std.json.Value,
@@ -17,6 +18,7 @@ pub fn prettyPrint(writer: anytype, json_text: []const u8, allocator: std.mem.Al
     // Pretty print the value
     try printValue(writer, parsed.value, 0);
     try writer.writeAll("\n");
+    // try writer.flush();
 }
 
 fn printValue(writer: anytype, value: std.json.Value, indent: usize) anyerror!void {
@@ -98,11 +100,10 @@ fn writeEscapedString(writer: anytype, s: []const u8) !void {
 
 test "prettyPrint - simple object" {
     const json = "{\"name\":\"Alice\",\"age\":30}";
-    var buffer = std.ArrayList(u8).init(std.testing.allocator);
-    defer buffer.deinit();
 
-    try prettyPrint(buffer.writer(), json, std.testing.allocator);
-
+    var bufferedWriter = std.io.Writer.Allocating.init(std.testing.allocator);
+    defer bufferedWriter.deinit();
+    try prettyPrint(&bufferedWriter.writer, json, std.testing.allocator);
     const expected =
         \\{
         \\  "name": "Alice",
@@ -110,16 +111,23 @@ test "prettyPrint - simple object" {
         \\}
         \\
     ;
-    try std.testing.expectEqualStrings(expected, buffer.items);
+    try std.testing.expectEqualStrings(expected, bufferedWriter.written());
 }
 
 test "prettyPrint - nested object" {
     const json = "{\"user\":{\"name\":\"Bob\"},\"active\":true}";
-    var buffer = std.ArrayList(u8).init(std.testing.allocator);
-    defer buffer.deinit();
 
-    try prettyPrint(buffer.writer(), json, std.testing.allocator);
-
-    // Just verify it doesn't crash and produces output
-    try std.testing.expect(buffer.items.len > 0);
+    var bufferedWriter = std.io.Writer.Allocating.init(std.testing.allocator);
+    defer bufferedWriter.deinit();
+    try prettyPrint(&bufferedWriter.writer, json, std.testing.allocator);
+    const expected =
+        \\{
+        \\  "user": {
+        \\    "name": "Bob"
+        \\  },
+        \\  "active": true
+        \\}
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, bufferedWriter.written());
 }

@@ -1,0 +1,219 @@
+# https://taskfile.dev
+
+version: "3"
+
+vars:
+  PROJECT_NAME: edge
+  BUILD_DIR: zig-out
+
+tasks:
+  default:
+    desc: "Build the project in debug mode"
+    aliases: [b]
+    cmds:
+      - zig build
+
+  build:
+    desc: "Build the project with specified optimization"
+    aliases: [build-opt]
+    cmds:
+      - zig build -Doptimize={{.OPTIMIZE | default "Debug"}}
+
+  build:release:
+    desc: "Build the project in release mode (ReleaseFast)"
+    aliases: [br, release]
+    cmds:
+      - zig build -Doptimize=ReleaseFast
+
+  build:safe:
+    desc: "Build the project in ReleaseSafe mode"
+    aliases: [bs]
+    cmds:
+      - zig build -Doptimize=ReleaseSafe
+
+  build:small:
+    desc: "Build the project in ReleaseSmall mode"
+    aliases: [bsm]
+    cmds:
+      - zig build -Doptimize=ReleaseSmall
+
+  run:
+    desc: "Build and run the project"
+    aliases: [r]
+    cmds:
+      - zig build run
+
+  run:release:
+    desc: "Build and run the project in release mode"
+    aliases: [rr]
+    cmds:
+      - zig build run -Doptimize=ReleaseFast
+
+  test:
+    desc: "Run all tests"
+    aliases: [t]
+    cmds:
+      - zig build test
+
+  test:file:
+    desc: "Run tests for a specific file"
+    aliases: [tf]
+    cmds:
+      - |
+        if [ -z "{{.FILE}}" ]; then
+          echo "Usage: task test:file FILE=<path>"
+          echo "Example: task test:file FILE=src/json/pretty_print.zig"
+          exit 1
+        fi
+        zig test {{.FILE}}
+
+  test:summary:
+    desc: "Run tests with summary output"
+    aliases: [ts]
+    cmds:
+      - zig build test --summary all
+
+  format:
+    desc: "Format all Zig source files"
+    aliases: [fmt, f]
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - zig fmt src/
+      - zig fmt build.zig
+
+  format:check:
+    desc: "Check if code is formatted correctly"
+    aliases: [fmt-check, fc]
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - zig fmt --check src/
+      - zig fmt --check build.zig
+
+  lint:
+    desc: "Run linting checks"
+    aliases: [l]
+    cmds:
+      - task: format:check
+      - echo "✅ Linting complete"
+
+  clean:
+    desc: "Clean build artifacts"
+    aliases: [c]
+    cmds:
+      - rm -rf zig-out/
+      - rm -rf zig-cache/
+      - rm -rf .zig-cache/
+      - echo "✅ Cleaned build artifacts"
+
+  check:
+    desc: "Check the project (build without running)"
+    cmds:
+      - zig build --summary failures
+
+  docs:
+    desc: "Generate documentation"
+    cmds:
+      - echo "Generating documentation..."
+      - zig build-lib src/root.zig -femit-docs -fno-emit-bin
+      - echo "✅ Documentation generated in zig-out/doc/"
+
+  deps:
+    desc: "Check dependencies and Zig installation"
+    cmds:
+      - zig version
+      - zig env
+
+  benchmark:
+    desc: "Run benchmarks"
+    aliases: [bench, bm]
+    cmds:
+      - echo "Running benchmarks..."
+      - zig build test -Doptimize=ReleaseFast
+
+  watch:
+    desc: "Watch for changes and rebuild"
+    aliases: [w]
+    cmds:
+      - |
+        echo "Watching for changes... (Ctrl+C to stop)"
+        while true; do
+          zig build 2>&1 | grep -v "Build succeeded"
+          inotifywait -e modify -r src/ build.zig 2>/dev/null || \
+          fswatch -1 -r src/ build.zig 2>/dev/null || \
+          sleep 2
+        done
+
+  watch:test:
+    desc: "Watch for changes and run tests"
+    aliases: [wt]
+    cmds:
+      - |
+        echo "Watching for changes and running tests... (Ctrl+C to stop)"
+        while true; do
+          zig build test
+          inotifywait -e modify -r src/ 2>/dev/null || \
+          fswatch -1 -r src/ 2>/dev/null || \
+          sleep 2
+        done
+
+  coverage:
+    desc: "Generate test coverage report"
+    cmds:
+      - echo "Coverage reporting is not yet standardized in Zig"
+      - echo "Consider using kcov or similar tools manually"
+
+  analyze:
+    desc: "Run static analysis"
+    cmds:
+      - zig build --verbose
+
+  do:
+    desc: "Run all pre-commit checks"
+    cmds:
+      - task: format
+      - task: lint
+      - task: test
+      - echo "✅ All checks passed"
+
+  signoff:
+    desc: "Sign off the codebase"
+    aliases: ["sign", "s"]
+    deps:
+      - task: do
+    cmds:
+      - gh signoff
+
+  install:
+    desc: "Install the binary"
+    cmds:
+      - zig build -Doptimize=ReleaseFast
+      - echo "Binary installed to {{.BUILD_DIR}}/bin/{{.PROJECT_NAME}}"
+
+  uninstall:
+    desc: "Remove installed binary"
+    cmds:
+      - rm -f {{.BUILD_DIR}}/bin/{{.PROJECT_NAME}}
+      - echo "✅ Binary removed"
+
+  info:
+    desc: "Show project information"
+    cmds:
+      - echo "Project {{.PROJECT_NAME}}"
+      - echo "Build directory {{.BUILD_DIR}}"
+      - zig version
+      - echo ""
+      - echo "Available build modes:"
+      - echo "  - Debug (default)"
+      - echo "  - ReleaseFast (task build:release)"
+      - echo "  - ReleaseSafe (task build:safe)"
+      - echo "  - ReleaseSmall (task build:small)"
+
+  repl:
+    desc: "Start Zig REPL (if available)"
+    cmds:
+      - |
+        if command -v ziggy >/dev/null 2>&1; then
+          ziggy
+        else
+          echo "No Zig REPL found. Install ziggy: https://github.com/zigtools/ziggy"
+        fi
