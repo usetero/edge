@@ -1,0 +1,27 @@
+# Tero Edge HTTP Proxy Configuration
+
+# Network Configuration
+listen_address=127.0.0.1
+listen_port=8080
+
+# Upstream destination
+# Example: httpbin.org (93.184.216.34 is example.com)
+upstream_address=127.0.0.1
+upstream_port=8081
+
+# Threading Configuration
+max_concurrent_connections=1024
+thread_pool_size=8
+
+# Protocol Support
+enable_http1=true
+enable_http2=true
+
+# Inspection Configuration
+log_level=info
+pretty_print_json=true
+max_body_size=1048576
+
+# Hot-reload: Edit this file and either:
+# 1. Wait for automatic detection (polls every second)
+# 2. Send SIGHUP: kill -HUP <pid>
