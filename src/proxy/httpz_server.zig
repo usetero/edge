@@ -1,10 +1,13 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const config_types = @import("../config/types.zig");
+const handler_pipeline = @import("handler_pipeline.zig");
+const handler_types = @import("handlers/types.zig");
 
 const ProxyContext = struct {
     allocator: std.mem.Allocator,
     config: *const std.atomic.Value(*const config_types.ProxyConfig),
+    pipeline: handler_pipeline.Pipeline,
 };
 
 pub const HttpzProxyServer = struct {
@@ -17,9 +20,33 @@ pub const HttpzProxyServer = struct {
         config: *const std.atomic.Value(*const config_types.ProxyConfig),
     ) !HttpzProxyServer {
         const ctx = try allocator.create(ProxyContext);
+        errdefer allocator.destroy(ctx);
+
+        // Initialize handlers with long-lived allocator
+        // TODO: Load from config instead of hardcoding
+        const handlers = [_]handler_types.Handler{
+            .{ .log_filter = try handler_types.LogFilterConfig.init(
+                allocator,
+                &[_][]const u8{
+                    "DROP TABLE",
+                    "DELETE FROM",
+                    "<script>",
+                },
+                .reject,
+                .{
+                    .path_pattern = "/api/*",
+                    .content_type_pattern = "application/json",
+                },
+            ) },
+        };
+
+        var pipeline = try handler_pipeline.Pipeline.init(allocator, &handlers);
+        errdefer pipeline.deinit();
+
         ctx.* = .{
             .allocator = allocator,
             .config = config,
+            .pipeline = pipeline,
         };
 
         const current_config = config.load(.acquire);
@@ -41,6 +68,7 @@ pub const HttpzProxyServer = struct {
     }
 
     pub fn deinit(self: *HttpzProxyServer) void {
+        self.context.pipeline.deinit();
         self.server.deinit();
         self.allocator.destroy(self.context);
         self.allocator.destroy(self.server);
@@ -48,6 +76,16 @@ pub const HttpzProxyServer = struct {
 
     pub fn listen(self: *HttpzProxyServer) !void {
         try self.server.listen();
+    }
+
+    pub fn dispatch(self: *App, action: httpz.Action(*App), req: *httpz.Request, res: *httpz.Response) !void {
+        var timer = try std.time.Timer.start();
+
+        // your `dispatch` doesn't _have_ to call the action
+        try action(self, req, res);
+
+        const elapsed = timer.lap() / 1000; // ns -> us
+        std.log.info("{} {s} {d}", .{ req.method, req.url.path, elapsed });
     }
 
     fn formatAddress(addr: [4]u8) []const u8 {
@@ -103,8 +141,6 @@ pub const HttpzProxyServer = struct {
             break :blk fbs.getWritten();
         };
 
-        const uri = try std.Uri.parse(upstream_url);
-
         // Determine the HTTP method from the request
         const method: std.http.Method = switch (req.method) {
             .GET => .GET,
@@ -153,16 +189,62 @@ pub const HttpzProxyServer = struct {
             idx += 1;
         }
 
+        // Extract content-type from headers for pipeline routing
+        var content_type: ?[]const u8 = null;
+        for (headers_to_forward) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+                content_type = header.value;
+                break;
+            }
+        }
+
+        // Create request context for pipeline processing
+        const initial_ctx = handler_types.RequestContext{
+            .method = method,
+            .path = req.url.path,
+            .url = upstream_url,
+            .content_type = content_type,
+            .headers = headers_to_forward,
+            .body = if (req.body_buffer) |b| b.data else null,
+            .allocator = req.arena, // Request-scoped allocator
+        };
+
+        // Process through handler pipeline
+        const result = try ctx.pipeline.process(initial_ctx);
+
+        // Check if request was rejected by handlers
+        switch (result.action) {
+            .reject => {
+                res.status = 403;
+                res.body = "Request rejected by security handler";
+                std.log.warn("{s} {s} - rejected by handler pipeline", .{
+                    @tagName(req.method),
+                    req.url.path,
+                });
+                return;
+            },
+            .forward, .continue_pipeline => {
+                // Continue with forwarding (potentially modified request)
+            },
+        }
+
         // Create upstream request with forwarded headers
-        var upstream_req = try client.request(method, uri, .{
-            .extra_headers = headers_to_forward,
+        // Use potentially modified URL from pipeline
+        const final_uri = try std.Uri.parse(result.context.url);
+        var upstream_req = try client.request(method, final_uri, .{
+            .extra_headers = result.context.headers,
         });
         defer upstream_req.deinit();
 
         // Send request with body if present and method supports it
-        if (req.body_buffer) |body| {
+        // Use potentially modified body from pipeline
+        if (result.context.body) |body| {
             switch (method) {
-                .POST, .PUT, .PATCH => try upstream_req.sendBodyComplete(body.data),
+                .POST, .PUT, .PATCH => {
+                    // sendBodyComplete requires mutable slice, so we need to copy
+                    const mutable_body = try req.arena.dupe(u8, body);
+                    try upstream_req.sendBodyComplete(mutable_body);
+                },
                 else => try upstream_req.sendBodiless(),
             }
         } else {
