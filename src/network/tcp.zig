@@ -52,6 +52,28 @@ pub const TcpListener = struct {
             .address = client_addr,
         };
     }
+
+    /// Accept with timeout - returns null if timeout expires without connection
+    pub fn acceptTimeout(self: *TcpListener, timeout_ms: i32) !?TcpConnection {
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = self.fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+
+        const ready = try posix.poll(&poll_fds, timeout_ms);
+
+        if (ready == 0) {
+            // Timeout
+            return null;
+        }
+
+        if (poll_fds[0].revents & posix.POLL.IN != 0) {
+            return try self.accept();
+        }
+
+        return null;
+    }
 };
 
 pub const TcpConnection = struct {

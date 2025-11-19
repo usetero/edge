@@ -1,9 +1,36 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
 const config_watcher = @import("config/watcher.zig");
 const tcp = @import("network/tcp.zig");
 const thread_pool = @import("proxy/thread_pool.zig");
+
+/// Global shutdown flag - set by signal handler
+var shutdown = std.atomic.Value(bool).init(false);
+
+/// Signal handler for graceful shutdown
+fn handleShutdownSignal(sig: c_int) callconv(.c) void {
+    _ = sig;
+    shutdown.store(true, .release);
+    std.log.info("Shutdown signal received, initiating graceful shutdown...", .{});
+}
+
+/// Install SIGINT and SIGTERM handlers
+fn installShutdownHandlers() void {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+        return; // Signal handling not supported on this platform
+    }
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handleShutdownSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -44,9 +71,11 @@ pub fn main() !void {
     std.log.info("HTTP/1.1: {s}", .{if (initial_config.enable_http1) "enabled" else "disabled"});
     std.log.info("HTTP/2: {s}", .{if (initial_config.enable_http2) "enabled" else "disabled"});
 
-    // Install signal handler for hot-reload
+    // Install signal handlers
+    installShutdownHandlers();
+
     config_watcher.installSignalHandler(&config_manager) catch |err| {
-        std.log.warn("Failed to install signal handler: {}", .{err});
+        std.log.warn("Failed to install config reload handler: {}", .{err});
     };
 
     // Start config file watcher
@@ -68,22 +97,31 @@ pub fn main() !void {
     });
 
     // Create thread pool
-    var pool = try thread_pool.ThreadPool.init(
+    const pool = try thread_pool.ThreadPool.init(
         allocator,
         &config_manager.current,
         initial_config.thread_pool_size,
     );
-    defer pool.deinit();
+    defer pool.deinit(allocator);
 
     std.log.info("Proxy ready. Waiting for connections...", .{});
 
-    // Main accept loop
-    while (true) {
-        // Accept client connection
-        const client = listener.accept() catch |err| {
+    std.log.info("Main: entering accept loop", .{});
+    var loop_iterations: usize = 0;
+    // Main accept loop with graceful shutdown support
+    while (!shutdown.load(.acquire)) {
+        loop_iterations += 1;
+        if (loop_iterations % 10 == 0) {
+            std.log.info("Main: accept loop iteration {}", .{loop_iterations});
+        }
+        // Accept client connection with timeout to allow checking shutdown flag
+        const client = listener.acceptTimeout(1000) catch |err| {
             std.log.err("Accept failed: {}", .{err});
             continue;
         };
+
+        // Timeout - no connection, check shutdown flag
+        if (client == null) continue;
 
         const current_config = config_manager.get();
 
@@ -93,23 +131,26 @@ pub fn main() !void {
             current_config.upstream_port,
         ) catch |err| {
             std.log.err("Failed to connect to upstream: {}", .{err});
-            var mutable_client = client;
+            var mutable_client = client.?;
             mutable_client.close();
             continue;
         };
 
         // Submit to thread pool
         pool.submit(.{
-            .client = client.fd,
+            .client = client.?.fd,
             .upstream = upstream.fd,
         }) catch |err| {
             std.log.err("Failed to submit connection to pool: {}", .{err});
-            var mutable_client = client;
+            var mutable_client = client.?;
             mutable_client.close();
             upstream.close();
             continue;
         };
     }
+
+    std.log.info("Shutting down gracefully...", .{});
+    std.log.info("Proxy stopped.", .{});
 }
 
 test "simple test" {
