@@ -38,10 +38,13 @@ pub fn inspectRequest(
 
     // Request line
     try stdout.print("║ {s} {s} {s}\n", .{ @tagName(req.method), req.target, @tagName(req.version) });
-
+    var contentLength: u32 = 1024;
     // Headers
     for (req.headers) |header| {
         try stdout.print("║ {s}: {s}\n", .{ header.name, header.value });
+        if (std.mem.eql(u8, header.name, "Content-Length")) {
+            contentLength = std.fmt.parseInt(u32, header.value, 10) catch 0;
+        }
     }
 
     // Body inspection
@@ -53,13 +56,16 @@ pub fn inspectRequest(
             try stdout.writeAll("(JSON) ");
             try stdout.writeAll("─────────────────────────────────────────────────\n");
 
-            json_pp.prettyPrint(stdout, req.body, allocator) catch |err| {
+            var bufferedWriter = try std.io.Writer.Allocating.initCapacity(allocator, contentLength);
+            defer bufferedWriter.deinit();
+
+            json_pp.prettyPrint(&bufferedWriter.writer, req.body, allocator) catch |err| {
                 try stdout.print("║ │ <JSON parse error: {}>\n", .{err});
                 try stdout.print("║ │ {s}\n", .{req.body});
             };
 
             // Print each line with prefix
-            var lines = std.mem.splitScalar(u8, &buffer, '\n');
+            var lines = std.mem.splitScalar(u8, bufferedWriter.written(), '\n');
             while (lines.next()) |line| {
                 if (line.len > 0) {
                     try stdout.print("║ │ {s}\n", .{line});

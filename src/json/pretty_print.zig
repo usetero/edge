@@ -1,5 +1,6 @@
 const std = @import("std");
 
+// prettyPrint prints a JSON value to the given writer in a pretty format. It is up to the caller to flush the writer.
 pub fn prettyPrint(writer: *std.io.Writer, json_text: []const u8, allocator: std.mem.Allocator) !void {
     // Parse JSON
     const parsed = std.json.parseFromSlice(
@@ -17,7 +18,7 @@ pub fn prettyPrint(writer: *std.io.Writer, json_text: []const u8, allocator: std
     // Pretty print the value
     try printValue(writer, parsed.value, 0);
     try writer.writeAll("\n");
-    try writer.flush();
+    // try writer.flush();
 }
 
 fn printValue(writer: anytype, value: std.json.Value, indent: usize) anyerror!void {
@@ -103,7 +104,7 @@ test "prettyPrint - simple object" {
     var buffer: [512]u8 = undefined;
     var bufferedWriter = std.io.Writer.fixed(&buffer);
     try prettyPrint(&bufferedWriter, json, std.testing.allocator);
-
+    try bufferedWriter.flush();
     const expected =
         \\{
         \\  "name": "Alice",
@@ -120,7 +121,7 @@ test "prettyPrint - nested object" {
     var buffer: [512]u8 = undefined;
     var bufferedWriter = std.io.Writer.fixed(&buffer);
     try prettyPrint(&bufferedWriter, json, std.testing.allocator);
-
+    try bufferedWriter.flush();
     const expected =
         \\{
         \\  "user": {
