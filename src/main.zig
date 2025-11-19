@@ -3,8 +3,7 @@ const builtin = @import("builtin");
 const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
 const config_watcher = @import("config/watcher.zig");
-const tcp = @import("network/tcp.zig");
-const thread_pool = @import("proxy/thread_pool.zig");
+const httpz_server = @import("proxy/httpz_server.zig");
 
 /// Global shutdown flag - set by signal handler
 var shutdown = std.atomic.Value(bool).init(false);
@@ -67,7 +66,6 @@ pub fn main() !void {
         initial_config.upstream_address[3],
         initial_config.upstream_port,
     });
-    std.log.info("Thread pool size: {}", .{initial_config.thread_pool_size});
     std.log.info("HTTP/1.1: {s}", .{if (initial_config.enable_http1) "enabled" else "disabled"});
     std.log.info("HTTP/2: {s}", .{if (initial_config.enable_http2) "enabled" else "disabled"});
 
@@ -81,73 +79,17 @@ pub fn main() !void {
     // Start config file watcher
     try config_manager.startWatching();
 
-    // Create TCP listener
-    var listener = try tcp.TcpListener.init(
-        initial_config.listen_address,
-        initial_config.listen_port,
-    );
-    defer listener.deinit();
-
-    std.log.info("Listening on {}.{}.{}.{}:{}", .{
-        initial_config.listen_address[0],
-        initial_config.listen_address[1],
-        initial_config.listen_address[2],
-        initial_config.listen_address[3],
-        initial_config.listen_port,
-    });
-
-    // Create thread pool
-    const pool = try thread_pool.ThreadPool.init(
+    // Create httpz proxy server
+    var proxy = try httpz_server.HttpzProxyServer.init(
         allocator,
         &config_manager.current,
-        initial_config.thread_pool_size,
     );
-    defer pool.deinit(allocator);
+    defer proxy.deinit();
 
     std.log.info("Proxy ready. Waiting for connections...", .{});
 
-    std.log.info("Main: entering accept loop", .{});
-    var loop_iterations: usize = 0;
-    // Main accept loop with graceful shutdown support
-    while (!shutdown.load(.acquire)) {
-        loop_iterations += 1;
-        if (loop_iterations % 10 == 0) {
-            std.log.info("Main: accept loop iteration {}", .{loop_iterations});
-        }
-        // Accept client connection with timeout to allow checking shutdown flag
-        const client = listener.acceptTimeout(1000) catch |err| {
-            std.log.err("Accept failed: {}", .{err});
-            continue;
-        };
-
-        // Timeout - no connection, check shutdown flag
-        if (client == null) continue;
-
-        const current_config = config_manager.get();
-
-        // Connect to upstream
-        var upstream = tcp.TcpConnection.connect(
-            current_config.upstream_address,
-            current_config.upstream_port,
-        ) catch |err| {
-            std.log.err("Failed to connect to upstream: {}", .{err});
-            var mutable_client = client.?;
-            mutable_client.close();
-            continue;
-        };
-
-        // Submit to thread pool
-        pool.submit(.{
-            .client = client.?.fd,
-            .upstream = upstream.fd,
-        }) catch |err| {
-            std.log.err("Failed to submit connection to pool: {}", .{err});
-            var mutable_client = client.?;
-            mutable_client.close();
-            upstream.close();
-            continue;
-        };
-    }
+    // Start listening
+    try proxy.listen();
 
     std.log.info("Shutting down gracefully...", .{});
     std.log.info("Proxy stopped.", .{});
