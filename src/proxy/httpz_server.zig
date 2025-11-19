@@ -3,8 +3,20 @@ const httpz = @import("httpz");
 const config_types = @import("../config/types.zig");
 
 const ProxyContext = struct {
-    allocator: std.mem.Allocator,
     config: *const std.atomic.Value(*const config_types.ProxyConfig),
+
+    pub fn dispatch(self: *ProxyContext, action: httpz.Action(*ProxyContext), req: *httpz.Request, res: *httpz.Response) !void {
+        // Our custom dispatch lets us add a log + timing for every request
+        // httpz supports middlewares, but in many cases, having a dispatch is good
+        // enough and is much more straightforward.
+
+        var start = try std.time.Timer.start();
+        // We don't _have_ to call the action if we don't want to. For example
+        // we could do authentication and set the response directly on error.
+        try action(self, req, res);
+
+        std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+    }
 };
 
 pub const HttpzProxyServer = struct {
@@ -18,7 +30,6 @@ pub const HttpzProxyServer = struct {
     ) !HttpzProxyServer {
         const ctx = try allocator.create(ProxyContext);
         ctx.* = .{
-            .allocator = allocator,
             .config = config,
         };
 
@@ -74,7 +85,7 @@ pub const HttpzProxyServer = struct {
         });
 
         // Create HTTP client for upstream request
-        var client = std.http.Client{ .allocator = ctx.allocator };
+        var client = std.http.Client{ .allocator = req.arena };
         defer client.deinit();
 
         // Build full upstream URL by combining base URL with request path and query string
@@ -132,8 +143,8 @@ pub const HttpzProxyServer = struct {
         }
 
         // Allocate array for headers
-        const headers_to_forward = try ctx.allocator.alloc(std.http.Header, header_count);
-        defer ctx.allocator.free(headers_to_forward);
+        const headers_to_forward = try req.arena.alloc(std.http.Header, header_count);
+        defer req.arena.free(headers_to_forward);
 
         // Copy headers to array
         var idx: usize = 0;

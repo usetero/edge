@@ -48,7 +48,7 @@ pub fn main() !void {
 
     _ = args.next(); // Skip program name
 
-    const config_path = args.next() orelse "config.txt";
+    const config_path = args.next() orelse "config.json";
 
     std.log.info("Tero Edge HTTP Proxy starting...", .{});
     std.log.info("Configuration file: {s}", .{config_path});
@@ -66,8 +66,6 @@ pub fn main() !void {
         initial_config.listen_port,
     });
     std.log.info("Upstream URL: {s}", .{initial_config.upstream_url});
-    std.log.info("HTTP/1.1: {s}", .{if (initial_config.enable_http1) "enabled" else "disabled"});
-    std.log.info("HTTP/2: {s}", .{if (initial_config.enable_http2) "enabled" else "disabled"});
 
     // Install signal handlers
     installShutdownHandlers();

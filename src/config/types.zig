@@ -1,4 +1,11 @@
 const std = @import("std");
+const policy_mod = @import("../core/policy.zig");
+
+pub const Policy = policy_mod.Policy;
+pub const PolicyType = policy_mod.PolicyType;
+pub const TelemetryType = policy_mod.TelemetryType;
+pub const Action = policy_mod.Action;
+pub const ActionType = policy_mod.ActionType;
 
 pub const LogLevel = enum(u8) {
     debug,
@@ -21,35 +28,23 @@ pub const ProxyConfig = struct {
     listen_port: u16,
     upstream_url: []const u8, // Now supports full URLs like "http://example.com:8080"
 
-    // Threading config
-    max_concurrent_connections: u32,
-    thread_pool_size: u16,
-
-    // Protocol config
-    enable_http1: bool,
-    enable_http2: bool,
-
     // Inspection config
     log_level: LogLevel,
     pretty_print_json: bool,
     max_body_size: u32,
 
-    // Hot-reload timestamp
-    last_modified: i64,
+    // Policies for filtering/transforming telemetry
+    policies: []Policy,
 
     pub fn default() ProxyConfig {
         return .{
             .listen_address = .{ 127, 0, 0, 1 },
             .listen_port = 8080,
             .upstream_url = "http://127.0.0.1:80",
-            .max_concurrent_connections = 1024,
-            .thread_pool_size = 16,
-            .enable_http1 = true,
-            .enable_http2 = true,
             .log_level = .info,
             .pretty_print_json = true,
             .max_body_size = 1024 * 1024, // 1MB
-            .last_modified = 0,
+            .policies = &.{}, // Empty slice by default
         };
     }
 };
