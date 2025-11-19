@@ -1,0 +1,73 @@
+---
+# This file was bootstrapped by Terraform but is now owned by this repository.
+# Feel free to customize it for your repo's needs (runner size, setup steps, etc.)
+name: bot-signoff
+
+# This workflow runs the same signoff process for bots that humans run locally.
+# It handles:
+# - Bot PRs (Renovate, Dependabot)
+# - Master branch pushes (post-merge validation)
+# - Manual trigger via 'ci' label
+#
+# Bots and humans follow the exact same validation process via 'task signoff'.
+
+"on":
+  workflow_dispatch:
+  pull_request:
+    types:
+      - labeled
+      - opened
+      - synchronize
+      - reopened
+  push:
+    branches: ["master"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPRIVATE: github.com/usetero/
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.TERO_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TERO_BOT_PRIVATE_SIGNING_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+          ref: ${{ github.head_ref || github.ref }}
+          fetch-depth: 0
+      - uses: cashapp/activate-hermit@v1
+
+      - run: git config --global url.https://x-access-token:${{ steps.generate-token.outputs.token }}@github.com/.insteadOf https://github.com/
+
+      - run: gh extension install basecamp/gh-signoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - run: git config user.name "github-actions[bot]"
+      - run: git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup CI environment (if task exists)
+        run: |
+          if task --list | grep -q "ci:setup"; then
+            task ci:setup
+          fi
+
+      - if: github.actor == 'renovate[bot]'
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "chore(renovate): auto-fix from CI"
+
+      - run: task signoff
