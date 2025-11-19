@@ -5,20 +5,24 @@ const config_parser = @import("config/parser.zig");
 const config_watcher = @import("config/watcher.zig");
 const httpz_server = @import("proxy/httpz_server.zig");
 
-/// Global shutdown flag - set by signal handler
-var shutdown = std.atomic.Value(bool).init(false);
+/// Global server instance for signal handler
+var server_instance: ?*httpz_server.HttpzProxyServer = null;
 
 /// Signal handler for graceful shutdown
 fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     _ = sig;
-    shutdown.store(true, .release);
-    std.log.info("Shutdown signal received, initiating graceful shutdown...", .{});
+    std.log.info("Shutdown signal received, stopping server...", .{});
+    if (server_instance) |server| {
+        server_instance = null;
+        server.server.stop();
+    }
 }
 
 /// Install SIGINT and SIGTERM handlers
 fn installShutdownHandlers() void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
-        return; // Signal handling not supported on this platform
+        std.log.warn("Signal handling not supported on this platform", .{});
+        return;
     }
 
     const act = std.posix.Sigaction{
@@ -29,6 +33,8 @@ fn installShutdownHandlers() void {
 
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+
+    std.log.debug("Installed signal handlers for SIGINT and SIGTERM", .{});
 }
 
 pub fn main() !void {
@@ -59,13 +65,7 @@ pub fn main() !void {
         initial_config.listen_address[3],
         initial_config.listen_port,
     });
-    std.log.info("Upstream address: {}.{}.{}.{}:{}", .{
-        initial_config.upstream_address[0],
-        initial_config.upstream_address[1],
-        initial_config.upstream_address[2],
-        initial_config.upstream_address[3],
-        initial_config.upstream_port,
-    });
+    std.log.info("Upstream URL: {s}", .{initial_config.upstream_url});
     std.log.info("HTTP/1.1: {s}", .{if (initial_config.enable_http1) "enabled" else "disabled"});
     std.log.info("HTTP/2: {s}", .{if (initial_config.enable_http2) "enabled" else "disabled"});
 
@@ -86,13 +86,19 @@ pub fn main() !void {
     );
     defer proxy.deinit();
 
-    std.log.info("Proxy ready. Waiting for connections...", .{});
+    // Set global server instance for signal handler
+    server_instance = &proxy;
+    defer server_instance = null;
 
-    // Start listening
+    std.log.info("Proxy ready. Waiting for connections...", .{});
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        std.log.info("To shutdown: kill -s INT {d}", .{std.c.getpid()});
+    }
+
+    // Start listening (blocks until server.stop() is called)
     try proxy.listen();
 
-    std.log.info("Shutting down gracefully...", .{});
-    std.log.info("Proxy stopped.", .{});
+    std.log.info("Server stopped gracefully.", .{});
 }
 
 test "simple test" {
