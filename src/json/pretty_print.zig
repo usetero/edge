@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn prettyPrint(writer: std.io.Writer, json_text: []const u8, allocator: std.mem.Allocator) !void {
+pub fn prettyPrint(writer: *std.io.Writer, json_text: []const u8, allocator: std.mem.Allocator) !void {
     // Parse JSON
     const parsed = std.json.parseFromSlice(
         std.json.Value,
@@ -17,6 +17,7 @@ pub fn prettyPrint(writer: std.io.Writer, json_text: []const u8, allocator: std.
     // Pretty print the value
     try printValue(writer, parsed.value, 0);
     try writer.writeAll("\n");
+    try writer.flush();
 }
 
 fn printValue(writer: anytype, value: std.json.Value, indent: usize) anyerror!void {
@@ -98,10 +99,10 @@ fn writeEscapedString(writer: anytype, s: []const u8) !void {
 
 test "prettyPrint - simple object" {
     const json = "{\"name\":\"Alice\",\"age\":30}";
-    var buffer: [1024]u8 = undefined;
-    const stdout_writer = std.fs.File.stdout().writer(&buffer);
-    const writer = std.io.Writer.buffered(&stdout_writer);
-    try prettyPrint(writer, json, std.testing.allocator);
+
+    var buffer: [512]u8 = undefined;
+    var bufferedWriter = std.io.Writer.fixed(&buffer);
+    try prettyPrint(&bufferedWriter, json, std.testing.allocator);
 
     const expected =
         \\{
@@ -110,16 +111,24 @@ test "prettyPrint - simple object" {
         \\}
         \\
     ;
-    try std.testing.expectEqualStrings(expected, buffer.items);
+    try std.testing.expectEqualStrings(expected, &buffer);
 }
 
 test "prettyPrint - nested object" {
     const json = "{\"user\":{\"name\":\"Bob\"},\"active\":true}";
-    var buffer = std.ArrayList(u8).init(std.testing.allocator);
-    defer buffer.deinit();
 
-    try prettyPrint(buffer.writer(), json, std.testing.allocator);
+    var buffer: [512]u8 = undefined;
+    var bufferedWriter = std.io.Writer.fixed(&buffer);
+    try prettyPrint(&bufferedWriter, json, std.testing.allocator);
 
-    // Just verify it doesn't crash and produces output
-    try std.testing.expect(buffer.items.len > 0);
+    const expected =
+        \\{
+        \\  "user": {
+        \\    "name": "Bob"
+        \\  },
+        \\  "active": true
+        \\}
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, &buffer);
 }
