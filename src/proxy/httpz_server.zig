@@ -1,19 +1,59 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const config_types = @import("../config/types.zig");
+const filter_mod = @import("../core/filter.zig");
 
 const ProxyContext = struct {
     config: *const std.atomic.Value(*const config_types.ProxyConfig),
+    filter: *const filter_mod.FilterEvaluator,
 
     pub fn dispatch(self: *ProxyContext, action: httpz.Action(*ProxyContext), req: *httpz.Request, res: *httpz.Response) !void {
         // Our custom dispatch lets us add a log + timing for every request
         // httpz supports middlewares, but in many cases, having a dispatch is good
         // enough and is much more straightforward.
 
+        std.log.info("{s} {s} -> ({} bytes)", .{
+            @tagName(req.method),
+            req.url.path,
+            req.body_len,
+        });
         var start = try std.time.Timer.start();
-        // We don't _have_ to call the action if we don't want to. For example
-        // we could do authentication and set the response directly on error.
-        try action(self, req, res);
+        if (res.body.len == 0) {
+            try action(self, req, res);
+            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+            return;
+        }
+
+        const filter_result = self.filter.evaluate(res.body, .log) catch |err| {
+            std.log.warn("Filter evaluation failed: {}", .{err});
+            // On error, default to keeping the response
+            // Call the handler to process the request
+            try action(self, req, res);
+            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+            return;
+        };
+
+        switch (filter_result) {
+            .drop => {
+                std.log.debug("{s} {s} DROPPED by filter ({} bytes)", .{
+                    @tagName(req.method),
+                    req.url.path,
+                    res.body.len,
+                });
+                // Clear the response and return 204 No Content
+                res.status = 204;
+                res.body = "";
+            },
+            .keep => {
+                std.log.debug("{s} {s} PASSED filter ({} bytes)", .{
+                    @tagName(req.method),
+                    req.url.path,
+                    res.body.len,
+                });
+                // Call the handler to process the request
+                try action(self, req, res);
+            },
+        }
 
         std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
     }
@@ -27,10 +67,12 @@ pub const HttpzProxyServer = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         config: *const std.atomic.Value(*const config_types.ProxyConfig),
+        filter: *const filter_mod.FilterEvaluator,
     ) !HttpzProxyServer {
         const ctx = try allocator.create(ProxyContext);
         ctx.* = .{
             .config = config,
+            .filter = filter,
         };
 
         const current_config = config.load(.acquire);
