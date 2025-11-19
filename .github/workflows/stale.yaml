@@ -1,4 +1,18 @@
 ---
+# Stale PR Cleanup Workflow
+#
+# Why this exists:
+# PRs that sit open for too long get forgotten and become merge nightmares.
+# This workflow gently nudges us to either finish the work or close it.
+#
+# What it does:
+# - After 30 days of no activity, marks the PR as stale
+# - After 7 more days of no activity, closes the PR
+# - Skips PRs labeled "dependencies" or "security" (those are important!)
+#
+# How to prevent closure:
+# Just comment on the PR or push a commit - any activity resets the timer.
+#
 # DO NOT EDIT: Managed by Terraform at https://github.com/usetero/infrastructure
 name: "Close stale PRs"
 on:
