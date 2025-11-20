@@ -5,7 +5,7 @@ const compress = @import("compress.zig");
 /// Handles Datadog log ingestion
 /// Takes an httpz.Request object and data buffer, processes the logs, and returns them in original format
 /// Uses the request's arena allocator for all temporary allocations
-pub fn processDatadogLogs(request: *httpz.Request, data: []const u8, verbose: bool) ![]u8 {
+pub fn processDatadogLogs(request: *httpz.Request, data: []const u8) ![]u8 {
     const allocator = request.arena;
 
     // Check if the data is compressed
@@ -32,19 +32,13 @@ pub fn processDatadogLogs(request: *httpz.Request, data: []const u8, verbose: bo
     // Process based on content type
     if (std.mem.indexOf(u8, contentType, "application/json") != null) {
         // Parse and log JSON data
-        if (verbose) {
-            try processJsonLogs(allocator, processedData);
-        }
+        try processJsonLogs(allocator, processedData);
     } else if (std.mem.indexOf(u8, contentType, "application/logplex") != null) {
         // Handle logplex format
-        if (verbose) {
-            try processLogplexLogs(processedData);
-        }
+        try processLogplexLogs(processedData);
     } else {
         // Handle raw text logs
-        if (verbose) {
-            try processRawLogs(processedData);
-        }
+        try processRawLogs(processedData);
     }
 
     // Reserialize the data in original format
@@ -207,7 +201,7 @@ fn processRawLogs(data: []const u8) !void {
 /// Returns the data in its original format (compressed if it was compressed)
 /// Uses the request's arena allocator for all temporary allocations
 pub fn process(request: *httpz.Request, data: []const u8) ![]u8 {
-    return processDatadogLogs(request, data, true);
+    return processDatadogLogs(request, data);
 }
 
 // ============================================================================
