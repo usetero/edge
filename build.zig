@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
 
     // Link zlib for gzip compression
     exe.linkSystemLibrary("z");
+    exe.linkSystemLibrary("zstd");
     exe.linkLibC();
     exe.root_module.link_libc = true;
 
@@ -135,6 +136,7 @@ pub fn build(b: *std.Build) void {
     // Link zlib for tests too
     mod_tests.root_module.link_libc = true;
     mod_tests.root_module.linkSystemLibrary("z", .{});
+    mod_tests.root_module.linkSystemLibrary("zstd", .{});
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -148,6 +150,7 @@ pub fn build(b: *std.Build) void {
     // Link zlib for exe tests too
     exe_tests.root_module.link_libc = true;
     exe_tests.root_module.linkSystemLibrary("z", .{});
+    exe_tests.root_module.linkSystemLibrary("zstd", .{});
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
