@@ -5,11 +5,11 @@ const compress = @import("compress.zig");
 /// Handles Datadog log ingestion
 /// Takes an httpz.Request object and data buffer, processes the logs, and returns them in original format
 /// Uses the request's arena allocator for all temporary allocations
-pub fn processDatadogLogs(request: *httpz.Request, data: []const u8) ![]u8 {
-    const allocator = request.arena;
+pub fn processDatadogLogs(req: *httpz.Request, data: []const u8) ![]u8 {
+    const allocator = req.arena;
 
     // Check if the data is compressed
-    const isCompressed = checkIfCompressed(request);
+    const isCompressed = checkIfCompressed(req);
 
     // Decompress if needed
     var processedData: []u8 = undefined;
@@ -27,8 +27,7 @@ pub fn processDatadogLogs(request: *httpz.Request, data: []const u8) ![]u8 {
     defer if (needsCleanup) allocator.free(processedData);
 
     // Determine the content type
-    const contentType = getContentType(request);
-
+    const contentType = getContentType(req);
     // Process based on content type
     if (std.mem.indexOf(u8, contentType, "application/json") != null) {
         // Parse and log JSON data
@@ -59,7 +58,7 @@ pub fn processDatadogLogs(request: *httpz.Request, data: []const u8) ![]u8 {
 /// Check if the request contains compressed data using httpz.Request
 fn checkIfCompressed(request: *httpz.Request) bool {
     // httpz.Request has a headers field that can be queried
-    if (request.header("Content-Encoding")) |encoding| {
+    if (request.header("content-encoding")) |encoding| {
         return std.mem.indexOf(u8, encoding, "gzip") != null or
             std.mem.indexOf(u8, encoding, "deflate") != null;
     }
@@ -68,7 +67,7 @@ fn checkIfCompressed(request: *httpz.Request) bool {
 
 /// Get the content type from request headers using httpz.Request
 fn getContentType(request: *httpz.Request) []const u8 {
-    if (request.header("Content-Type")) |content_type| {
+    if (request.header("content-type")) |content_type| {
         return content_type;
     }
     return "text/plain";
@@ -190,18 +189,6 @@ fn processRawLogs(data: []const u8) !void {
 
     try stdout.print("\nTotal bytes: {d}\n", .{data.len});
     try stdout.flush();
-}
-
-// ============================================================================
-// MAIN PUBLIC FUNCTION - Simple Interface
-// ============================================================================
-
-/// Main public function for processing Datadog logs
-/// Takes an httpz.Request and data buffer
-/// Returns the data in its original format (compressed if it was compressed)
-/// Uses the request's arena allocator for all temporary allocations
-pub fn process(request: *httpz.Request, data: []const u8) ![]u8 {
-    return processDatadogLogs(request, data);
 }
 
 // ============================================================================

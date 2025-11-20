@@ -2,6 +2,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const config_types = @import("../config/types.zig");
 const filter_mod = @import("../core/filter.zig");
+const datadog_v2_logs = @import("datadog_v2_logs.zig");
 
 const ProxyContext = struct {
     config: *const std.atomic.Value(*const config_types.ProxyConfig),
@@ -18,64 +19,70 @@ const ProxyContext = struct {
             req.body_len,
         });
         var start = try std.time.Timer.start();
+        defer {
+            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+        }
+
         if (req.body_len == 0 or req.body_buffer == null) {
             try action(self, req, res);
-            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
             return;
         }
-        const body = req.body() orelse {
-            try action(self, req, res);
-            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
-            return;
-        };
 
-        const parsed = std.json.parseFromSliceLeaky(
-            std.json.Value,
-            req.arena,
-            body,
-            .{},
-        ) catch |err| {
-            std.log.err("failed to parse: {}", .{err});
-            // If parsing fails, just passthrough
-            try action(self, req, res);
-            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
-            return;
-        };
-        // defer parsed.deinit();
-        std.log.debug("Parsed JSON: {any}", .{parsed});
-
-        const filter_result = self.filter.evaluate(body, .log) catch |err| {
-            std.log.warn("Filter evaluation failed: {}", .{err});
-            // On error, default to keeping the response
-            // Call the handler to process the request
-            try action(self, req, res);
-            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
-            return;
-        };
-
-        switch (filter_result) {
-            .drop => {
-                std.log.debug("{s} {s} DROPPED by filter ({} bytes)", .{
-                    @tagName(req.method),
-                    req.url.path,
-                    res.body.len,
-                });
-                // Clear the response and return 204 No Content
-                res.status = 204;
-                res.body = "";
-            },
-            .keep => {
-                std.log.debug("{s} {s} PASSED filter ({} bytes)", .{
-                    @tagName(req.method),
-                    req.url.path,
-                    res.body.len,
-                });
-                // Call the handler to process the request
+        // Check if this is a Datadog v2 logs request
+        if (std.mem.eql(u8, req.url.path, "/api/v2/logs")) {
+            const body = req.body() orelse {
+                std.log.err("Missing body", .{});
                 try action(self, req, res);
-            },
+                return;
+            };
+
+            // Process Datadog logs (skip policy evaluation for now)
+            const processed_data = datadog_v2_logs.processDatadogLogs(req, body) catch |err| {
+                std.log.err("Failed to process Datadog logs: {}", .{err});
+                try action(self, req, res);
+                return;
+            };
+
+            // Set the processed data as the response body
+            res.body = processed_data;
+            res.status = 200;
+
+            try action(self, req, res);
+            return;
         }
 
-        std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+        try action(self, req, res);
+        return;
+
+        // const filter_result = self.filter.evaluate(body, .log) catch |err| {
+        //     std.log.warn("Filter evaluation failed: {}", .{err});
+        //     // On error, default to keeping the response
+        //     // Call the handler to process the request
+        //     try action(self, req, res);
+        //     return;
+        // };
+
+        // switch (filter_result) {
+        //     .drop => {
+        //         std.log.debug("{s} {s} DROPPED by filter ({} bytes)", .{
+        //             @tagName(req.method),
+        //             req.url.path,
+        //             res.body.len,
+        //         });
+        //         // Clear the response and return 204 No Content
+        //         res.status = 204;
+        //         res.body = "";
+        //     },
+        //     .keep => {
+        //         std.log.debug("{s} {s} PASSED filter ({} bytes)", .{
+        //             @tagName(req.method),
+        //             req.url.path,
+        //             res.body.len,
+        //         });
+        //         // Call the handler to process the request
+        //         try action(self, req, res);
+        //     },
+        // }
     }
 };
 
