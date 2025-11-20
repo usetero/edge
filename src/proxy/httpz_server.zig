@@ -18,13 +18,33 @@ const ProxyContext = struct {
             req.body_len,
         });
         var start = try std.time.Timer.start();
-        if (res.body.len == 0) {
+        if (req.body_len == 0 or req.body_buffer == null) {
             try action(self, req, res);
             std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
             return;
         }
+        const body = req.body() orelse {
+            try action(self, req, res);
+            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+            return;
+        };
 
-        const filter_result = self.filter.evaluate(res.body, .log) catch |err| {
+        const parsed = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            req.arena,
+            body,
+            .{},
+        ) catch |err| {
+            std.log.err("failed to parse: {}", .{err});
+            // If parsing fails, just passthrough
+            try action(self, req, res);
+            std.debug.print("ts={d} us={d} path={s}\n", .{ std.time.timestamp(), start.lap() / 1000, req.url.path });
+            return;
+        };
+        // defer parsed.deinit();
+        std.log.debug("Parsed JSON: {any}", .{parsed});
+
+        const filter_result = self.filter.evaluate(body, .log) catch |err| {
             std.log.warn("Filter evaluation failed: {}", .{err});
             // On error, default to keeping the response
             // Call the handler to process the request

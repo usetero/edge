@@ -1,0 +1,23 @@
+kind: "DatadogAgent"
+apiVersion: "datadoghq.com/v2alpha1"
+metadata:
+  name: "datadog"
+spec:
+  global:
+    site: "us5.datadoghq.com"
+    credentials:
+      apiSecret:
+        secretName: "datadog-secret"
+        keyName: "api-key"
+    clusterName: "jacob-local"
+    tags:
+      - "env:staging"
+  features:
+    logCollection:
+      enabled: true
+      containerCollectAll: true
+  override:
+    nodeAgent:
+      env:
+        - name: DD_LOGS_CONFIG_LOGS_DD_URL
+          value: "http://host.docker.internal:8080" # <-- your custom logs dd url
