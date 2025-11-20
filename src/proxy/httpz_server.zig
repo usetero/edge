@@ -201,8 +201,11 @@ pub const HttpzProxyServer = struct {
         // Count how many headers we need to forward
         var header_count: usize = 0;
         var count_it = req.headers.iterator();
+
+        std.log.info("----------------", .{});
         while (count_it.next()) |header| {
             const name = header.key;
+            std.log.info("Incoming header: {s}: {s}", .{ name, header.value });
             // Skip headers that the HTTP client sets automatically
             if (std.mem.eql(u8, name, "host")) continue;
             if (std.mem.eql(u8, name, "connection")) continue;
@@ -210,6 +213,7 @@ pub const HttpzProxyServer = struct {
             if (std.mem.eql(u8, name, "transfer-encoding")) continue;
             header_count += 1;
         }
+        std.log.info("----------------", .{});
 
         // Allocate array for headers
         const headers_to_forward = try req.arena.alloc(std.http.Header, header_count);
@@ -232,11 +236,18 @@ pub const HttpzProxyServer = struct {
             };
             idx += 1;
         }
-
+        std.log.info("----------------", .{});
+        for (headers_to_forward) |header| {
+            std.log.info("Outgoing header: {s}: {s}", .{ header.name, header.value });
+        }
+        std.log.info("----------------", .{});
+        std.log.info("uri: {s}, method: {any}", .{ upstream_url, method });
+        std.log.info("----------------", .{});
         // Create upstream request with forwarded headers
         var upstream_req = try client.request(method, uri, .{
             .extra_headers = headers_to_forward,
         });
+
         defer upstream_req.deinit();
 
         // Send request with body if present and method supports it
@@ -266,7 +277,9 @@ pub const HttpzProxyServer = struct {
             const header_name = try req.arena.dupe(u8, header.name);
             const header_value = try req.arena.dupe(u8, header.value);
             res.header(header_name, header_value);
+            std.log.info("Received Header: {s}: {s}", .{ header_name, header_value });
         }
+        std.log.info("-------------------------", .{});
 
         // Read response body
         var body_writer = std.Io.Writer.Allocating.init(req.arena);
@@ -280,8 +293,12 @@ pub const HttpzProxyServer = struct {
         var total_bytes_read: usize = 0;
         while (total_bytes_read < max_size) {
             const bytes_read = upstream_body_reader.stream(&body_writer.writer, std.io.Limit.limited(max_size - total_bytes_read)) catch |err| switch (err) {
-                error.EndOfStream => break,
+                error.EndOfStream => {
+                    std.log.err("Reached end of stream: {}", .{err});
+                    break;
+                },
                 else => {
+                    std.log.info("BIG ERROR HERE I GUESS: {}", .{err});
                     std.log.err("Error reading upstream response: {}", .{err});
                     res.status = 502; // Bad Gateway
                     res.body = "Error reading upstream response";
@@ -301,9 +318,10 @@ pub const HttpzProxyServer = struct {
         // Copy the body to arena memory before deinit invalidates it
         const temp_body = body_writer.written();
         const body = try req.arena.dupe(u8, temp_body);
+        std.log.info("Body ({} bytes): {s}", .{ body.len, body });
         res.body = body;
 
-        std.log.info("{s} {s} <- {} ({} bytes)", .{
+        std.log.info("{s} {s} <- {} ({} bytes)\nxxxxxxxxxxxxxxxxxxxxxxxx", .{
             @tagName(req.method),
             req.url.path,
             res.status,
