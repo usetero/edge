@@ -90,9 +90,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("httpz", httpz.module("httpz"));
 
     // Link zlib for gzip compression
+    exe.linkLibC();
     exe.linkSystemLibrary("z");
     exe.linkSystemLibrary("zstd");
-    exe.linkLibC();
     exe.root_module.link_libc = true;
 
     // This declares intent for the executable to be installed into the
@@ -133,6 +133,9 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    mod_tests.linkLibC();
+    mod_tests.linkSystemLibrary("z");
+    mod_tests.linkSystemLibrary("zstd");
     // Link zlib for tests too
     mod_tests.root_module.link_libc = true;
     mod_tests.root_module.linkSystemLibrary("z", .{});
@@ -147,6 +150,9 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_tests.linkLibC();
+    exe_tests.linkSystemLibrary("z");
+    exe_tests.linkSystemLibrary("zstd");
     // Link zlib for exe tests too
     exe_tests.root_module.link_libc = true;
     exe_tests.root_module.linkSystemLibrary("z", .{});

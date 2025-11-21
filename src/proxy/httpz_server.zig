@@ -3,6 +3,155 @@ const httpz = @import("httpz");
 const config_types = @import("../config/types.zig");
 const filter_mod = @import("../core/filter.zig");
 const datadog_v2_logs = @import("datadog_v2_logs.zig");
+const compress = @import("compress.zig");
+
+/// Represents the compression encoding used in a request or response
+const CompressionEncoding = enum {
+    none,
+    gzip,
+    zstd,
+
+    /// Detect compression encoding from Content-Encoding header
+    fn fromHeader(header_value: ?[]const u8) CompressionEncoding {
+        const encoding = header_value orelse return .none;
+
+        if (std.mem.indexOf(u8, encoding, "gzip") != null) {
+            return .gzip;
+        } else if (std.mem.indexOf(u8, encoding, "zstd") != null) {
+            return .zstd;
+        }
+
+        return .none;
+    }
+
+    /// Get the header value for this encoding
+    fn toHeaderValue(self: CompressionEncoding) ?[]const u8 {
+        return switch (self) {
+            .none => null,
+            .gzip => "gzip",
+            .zstd => "zstd",
+        };
+    }
+};
+
+/// Decompress request body if it's compressed
+fn decompressRequestBody(allocator: std.mem.Allocator, req: *httpz.Request, body: []const u8) ![]const u8 {
+    const encoding = CompressionEncoding.fromHeader(req.header("content-encoding"));
+
+    return switch (encoding) {
+        .none => {
+            // Not compressed, return original
+            const result = try allocator.alloc(u8, body.len);
+            @memcpy(result, body);
+            return result;
+        },
+        .gzip => {
+            std.log.debug("Decompressing gzip request body ({} bytes)", .{body.len});
+            return try compress.decompressGzip(allocator, body);
+        },
+        .zstd => {
+            std.log.debug("Decompressing zstd request body ({} bytes)", .{body.len});
+            return try compress.decompressZstd(allocator, body);
+        },
+    };
+}
+
+/// Compress response body if original request was compressed
+fn compressResponseBody(allocator: std.mem.Allocator, req: *httpz.Request, body: []const u8) ![]const u8 {
+    const encoding = CompressionEncoding.fromHeader(req.header("content-encoding"));
+
+    return switch (encoding) {
+        .none => {
+            // No compression needed, return copy
+            const result = try allocator.alloc(u8, body.len);
+            @memcpy(result, body);
+            return result;
+        },
+        .gzip => {
+            std.log.debug("Compressing gzip response body ({} bytes)", .{body.len});
+            return try compress.compressGzip(allocator, body);
+        },
+        .zstd => {
+            std.log.debug("Compressing zstd response body ({} bytes)", .{body.len});
+            return try compress.compressZstd(allocator, body);
+        },
+    };
+}
+
+/// Get the content type from request headers
+fn getContentType(req: *httpz.Request) []const u8 {
+    if (req.header("content-type")) |content_type| {
+        return content_type;
+    }
+    return "text/plain";
+}
+
+/// Handler function signature that modifies request body in place
+const HandlerFn = *const fn (req: *httpz.Request, decompressed_body: []const u8) anyerror![]const u8;
+
+/// Generic wrapper that handles compression/decompression for any handler
+/// This wrapper:
+/// 1. Decompresses the request body if needed
+/// 2. Calls the handler with decompressed data
+/// 3. Updates the request body buffer with the modified data
+/// 4. Recompresses if the original request was compressed
+fn withCompressionHandling(req: *httpz.Request, handler: HandlerFn) !void {
+    const allocator = req.arena;
+
+    const original_body = req.body() orelse {
+        std.log.err("Missing body in request", .{});
+        return error.MissingBody;
+    };
+
+    // Remember the original encoding
+    const encoding = CompressionEncoding.fromHeader(req.header("content-encoding"));
+
+    // Step 1: Decompress request body if needed
+    const decompressed_body = decompressRequestBody(allocator, req, original_body) catch |err| {
+        std.log.err("Failed to decompress request body: {}", .{err});
+        return error.DecompressionFailed;
+    };
+    defer allocator.free(decompressed_body);
+
+    // Step 2: Call the handler to process the data
+    const processed_data = handler(req, decompressed_body) catch |err| {
+        std.log.err("Handler failed: {}", .{err});
+        return err;
+    };
+    defer allocator.free(processed_data);
+
+    // Step 3: Recompress if original was compressed
+    const final_body = compressResponseBody(allocator, req, processed_data) catch |err| {
+        std.log.err("Failed to compress request body: {}", .{err});
+        return error.CompressionFailed;
+    };
+
+    // Step 4: Update the request body buffer with the modified data
+    if (req.body_buffer) |*body_buffer| {
+        if (final_body.len <= body_buffer.data.len) {
+            // Fits in existing buffer
+            @memcpy(body_buffer.data[0..final_body.len], final_body);
+            req.body_len = final_body.len;
+        } else {
+            // Need to allocate new buffer (use arena allocator)
+            const new_data = try allocator.alloc(u8, final_body.len);
+            @memcpy(new_data, final_body);
+            body_buffer.data = new_data;
+            req.body_len = final_body.len;
+        }
+    }
+
+    std.log.info("Successfully processed with compression handling: {} bytes -> {} bytes (encoding: {s})", .{
+        original_body.len,
+        final_body.len,
+        @tagName(encoding),
+    });
+}
+
+/// Handle Datadog v2 logs requests
+fn handleDatadogLogs(req: *httpz.Request, decompressed_body: []const u8) ![]const u8 {
+    return try datadog_v2_logs.processDatadogLogs(req, decompressed_body);
+}
 
 const ProxyContext = struct {
     config: *const std.atomic.Value(*const config_types.ProxyConfig),
@@ -30,25 +179,8 @@ const ProxyContext = struct {
 
         // Check if this is a Datadog v2 logs request
         if (std.mem.eql(u8, req.url.path, "/api/v2/logs")) {
-            const body = req.body() orelse {
-                std.log.err("Missing body", .{});
-                try action(self, req, res);
-                return;
-            };
-
-            // Process Datadog logs (skip policy evaluation for now)
-            const processed_data = datadog_v2_logs.processDatadogLogs(req, body) catch |err| {
-                std.log.err("Failed to process Datadog logs: {}", .{err});
-                try action(self, req, res);
-                return;
-            };
-
-            // Set the processed data as the response body
-            res.body = processed_data;
-            res.status = 200;
-
-            try action(self, req, res);
-            return;
+            // Process with compression handling (modifies request body in place)
+            try withCompressionHandling(req, handleDatadogLogs);
         }
 
         try action(self, req, res);
@@ -251,9 +383,13 @@ pub const HttpzProxyServer = struct {
         defer upstream_req.deinit();
 
         // Send request with body if present and method supports it
-        if (req.body_buffer) |body| {
+        if (req.body()) |body| {
             switch (method) {
-                .POST, .PUT, .PATCH => try upstream_req.sendBodyComplete(body.data),
+                .POST, .PUT, .PATCH => {
+                    std.log.debug("Sending {} bytes to upstream", .{body.len});
+                    // Note: sendBodyComplete requires mutable slice but doesn't actually mutate
+                    try upstream_req.sendBodyComplete(@constCast(body));
+                },
                 else => try upstream_req.sendBodiless(),
             }
         } else {
@@ -294,12 +430,16 @@ pub const HttpzProxyServer = struct {
         while (total_bytes_read < max_size) {
             const bytes_read = upstream_body_reader.stream(&body_writer.writer, std.io.Limit.limited(max_size - total_bytes_read)) catch |err| switch (err) {
                 error.EndOfStream => {
-                    std.log.err("Reached end of stream: {}", .{err});
+                    // Normal end of HTTP response body
+                    std.log.debug("Reached end of response body", .{});
                     break;
                 },
                 else => {
-                    std.log.info("BIG ERROR HERE I GUESS: {}", .{err});
-                    std.log.err("Error reading upstream response: {}", .{err});
+                    std.log.err("Error reading upstream response: {} (error set: {s}, total_bytes_read: {})", .{
+                        err,
+                        @errorName(err),
+                        total_bytes_read,
+                    });
                     res.status = 502; // Bad Gateway
                     res.body = "Error reading upstream response";
                     client.deinit();

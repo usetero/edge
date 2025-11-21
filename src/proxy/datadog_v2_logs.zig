@@ -1,68 +1,33 @@
 const std = @import("std");
 const httpz = @import("httpz");
-const compress = @import("compress.zig");
 
 /// Handles Datadog log ingestion
-/// Takes an httpz.Request object and data buffer, processes the logs, and returns them in original format
+/// Takes an httpz.Request object and decompressed data buffer, processes the logs, and returns them
 /// Uses the request's arena allocator for all temporary allocations
+/// NOTE: Compression/decompression is now handled by the caller (httpz_server.zig)
 pub fn processDatadogLogs(req: *httpz.Request, data: []const u8) ![]u8 {
     const allocator = req.arena;
 
-    // Check if the data is compressed
-    const isCompressed = checkIfCompressed(req);
-
-    // Decompress if needed
-    var processedData: []u8 = undefined;
-    var needsCleanup = false;
-
-    if (isCompressed) {
-        processedData = try compress.decompressGzip(allocator, data);
-        needsCleanup = true;
-    } else {
-        // Create a mutable copy for non-compressed data
-        processedData = try allocator.alloc(u8, data.len);
-        @memcpy(processedData, data);
-        needsCleanup = true;
-    }
-    defer if (needsCleanup) allocator.free(processedData);
-
     // Determine the content type
     const contentType = getContentType(req);
+
     // Process based on content type
     if (std.mem.indexOf(u8, contentType, "application/json") != null) {
         // Parse and log JSON data
-        try processJsonLogs(allocator, processedData);
+        try processJsonLogs(allocator, data);
     } else if (std.mem.indexOf(u8, contentType, "application/logplex") != null) {
         // Handle logplex format
-        try processLogplexLogs(processedData);
+        try processLogplexLogs(data);
     } else {
         // Handle raw text logs
-        try processRawLogs(processedData);
+        try processRawLogs(data);
     }
 
-    // Reserialize the data in original format
-    var result: []u8 = undefined;
-
-    if (isCompressed) {
-        // Recompress the data
-        result = try compress.compressGzip(allocator, processedData);
-    } else {
-        // Return uncompressed data
-        result = try allocator.alloc(u8, processedData.len);
-        @memcpy(result, processedData);
-    }
+    // Return a copy of the processed data
+    const result = try allocator.alloc(u8, data.len);
+    @memcpy(result, data);
 
     return result;
-}
-
-/// Check if the request contains compressed data using httpz.Request
-fn checkIfCompressed(request: *httpz.Request) bool {
-    // httpz.Request has a headers field that can be queried
-    if (request.header("content-encoding")) |encoding| {
-        return std.mem.indexOf(u8, encoding, "gzip") != null or
-            std.mem.indexOf(u8, encoding, "deflate") != null;
-    }
-    return false;
 }
 
 /// Get the content type from request headers using httpz.Request
