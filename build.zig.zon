@@ -36,6 +36,10 @@
             .url = "git+https://github.com/karlseguin/http.zig?ref=master#a4477b1dbdc5b820fd4ad301797ca6399f7eb6e4",
             .hash = "httpz-0.0.0-PNVzrBgtBwCVkSJyophIX6WHwDR0r8XhBGQr96Kk-1El",
         },
+        .protobuf = .{
+            .url = "git+https://github.com/Arwalk/zig-protobuf?ref=master#0c69509ffd2a9ca4448977fcbd94ad5217b3df8e",
+            .hash = "protobuf-3.0.0-0e82anPRKADr_h_KCVG8ZMCa5fVi4KRpk_e6RH-SnG-k",
+        },
     },
     .paths = .{
         "build.zig",

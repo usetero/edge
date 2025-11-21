@@ -1,8 +1,8 @@
 const std = @import("std");
-const policy_mod = @import("./policy.zig");
-const Policy = policy_mod.Policy;
-const TelemetryType = policy_mod.TelemetryType;
-const ActionType = policy_mod.ActionType;
+const policy_pb = @import("../proto/tero/edge/policy.pb.zig");
+const Policy = policy_pb.Policy;
+const TelemetryType = policy_pb.TelemetryType;
+const ActionType = policy_pb.ActionType;
 
 /// FilterResult indicates whether to keep or drop the data
 pub const FilterResult = enum {
@@ -46,9 +46,10 @@ pub const FilterEvaluator = struct {
     /// Add a policy to the appropriate telemetry-specific list
     pub fn addPolicy(self: *FilterEvaluator, new_policy: Policy) !void {
         switch (new_policy.telemetry_type) {
-            .log => try self.log_policies.append(self.allocator, new_policy),
-            .metric => try self.metric_policies.append(self.allocator, new_policy),
-            .span => try self.span_policies.append(self.allocator, new_policy),
+            .TELEMETRY_TYPE_LOG => try self.log_policies.append(self.allocator, new_policy),
+            .TELEMETRY_TYPE_METRIC => try self.metric_policies.append(self.allocator, new_policy),
+            .TELEMETRY_TYPE_SPAN => try self.span_policies.append(self.allocator, new_policy),
+            else => {}, // Ignore unspecified or unknown types
         }
     }
 
@@ -78,9 +79,10 @@ pub const FilterEvaluator = struct {
         // Select the correct policy list based on telemetry type
         // This eliminates the need to check telemetry_type in the inner loop
         const policies = switch (telemetry_type) {
-            .log => &self.log_policies,
-            .metric => &self.metric_policies,
-            .span => &self.span_policies,
+            .TELEMETRY_TYPE_LOG => &self.log_policies,
+            .TELEMETRY_TYPE_METRIC => &self.metric_policies,
+            .TELEMETRY_TYPE_SPAN => &self.span_policies,
+            else => return FilterResult.keep, // Unknown types default to keep
         };
 
         // Data-oriented approach: iterate through struct-of-arrays
@@ -102,18 +104,19 @@ pub const FilterEvaluator = struct {
             _ = i;
 
             // Only process filter policies for now
-            if (policy_type != .filter) {
+            if (policy_type != .POLICY_TYPE_FILTER) {
                 continue;
             }
 
             // Check if any regex matches the JSON data
-            const matches = try self.matchesAnyRegex(json_data, regexes);
+            const matches = try self.matchesAnyRegex(json_data, regexes.items);
 
             if (matches) {
                 // Return the action from the matching policy
-                return switch (action) {
-                    .keep => FilterResult.keep,
-                    .drop => FilterResult.drop,
+                return switch (action.type) {
+                    .ACTION_TYPE_KEEP => FilterResult.keep,
+                    .ACTION_TYPE_DROP => FilterResult.drop,
+                    else => FilterResult.keep, // Unknown actions default to keep
                 };
             }
         }
@@ -154,14 +157,17 @@ test "Filter.addPolicy increases policy count" {
     var filter = FilterEvaluator.init(std.testing.allocator);
     defer filter.deinit();
 
-    const patterns = [_][]const u8{"error"};
-    const test_policy = Policy.init(
-        "test",
-        .filter,
-        .log,
-        &patterns,
-        policy_mod.Action.init(.drop),
-    );
+    var regexes = std.ArrayListUnmanaged([]const u8){};
+    defer regexes.deinit(std.testing.allocator);
+    try regexes.append(std.testing.allocator, "error");
+
+    const test_policy = Policy{
+        .name = "test",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_LOG,
+        .regexes = regexes,
+        .action = .{ .type = .ACTION_TYPE_DROP },
+    };
 
     try filter.addPolicy(test_policy);
     try std.testing.expectEqual(@as(usize, 1), filter.policyCount());
@@ -171,12 +177,23 @@ test "Filter.addPolicy routes to correct telemetry list" {
     var filter = FilterEvaluator.init(std.testing.allocator);
     defer filter.deinit();
 
-    const patterns = [_][]const u8{"test"};
+    var regexes1 = std.ArrayListUnmanaged([]const u8){};
+    try regexes1.append(std.testing.allocator, "test");
+    var regexes2 = std.ArrayListUnmanaged([]const u8){};
+    try regexes2.append(std.testing.allocator, "test");
+    var regexes3 = std.ArrayListUnmanaged([]const u8){};
+    try regexes3.append(std.testing.allocator, "test");
+    var regexes4 = std.ArrayListUnmanaged([]const u8){};
+    try regexes4.append(std.testing.allocator, "test");
+    defer regexes1.deinit(std.testing.allocator);
+    defer regexes2.deinit(std.testing.allocator);
+    defer regexes3.deinit(std.testing.allocator);
+    defer regexes4.deinit(std.testing.allocator);
 
-    try filter.addPolicy(Policy.init("log1", .filter, .log, &patterns, policy_mod.Action.init(.drop)));
-    try filter.addPolicy(Policy.init("log2", .filter, .log, &patterns, policy_mod.Action.init(.keep)));
-    try filter.addPolicy(Policy.init("metric1", .filter, .metric, &patterns, policy_mod.Action.init(.drop)));
-    try filter.addPolicy(Policy.init("span1", .filter, .span, &patterns, policy_mod.Action.init(.keep)));
+    try filter.addPolicy(Policy{ .name = "log1", .policy_type = .POLICY_TYPE_FILTER, .telemetry_type = .TELEMETRY_TYPE_LOG, .regexes = regexes1, .action = .{ .type = .ACTION_TYPE_DROP } });
+    try filter.addPolicy(Policy{ .name = "log2", .policy_type = .POLICY_TYPE_FILTER, .telemetry_type = .TELEMETRY_TYPE_LOG, .regexes = regexes2, .action = .{ .type = .ACTION_TYPE_KEEP } });
+    try filter.addPolicy(Policy{ .name = "metric1", .policy_type = .POLICY_TYPE_FILTER, .telemetry_type = .TELEMETRY_TYPE_METRIC, .regexes = regexes3, .action = .{ .type = .ACTION_TYPE_DROP } });
+    try filter.addPolicy(Policy{ .name = "span1", .policy_type = .POLICY_TYPE_FILTER, .telemetry_type = .TELEMETRY_TYPE_SPAN, .regexes = regexes4, .action = .{ .type = .ACTION_TYPE_KEEP } });
 
     // Verify policies are in correct lists
     try std.testing.expectEqual(@as(usize, 2), filter.log_policies.len);
@@ -189,14 +206,17 @@ test "Filter.clearPolicies removes all policies" {
     var filter = FilterEvaluator.init(std.testing.allocator);
     defer filter.deinit();
 
-    const patterns = [_][]const u8{"error"};
-    const test_policy = Policy.init(
-        "test",
-        .filter,
-        .log,
-        &patterns,
-        policy_mod.Action.init(.drop),
-    );
+    var regexes = std.ArrayListUnmanaged([]const u8){};
+    defer regexes.deinit(std.testing.allocator);
+    try regexes.append(std.testing.allocator, "error");
+
+    const test_policy = Policy{
+        .name = "test",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_LOG,
+        .regexes = regexes,
+        .action = .{ .type = .ACTION_TYPE_DROP },
+    };
 
     try filter.addPolicy(test_policy);
     try std.testing.expectEqual(@as(usize, 1), filter.policyCount());
@@ -209,19 +229,22 @@ test "Filter.evaluate drops matching JSON" {
     var filter = FilterEvaluator.init(std.testing.allocator);
     defer filter.deinit();
 
-    const patterns = [_][]const u8{"error"};
-    const drop_policy = Policy.init(
-        "drop-errors",
-        .filter,
-        .log,
-        &patterns,
-        policy_mod.Action.init(.drop),
-    );
+    var regexes = std.ArrayListUnmanaged([]const u8){};
+    defer regexes.deinit(std.testing.allocator);
+    try regexes.append(std.testing.allocator, "error");
+
+    const drop_policy = Policy{
+        .name = "drop-errors",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_LOG,
+        .regexes = regexes,
+        .action = .{ .type = .ACTION_TYPE_DROP },
+    };
 
     try filter.addPolicy(drop_policy);
 
     const json_with_error = "{\"level\":\"error\",\"msg\":\"failed\"}";
-    const result = try filter.evaluate(json_with_error, .log);
+    const result = try filter.evaluate(json_with_error, .TELEMETRY_TYPE_LOG);
     try std.testing.expect(result == FilterResult.drop);
 }
 
@@ -229,19 +252,22 @@ test "Filter.evaluate keeps non-matching JSON" {
     var filter = FilterEvaluator.init(std.testing.allocator);
     defer filter.deinit();
 
-    const patterns = [_][]const u8{"error"};
-    const drop_policy = Policy.init(
-        "drop-errors",
-        .filter,
-        .log,
-        &patterns,
-        policy_mod.Action.init(.drop),
-    );
+    var regexes = std.ArrayListUnmanaged([]const u8){};
+    defer regexes.deinit(std.testing.allocator);
+    try regexes.append(std.testing.allocator, "error");
+
+    const drop_policy = Policy{
+        .name = "drop-errors",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_LOG,
+        .regexes = regexes,
+        .action = .{ .type = .ACTION_TYPE_DROP },
+    };
 
     try filter.addPolicy(drop_policy);
 
     const json_without_error = "{\"level\":\"info\",\"msg\":\"success\"}";
-    const result = try filter.evaluate(json_without_error, .log);
+    const result = try filter.evaluate(json_without_error, .TELEMETRY_TYPE_LOG);
     try std.testing.expect(result == FilterResult.keep);
 }
 
@@ -249,30 +275,32 @@ test "Filter.evaluate respects telemetry type isolation" {
     var filter = FilterEvaluator.init(std.testing.allocator);
     defer filter.deinit();
 
-    const patterns = [_][]const u8{"error"};
+    var regexes = std.ArrayListUnmanaged([]const u8){};
+    defer regexes.deinit(std.testing.allocator);
+    try regexes.append(std.testing.allocator, "error");
 
     // Add log policy that drops on "error"
-    const log_policy = Policy.init(
-        "drop-log-errors",
-        .filter,
-        .log,
-        &patterns,
-        policy_mod.Action.init(.drop),
-    );
+    const log_policy = Policy{
+        .name = "drop-log-errors",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_LOG,
+        .regexes = regexes,
+        .action = .{ .type = .ACTION_TYPE_DROP },
+    };
     try filter.addPolicy(log_policy);
 
     const json_with_error = "{\"level\":\"error\",\"msg\":\"failed\"}";
 
     // Should drop for log type (policy exists)
-    const log_result = try filter.evaluate(json_with_error, .log);
+    const log_result = try filter.evaluate(json_with_error, .TELEMETRY_TYPE_LOG);
     try std.testing.expect(log_result == FilterResult.drop);
 
     // Should keep for metric type (no metric policies, different list)
-    const metric_result = try filter.evaluate(json_with_error, .metric);
+    const metric_result = try filter.evaluate(json_with_error, .TELEMETRY_TYPE_METRIC);
     try std.testing.expect(metric_result == FilterResult.keep);
 
     // Should keep for span type (no span policies, different list)
-    const span_result = try filter.evaluate(json_with_error, .span);
+    const span_result = try filter.evaluate(json_with_error, .TELEMETRY_TYPE_SPAN);
     try std.testing.expect(span_result == FilterResult.keep);
 }
 
@@ -280,30 +308,36 @@ test "Filter.evaluate uses first matching policy" {
     var filter = FilterEvaluator.init(std.testing.allocator);
     defer filter.deinit();
 
-    const error_patterns = [_][]const u8{"error"};
-    const drop_policy = Policy.init(
-        "drop-errors",
-        .filter,
-        .log,
-        &error_patterns,
-        policy_mod.Action.init(.drop),
-    );
+    var error_regexes = std.ArrayListUnmanaged([]const u8){};
+    defer error_regexes.deinit(std.testing.allocator);
+    try error_regexes.append(std.testing.allocator, "error");
 
-    const all_patterns = [_][]const u8{"level"};
-    const keep_policy = Policy.init(
-        "keep-all",
-        .filter,
-        .log,
-        &all_patterns,
-        policy_mod.Action.init(.keep),
-    );
+    const drop_policy = Policy{
+        .name = "drop-errors",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_LOG,
+        .regexes = error_regexes,
+        .action = .{ .type = .ACTION_TYPE_DROP },
+    };
+
+    var all_regexes = std.ArrayListUnmanaged([]const u8){};
+    defer all_regexes.deinit(std.testing.allocator);
+    try all_regexes.append(std.testing.allocator, "level");
+
+    const keep_policy = Policy{
+        .name = "keep-all",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_LOG,
+        .regexes = all_regexes,
+        .action = .{ .type = .ACTION_TYPE_KEEP },
+    };
 
     // Add drop policy first
     try filter.addPolicy(drop_policy);
     try filter.addPolicy(keep_policy);
 
     const json = "{\"level\":\"error\",\"msg\":\"failed\"}";
-    const result = try filter.evaluate(json, .log);
+    const result = try filter.evaluate(json, .TELEMETRY_TYPE_LOG);
 
     // Should use first matching policy (drop)
     try std.testing.expect(result == FilterResult.drop);
@@ -314,7 +348,7 @@ test "Filter.evaluate defaults to keep when no policies match" {
     defer filter.deinit();
 
     const json = "{\"level\":\"info\",\"msg\":\"test\"}";
-    const result = try filter.evaluate(json, .log);
+    const result = try filter.evaluate(json, .TELEMETRY_TYPE_LOG);
 
     try std.testing.expect(result == FilterResult.keep);
 }
@@ -335,33 +369,41 @@ test "Filter MultiArrayList layout per telemetry type" {
     defer filter.deinit();
 
     // Add multiple policies to verify MultiArrayList storage separation
-    const error_patterns = [_][]const u8{"error"};
-    const warn_patterns = [_][]const u8{"warn"};
-    const info_patterns = [_][]const u8{"info"};
+    var error_regexes = std.ArrayListUnmanaged([]const u8){};
+    defer error_regexes.deinit(std.testing.allocator);
+    try error_regexes.append(std.testing.allocator, "error");
 
-    try filter.addPolicy(Policy.init(
-        "log-policy1",
-        .filter,
-        .log,
-        &error_patterns,
-        policy_mod.Action.init(.drop),
-    ));
+    var warn_regexes = std.ArrayListUnmanaged([]const u8){};
+    defer warn_regexes.deinit(std.testing.allocator);
+    try warn_regexes.append(std.testing.allocator, "warn");
 
-    try filter.addPolicy(Policy.init(
-        "metric-policy1",
-        .filter,
-        .metric,
-        &warn_patterns,
-        policy_mod.Action.init(.keep),
-    ));
+    var info_regexes = std.ArrayListUnmanaged([]const u8){};
+    defer info_regexes.deinit(std.testing.allocator);
+    try info_regexes.append(std.testing.allocator, "info");
 
-    try filter.addPolicy(Policy.init(
-        "span-policy1",
-        .filter,
-        .span,
-        &info_patterns,
-        policy_mod.Action.init(.drop),
-    ));
+    try filter.addPolicy(Policy{
+        .name = "log-policy1",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_LOG,
+        .regexes = error_regexes,
+        .action = .{ .type = .ACTION_TYPE_DROP },
+    });
+
+    try filter.addPolicy(Policy{
+        .name = "metric-policy1",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_METRIC,
+        .regexes = warn_regexes,
+        .action = .{ .type = .ACTION_TYPE_KEEP },
+    });
+
+    try filter.addPolicy(Policy{
+        .name = "span-policy1",
+        .policy_type = .POLICY_TYPE_FILTER,
+        .telemetry_type = .TELEMETRY_TYPE_SPAN,
+        .regexes = info_regexes,
+        .action = .{ .type = .ACTION_TYPE_DROP },
+    });
 
     try std.testing.expectEqual(@as(usize, 3), filter.policyCount());
     try std.testing.expectEqual(@as(usize, 1), filter.log_policies.len);

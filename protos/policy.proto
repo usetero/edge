@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package tero.edge.policy;
+
+// Policy type determines what kind of operation to perform
+enum PolicyType {
+  POLICY_TYPE_UNSPECIFIED = 0;
+  POLICY_TYPE_FILTER = 1;
+  POLICY_TYPE_TRANSFORM = 2;
+  POLICY_TYPE_REDACT = 3;
+}
+
+// Telemetry type specifies what kind of telemetry data this policy applies to
+enum TelemetryType {
+  TELEMETRY_TYPE_UNSPECIFIED = 0;
+  TELEMETRY_TYPE_LOG = 1;
+  TELEMETRY_TYPE_METRIC = 2;
+  TELEMETRY_TYPE_SPAN = 3;
+}
+
+// Action outcome for a policy match
+enum ActionType {
+  ACTION_TYPE_UNSPECIFIED = 0;
+  ACTION_TYPE_KEEP = 1;
+  ACTION_TYPE_DROP = 2;
+}
+
+// Action represents what to do when a policy matches
+message Action {
+  ActionType type = 1;
+}
+
+// Policy represents a filtering/processing rule for telemetry data
+message Policy {
+  // Human-readable name for this policy
+  string name = 1;
+
+  // Type of policy operation
+  PolicyType policy_type = 2;
+
+  // Type of telemetry this applies to
+  TelemetryType telemetry_type = 3;
+
+  // List of regex patterns to match against
+  repeated string regexes = 4;
+
+  // Action to take when this policy matches
+  Action action = 5;
+}
+
+// Collection of policies
+message PolicyList {
+  repeated Policy policies = 1;
+}

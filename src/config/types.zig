@@ -1,11 +1,11 @@
 const std = @import("std");
-const policy_mod = @import("../core/policy.zig");
+const policy_pb = @import("../proto/tero/edge/policy.pb.zig");
 
-pub const Policy = policy_mod.Policy;
-pub const PolicyType = policy_mod.PolicyType;
-pub const TelemetryType = policy_mod.TelemetryType;
-pub const Action = policy_mod.Action;
-pub const ActionType = policy_mod.ActionType;
+pub const Policy = policy_pb.Policy;
+pub const PolicyType = policy_pb.PolicyType;
+pub const TelemetryType = policy_pb.TelemetryType;
+pub const Action = policy_pb.Action;
+pub const ActionType = policy_pb.ActionType;
 
 pub const LogLevel = enum(u8) {
     debug,

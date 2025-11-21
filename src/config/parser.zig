@@ -93,19 +93,21 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
         // Allocate and copy name
         const name = try allocator.dupe(u8, json_policy.name);
 
-        // Allocate and copy regexes
-        const regexes = try allocator.alloc([]const u8, json_policy.regexes.len);
-        for (json_policy.regexes, 0..) |regex, j| {
-            regexes[j] = try allocator.dupe(u8, regex);
+        // Allocate and copy regexes into ArrayListUnmanaged
+        var regexes = std.ArrayListUnmanaged([]const u8){};
+        try regexes.ensureTotalCapacity(allocator, json_policy.regexes.len);
+        for (json_policy.regexes) |regex| {
+            const regex_copy = try allocator.dupe(u8, regex);
+            regexes.appendAssumeCapacity(regex_copy);
         }
 
-        policies[i] = Policy.init(
-            name,
-            policy_type,
-            telemetry_type,
-            regexes,
-            action,
-        );
+        policies[i] = Policy{
+            .name = name,
+            .policy_type = policy_type,
+            .telemetry_type = telemetry_type,
+            .regexes = regexes,
+            .action = action,
+        };
     }
 
     return policies;
@@ -113,24 +115,24 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
 
 /// Parse PolicyType from string
 fn parsePolicyType(s: []const u8) !PolicyType {
-    if (std.mem.eql(u8, s, "filter")) return .filter;
-    if (std.mem.eql(u8, s, "transform")) return .transform;
-    if (std.mem.eql(u8, s, "redact")) return .redact;
+    if (std.mem.eql(u8, s, "filter")) return .POLICY_TYPE_FILTER;
+    if (std.mem.eql(u8, s, "transform")) return .POLICY_TYPE_TRANSFORM;
+    if (std.mem.eql(u8, s, "redact")) return .POLICY_TYPE_REDACT;
     return error.InvalidPolicyType;
 }
 
 /// Parse TelemetryType from string
 fn parseTelemetryType(s: []const u8) !TelemetryType {
-    if (std.mem.eql(u8, s, "log")) return .log;
-    if (std.mem.eql(u8, s, "metric")) return .metric;
-    if (std.mem.eql(u8, s, "span")) return .span;
+    if (std.mem.eql(u8, s, "log")) return .TELEMETRY_TYPE_LOG;
+    if (std.mem.eql(u8, s, "metric")) return .TELEMETRY_TYPE_METRIC;
+    if (std.mem.eql(u8, s, "span")) return .TELEMETRY_TYPE_SPAN;
     return error.InvalidTelemetryType;
 }
 
 /// Parse Action from string
 fn parseAction(s: []const u8) !Action {
-    if (std.mem.eql(u8, s, "keep")) return Action.init(.keep);
-    if (std.mem.eql(u8, s, "drop")) return Action.init(.drop);
+    if (std.mem.eql(u8, s, "keep")) return .{ .type = .ACTION_TYPE_KEEP };
+    if (std.mem.eql(u8, s, "drop")) return .{ .type = .ACTION_TYPE_DROP };
     return error.InvalidAction;
 }
 

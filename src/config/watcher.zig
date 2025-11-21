@@ -34,12 +34,12 @@ pub const ConfigManager = struct {
         const config = self.current.load(.acquire);
 
         // Free policy resources
-        for (config.policies) |policy| {
+        for (config.policies) |*policy| {
             self.allocator.free(policy.name);
-            for (policy.regexes) |regex| {
+            for (policy.regexes.items) |regex| {
                 self.allocator.free(regex);
             }
-            self.allocator.free(policy.regexes);
+            policy.regexes.deinit(self.allocator);
         }
         self.allocator.free(config.policies);
 
