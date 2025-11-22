@@ -1,10 +1,17 @@
 const std = @import("std");
 const types = @import("types.zig");
 const parser = @import("parser.zig");
+const policy_registry = @import("../core/policy_registry.zig");
+const policy_source = @import("../core/policy_source.zig");
 
-/// HTTP-based configuration manager that periodically polls a remote endpoint
+const PolicyRegistry = policy_registry.PolicyRegistry;
+const SourceType = policy_source.SourceType;
+
+/// HTTP-based configuration client that periodically polls a remote endpoint
+/// Policies are pushed to the centralized registry with HTTP source priority
 pub const HttpConfigClient = struct {
     current: std.atomic.Value(*const types.ProxyConfig),
+    policy_registry: *PolicyRegistry,
     allocator: std.mem.Allocator,
     http_client: std.http.Client,
     config_url: []const u8,
@@ -15,6 +22,7 @@ pub const HttpConfigClient = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        registry: *PolicyRegistry,
         config_url: []const u8,
         poll_interval_seconds: u64,
     ) !HttpConfigClient {
@@ -28,11 +36,15 @@ pub const HttpConfigClient = struct {
         // Initial fetch should never return null (no ETag to compare against)
         const initial_config = maybe_initial_config orelse return error.InitialFetchFailed;
 
+        // Push policies to registry with HTTP source (higher priority)
+        try registry.updatePolicies(initial_config.policies, .http);
+
         const url_copy = try allocator.dupe(u8, config_url);
         errdefer allocator.free(url_copy);
 
         return .{
             .current = std.atomic.Value(*const types.ProxyConfig).init(initial_config),
+            .policy_registry = registry,
             .allocator = allocator,
             .http_client = http_client,
             .config_url = url_copy,
@@ -99,6 +111,9 @@ pub const HttpConfigClient = struct {
         }
 
         const new_config = maybe_new_config.?;
+
+        // Update policies in registry (HTTP source - higher priority)
+        try self.policy_registry.updatePolicies(new_config.policies, .http);
 
         // Update ETag
         if (self.last_etag) |old_etag| {

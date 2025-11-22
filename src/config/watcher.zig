@@ -2,21 +2,35 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
 const parser = @import("parser.zig");
+const policy_registry = @import("../core/policy_registry.zig");
+const policy_source = @import("../core/policy_source.zig");
+
+const PolicyRegistry = policy_registry.PolicyRegistry;
+const SourceType = policy_source.SourceType;
 
 pub const ConfigManager = struct {
     current: std.atomic.Value(*const types.ProxyConfig),
+    policy_registry: *PolicyRegistry,
     allocator: std.mem.Allocator,
     config_path: []const u8,
     watch_thread: ?std.Thread,
     shutdown: std.atomic.Value(bool),
 
-    pub fn init(allocator: std.mem.Allocator, config_path: []const u8) !ConfigManager {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        registry: *PolicyRegistry,
+        config_path: []const u8,
+    ) !ConfigManager {
         const initial_config = try parser.parseConfigFile(allocator, config_path);
+
+        // Push policies to registry with file source
+        try registry.updatePolicies(initial_config.policies, .file);
 
         const path_copy = try allocator.dupe(u8, config_path);
 
         return .{
             .current = std.atomic.Value(*const types.ProxyConfig).init(initial_config),
+            .policy_registry = registry,
             .allocator = allocator,
             .config_path = path_copy,
             .watch_thread = null,
@@ -60,6 +74,9 @@ pub const ConfigManager = struct {
             std.log.err("Failed to parse new config: {}", .{err});
             return err;
         };
+
+        // Update policies in registry (file source)
+        try self.policy_registry.updatePolicies(new_config.policies, .file);
 
         const old_config = self.current.swap(new_config, .acq_rel);
 

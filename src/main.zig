@@ -6,6 +6,7 @@ const config_watcher = @import("config/watcher.zig");
 const config_http_client = @import("config/http_client.zig");
 const httpz_server = @import("proxy/httpz_server.zig");
 const filter_mod = @import("core/filter.zig");
+const policy_registry_mod = @import("core/policy_registry.zig");
 
 /// Global server instance for signal handler
 var server_instance: ?*httpz_server.HttpzProxyServer = null;
@@ -61,33 +62,39 @@ pub fn main() !void {
     std.log.info("Tero Edge HTTP Proxy starting...", .{});
     std.log.info("Configuration source: {s}", .{config_source});
 
+    // Create centralized policy registry
+    var policy_registry = policy_registry_mod.PolicyRegistry.init(allocator);
+    defer policy_registry.deinit();
+
     // Determine if we're using HTTP or file-based config
     const use_http = isHttpUrl(config_source);
 
     // Pointer to config that will be used by the server
     var config_ptr: *std.atomic.Value(*const config_types.ProxyConfig) = undefined;
 
-    // Initialize appropriate config manager
-    var file_config_manager: ?config_watcher.ConfigManager = null;
+    // Initialize file config manager (always active for non-policy config)
+    var file_config_manager = try config_watcher.ConfigManager.init(
+        allocator,
+        &policy_registry,
+        if (use_http) "config.json" else config_source,
+    );
+    defer file_config_manager.deinit();
+    config_ptr = &file_config_manager.current;
+
+    // Optionally initialize HTTP client for policy overlays
     var http_config_client: ?config_http_client.HttpConfigClient = null;
+    defer if (http_config_client) |*client| client.deinit();
 
     if (use_http) {
-        std.log.info("Using HTTP config client (polling every 60s)", .{});
+        std.log.info("Using HTTP config client for policies (polling every 60s)", .{});
         http_config_client = try config_http_client.HttpConfigClient.init(
             allocator,
+            &policy_registry,
             config_source,
             60, // Poll every 60 seconds
         );
-        config_ptr = &http_config_client.?.current;
     } else {
         std.log.info("Using file-based config watcher", .{});
-        file_config_manager = try config_watcher.ConfigManager.init(allocator, config_source);
-        config_ptr = &file_config_manager.?.current;
-    }
-
-    defer {
-        if (http_config_client) |*client| client.deinit();
-        if (file_config_manager) |*manager| manager.deinit();
     }
 
     const initial_config = config_ptr.load(.acquire);
@@ -99,27 +106,22 @@ pub fn main() !void {
         initial_config.listen_port,
     });
     std.log.info("Upstream URL: {s}", .{initial_config.upstream_url});
+    std.log.info("Policy count: {}", .{policy_registry.getPolicyCount()});
 
-    // Create filter evaluator from config policies
-    var filter_evaluator = filter_mod.FilterEvaluator.init(allocator);
+    // Create filter evaluator with reference to registry
+    var filter_evaluator = filter_mod.FilterEvaluator.init(&policy_registry);
     defer filter_evaluator.deinit();
-
-    // Load policies from config into filter
-    for (initial_config.policies) |policy| {
-        try filter_evaluator.addPolicy(policy);
-    }
-    std.log.info("Loaded {} policies", .{filter_evaluator.policyCount()});
 
     // Install signal handlers
     installShutdownHandlers();
 
     // Install config-specific handlers and start watching/polling
-    if (file_config_manager) |*manager| {
-        config_watcher.installSignalHandler(manager) catch |err| {
-            std.log.warn("Failed to install config reload handler: {}", .{err});
-        };
-        try manager.startWatching();
-    } else if (http_config_client) |*client| {
+    config_watcher.installSignalHandler(&file_config_manager) catch |err| {
+        std.log.warn("Failed to install config reload handler: {}", .{err});
+    };
+    try file_config_manager.startWatching();
+
+    if (http_config_client) |*client| {
         try client.startPolling();
     }
 
