@@ -71,3 +71,17 @@ message EdgeMetadata {
   // Arbitrary key-value pairs for additional metadata
   map<string, string> labels = 5;
 }
+
+// SyncRequest is sent by edge instances to request policy updates
+message SyncRequest {
+  EdgeMetadata metadata = 1;
+}
+
+// SyncResponse contains the policies to apply
+message SyncResponse {
+  // Policies to apply on the edge
+  PolicyList policy_list = 1;
+
+  // Timestamp of this sync (Unix epoch in seconds)
+  int64 sync_timestamp = 2;
+}

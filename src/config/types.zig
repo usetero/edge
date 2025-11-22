@@ -22,6 +22,20 @@ pub const LogLevel = enum(u8) {
     }
 };
 
+pub const ProviderType = enum {
+    file,
+    http,
+};
+
+pub const ProviderConfig = struct {
+    type: ProviderType,
+    // For file provider
+    path: ?[]const u8 = null,
+    // For http provider
+    url: ?[]const u8 = null,
+    poll_interval: ?u64 = null, // seconds
+};
+
 pub const ProxyConfig = struct {
     // Network config
     listen_address: [4]u8,
@@ -33,7 +47,10 @@ pub const ProxyConfig = struct {
     pretty_print_json: bool,
     max_body_size: u32,
 
-    // Policies for filtering/transforming telemetry
+    // Policy providers
+    policy_providers: []ProviderConfig,
+
+    // Deprecated: kept for backwards compatibility, will be removed
     policies: []Policy,
 
     pub fn default() ProxyConfig {
@@ -44,6 +61,7 @@ pub const ProxyConfig = struct {
             .log_level = .info,
             .pretty_print_json = true,
             .max_body_size = 1024 * 1024, // 1MB
+            .policy_providers = &.{},
             .policies = &.{}, // Empty slice by default
         };
     }

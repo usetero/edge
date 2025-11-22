@@ -2,11 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
-const config_watcher = @import("config/watcher.zig");
-const config_http_client = @import("config/http_client.zig");
 const httpz_server = @import("proxy/httpz_server.zig");
 const filter_mod = @import("core/filter.zig");
 const policy_registry_mod = @import("core/policy_registry.zig");
+const policy_provider = @import("core/policy_provider.zig");
+const FileProvider = @import("config/providers/file_provider.zig").FileProvider;
+const HttpProvider = @import("config/providers/http_provider.zig").HttpProvider;
 
 /// Global server instance for signal handler
 var server_instance: ?*httpz_server.HttpzProxyServer = null;
@@ -40,11 +41,19 @@ fn installShutdownHandlers() void {
     std.log.debug("Installed signal handlers for SIGINT and SIGTERM", .{});
 }
 
-/// Check if config source is an HTTP(S) URL
-fn isHttpUrl(source: []const u8) bool {
-    return std.mem.startsWith(u8, source, "http://") or
-        std.mem.startsWith(u8, source, "https://");
-}
+/// Context for policy update callback
+const PolicyCallbackContext = struct {
+    registry: *policy_registry_mod.PolicyRegistry,
+
+    fn handleUpdate(context: *anyopaque, update: policy_provider.PolicyUpdate) !void {
+        const self: *PolicyCallbackContext = @ptrCast(@alignCast(context));
+        try self.registry.updatePolicies(update.policies, update.source);
+        std.log.info("Policy registry updated from {s} source with {} policies", .{
+            @tagName(update.source),
+            update.policies.len,
+        });
+    }
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -57,78 +66,110 @@ pub fn main() !void {
 
     _ = args.next(); // Skip program name
 
-    const config_source = args.next() orelse "config.json";
+    const config_path = args.next() orelse "config.json";
 
     std.log.info("Tero Edge HTTP Proxy starting...", .{});
-    std.log.info("Configuration source: {s}", .{config_source});
+    std.log.info("Configuration file: {s}", .{config_path});
 
-    // Create centralized policy registry
-    var policy_registry = policy_registry_mod.PolicyRegistry.init(allocator);
-    defer policy_registry.deinit();
-
-    // Determine if we're using HTTP or file-based config
-    const use_http = isHttpUrl(config_source);
-
-    // Pointer to config that will be used by the server
-    var config_ptr: *std.atomic.Value(*const config_types.ProxyConfig) = undefined;
-
-    // Initialize file config manager (always active for non-policy config)
-    var file_config_manager = try config_watcher.ConfigManager.init(
-        allocator,
-        &policy_registry,
-        if (use_http) "config.json" else config_source,
-    );
-    defer file_config_manager.deinit();
-    config_ptr = &file_config_manager.current;
-
-    // Optionally initialize HTTP client for policy overlays
-    var http_config_client: ?config_http_client.HttpConfigClient = null;
-    defer if (http_config_client) |*client| client.deinit();
-
-    if (use_http) {
-        std.log.info("Using HTTP config client for policies (polling every 60s)", .{});
-        http_config_client = try config_http_client.HttpConfigClient.init(
-            allocator,
-            &policy_registry,
-            config_source,
-            60, // Poll every 60 seconds
-        );
-    } else {
-        std.log.info("Using file-based config watcher", .{});
+    // Parse configuration
+    const config = try config_parser.parseConfigFile(allocator, config_path);
+    defer {
+        allocator.free(config.upstream_url);
+        // Free policy providers
+        for (config.policy_providers) |provider_config| {
+            if (provider_config.path) |path| allocator.free(path);
+            if (provider_config.url) |url| allocator.free(url);
+        }
+        allocator.free(config.policy_providers);
+        // Free deprecated policies if present
+        for (config.policies) |policy| {
+            allocator.free(policy.name);
+            for (policy.regexes.items) |regex| allocator.free(regex);
+            // Cast away const to free the ArrayListUnmanaged
+            var regexes_mut = @constCast(&policy.regexes);
+            regexes_mut.deinit(allocator);
+        }
+        allocator.free(config.policies);
+        allocator.destroy(config);
     }
 
-    const initial_config = config_ptr.load(.acquire);
     std.log.info("Listen address: {}.{}.{}.{}:{}", .{
-        initial_config.listen_address[0],
-        initial_config.listen_address[1],
-        initial_config.listen_address[2],
-        initial_config.listen_address[3],
-        initial_config.listen_port,
+        config.listen_address[0],
+        config.listen_address[1],
+        config.listen_address[2],
+        config.listen_address[3],
+        config.listen_port,
     });
-    std.log.info("Upstream URL: {s}", .{initial_config.upstream_url});
-    std.log.info("Policy count: {}", .{policy_registry.getPolicyCount()});
+    std.log.info("Upstream URL: {s}", .{config.upstream_url});
+
+    // Create centralized policy registry
+    var registry = policy_registry_mod.PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create callback context for policy updates
+    var callback_context = PolicyCallbackContext{ .registry = &registry };
+    const callback = policy_provider.PolicyCallback{
+        .context = @ptrCast(&callback_context),
+        .onUpdate = PolicyCallbackContext.handleUpdate,
+    };
+
+    // Initialize providers from config (keep pointers for cleanup)
+    var file_providers: std.ArrayList(*FileProvider) = .empty;
+    defer {
+        for (file_providers.items) |provider| {
+            provider.deinit();
+        }
+        file_providers.deinit(allocator);
+    }
+
+    var http_providers: std.ArrayList(*HttpProvider) = .empty;
+    defer {
+        for (http_providers.items) |provider| {
+            provider.deinit();
+        }
+        http_providers.deinit(allocator);
+    }
+
+    std.log.info("Initializing {} policy provider(s)...", .{config.policy_providers.len});
+    for (config.policy_providers) |provider_config| {
+        switch (provider_config.type) {
+            .file => {
+                const path = provider_config.path orelse return error.FileProviderRequiresPath;
+                std.log.info("  - File provider: {s}", .{path});
+
+                const file_provider = try FileProvider.init(allocator, path);
+                errdefer file_provider.deinit();
+
+                try file_provider.subscribe(callback);
+                try file_providers.append(allocator, file_provider);
+            },
+            .http => {
+                const url = provider_config.url orelse return error.HttpProviderRequiresUrl;
+                const poll_interval = provider_config.poll_interval orelse 60;
+                std.log.info("  - HTTP provider: {s} (poll interval: {}s)", .{ url, poll_interval });
+
+                const http_provider = try HttpProvider.init(allocator, url, poll_interval);
+                errdefer http_provider.deinit();
+
+                try http_provider.subscribe(callback);
+                try http_providers.append(allocator, http_provider);
+            },
+        }
+    }
+
+    std.log.info("Policy count: {}", .{registry.getPolicyCount()});
 
     // Create filter evaluator with reference to registry
-    var filter_evaluator = filter_mod.FilterEvaluator.init(&policy_registry);
+    var filter_evaluator = filter_mod.FilterEvaluator.init(&registry);
     defer filter_evaluator.deinit();
 
     // Install signal handlers
     installShutdownHandlers();
 
-    // Install config-specific handlers and start watching/polling
-    config_watcher.installSignalHandler(&file_config_manager) catch |err| {
-        std.log.warn("Failed to install config reload handler: {}", .{err});
-    };
-    try file_config_manager.startWatching();
-
-    if (http_config_client) |*client| {
-        try client.startPolling();
-    }
-
     // Create httpz proxy server
     var proxy = try httpz_server.HttpzProxyServer.init(
         allocator,
-        config_ptr,
+        config,
         &filter_evaluator,
     );
     defer proxy.deinit();

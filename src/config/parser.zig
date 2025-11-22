@@ -17,6 +17,19 @@ const PolicyJson = struct {
     action: []const u8,
 };
 
+/// JSON schema for a policies-only file
+const PoliciesFileJson = struct {
+    policies: []PolicyJson,
+};
+
+/// JSON schema for policy provider configuration
+const ProviderJson = struct {
+    type: []const u8,
+    path: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    poll_interval: ?u64 = null,
+};
+
 /// JSON schema for configuration file
 const ConfigJson = struct {
     listen_address: []const u8,
@@ -25,7 +38,8 @@ const ConfigJson = struct {
     log_level: []const u8,
     pretty_print_json: bool,
     max_body_size: u32,
-    policies: ?[]PolicyJson = null,
+    policy_providers: ?[]ProviderJson = null,
+    policies: ?[]PolicyJson = null, // Deprecated
 };
 
 /// Parse JSON configuration file into ProxyConfig
@@ -37,6 +51,31 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !*ProxyCo
     defer allocator.free(contents);
 
     return parseConfigBytes(allocator, contents);
+}
+
+/// Parse policies-only JSON file
+pub fn parsePoliciesFile(allocator: std.mem.Allocator, path: []const u8) ![]Policy {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(contents);
+
+    return parsePoliciesBytes(allocator, contents);
+}
+
+/// Parse policies from JSON bytes
+pub fn parsePoliciesBytes(allocator: std.mem.Allocator, json_bytes: []const u8) ![]Policy {
+    const parsed = try std.json.parseFromSlice(
+        PoliciesFileJson,
+        allocator,
+        json_bytes,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+
+    const json_policies = parsed.value;
+    return parsePolicies(allocator, json_policies.policies);
 }
 
 /// Parse configuration from JSON bytes
@@ -69,7 +108,13 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
     config.pretty_print_json = json_config.pretty_print_json;
     config.max_body_size = json_config.max_body_size;
 
-    // Parse policies if present
+    // Parse policy providers if present
+    if (json_config.policy_providers) |json_providers| {
+        const providers = try parseProviders(allocator, json_providers);
+        config.policy_providers = providers;
+    }
+
+    // Parse policies if present (deprecated, for backwards compatibility)
     if (json_config.policies) |json_policies| {
         const policies = try parsePolicies(allocator, json_policies);
         config.policies = policies;
@@ -116,6 +161,46 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
     }
 
     return policies;
+}
+
+/// Parse provider configurations from JSON array
+fn parseProviders(allocator: std.mem.Allocator, json_providers: []ProviderJson) ![]types.ProviderConfig {
+    var providers = try allocator.alloc(types.ProviderConfig, json_providers.len);
+
+    for (json_providers, 0..) |json_provider, i| {
+        // Parse provider type
+        const provider_type = try parseProviderType(json_provider.type);
+
+        providers[i] = types.ProviderConfig{
+            .type = provider_type,
+            .path = if (json_provider.path) |p| try allocator.dupe(u8, p) else null,
+            .url = if (json_provider.url) |u| try allocator.dupe(u8, u) else null,
+            .poll_interval = json_provider.poll_interval,
+        };
+
+        // Validate provider-specific required fields
+        switch (provider_type) {
+            .file => {
+                if (providers[i].path == null) {
+                    return error.FileProviderRequiresPath;
+                }
+            },
+            .http => {
+                if (providers[i].url == null) {
+                    return error.HttpProviderRequiresUrl;
+                }
+            },
+        }
+    }
+
+    return providers;
+}
+
+/// Parse ProviderType from string
+fn parseProviderType(s: []const u8) !types.ProviderType {
+    if (std.mem.eql(u8, s, "file")) return .file;
+    if (std.mem.eql(u8, s, "http")) return .http;
+    return error.InvalidProviderType;
 }
 
 /// Parse PolicyType from string
