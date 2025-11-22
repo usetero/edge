@@ -1,5 +1,5 @@
 const std = @import("std");
-const policy_pb = @import("../proto/tero/edge/policy.pb.zig");
+const policy_pb = @import("../proto/tero/edge/policy/v1.pb.zig");
 
 pub const Policy = policy_pb.Policy;
 pub const PolicyType = policy_pb.PolicyType;

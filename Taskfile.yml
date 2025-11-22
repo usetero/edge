@@ -19,6 +19,11 @@ tasks:
     cmds:
       - zig build -Doptimize={{.OPTIMIZE | default "Debug"}}
 
+  build:protos:
+    desc: "Build the project with protos"
+    cmds:
+      - zig build gen-proto
+
   build:release:
     desc: "Build the project in release mode (ReleaseFast)"
     aliases: [br, release]

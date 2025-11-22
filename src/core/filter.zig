@@ -1,5 +1,5 @@
 const std = @import("std");
-const policy_pb = @import("../proto/tero/edge/policy.pb.zig");
+const policy_pb = @import("../proto/tero/edge/policy/v1.pb.zig");
 const Policy = policy_pb.Policy;
 const TelemetryType = policy_pb.TelemetryType;
 const ActionType = policy_pb.ActionType;
