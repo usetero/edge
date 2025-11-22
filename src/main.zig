@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
 const config_watcher = @import("config/watcher.zig");
+const config_http_client = @import("config/http_client.zig");
 const httpz_server = @import("proxy/httpz_server.zig");
 const filter_mod = @import("core/filter.zig");
 
@@ -38,6 +39,12 @@ fn installShutdownHandlers() void {
     std.log.debug("Installed signal handlers for SIGINT and SIGTERM", .{});
 }
 
+/// Check if config source is an HTTP(S) URL
+fn isHttpUrl(source: []const u8) bool {
+    return std.mem.startsWith(u8, source, "http://") or
+        std.mem.startsWith(u8, source, "https://");
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -49,16 +56,41 @@ pub fn main() !void {
 
     _ = args.next(); // Skip program name
 
-    const config_path = args.next() orelse "config.json";
+    const config_source = args.next() orelse "config.json";
 
     std.log.info("Tero Edge HTTP Proxy starting...", .{});
-    std.log.info("Configuration file: {s}", .{config_path});
+    std.log.info("Configuration source: {s}", .{config_source});
 
-    // Load configuration
-    var config_manager = try config_watcher.ConfigManager.init(allocator, config_path);
-    defer config_manager.deinit();
+    // Determine if we're using HTTP or file-based config
+    const use_http = isHttpUrl(config_source);
 
-    const initial_config = config_manager.get();
+    // Pointer to config that will be used by the server
+    var config_ptr: *std.atomic.Value(*const config_types.ProxyConfig) = undefined;
+
+    // Initialize appropriate config manager
+    var file_config_manager: ?config_watcher.ConfigManager = null;
+    var http_config_client: ?config_http_client.HttpConfigClient = null;
+
+    if (use_http) {
+        std.log.info("Using HTTP config client (polling every 60s)", .{});
+        http_config_client = try config_http_client.HttpConfigClient.init(
+            allocator,
+            config_source,
+            60, // Poll every 60 seconds
+        );
+        config_ptr = &http_config_client.?.current;
+    } else {
+        std.log.info("Using file-based config watcher", .{});
+        file_config_manager = try config_watcher.ConfigManager.init(allocator, config_source);
+        config_ptr = &file_config_manager.?.current;
+    }
+
+    defer {
+        if (http_config_client) |*client| client.deinit();
+        if (file_config_manager) |*manager| manager.deinit();
+    }
+
+    const initial_config = config_ptr.load(.acquire);
     std.log.info("Listen address: {}.{}.{}.{}:{}", .{
         initial_config.listen_address[0],
         initial_config.listen_address[1],
@@ -81,17 +113,20 @@ pub fn main() !void {
     // Install signal handlers
     installShutdownHandlers();
 
-    config_watcher.installSignalHandler(&config_manager) catch |err| {
-        std.log.warn("Failed to install config reload handler: {}", .{err});
-    };
-
-    // Start config file watcher
-    try config_manager.startWatching();
+    // Install config-specific handlers and start watching/polling
+    if (file_config_manager) |*manager| {
+        config_watcher.installSignalHandler(manager) catch |err| {
+            std.log.warn("Failed to install config reload handler: {}", .{err});
+        };
+        try manager.startWatching();
+    } else if (http_config_client) |*client| {
+        try client.startPolling();
+    }
 
     // Create httpz proxy server
     var proxy = try httpz_server.HttpzProxyServer.init(
         allocator,
-        &config_manager.current,
+        config_ptr,
         &filter_evaluator,
     );
     defer proxy.deinit();

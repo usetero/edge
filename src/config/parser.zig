@@ -36,11 +36,16 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !*ProxyCo
     const contents = try file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(contents);
 
+    return parseConfigBytes(allocator, contents);
+}
+
+/// Parse configuration from JSON bytes
+pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*ProxyConfig {
     // Parse JSON
     const parsed = try std.json.parseFromSlice(
         ConfigJson,
         allocator,
-        contents,
+        json_bytes,
         .{ .allocate = .alloc_always },
     );
     defer parsed.deinit();
