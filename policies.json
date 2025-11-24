@@ -1,0 +1,25 @@
+{
+  "policies": [
+    {
+      "name": "drop-debug-logs",
+      "policy_type": "filter",
+      "telemetry_type": "log",
+      "regexes": ["debug", "trace"],
+      "action": "drop"
+    },
+    {
+      "name": "keep-error-logs",
+      "policy_type": "filter",
+      "telemetry_type": "log",
+      "regexes": ["error", "critical", "fatal"],
+      "action": "keep"
+    },
+    {
+      "name": "drop-test-metrics",
+      "policy_type": "filter",
+      "telemetry_type": "metric",
+      "regexes": ["test\\."],
+      "action": "drop"
+    }
+  ]
+}

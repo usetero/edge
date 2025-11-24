@@ -1,4 +1,5 @@
 const std = @import("std");
+const protobuf = @import("protobuf");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -22,6 +23,10 @@ pub fn build(b: *std.Build) void {
     // in this directory.
 
     const httpz = b.dependency("httpz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const protobuf_dep = b.dependency("protobuf", .{
         .target = target,
         .optimize = optimize,
     });
@@ -88,6 +93,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("httpz", httpz.module("httpz"));
+    exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
 
     // Link zlib for gzip compression
     exe.linkLibC();
@@ -168,6 +174,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    const gen_proto = b.step("gen-proto", "generates zig files from protocol buffer definitions");
+
+    const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
+        // out directory for the generated zig files
+        .destination_directory = b.path("src/proto"),
+        .source_files = &.{
+            "protos/policy.proto",
+        },
+        .include_directories = &.{},
+    });
+
+    gen_proto.dependOn(&protoc_step.step);
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

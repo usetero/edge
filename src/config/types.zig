@@ -1,11 +1,11 @@
 const std = @import("std");
-const policy_mod = @import("../core/policy.zig");
+const policy_pb = @import("../proto/tero/edge/policy/v1.pb.zig");
 
-pub const Policy = policy_mod.Policy;
-pub const PolicyType = policy_mod.PolicyType;
-pub const TelemetryType = policy_mod.TelemetryType;
-pub const Action = policy_mod.Action;
-pub const ActionType = policy_mod.ActionType;
+pub const Policy = policy_pb.Policy;
+pub const PolicyType = policy_pb.PolicyType;
+pub const TelemetryType = policy_pb.TelemetryType;
+pub const Action = policy_pb.Action;
+pub const ActionType = policy_pb.ActionType;
 
 pub const LogLevel = enum(u8) {
     debug,
@@ -22,18 +22,38 @@ pub const LogLevel = enum(u8) {
     }
 };
 
+pub const ProviderType = enum {
+    file,
+    http,
+};
+
+pub const ProviderConfig = struct {
+    type: ProviderType,
+    // For file provider
+    path: ?[]const u8 = null,
+    // For http provider
+    url: ?[]const u8 = null,
+    poll_interval: ?u64 = null, // seconds
+};
+
 pub const ProxyConfig = struct {
     // Network config
     listen_address: [4]u8,
     listen_port: u16,
     upstream_url: []const u8, // Now supports full URLs like "http://example.com:8080"
 
+    // Edge metadata
+    workspace_id: []const u8,
+
     // Inspection config
     log_level: LogLevel,
     pretty_print_json: bool,
     max_body_size: u32,
 
-    // Policies for filtering/transforming telemetry
+    // Policy providers
+    policy_providers: []ProviderConfig,
+
+    // Deprecated: kept for backwards compatibility, will be removed
     policies: []Policy,
 
     pub fn default() ProxyConfig {
@@ -41,9 +61,11 @@ pub const ProxyConfig = struct {
             .listen_address = .{ 127, 0, 0, 1 },
             .listen_port = 8080,
             .upstream_url = "http://127.0.0.1:80",
+            .workspace_id = "90A6EFC2-27B8-41BC-9343-43BFB1DF0732",
             .log_level = .info,
             .pretty_print_json = true,
             .max_body_size = 1024 * 1024, // 1MB
+            .policy_providers = &.{},
             .policies = &.{}, // Empty slice by default
         };
     }

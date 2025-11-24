@@ -154,7 +154,7 @@ fn handleDatadogLogs(req: *httpz.Request, decompressed_body: []const u8) ![]cons
 }
 
 const ProxyContext = struct {
-    config: *const std.atomic.Value(*const config_types.ProxyConfig),
+    config: *const config_types.ProxyConfig,
     filter: *const filter_mod.FilterEvaluator,
 
     pub fn dispatch(self: *ProxyContext, action: httpz.Action(*ProxyContext), req: *httpz.Request, res: *httpz.Response) !void {
@@ -225,7 +225,7 @@ pub const HttpzProxyServer = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        config: *const std.atomic.Value(*const config_types.ProxyConfig),
+        config: *const config_types.ProxyConfig,
         filter: *const filter_mod.FilterEvaluator,
     ) !HttpzProxyServer {
         const ctx = try allocator.create(ProxyContext);
@@ -234,7 +234,7 @@ pub const HttpzProxyServer = struct {
             .filter = filter,
         };
 
-        const current_config = config.load(.acquire);
+        const current_config = config;
 
         const server = try allocator.create(httpz.Server(*ProxyContext));
         server.* = try httpz.Server(*ProxyContext).init(allocator, .{
@@ -276,7 +276,7 @@ pub const HttpzProxyServer = struct {
     }
 
     fn proxyHandler(ctx: *ProxyContext, req: *httpz.Request, res: *httpz.Response) !void {
-        const current_config = ctx.config.load(.acquire);
+        const current_config = ctx.config;
 
         // Log the incoming request
         std.log.info("{s} {s} -> {s}", .{

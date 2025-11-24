@@ -17,15 +17,29 @@ const PolicyJson = struct {
     action: []const u8,
 };
 
+/// JSON schema for a policies-only file
+const PoliciesFileJson = struct {
+    policies: []PolicyJson,
+};
+
+/// JSON schema for policy provider configuration
+const ProviderJson = struct {
+    type: []const u8,
+    path: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    poll_interval: ?u64 = null,
+};
+
 /// JSON schema for configuration file
 const ConfigJson = struct {
     listen_address: []const u8,
     listen_port: u16,
     upstream_url: []const u8,
+    workspace_id: []const u8,
     log_level: []const u8,
     pretty_print_json: bool,
     max_body_size: u32,
-    policies: ?[]PolicyJson = null,
+    policy_providers: ?[]ProviderJson = null,
 };
 
 /// Parse JSON configuration file into ProxyConfig
@@ -36,11 +50,41 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !*ProxyCo
     const contents = try file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(contents);
 
+    return parseConfigBytes(allocator, contents);
+}
+
+/// Parse policies-only JSON file
+pub fn parsePoliciesFile(allocator: std.mem.Allocator, path: []const u8) ![]Policy {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const contents = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(contents);
+
+    return parsePoliciesBytes(allocator, contents);
+}
+
+/// Parse policies from JSON bytes
+pub fn parsePoliciesBytes(allocator: std.mem.Allocator, json_bytes: []const u8) ![]Policy {
+    const parsed = try std.json.parseFromSlice(
+        PoliciesFileJson,
+        allocator,
+        json_bytes,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+
+    const json_policies = parsed.value;
+    return parsePolicies(allocator, json_policies.policies);
+}
+
+/// Parse configuration from JSON bytes
+pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*ProxyConfig {
     // Parse JSON
     const parsed = try std.json.parseFromSlice(
         ConfigJson,
         allocator,
-        contents,
+        json_bytes,
         .{ .allocate = .alloc_always },
     );
     defer parsed.deinit();
@@ -57,6 +101,9 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !*ProxyCo
     // Allocate and copy upstream URL
     config.upstream_url = try allocator.dupe(u8, json_config.upstream_url);
 
+    // Allocate and copy workspace ID
+    config.workspace_id = try allocator.dupe(u8, json_config.workspace_id);
+
     // Parse log level
     config.log_level = try LogLevel.parse(json_config.log_level);
 
@@ -64,10 +111,10 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !*ProxyCo
     config.pretty_print_json = json_config.pretty_print_json;
     config.max_body_size = json_config.max_body_size;
 
-    // Parse policies if present
-    if (json_config.policies) |json_policies| {
-        const policies = try parsePolicies(allocator, json_policies);
-        config.policies = policies;
+    // Parse policy providers if present
+    if (json_config.policy_providers) |json_providers| {
+        const providers = try parseProviders(allocator, json_providers);
+        config.policy_providers = providers;
     }
 
     // Allocate and return config
@@ -93,44 +140,86 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
         // Allocate and copy name
         const name = try allocator.dupe(u8, json_policy.name);
 
-        // Allocate and copy regexes
-        const regexes = try allocator.alloc([]const u8, json_policy.regexes.len);
-        for (json_policy.regexes, 0..) |regex, j| {
-            regexes[j] = try allocator.dupe(u8, regex);
+        // Allocate and copy regexes into ArrayListUnmanaged
+        var regexes = std.ArrayListUnmanaged([]const u8){};
+        try regexes.ensureTotalCapacity(allocator, json_policy.regexes.len);
+        for (json_policy.regexes) |regex| {
+            const regex_copy = try allocator.dupe(u8, regex);
+            regexes.appendAssumeCapacity(regex_copy);
         }
 
-        policies[i] = Policy.init(
-            name,
-            policy_type,
-            telemetry_type,
-            regexes,
-            action,
-        );
+        policies[i] = Policy{
+            .name = name,
+            .policy_type = policy_type,
+            .telemetry_type = telemetry_type,
+            .regexes = regexes,
+            .action = action,
+        };
     }
 
     return policies;
 }
 
+/// Parse provider configurations from JSON array
+fn parseProviders(allocator: std.mem.Allocator, json_providers: []ProviderJson) ![]types.ProviderConfig {
+    var providers = try allocator.alloc(types.ProviderConfig, json_providers.len);
+
+    for (json_providers, 0..) |json_provider, i| {
+        // Parse provider type
+        const provider_type = try parseProviderType(json_provider.type);
+
+        providers[i] = types.ProviderConfig{
+            .type = provider_type,
+            .path = if (json_provider.path) |p| try allocator.dupe(u8, p) else null,
+            .url = if (json_provider.url) |u| try allocator.dupe(u8, u) else null,
+            .poll_interval = json_provider.poll_interval,
+        };
+
+        // Validate provider-specific required fields
+        switch (provider_type) {
+            .file => {
+                if (providers[i].path == null) {
+                    return error.FileProviderRequiresPath;
+                }
+            },
+            .http => {
+                if (providers[i].url == null) {
+                    return error.HttpProviderRequiresUrl;
+                }
+            },
+        }
+    }
+
+    return providers;
+}
+
+/// Parse ProviderType from string
+fn parseProviderType(s: []const u8) !types.ProviderType {
+    if (std.mem.eql(u8, s, "file")) return .file;
+    if (std.mem.eql(u8, s, "http")) return .http;
+    return error.InvalidProviderType;
+}
+
 /// Parse PolicyType from string
 fn parsePolicyType(s: []const u8) !PolicyType {
-    if (std.mem.eql(u8, s, "filter")) return .filter;
-    if (std.mem.eql(u8, s, "transform")) return .transform;
-    if (std.mem.eql(u8, s, "redact")) return .redact;
+    if (std.mem.eql(u8, s, "filter")) return .POLICY_TYPE_FILTER;
+    if (std.mem.eql(u8, s, "transform")) return .POLICY_TYPE_TRANSFORM;
+    if (std.mem.eql(u8, s, "redact")) return .POLICY_TYPE_REDACT;
     return error.InvalidPolicyType;
 }
 
 /// Parse TelemetryType from string
 fn parseTelemetryType(s: []const u8) !TelemetryType {
-    if (std.mem.eql(u8, s, "log")) return .log;
-    if (std.mem.eql(u8, s, "metric")) return .metric;
-    if (std.mem.eql(u8, s, "span")) return .span;
+    if (std.mem.eql(u8, s, "log")) return .TELEMETRY_TYPE_LOG;
+    if (std.mem.eql(u8, s, "metric")) return .TELEMETRY_TYPE_METRIC;
+    if (std.mem.eql(u8, s, "span")) return .TELEMETRY_TYPE_SPAN;
     return error.InvalidTelemetryType;
 }
 
 /// Parse Action from string
 fn parseAction(s: []const u8) !Action {
-    if (std.mem.eql(u8, s, "keep")) return Action.init(.keep);
-    if (std.mem.eql(u8, s, "drop")) return Action.init(.drop);
+    if (std.mem.eql(u8, s, "keep")) return .{ .type = .ACTION_TYPE_KEEP };
+    if (std.mem.eql(u8, s, "drop")) return .{ .type = .ACTION_TYPE_DROP };
     return error.InvalidAction;
 }
 
