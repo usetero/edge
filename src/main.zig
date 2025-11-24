@@ -93,6 +93,7 @@ pub fn main() !void {
     const config = try config_parser.parseConfigFile(allocator, config_path);
     defer {
         allocator.free(config.upstream_url);
+        allocator.free(config.workspace_id);
         // Free policy providers
         for (config.policy_providers) |provider_config| {
             if (provider_config.path) |path| allocator.free(path);
@@ -174,7 +175,7 @@ pub fn main() !void {
                 const poll_interval = provider_config.poll_interval orelse 60;
                 std.log.info("  - HTTP provider: {s} (poll interval: {}s)", .{ url, poll_interval });
 
-                const http_provider = try HttpProvider.init(allocator, url, poll_interval);
+                const http_provider = try HttpProvider.init(allocator, url, poll_interval, config.workspace_id);
                 errdefer http_provider.deinit();
 
                 try http_provider.subscribe(callback);

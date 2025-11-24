@@ -33,6 +33,7 @@ pub const HttpProvider = struct {
         allocator: std.mem.Allocator,
         config_url: []const u8,
         poll_interval_seconds: u64,
+        workspace_id: []const u8,
     ) !*HttpProvider {
         const self = try allocator.create(HttpProvider);
         errdefer allocator.destroy(self);
@@ -50,7 +51,7 @@ pub const HttpProvider = struct {
         const version_copy = try allocator.dupe(u8, "0.1.0");
         errdefer allocator.free(version_copy);
 
-        const workspace_id_copy = try allocator.dupe(u8, "default");
+        const workspace_id_copy = try allocator.dupe(u8, workspace_id);
         errdefer allocator.free(workspace_id_copy);
 
         self.* = .{

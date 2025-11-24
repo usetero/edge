@@ -42,6 +42,9 @@ pub const ProxyConfig = struct {
     listen_port: u16,
     upstream_url: []const u8, // Now supports full URLs like "http://example.com:8080"
 
+    // Edge metadata
+    workspace_id: []const u8,
+
     // Inspection config
     log_level: LogLevel,
     pretty_print_json: bool,
@@ -58,6 +61,7 @@ pub const ProxyConfig = struct {
             .listen_address = .{ 127, 0, 0, 1 },
             .listen_port = 8080,
             .upstream_url = "http://127.0.0.1:80",
+            .workspace_id = "90A6EFC2-27B8-41BC-9343-43BFB1DF0732",
             .log_level = .info,
             .pretty_print_json = true,
             .max_body_size = 1024 * 1024, // 1MB

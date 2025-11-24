@@ -35,6 +35,7 @@ const ConfigJson = struct {
     listen_address: []const u8,
     listen_port: u16,
     upstream_url: []const u8,
+    workspace_id: []const u8,
     log_level: []const u8,
     pretty_print_json: bool,
     max_body_size: u32,
@@ -100,6 +101,9 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
 
     // Allocate and copy upstream URL
     config.upstream_url = try allocator.dupe(u8, json_config.upstream_url);
+
+    // Allocate and copy workspace ID
+    config.workspace_id = try allocator.dupe(u8, json_config.workspace_id);
 
     // Parse log level
     config.log_level = try LogLevel.parse(json_config.log_level);
