@@ -185,36 +185,6 @@ const ProxyContext = struct {
 
         try action(self, req, res);
         return;
-
-        // const filter_result = self.filter.evaluate(body, .log) catch |err| {
-        //     std.log.warn("Filter evaluation failed: {}", .{err});
-        //     // On error, default to keeping the response
-        //     // Call the handler to process the request
-        //     try action(self, req, res);
-        //     return;
-        // };
-
-        // switch (filter_result) {
-        //     .drop => {
-        //         std.log.debug("{s} {s} DROPPED by filter ({} bytes)", .{
-        //             @tagName(req.method),
-        //             req.url.path,
-        //             res.body.len,
-        //         });
-        //         // Clear the response and return 204 No Content
-        //         res.status = 204;
-        //         res.body = "";
-        //     },
-        //     .keep => {
-        //         std.log.debug("{s} {s} PASSED filter ({} bytes)", .{
-        //             @tagName(req.method),
-        //             req.url.path,
-        //             res.body.len,
-        //         });
-        //         // Call the handler to process the request
-        //         try action(self, req, res);
-        //     },
-        // }
     }
 };
 
@@ -240,6 +210,9 @@ pub const HttpzProxyServer = struct {
         server.* = try httpz.Server(*ProxyContext).init(allocator, .{
             .address = formatAddress(current_config.listen_address),
             .port = current_config.listen_port,
+            // .request = .{
+            //     .lazy_read_size = 4_096,
+            // },
         }, ctx);
 
         var router = try server.router(.{});

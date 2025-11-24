@@ -1,5 +1,5 @@
 const std = @import("std");
-const policy_pb = @import("../proto/tero/edge/policy/v1.pb.zig");
+const policy_pb = @import("proto");
 
 pub const Policy = policy_pb.Policy;
 pub const PolicyType = policy_pb.PolicyType;
@@ -53,9 +53,6 @@ pub const ProxyConfig = struct {
     // Policy providers
     policy_providers: []ProviderConfig,
 
-    // Deprecated: kept for backwards compatibility, will be removed
-    policies: []Policy,
-
     pub fn default() ProxyConfig {
         return .{
             .listen_address = .{ 127, 0, 0, 1 },
@@ -66,7 +63,6 @@ pub const ProxyConfig = struct {
             .pretty_print_json = true,
             .max_body_size = 1024 * 1024, // 1MB
             .policy_providers = &.{},
-            .policies = &.{}, // Empty slice by default
         };
     }
 };

@@ -3,9 +3,9 @@ const builtin = @import("builtin");
 const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
 const httpz_server = @import("proxy/httpz_server.zig");
-const filter_mod = @import("core/filter.zig");
-const policy_registry_mod = @import("core/policy_registry.zig");
-const policy_provider = @import("core/policy_provider.zig");
+const filter_mod = @import("./core/filter.zig");
+const policy_registry_mod = @import("./core/policy_registry.zig");
+const policy_provider = @import("./core/policy_provider.zig");
 const FileProvider = @import("config/providers/file_provider.zig").FileProvider;
 const HttpProvider = @import("config/providers/http_provider.zig").HttpProvider;
 
@@ -100,15 +100,6 @@ pub fn main() !void {
             if (provider_config.url) |url| allocator.free(url);
         }
         allocator.free(config.policy_providers);
-        // Free deprecated policies if present
-        for (config.policies) |policy| {
-            allocator.free(policy.name);
-            for (policy.regexes.items) |regex| allocator.free(regex);
-            // Cast away const to free the ArrayListUnmanaged
-            var regexes_mut = @constCast(&policy.regexes);
-            regexes_mut.deinit(allocator);
-        }
-        allocator.free(config.policies);
         allocator.destroy(config);
     }
 

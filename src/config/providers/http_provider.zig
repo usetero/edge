@@ -3,7 +3,7 @@ const policy_provider = @import("../../core/policy_provider.zig");
 const policy_source = @import("../../core/policy_source.zig");
 const parser = @import("../parser.zig");
 const types = @import("../types.zig");
-const policy_pb = @import("../../proto/tero/edge/policy/v1.pb.zig");
+const policy_pb = @import("proto");
 
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;

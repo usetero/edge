@@ -21,3 +21,16 @@ pub fn add(a: i32, b: i32) i32 {
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
+
+// Import modules to include their tests
+test {
+    _ = @import("config/types.zig");
+    _ = @import("config/parser.zig");
+    _ = @import("core/filter.zig");
+    _ = @import("core/policy_source.zig");
+    _ = @import("core/policy_registry.zig");
+    _ = @import("core/policy_provider.zig");
+    _ = @import("proxy/datadog_v2_logs.zig");
+    _ = @import("proxy/compress.zig");
+    _ = @import("json/pretty_print.zig");
+}

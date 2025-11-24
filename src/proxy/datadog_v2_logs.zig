@@ -42,118 +42,26 @@ fn getContentType(request: *httpz.Request) []const u8 {
 fn processJsonLogs(allocator: std.mem.Allocator, data: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
-
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    // Check if it's an array of logs or a single log
-    switch (parsed.value) {
-        .array => |logs| {
-            try stdout.print("Processing {d} log entries:\n", .{logs.items.len});
-            try stdout.flush();
-            for (logs.items, 0..) |log, i| {
-                try stdout.print("\n=== Log Entry {d} ===\n", .{i + 1});
-                try stdout.flush();
-                try printJsonLog(log);
-            }
-        },
-        .object => {
-            try stdout.print("\n=== Single Log Entry ===\n", .{});
-            try stdout.flush();
-            try printJsonLog(parsed.value);
-        },
-        else => {
-            try stdout.print("Unexpected JSON format\n", .{});
-            try stdout.flush();
-        },
-    }
-}
-
-/// Print a single JSON log entry
-fn printJsonLog(log: std.json.Value) !void {
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    try std.json.Stringify.value(log, .{ .whitespace = .indent_2 }, stdout);
-    try stdout.print("\n", .{});
-    try stdout.flush();
+    // Validation only - just check that JSON is well-formed
+    _ = parsed.value;
 }
 
 /// Process logplex formatted logs
 fn processLogplexLogs(data: []const u8) !void {
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    try stdout.print("\n=== Logplex Format Logs ===\n", .{});
-    try stdout.flush();
-
-    // Logplex format: <prival>version timestamp hostname app procid msgid msg
+    // Validation only - just check that data can be tokenized
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
-    var lineNum: usize = 1;
-
-    while (lines.next()) |line| {
-        try stdout.print("Line {d}: {s}\n", .{ lineNum, line });
-
-        // Basic parsing of syslog format
-        if (line.len > 0 and line[0] == '<') {
-            // Find end of priority
-            if (std.mem.indexOf(u8, line, ">")) |endPri| {
-                const remaining = line[endPri + 1 ..];
-                var parts = std.mem.tokenizeScalar(u8, remaining, ' ');
-
-                if (parts.next()) |version| {
-                    try stdout.print("  Version: {s}\n", .{version});
-                }
-                if (parts.next()) |timestamp| {
-                    try stdout.print("  Timestamp: {s}\n", .{timestamp});
-                }
-                if (parts.next()) |hostname| {
-                    try stdout.print("  Hostname: {s}\n", .{hostname});
-                }
-                if (parts.next()) |app| {
-                    try stdout.print("  App: {s}\n", .{app});
-                }
-                if (parts.next()) |procid| {
-                    try stdout.print("  ProcID: {s}\n", .{procid});
-                }
-                if (parts.next()) |msgid| {
-                    try stdout.print("  MsgID: {s}\n", .{msgid});
-                }
-
-                // Rest is the message
-                if (parts.rest().len > 0) {
-                    try stdout.print("  Message: {s}\n", .{parts.rest()});
-                }
-            }
-        }
-
-        lineNum += 1;
+    while (lines.next()) |_| {
+        // Just iterate to validate
     }
-    try stdout.flush();
 }
 
 /// Process raw text logs
 fn processRawLogs(data: []const u8) !void {
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    try stdout.print("\n=== Raw Text Logs ===\n", .{});
-
-    // Split by newlines and print each line
+    // Validation only - just check that data can be tokenized
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
-    var lineNum: usize = 1;
-
-    while (lines.next()) |line| {
-        try stdout.print("Line {d}: {s}\n", .{ lineNum, line });
-        lineNum += 1;
+    while (lines.next()) |_| {
+        // Just iterate to validate
     }
-
-    try stdout.print("\nTotal bytes: {d}\n", .{data.len});
-    try stdout.flush();
 }
 
 // ============================================================================

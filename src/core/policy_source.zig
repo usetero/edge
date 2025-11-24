@@ -1,5 +1,5 @@
 const std = @import("std");
-const policy_pb = @import("../proto/tero/edge/policy/v1.pb.zig");
+const policy_pb = @import("proto");
 const TelemetryType = policy_pb.TelemetryType;
 
 /// Source type for policies with priority ordering
