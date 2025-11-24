@@ -132,13 +132,12 @@ pub const HttpProvider = struct {
         std.log.debug("Fetching policies from HTTP: {s}", .{self.config_url});
 
         var new_etag: ?[]u8 = null;
-        const maybe_response = try self.fetchPolicies(&new_etag);
+        var maybe_parsed = try self.fetchPolicies(&new_etag);
 
-        if (maybe_response) |response| {
-            defer {
-                var mut_response = response;
-                mut_response.deinit(self.allocator);
-            }
+        if (maybe_parsed) |*parsed| {
+            defer parsed.deinit();
+
+            const response = parsed.value;
 
             // Update ETag
             if (self.last_etag) |old_etag| {
@@ -172,7 +171,7 @@ pub const HttpProvider = struct {
         }
     }
 
-    fn fetchPolicies(self: *HttpProvider, out_etag: *?[]u8) !?SyncResponse {
+    fn fetchPolicies(self: *HttpProvider, out_etag: *?[]u8) !?std.json.Parsed(SyncResponse) {
         const uri = try std.Uri.parse(self.config_url);
 
         // Create SyncRequest with metadata
@@ -264,6 +263,6 @@ pub const HttpProvider = struct {
         // Decode SyncResponse from JSON
         const parsed = try SyncResponse.jsonDecode(response_body, .{}, self.allocator);
 
-        return parsed.value;
+        return parsed;
     }
 };
