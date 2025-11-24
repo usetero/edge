@@ -30,8 +30,7 @@ test {
     _ = @import("core/policy_source.zig");
     _ = @import("core/policy_registry.zig");
     _ = @import("core/policy_provider.zig");
-    // Skip datadog_v2_logs tests - they write to stdout and hang in test runner
-    // _ = @import("proxy/datadog_v2_logs.zig");
+    _ = @import("proxy/datadog_v2_logs.zig");
     _ = @import("proxy/compress.zig");
     _ = @import("json/pretty_print.zig");
 }
