@@ -40,7 +40,6 @@ const ConfigJson = struct {
     pretty_print_json: bool,
     max_body_size: u32,
     policy_providers: ?[]ProviderJson = null,
-    policies: ?[]PolicyJson = null, // Deprecated
 };
 
 /// Parse JSON configuration file into ProxyConfig
@@ -116,12 +115,6 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
     if (json_config.policy_providers) |json_providers| {
         const providers = try parseProviders(allocator, json_providers);
         config.policy_providers = providers;
-    }
-
-    // Parse policies if present (deprecated, for backwards compatibility)
-    if (json_config.policies) |json_policies| {
-        const policies = try parsePolicies(allocator, json_policies);
-        config.policies = policies;
     }
 
     // Allocate and return config
