@@ -12,10 +12,28 @@ const HttpProvider = @import("config/providers/http_provider.zig").HttpProvider;
 /// Global server instance for signal handler
 var server_instance: ?*httpz_server.HttpzProxyServer = null;
 
+/// Global provider lists for signal handler
+var global_file_providers: ?*std.ArrayList(*FileProvider) = null;
+var global_http_providers: ?*std.ArrayList(*HttpProvider) = null;
+
 /// Signal handler for graceful shutdown
 fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     _ = sig;
     std.log.info("Shutdown signal received, stopping server...", .{});
+
+    // Shutdown all providers first
+    if (global_file_providers) |providers| {
+        for (providers.items) |provider| {
+            provider.shutdown();
+        }
+    }
+    if (global_http_providers) |providers| {
+        for (providers.items) |provider| {
+            provider.shutdown();
+        }
+    }
+
+    // Then stop the server
     if (server_instance) |server| {
         server_instance = null;
         server.server.stop();
@@ -128,6 +146,14 @@ pub fn main() !void {
             provider.deinit();
         }
         http_providers.deinit(allocator);
+    }
+
+    // Set global provider references for signal handler
+    global_file_providers = &file_providers;
+    global_http_providers = &http_providers;
+    defer {
+        global_file_providers = null;
+        global_http_providers = null;
     }
 
     std.log.info("Initializing {} policy provider(s)...", .{config.policy_providers.len});

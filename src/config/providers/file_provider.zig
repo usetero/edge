@@ -14,7 +14,7 @@ pub const FileProvider = struct {
     config_path: []const u8,
     callback: ?PolicyCallback,
     watch_thread: ?std.Thread,
-    shutdown: std.atomic.Value(bool),
+    shutdown_flag: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, config_path: []const u8) !*FileProvider {
         const self = try allocator.create(FileProvider);
@@ -28,7 +28,7 @@ pub const FileProvider = struct {
             .config_path = path_copy,
             .callback = null,
             .watch_thread = null,
-            .shutdown = std.atomic.Value(bool).init(false),
+            .shutdown_flag = std.atomic.Value(bool).init(false),
         };
 
         return self;
@@ -44,12 +44,18 @@ pub const FileProvider = struct {
         self.watch_thread = try std.Thread.spawn(.{}, watchLoop, .{self});
     }
 
-    pub fn deinit(self: *FileProvider) void {
-        self.shutdown.store(true, .release);
+    pub fn shutdown(self: *FileProvider) void {
+        self.shutdown_flag.store(true, .release);
 
         if (self.watch_thread) |thread| {
             thread.join();
+            self.watch_thread = null;
         }
+    }
+
+    pub fn deinit(self: *FileProvider) void {
+        // Ensure shutdown is called first
+        self.shutdown();
 
         self.allocator.free(self.config_path);
         self.allocator.destroy(self);
@@ -92,7 +98,7 @@ pub const FileProvider = struct {
     fn watchLoopPoll(self: *FileProvider) !void {
         var last_mtime: i128 = 0;
 
-        while (!self.shutdown.load(.acquire)) {
+        while (!self.shutdown_flag.load(.acquire)) {
             std.Thread.sleep(1 * std.time.ns_per_s); // Check every second
 
             const file = std.fs.cwd().openFile(self.config_path, .{}) catch continue;
