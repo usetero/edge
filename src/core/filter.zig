@@ -1,5 +1,5 @@
 const std = @import("std");
-const policy_pb = @import("../proto/tero/edge/policy/v1.pb.zig");
+const policy_pb = @import("proto");
 const policy_registry = @import("policy_registry.zig");
 
 const Policy = policy_pb.Policy;
@@ -60,17 +60,22 @@ pub const FilterEvaluator = struct {
             if (policy.policy_type != .POLICY_TYPE_FILTER) {
                 continue;
             }
+            if (policy.action == null) {
+                continue;
+            }
 
             // Check if any regex matches the JSON data
             const matches = try self.matchesAnyRegex(json_data, policy.regexes.items);
 
-            if (matches) {
-                // Return the action from the matching policy
-                return switch (policy.action.type) {
-                    .ACTION_TYPE_KEEP => FilterResult.keep,
-                    .ACTION_TYPE_DROP => FilterResult.drop,
-                    else => FilterResult.keep, // Unknown actions default to keep
-                };
+            if (policy.action) |action| {
+                if (matches) {
+                    // Return the action from the matching policy
+                    return switch (action.type) {
+                        .ACTION_TYPE_KEEP => FilterResult.keep,
+                        .ACTION_TYPE_DROP => FilterResult.drop,
+                        else => FilterResult.keep, // Unknown actions default to keep
+                    };
+                }
             }
         }
 

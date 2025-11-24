@@ -1,6 +1,6 @@
 const std = @import("std");
-const policy_pb = @import("../proto/tero/edge/policy/v1.pb.zig");
-const policy_source = @import("policy_source.zig");
+const policy_pb = @import("proto");
+const policy_source = @import("./policy_source.zig");
 
 const Policy = policy_pb.Policy;
 const TelemetryType = policy_pb.TelemetryType;

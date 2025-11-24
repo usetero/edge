@@ -258,6 +258,7 @@ test "parseConfigFile with JSON" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://127.0.0.1:80",
+        \\  "workspace_id": "test-workspace-123",
         \\  "log_level": "info",
         \\  "pretty_print_json": true,
         \\  "max_body_size": 1048576
@@ -277,6 +278,7 @@ test "parseConfigFile with JSON" {
     const config = try parseConfigFile(std.testing.allocator, tmp_path);
     defer {
         std.testing.allocator.free(config.upstream_url);
+        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.destroy(config);
     }
 
@@ -286,93 +288,20 @@ test "parseConfigFile with JSON" {
     try std.testing.expectEqual(LogLevel.info, config.log_level);
     try std.testing.expectEqual(true, config.pretty_print_json);
     try std.testing.expectEqual(@as(u32, 1048576), config.max_body_size);
-    try std.testing.expectEqual(@as(usize, 0), config.policies.len);
-}
-
-test "parseConfigFile with policies" {
-    const json_content =
-        \\{
-        \\  "listen_address": "127.0.0.1",
-        \\  "listen_port": 8080,
-        \\  "upstream_url": "http://127.0.0.1:80",
-        \\  "log_level": "info",
-        \\  "pretty_print_json": true,
-        \\  "max_body_size": 1048576,
-        \\  "policies": [
-        \\    {
-        \\      "name": "drop-debug",
-        \\      "policy_type": "filter",
-        \\      "telemetry_type": "log",
-        \\      "regexes": ["debug", "trace"],
-        \\      "action": "drop"
-        \\    },
-        \\    {
-        \\      "name": "keep-errors",
-        \\      "policy_type": "filter",
-        \\      "telemetry_type": "log",
-        \\      "regexes": ["error"],
-        \\      "action": "keep"
-        \\    }
-        \\  ]
-        \\}
-    ;
-
-    // Write temporary config file
-    const tmp_path = "test_config_policies.json";
-    {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(json_content);
-    }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
-
-    // Parse config
-    const config = try parseConfigFile(std.testing.allocator, tmp_path);
-    defer {
-        std.testing.allocator.free(config.upstream_url);
-        for (config.policies) |policy| {
-            std.testing.allocator.free(policy.name);
-            for (policy.regexes) |regex| {
-                std.testing.allocator.free(regex);
-            }
-            std.testing.allocator.free(policy.regexes);
-        }
-        std.testing.allocator.free(config.policies);
-        std.testing.allocator.destroy(config);
-    }
-
-    // Verify policies were parsed
-    try std.testing.expectEqual(@as(usize, 2), config.policies.len);
-
-    // Verify first policy
-    try std.testing.expectEqualStrings("drop-debug", config.policies[0].name);
-    try std.testing.expect(config.policies[0].policy_type == .filter);
-    try std.testing.expect(config.policies[0].telemetry_type == .log);
-    try std.testing.expectEqual(@as(usize, 2), config.policies[0].regexes.len);
-    try std.testing.expectEqualStrings("debug", config.policies[0].regexes[0]);
-    try std.testing.expectEqualStrings("trace", config.policies[0].regexes[1]);
-    try std.testing.expect(config.policies[0].action == .drop);
-
-    // Verify second policy
-    try std.testing.expectEqualStrings("keep-errors", config.policies[1].name);
-    try std.testing.expect(config.policies[1].policy_type == .filter);
-    try std.testing.expect(config.policies[1].telemetry_type == .log);
-    try std.testing.expectEqual(@as(usize, 1), config.policies[1].regexes.len);
-    try std.testing.expectEqualStrings("error", config.policies[1].regexes[0]);
-    try std.testing.expect(config.policies[1].action == .keep);
+    try std.testing.expectEqual(@as(usize, 0), config.policy_providers.len);
 }
 
 test "parsePolicyType" {
-    try std.testing.expect(try parsePolicyType("filter") == .filter);
-    try std.testing.expect(try parsePolicyType("transform") == .transform);
-    try std.testing.expect(try parsePolicyType("redact") == .redact);
+    try std.testing.expect(try parsePolicyType("filter") == .POLICY_TYPE_FILTER);
+    try std.testing.expect(try parsePolicyType("transform") == .POLICY_TYPE_TRANSFORM);
+    try std.testing.expect(try parsePolicyType("redact") == .POLICY_TYPE_REDACT);
     try std.testing.expectError(error.InvalidPolicyType, parsePolicyType("invalid"));
 }
 
 test "parseTelemetryType" {
-    try std.testing.expect(try parseTelemetryType("log") == .log);
-    try std.testing.expect(try parseTelemetryType("metric") == .metric);
-    try std.testing.expect(try parseTelemetryType("span") == .span);
+    try std.testing.expect(try parseTelemetryType("log") == .TELEMETRY_TYPE_LOG);
+    try std.testing.expect(try parseTelemetryType("metric") == .TELEMETRY_TYPE_METRIC);
+    try std.testing.expect(try parseTelemetryType("span") == .TELEMETRY_TYPE_SPAN);
     try std.testing.expectError(error.InvalidTelemetryType, parseTelemetryType("invalid"));
 }
 
@@ -380,7 +309,7 @@ test "parseAction" {
     const keep_action = try parseAction("keep");
     const drop_action = try parseAction("drop");
 
-    try std.testing.expect(keep_action == .keep);
-    try std.testing.expect(drop_action == .drop);
+    try std.testing.expect(keep_action.type == .ACTION_TYPE_KEEP);
+    try std.testing.expect(drop_action.type == .ACTION_TYPE_DROP);
     try std.testing.expectError(error.InvalidAction, parseAction("invalid"));
 }
