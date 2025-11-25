@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
     // Create a proto module for generated protobuf files
     const proto_mod = b.addModule("proto", .{
-        .root_source_file = b.path("src/proto/tero/edge/policy/v1.pb.zig"),
+        .root_source_file = b.path("src/proto/root.zig"),
         .target = target,
     });
     proto_mod.addImport("protobuf", protobuf_dep.module("protobuf"));
@@ -191,9 +191,11 @@ pub fn build(b: *std.Build) void {
         // out directory for the generated zig files
         .destination_directory = b.path("src/proto"),
         .source_files = &.{
-            "protos/policy.proto",
+            "proto/policy/opentelemetry/proto/policy/v1/policy.proto",
         },
-        .include_directories = &.{},
+        .include_directories = &.{
+            "proto/policy",
+        },
     });
 
     gen_proto.dependOn(&protoc_step.step);

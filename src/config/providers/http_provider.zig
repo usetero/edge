@@ -3,14 +3,14 @@ const policy_provider = @import("../../core/policy_provider.zig");
 const policy_source = @import("../../core/policy_source.zig");
 const parser = @import("../parser.zig");
 const types = @import("../types.zig");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
 const SourceType = policy_source.SourceType;
-const SyncRequest = policy_pb.SyncRequest;
-const SyncResponse = policy_pb.SyncResponse;
-const EdgeMetadata = policy_pb.EdgeMetadata;
+const SyncRequest = proto.policy.SyncRequest;
+const SyncResponse = proto.policy.SyncResponse;
+const ClientMetadata = proto.policy.ClientMetadata;
 
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {

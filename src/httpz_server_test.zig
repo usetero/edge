@@ -2,16 +2,16 @@ const std = @import("std");
 const httpz_server = @import("proxy/httpz_server.zig");
 const config_types = @import("config/types.zig");
 const filter_mod = @import("filter.zig");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 const policy_registry_mod = @import("policy_registry.zig");
 const policy_source_mod = @import("policy_source.zig");
 
 const testing = std.testing;
-const Policy = policy_pb.Policy;
-const PolicyType = policy_pb.PolicyType;
-const TelemetryType = policy_pb.TelemetryType;
-const Action = policy_pb.Action;
-const ActionType = policy_pb.ActionType;
+const Policy = proto.policy.Policy;
+const PolicyType = proto.policy.PolicyType;
+const TelemetryType = proto.policy.TelemetryType;
+const FilterAction = proto.policy.FilterAction;
+const FilterConfig = proto.policy.FilterConfig;
 const PolicyRegistry = policy_registry_mod.PolicyRegistry;
 const SourceType = policy_source_mod.SourceType;
 

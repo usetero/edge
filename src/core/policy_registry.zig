@@ -1,9 +1,9 @@
 const std = @import("std");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 const policy_source = @import("./policy_source.zig");
 
-const Policy = policy_pb.Policy;
-const TelemetryType = policy_pb.TelemetryType;
+const Policy = proto.policy.Policy;
+const TelemetryType = proto.policy.TelemetryType;
 const SourceType = policy_source.SourceType;
 const PolicyKey = policy_source.PolicyKey;
 const PolicyMetadata = policy_source.PolicyMetadata;

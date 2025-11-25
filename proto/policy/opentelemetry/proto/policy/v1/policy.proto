@@ -1,0 +1,254 @@
+syntax = "proto3";
+
+package opentelemetry.proto.policy.v1;
+
+import "opentelemetry/proto/common/v1/common.proto";
+
+option go_package = "github.com/open-telemetry/opentelemetry-proto/gen/go/policy/v1";
+option java_multiple_files = true;
+option java_package = "io.opentelemetry.proto.policy.v1";
+
+// =============================================================================
+// Core Policy Types
+// =============================================================================
+
+// PolicyType identifies the specific use case for a policy.
+// Policies of the same type can be merged; different types cannot.
+enum PolicyType {
+  POLICY_TYPE_UNSPECIFIED = 0;
+  POLICY_TYPE_LOG_FILTER = 1; // Define how logs are filtered (keep/drop)
+  POLICY_TYPE_REDACTION = 2; // Define data needing redaction/removal
+}
+
+// TelemetryType specifies what kind of telemetry data a policy applies to.
+enum TelemetryType {
+  TELEMETRY_TYPE_UNSPECIFIED = 0;
+  TELEMETRY_TYPE_LOGS = 1;
+}
+
+// =============================================================================
+// Matching
+// =============================================================================
+
+// Matcher provides a unified way to match against any telemetry data.
+// Uses JSONPath syntax to access fields and regex for value matching.
+//
+// Example paths for logs:
+//   - "$.resource.attributes.service.name"     -> service name
+//   - "$.resource.attributes.deployment.env"   -> deployment environment
+//   - "$.attributes.user.id"                   -> log attribute
+//   - "$.body"                                 -> log body
+//   - "$.severity_text"                        -> log severity (e.g., "ERROR")
+//   - "$.severity_number"                      -> log severity number
+//   - "$.attributes.*"                         -> any attribute key
+//
+// The regex uses RE2 syntax for consistency across implementations.
+message Matcher {
+  // JSONPath expression to access the field to match against.
+  // Uses dot notation: $.resource.attributes.service.name
+  string path = 1;
+
+  // Regular expression pattern to match the field value against.
+  // Uses RE2 syntax. An empty regex matches any value (existence check).
+  string regex = 2;
+
+  // If true, inverts the match (matches when regex does NOT match)
+  bool negate = 3;
+}
+
+// =============================================================================
+// Policy Type Configurations
+// =============================================================================
+
+// FilterAction specifies what to do with matched logs.
+enum FilterAction {
+  FILTER_ACTION_UNSPECIFIED = 0;
+  FILTER_ACTION_KEEP = 1; // Keep logs that match
+  FILTER_ACTION_DROP = 2; // Drop logs that match
+}
+
+// FilterConfig defines configuration for LOG_FILTER policies.
+// Matches logs based on conditions and keeps or drops them.
+message FilterConfig {
+  // Matchers to identify which logs this filter applies to (AND logic)
+  repeated Matcher matchers = 1;
+
+  // Action to take on matched logs
+  FilterAction action = 2;
+}
+
+// RedactionRule defines a single find/replace redaction operation.
+// Similar to sed's s/pattern/replacement/ syntax.
+message RedactionRule {
+  // JSONPath to the field to apply redaction to.
+  // Example: "$.body", "$.attributes.user.email", "$.attributes.*"
+  string path = 1;
+
+  // Regular expression pattern to find (RE2 syntax).
+  // Example: "[0-9]{3}-[0-9]{2}-[0-9]{4}" for SSN
+  // Example: "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}" for email
+  string pattern = 2;
+
+  // Replacement string. Supports capture group references ($1, $2, etc.)
+  // Example: "[REDACTED]"
+  // Example: "$1-****-$3" to partially mask
+  // Default: "[REDACTED]"
+  string replacement = 3;
+}
+
+// RedactionConfig defines configuration for REDACTION policies.
+// Applies sed-like find/replace redaction rules to matched logs.
+message RedactionConfig {
+  // Matchers to identify which logs to apply redaction to (AND logic)
+  // If empty, redaction applies to all logs
+  repeated Matcher matchers = 1;
+
+  // Redaction rules to apply (applied in order)
+  repeated RedactionRule rules = 2;
+}
+
+// =============================================================================
+// Policy Definition
+// =============================================================================
+
+// Policy represents a complete telemetry policy definition.
+// Policies are designed to be:
+// - Typed: Self-identifies its type; same types can merge
+// - Implementation Agnostic: Works in SDK, Collector, or any component
+// - Standalone: No need to understand pipeline configuration
+// - Dynamic: Can be updated post-instantiation
+// - Idempotent: Safe to apply to multiple components
+// - Fail-Open: Does not interfere with telemetry on failure
+//
+// Merge Strategy: Policies of the same type are merged using priority.
+// Higher priority values take precedence when rules conflict.
+message Policy {
+  // Unique identifier for this policy
+  string id = 1;
+
+  // Human-readable name
+  string name = 2;
+
+  // Optional description
+  string description = 3;
+
+  // The type of policy (must match the config oneof field used)
+  PolicyType policy_type = 4;
+
+  // Telemetry types this policy applies to
+  repeated TelemetryType telemetry_types = 5;
+
+  // Priority for merge conflict resolution (higher = more important)
+  int32 priority = 6;
+
+  // Policy configuration based on policy_type
+  oneof config {
+    FilterConfig filter = 7;
+    RedactionConfig redaction = 8;
+  }
+
+  // Whether this policy is enabled
+  bool enabled = 9;
+
+  // Metadata labels for organization and filtering
+  repeated opentelemetry.proto.common.v1.KeyValue labels = 10;
+
+  // Timestamp when this policy was created (Unix epoch nanoseconds)
+  fixed64 created_at_unix_nano = 11;
+
+  // Timestamp when this policy was last modified (Unix epoch nanoseconds)
+  fixed64 modified_at_unix_nano = 12;
+}
+
+// =============================================================================
+// Policy Collections and Management
+// =============================================================================
+
+// PolicySet represents a collection of policies from a single source/provider.
+message PolicySet {
+  // Unique identifier for this policy set
+  string id = 1;
+
+  // Human-readable name
+  string name = 2;
+
+  // The policies in this set
+  repeated Policy policies = 3;
+
+  // Version/hash of the entire set (for change detection)
+  string version = 4;
+
+  // Source identifier (which provider supplied this)
+  string source = 5;
+
+  // Timestamp of this policy set (Unix epoch nanoseconds)
+  fixed64 timestamp_unix_nano = 6;
+}
+
+// =============================================================================
+// Sync Protocol (for Policy Providers)
+// =============================================================================
+
+// ClientMetadata contains information about the client requesting policies.
+message ClientMetadata {
+  // Unique identifier for the client instance
+  string client_id = 1;
+
+  // Version of the client software
+  string client_version = 2;
+
+  // Identifier for the workspace/tenant
+  string workspace_id = 3;
+
+  // Last sync timestamp (Unix epoch nanoseconds)
+  fixed64 last_sync_timestamp_unix_nano = 4;
+
+  // Policy types this client supports/wants
+  repeated PolicyType supported_policy_types = 5;
+
+  // Telemetry types this client handles
+  repeated TelemetryType supported_telemetry_types = 6;
+
+  // Additional metadata labels
+  repeated opentelemetry.proto.common.v1.KeyValue labels = 7;
+
+  // Resource attributes describing this client's identity
+  repeated opentelemetry.proto.common.v1.KeyValue resource_attributes = 8;
+}
+
+// SyncRequest is sent by clients to request policy updates.
+message SyncRequest {
+  // Client identification and capabilities
+  ClientMetadata client_metadata = 1;
+
+  // Request full sync (ignore last_policy_version)
+  bool full_sync = 2;
+}
+
+// SyncResponse contains policy updates for the client.
+message SyncResponse {
+  // The complete policy set to apply
+  PolicySet policy_set = 1;
+
+  // Timestamp of this sync (Unix epoch nanoseconds)
+  fixed64 sync_timestamp_unix_nano = 2;
+
+  // Suggested interval before next sync (in seconds)
+  uint32 recommended_sync_interval_seconds = 3;
+
+  // Whether this is a full replacement or incremental update
+  bool is_full_sync = 4;
+
+  // Error message if sync failed
+  string error_message = 5;
+}
+
+// =============================================================================
+// Policy Provider Service (optional - for gRPC providers)
+// =============================================================================
+
+// PolicyService defines the gRPC service for policy providers.
+service PolicyService {
+  // Sync policies with the provider
+  rpc Sync(SyncRequest) returns (SyncResponse);
+}

@@ -1,10 +1,10 @@
 const std = @import("std");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 const policy_registry = @import("policy_registry.zig");
 
-const Policy = policy_pb.Policy;
-const TelemetryType = policy_pb.TelemetryType;
-const ActionType = policy_pb.ActionType;
+const Policy = proto.policy.Policy;
+const TelemetryType = proto.policy.TelemetryType;
+const FilterAction = proto.policy.FilterAction;
 const PolicyRegistry = policy_registry.PolicyRegistry;
 
 /// FilterResult indicates whether to keep or drop the data

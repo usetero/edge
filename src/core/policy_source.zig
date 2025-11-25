@@ -1,6 +1,6 @@
 const std = @import("std");
-const policy_pb = @import("proto");
-const TelemetryType = policy_pb.TelemetryType;
+const proto = @import("proto");
+const TelemetryType = proto.policy.TelemetryType;
 
 /// Source type for policies with priority ordering
 /// Higher numeric value = higher priority (HTTP overlays file)
