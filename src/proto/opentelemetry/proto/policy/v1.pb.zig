@@ -4,6 +4,8 @@ const std = @import("std");
 
 const protobuf = @import("protobuf");
 const fd = protobuf.fd;
+/// import package google.api
+const google_api = @import("../../../google/api.pb.zig");
 /// import package opentelemetry.proto.common.v1
 const opentelemetry_proto_common_v1 = @import("../common/v1.pb.zig");
 

@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package opentelemetry.proto.policy.v1;
 
+import "google/api/annotations.proto";
 import "opentelemetry/proto/common/v1/common.proto";
 
 option go_package = "github.com/open-telemetry/opentelemetry-proto/gen/go/policy/v1";
@@ -250,5 +251,10 @@ message SyncResponse {
 // PolicyService defines the gRPC service for policy providers.
 service PolicyService {
   // Sync policies with the provider
-  rpc Sync(SyncRequest) returns (SyncResponse);
+  rpc Sync(SyncRequest) returns (SyncResponse) {
+    option (google.api.http) = {
+      post: "/v1/policy/sync"
+      body: "*"
+    };
+  }
 }
