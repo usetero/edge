@@ -56,6 +56,10 @@ pub const PolicyRegistry = struct {
     }
 
     pub fn deinit(self: *PolicyRegistry) void {
+        // Free all stored policies (we own them via dupe)
+        for (self.policies.items) |*policy| {
+            policy.deinit(self.allocator);
+        }
         self.policies.deinit(self.allocator);
 
         // Free source tracking keys and hashmap
@@ -125,22 +129,26 @@ pub const PolicyRegistry = struct {
     }
 
     /// Add a policy and track its source
+    /// Deep copies the policy so the registry owns the memory
     fn addPolicyInternal(
         self: *PolicyRegistry,
         policy: Policy,
         source: SourceType,
     ) !void {
-        try self.policies.append(self.allocator, policy);
+        // Deep copy the policy so we own the memory
+        const policy_copy = try policy.dupe(self.allocator);
+        try self.policies.append(self.allocator, policy_copy);
 
-        // Track source metadata
+        // Track source metadata (name is already copied in policy_copy)
         const name_key = try self.allocator.dupe(u8, policy.name);
         try self.policy_sources.put(name_key, PolicyMetadata.init(source));
     }
 
-    /// Remove a policy by name
+    /// Remove a policy by name and free its memory
     fn removePolicyByName(self: *PolicyRegistry, name: []const u8) void {
-        for (self.policies.items, 0..) |policy, i| {
+        for (self.policies.items, 0..) |*policy, i| {
             if (std.mem.eql(u8, policy.name, name)) {
+                policy.deinit(self.allocator);
                 _ = self.policies.swapRemove(i);
                 break;
             }
