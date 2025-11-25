@@ -5,16 +5,29 @@ const LogLevel = types.LogLevel;
 const Policy = types.Policy;
 const PolicyType = types.PolicyType;
 const TelemetryType = types.TelemetryType;
-const Action = types.Action;
-const ActionType = types.ActionType;
+const FilterAction = types.FilterAction;
+const FilterConfig = types.FilterConfig;
+const Matcher = types.Matcher;
+
+/// JSON schema for a matcher
+const MatcherJson = struct {
+    path: []const u8,
+    regex: []const u8,
+    negate: bool = false,
+};
 
 /// JSON schema for a policy
 const PolicyJson = struct {
+    id: ?[]const u8 = null,
     name: []const u8,
+    description: ?[]const u8 = null,
     policy_type: []const u8,
-    telemetry_type: []const u8,
-    regexes: [][]const u8,
-    action: []const u8,
+    telemetry_types: [][]const u8,
+    priority: i32 = 0,
+    enabled: bool = true,
+    // For filter policies
+    matchers: ?[]MatcherJson = null,
+    action: ?[]const u8 = null,
 };
 
 /// JSON schema for a policies-only file
@@ -131,29 +144,54 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
         // Parse policy type
         const policy_type = try parsePolicyType(json_policy.policy_type);
 
-        // Parse telemetry type
-        const telemetry_type = try parseTelemetryType(json_policy.telemetry_type);
+        // Parse telemetry types
+        var telemetry_types = std.ArrayListUnmanaged(TelemetryType){};
+        try telemetry_types.ensureTotalCapacity(allocator, json_policy.telemetry_types.len);
+        for (json_policy.telemetry_types) |tt| {
+            telemetry_types.appendAssumeCapacity(try parseTelemetryType(tt));
+        }
 
-        // Parse action
-        const action = try parseAction(json_policy.action);
-
-        // Allocate and copy name
+        // Allocate and copy strings
+        const id = if (json_policy.id) |id| try allocator.dupe(u8, id) else &.{};
         const name = try allocator.dupe(u8, json_policy.name);
+        const description = if (json_policy.description) |desc| try allocator.dupe(u8, desc) else &.{};
 
-        // Allocate and copy regexes into ArrayListUnmanaged
-        var regexes = std.ArrayListUnmanaged([]const u8){};
-        try regexes.ensureTotalCapacity(allocator, json_policy.regexes.len);
-        for (json_policy.regexes) |regex| {
-            const regex_copy = try allocator.dupe(u8, regex);
-            regexes.appendAssumeCapacity(regex_copy);
+        // Build config based on policy type
+        var config: ?Policy.config_union = null;
+        if (policy_type == .POLICY_TYPE_LOG_FILTER) {
+            // Parse matchers
+            var matchers = std.ArrayListUnmanaged(Matcher){};
+            if (json_policy.matchers) |json_matchers| {
+                try matchers.ensureTotalCapacity(allocator, json_matchers.len);
+                for (json_matchers) |jm| {
+                    matchers.appendAssumeCapacity(.{
+                        .path = try allocator.dupe(u8, jm.path),
+                        .regex = try allocator.dupe(u8, jm.regex),
+                        .negate = jm.negate,
+                    });
+                }
+            }
+
+            // Parse action
+            const action = if (json_policy.action) |a| try parseFilterAction(a) else .FILTER_ACTION_UNSPECIFIED;
+
+            config = .{
+                .filter = FilterConfig{
+                    .matchers = matchers,
+                    .action = action,
+                },
+            };
         }
 
         policies[i] = Policy{
+            .id = id,
             .name = name,
+            .description = description,
             .policy_type = policy_type,
-            .telemetry_type = telemetry_type,
-            .regexes = regexes,
-            .action = action,
+            .telemetry_types = telemetry_types,
+            .priority = json_policy.priority,
+            .enabled = json_policy.enabled,
+            .config = config,
         };
     }
 
@@ -202,24 +240,21 @@ fn parseProviderType(s: []const u8) !types.ProviderType {
 
 /// Parse PolicyType from string
 fn parsePolicyType(s: []const u8) !PolicyType {
-    if (std.mem.eql(u8, s, "filter")) return .POLICY_TYPE_FILTER;
-    if (std.mem.eql(u8, s, "transform")) return .POLICY_TYPE_TRANSFORM;
-    if (std.mem.eql(u8, s, "redact")) return .POLICY_TYPE_REDACT;
+    if (std.mem.eql(u8, s, "filter") or std.mem.eql(u8, s, "log_filter")) return .POLICY_TYPE_LOG_FILTER;
+    if (std.mem.eql(u8, s, "redaction") or std.mem.eql(u8, s, "redact")) return .POLICY_TYPE_REDACTION;
     return error.InvalidPolicyType;
 }
 
 /// Parse TelemetryType from string
 fn parseTelemetryType(s: []const u8) !TelemetryType {
-    if (std.mem.eql(u8, s, "log")) return .TELEMETRY_TYPE_LOG;
-    if (std.mem.eql(u8, s, "metric")) return .TELEMETRY_TYPE_METRIC;
-    if (std.mem.eql(u8, s, "span")) return .TELEMETRY_TYPE_SPAN;
+    if (std.mem.eql(u8, s, "log") or std.mem.eql(u8, s, "logs")) return .TELEMETRY_TYPE_LOGS;
     return error.InvalidTelemetryType;
 }
 
-/// Parse Action from string
-fn parseAction(s: []const u8) !Action {
-    if (std.mem.eql(u8, s, "keep")) return .{ .type = .ACTION_TYPE_KEEP };
-    if (std.mem.eql(u8, s, "drop")) return .{ .type = .ACTION_TYPE_DROP };
+/// Parse FilterAction from string
+fn parseFilterAction(s: []const u8) !FilterAction {
+    if (std.mem.eql(u8, s, "keep")) return .FILTER_ACTION_KEEP;
+    if (std.mem.eql(u8, s, "drop")) return .FILTER_ACTION_DROP;
     return error.InvalidAction;
 }
 
@@ -292,24 +327,21 @@ test "parseConfigFile with JSON" {
 }
 
 test "parsePolicyType" {
-    try std.testing.expect(try parsePolicyType("filter") == .POLICY_TYPE_FILTER);
-    try std.testing.expect(try parsePolicyType("transform") == .POLICY_TYPE_TRANSFORM);
-    try std.testing.expect(try parsePolicyType("redact") == .POLICY_TYPE_REDACT);
+    try std.testing.expect(try parsePolicyType("filter") == .POLICY_TYPE_LOG_FILTER);
+    try std.testing.expect(try parsePolicyType("log_filter") == .POLICY_TYPE_LOG_FILTER);
+    try std.testing.expect(try parsePolicyType("redaction") == .POLICY_TYPE_REDACTION);
+    try std.testing.expect(try parsePolicyType("redact") == .POLICY_TYPE_REDACTION);
     try std.testing.expectError(error.InvalidPolicyType, parsePolicyType("invalid"));
 }
 
 test "parseTelemetryType" {
-    try std.testing.expect(try parseTelemetryType("log") == .TELEMETRY_TYPE_LOG);
-    try std.testing.expect(try parseTelemetryType("metric") == .TELEMETRY_TYPE_METRIC);
-    try std.testing.expect(try parseTelemetryType("span") == .TELEMETRY_TYPE_SPAN);
+    try std.testing.expect(try parseTelemetryType("log") == .TELEMETRY_TYPE_LOGS);
+    try std.testing.expect(try parseTelemetryType("logs") == .TELEMETRY_TYPE_LOGS);
     try std.testing.expectError(error.InvalidTelemetryType, parseTelemetryType("invalid"));
 }
 
-test "parseAction" {
-    const keep_action = try parseAction("keep");
-    const drop_action = try parseAction("drop");
-
-    try std.testing.expect(keep_action.type == .ACTION_TYPE_KEEP);
-    try std.testing.expect(drop_action.type == .ACTION_TYPE_DROP);
-    try std.testing.expectError(error.InvalidAction, parseAction("invalid"));
+test "parseFilterAction" {
+    try std.testing.expect(try parseFilterAction("keep") == .FILTER_ACTION_KEEP);
+    try std.testing.expect(try parseFilterAction("drop") == .FILTER_ACTION_DROP);
+    try std.testing.expectError(error.InvalidAction, parseFilterAction("invalid"));
 }

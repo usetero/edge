@@ -3,23 +3,23 @@
     {
       "name": "drop-debug-logs",
       "policy_type": "filter",
-      "telemetry_type": "log",
-      "regexes": ["debug", "trace"],
+      "telemetry_types": ["logs"],
+      "matchers": [
+        { "path": "$.body", "regex": "debug" },
+        { "path": "$.body", "regex": "trace" }
+      ],
       "action": "drop"
     },
     {
       "name": "keep-error-logs",
       "policy_type": "filter",
-      "telemetry_type": "log",
-      "regexes": ["error", "critical", "fatal"],
+      "telemetry_types": ["logs"],
+      "matchers": [
+        { "path": "$.severity_text", "regex": "error" },
+        { "path": "$.severity_text", "regex": "critical" },
+        { "path": "$.severity_text", "regex": "fatal" }
+      ],
       "action": "keep"
-    },
-    {
-      "name": "drop-test-metrics",
-      "policy_type": "filter",
-      "telemetry_type": "metric",
-      "regexes": ["test\\."],
-      "action": "drop"
     }
   ]
 }

@@ -66,12 +66,8 @@ pub const FileProvider = struct {
 
         const policies = try parser.parsePoliciesFile(self.allocator, self.config_path);
         defer {
-            for (policies) |policy| {
-                self.allocator.free(policy.name);
-                for (policy.regexes.items) |regex| self.allocator.free(regex);
-                var regexes_mut = @constCast(&policy.regexes);
-                regexes_mut.deinit(self.allocator);
-            }
+            // Policies are copied by the registry, so we can free our local copies
+            // The parser allocates strings that need to be freed
             self.allocator.free(policies);
         }
 
