@@ -3,14 +3,14 @@ const policy_provider = @import("../../core/policy_provider.zig");
 const policy_source = @import("../../core/policy_source.zig");
 const parser = @import("../parser.zig");
 const types = @import("../types.zig");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
 const SourceType = policy_source.SourceType;
-const SyncRequest = policy_pb.SyncRequest;
-const SyncResponse = policy_pb.SyncResponse;
-const EdgeMetadata = policy_pb.EdgeMetadata;
+const SyncRequest = proto.policy.SyncRequest;
+const SyncResponse = proto.policy.SyncResponse;
+const ClientMetadata = proto.policy.ClientMetadata;
 
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {
@@ -146,24 +146,24 @@ pub const HttpProvider = struct {
             self.last_etag = new_etag;
 
             // Update last sync timestamp
-            self.last_sync_timestamp = response.sync_timestamp;
+            self.last_sync_timestamp = @intCast(response.sync_timestamp_unix_nano);
 
             // Extract policies from response
-            if (response.policy_list) |policy_list| {
+            if (response.policy_set) |policy_set| {
                 if (self.callback) |cb| {
                     try cb.call(.{
-                        .policies = policy_list.policies.items,
+                        .policies = policy_set.policies.items,
                         .source = .http,
                     });
                 }
 
                 std.log.info("Loaded {} policies from {s} (sync_timestamp: {})", .{
-                    policy_list.policies.items.len,
+                    policy_set.policies.items.len,
                     self.config_url,
-                    response.sync_timestamp,
+                    response.sync_timestamp_unix_nano,
                 });
             } else {
-                std.log.warn("Received SyncResponse with no policy_list", .{});
+                std.log.warn("Received SyncResponse with no policy_set", .{});
             }
         } else {
             // 304 Not Modified
@@ -176,12 +176,11 @@ pub const HttpProvider = struct {
 
         // Create SyncRequest with metadata
         var sync_request = SyncRequest{
-            .metadata = EdgeMetadata{
-                .edge_id = self.edge_id,
-                .version = self.version,
+            .client_metadata = ClientMetadata{
+                .client_id = self.edge_id,
+                .client_version = self.version,
                 .workspace_id = self.workspace_id,
-                .last_sync_timestamp = self.last_sync_timestamp,
-                .labels = .empty,
+                .last_sync_timestamp_unix_nano = @intCast(self.last_sync_timestamp),
             },
         };
 

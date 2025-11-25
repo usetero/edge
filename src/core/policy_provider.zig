@@ -1,8 +1,8 @@
 const std = @import("std");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 const policy_source = @import("./policy_source.zig");
 
-const Policy = policy_pb.Policy;
+const Policy = proto.policy.Policy;
 const SourceType = policy_source.SourceType;
 
 /// Update notification sent by providers to subscribers

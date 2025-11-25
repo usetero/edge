@@ -2,16 +2,17 @@ const std = @import("std");
 const httpz_server = @import("proxy/httpz_server.zig");
 const config_types = @import("config/types.zig");
 const filter_mod = @import("filter.zig");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 const policy_registry_mod = @import("policy_registry.zig");
 const policy_source_mod = @import("policy_source.zig");
 
 const testing = std.testing;
-const Policy = policy_pb.Policy;
-const PolicyType = policy_pb.PolicyType;
-const TelemetryType = policy_pb.TelemetryType;
-const Action = policy_pb.Action;
-const ActionType = policy_pb.ActionType;
+const Policy = proto.policy.Policy;
+const PolicyType = proto.policy.PolicyType;
+const TelemetryType = proto.policy.TelemetryType;
+const FilterAction = proto.policy.FilterAction;
+const FilterConfig = proto.policy.FilterConfig;
+const Matcher = proto.policy.Matcher;
 const PolicyRegistry = policy_registry_mod.PolicyRegistry;
 const SourceType = policy_source_mod.SourceType;
 
@@ -61,22 +62,50 @@ const test_payload_with_debug =
     \\]
 ;
 
+/// Helper to create a filter policy with matchers
+fn createFilterPolicy(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    patterns: []const []const u8,
+    action: FilterAction,
+) !Policy {
+    var matchers = std.ArrayListUnmanaged(Matcher){};
+    try matchers.ensureTotalCapacity(allocator, patterns.len);
+    for (patterns) |pattern| {
+        matchers.appendAssumeCapacity(.{
+            .path = "$.message",
+            .regex = pattern,
+        });
+    }
+
+    var telemetry_types = std.ArrayListUnmanaged(TelemetryType){};
+    try telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
+
+    return Policy{
+        .name = name,
+        .policy_type = .POLICY_TYPE_LOG_FILTER,
+        .telemetry_types = telemetry_types,
+        .enabled = true,
+        .config = .{
+            .filter = FilterConfig{
+                .matchers = matchers,
+                .action = action,
+            },
+        },
+    };
+}
+
 test "Filter evaluates Datadog log payload - no match keeps payload" {
     var registry = PolicyRegistry.init(testing.allocator);
     defer registry.deinit();
 
     // Add a filter that drops only ERROR logs
-    var error_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try error_regexes.append(testing.allocator, "ERROR");
-    defer error_regexes.deinit(testing.allocator);
-
-    const drop_errors = Policy{
-        .name = "drop-errors",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = error_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
+    const drop_errors = try createFilterPolicy(
+        testing.allocator,
+        "drop-errors",
+        &.{"ERROR"},
+        .FILTER_ACTION_DROP,
+    );
 
     const policies = [_]Policy{drop_errors};
     try registry.updatePolicies(&policies, .file);
@@ -84,8 +113,8 @@ test "Filter evaluates Datadog log payload - no match keeps payload" {
     var filter = filter_mod.FilterEvaluator.init(&registry);
     defer filter.deinit();
 
-    // Test INFO payload should be kept
-    const result = try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOG);
+    // Test INFO payload should be kept (no match = keep)
+    const result = try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOGS);
     try testing.expect(result == filter_mod.FilterResult.keep);
 }
 
@@ -94,17 +123,12 @@ test "Filter evaluates Datadog log payload - error match drops payload" {
     defer registry.deinit();
 
     // Add a filter that drops ERROR logs
-    var error_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try error_regexes.append(testing.allocator, "ERROR");
-    defer error_regexes.deinit(testing.allocator);
-
-    const drop_errors = Policy{
-        .name = "drop-errors",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = error_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
+    const drop_errors = try createFilterPolicy(
+        testing.allocator,
+        "drop-errors",
+        &.{"ERROR"},
+        .FILTER_ACTION_DROP,
+    );
 
     const policies = [_]Policy{drop_errors};
     try registry.updatePolicies(&policies, .file);
@@ -113,7 +137,7 @@ test "Filter evaluates Datadog log payload - error match drops payload" {
     defer filter.deinit();
 
     // Test ERROR payload should be dropped
-    const result = try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOG);
+    const result = try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOGS);
     try testing.expect(result == filter_mod.FilterResult.drop);
 }
 
@@ -122,17 +146,12 @@ test "Filter evaluates Datadog log payload - debug match drops payload" {
     defer registry.deinit();
 
     // Add a filter that drops DEBUG logs
-    var debug_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try debug_regexes.append(testing.allocator, "DEBUG");
-    defer debug_regexes.deinit(testing.allocator);
-
-    const drop_debug = Policy{
-        .name = "drop-debug",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = debug_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
+    const drop_debug = try createFilterPolicy(
+        testing.allocator,
+        "drop-debug",
+        &.{"DEBUG"},
+        .FILTER_ACTION_DROP,
+    );
 
     const policies = [_]Policy{drop_debug};
     try registry.updatePolicies(&policies, .file);
@@ -141,7 +160,7 @@ test "Filter evaluates Datadog log payload - debug match drops payload" {
     defer filter.deinit();
 
     // Test DEBUG payload should be dropped
-    const result = try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOG);
+    const result = try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOGS);
     try testing.expect(result == filter_mod.FilterResult.drop);
 }
 
@@ -150,30 +169,20 @@ test "Filter with multiple policies - first match wins" {
     defer registry.deinit();
 
     // Add drop policy for ERROR (first)
-    var error_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try error_regexes.append(testing.allocator, "ERROR");
-    defer error_regexes.deinit(testing.allocator);
+    const drop_errors = try createFilterPolicy(
+        testing.allocator,
+        "drop-errors",
+        &.{"ERROR"},
+        .FILTER_ACTION_DROP,
+    );
 
     // Add keep policy for all payment service (second)
-    var payment_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try payment_regexes.append(testing.allocator, "payment");
-    defer payment_regexes.deinit(testing.allocator);
-
-    const drop_errors = Policy{
-        .name = "drop-errors",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = error_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
-
-    const keep_payment = Policy{
-        .name = "keep-payment",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = payment_regexes,
-        .action = Action{ .type = .ACTION_TYPE_KEEP },
-    };
+    const keep_payment = try createFilterPolicy(
+        testing.allocator,
+        "keep-payment",
+        &.{"payment"},
+        .FILTER_ACTION_KEEP,
+    );
 
     const policies = [_]Policy{ drop_errors, keep_payment };
     try registry.updatePolicies(&policies, .file);
@@ -182,7 +191,7 @@ test "Filter with multiple policies - first match wins" {
     defer filter.deinit();
 
     // ERROR payload matches first policy (drop), should drop despite matching second
-    const result = try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOG);
+    const result = try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOGS);
     try testing.expect(result == filter_mod.FilterResult.drop);
 }
 
@@ -191,17 +200,12 @@ test "Filter respects service tags in Datadog payload" {
     defer registry.deinit();
 
     // Drop logs from payment service
-    var service_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try service_regexes.append(testing.allocator, "\"service\": \"payment\"");
-    defer service_regexes.deinit(testing.allocator);
-
-    const drop_payment = Policy{
-        .name = "drop-payment-service",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = service_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
+    const drop_payment = try createFilterPolicy(
+        testing.allocator,
+        "drop-payment-service",
+        &.{"\"service\": \"payment\""},
+        .FILTER_ACTION_DROP,
+    );
 
     const policies = [_]Policy{drop_payment};
     try registry.updatePolicies(&policies, .file);
@@ -210,9 +214,9 @@ test "Filter respects service tags in Datadog payload" {
     defer filter.deinit();
 
     // All test payloads have payment service
-    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.drop);
-    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.drop);
-    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.drop);
+    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.drop);
+    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.drop);
+    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.drop);
 }
 
 test "Filter respects environment tags in Datadog payload" {
@@ -220,17 +224,12 @@ test "Filter respects environment tags in Datadog payload" {
     defer registry.deinit();
 
     // Drop staging environment logs
-    var env_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try env_regexes.append(testing.allocator, "env:staging");
-    defer env_regexes.deinit(testing.allocator);
-
-    const drop_staging = Policy{
-        .name = "drop-staging",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = env_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
+    const drop_staging = try createFilterPolicy(
+        testing.allocator,
+        "drop-staging",
+        &.{"env:staging"},
+        .FILTER_ACTION_DROP,
+    );
 
     const policies = [_]Policy{drop_staging};
     try registry.updatePolicies(&policies, .file);
@@ -239,13 +238,13 @@ test "Filter respects environment tags in Datadog payload" {
     defer filter.deinit();
 
     // Staging payloads should be dropped
-    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.drop);
+    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.drop);
 
     // Production payload should be kept
-    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.keep);
+    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.keep);
 
     // Development payload should be kept
-    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.keep);
+    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.keep);
 }
 
 test "Filter matches on hostname in Datadog payload" {
@@ -253,17 +252,12 @@ test "Filter matches on hostname in Datadog payload" {
     defer registry.deinit();
 
     // Drop logs from specific host
-    var host_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try host_regexes.append(testing.allocator, "i-012345680");
-    defer host_regexes.deinit(testing.allocator);
-
-    const drop_host = Policy{
-        .name = "drop-specific-host",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = host_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
+    const drop_host = try createFilterPolicy(
+        testing.allocator,
+        "drop-specific-host",
+        &.{"i-012345680"},
+        .FILTER_ACTION_DROP,
+    );
 
     const policies = [_]Policy{drop_host};
     try registry.updatePolicies(&policies, .file);
@@ -272,11 +266,11 @@ test "Filter matches on hostname in Datadog payload" {
     defer filter.deinit();
 
     // Host i-012345680 should be dropped
-    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.drop);
+    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.drop);
 
     // Other hosts should be kept
-    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.keep);
-    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.keep);
+    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.keep);
+    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.keep);
 }
 
 test "Filter complex scenario - multiple conditions" {
@@ -284,43 +278,28 @@ test "Filter complex scenario - multiple conditions" {
     defer registry.deinit();
 
     // Drop DEBUG logs
-    var debug_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try debug_regexes.append(testing.allocator, "DEBUG");
-    defer debug_regexes.deinit(testing.allocator);
+    const drop_debug = try createFilterPolicy(
+        testing.allocator,
+        "drop-debug",
+        &.{"DEBUG"},
+        .FILTER_ACTION_DROP,
+    );
 
     // Keep ERROR logs (even though they might match other drop rules)
-    var error_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try error_regexes.append(testing.allocator, "ERROR");
-    defer error_regexes.deinit(testing.allocator);
+    const keep_errors = try createFilterPolicy(
+        testing.allocator,
+        "keep-errors",
+        &.{"ERROR"},
+        .FILTER_ACTION_KEEP,
+    );
 
     // Drop staging environment
-    var staging_regexes = std.ArrayListUnmanaged([]const u8).empty;
-    try staging_regexes.append(testing.allocator, "env:staging");
-    defer staging_regexes.deinit(testing.allocator);
-
-    const drop_debug = Policy{
-        .name = "drop-debug",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = debug_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
-
-    const keep_errors = Policy{
-        .name = "keep-errors",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = error_regexes,
-        .action = Action{ .type = .ACTION_TYPE_KEEP },
-    };
-
-    const drop_staging = Policy{
-        .name = "drop-staging",
-        .policy_type = .POLICY_TYPE_FILTER,
-        .telemetry_type = .TELEMETRY_TYPE_LOG,
-        .regexes = staging_regexes,
-        .action = Action{ .type = .ACTION_TYPE_DROP },
-    };
+    const drop_staging = try createFilterPolicy(
+        testing.allocator,
+        "drop-staging",
+        &.{"env:staging"},
+        .FILTER_ACTION_DROP,
+    );
 
     const policies = [_]Policy{ drop_debug, keep_errors, drop_staging };
     try registry.updatePolicies(&policies, .file);
@@ -330,13 +309,13 @@ test "Filter complex scenario - multiple conditions" {
 
     // Test scenarios:
     // 1. DEBUG log - matches first rule, dropped
-    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.drop);
+    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.drop);
 
     // 2. ERROR log - matches second rule (keep), kept
-    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.keep);
+    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.keep);
 
     // 3. INFO staging log - matches third rule, dropped
-    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.drop);
+    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.drop);
 }
 
 test "Empty filter always keeps payload" {
@@ -347,7 +326,7 @@ test "Empty filter always keeps payload" {
     defer filter.deinit();
 
     // No policies - should default to keep
-    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.keep);
-    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.keep);
-    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOG) == filter_mod.FilterResult.keep);
+    try testing.expect(try filter.evaluate(test_payload, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.keep);
+    try testing.expect(try filter.evaluate(test_payload_with_error, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.keep);
+    try testing.expect(try filter.evaluate(test_payload_with_debug, .TELEMETRY_TYPE_LOGS) == filter_mod.FilterResult.keep);
 }

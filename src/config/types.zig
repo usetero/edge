@@ -1,11 +1,12 @@
 const std = @import("std");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 
-pub const Policy = policy_pb.Policy;
-pub const PolicyType = policy_pb.PolicyType;
-pub const TelemetryType = policy_pb.TelemetryType;
-pub const Action = policy_pb.Action;
-pub const ActionType = policy_pb.ActionType;
+pub const Policy = proto.policy.Policy;
+pub const PolicyType = proto.policy.PolicyType;
+pub const TelemetryType = proto.policy.TelemetryType;
+pub const FilterAction = proto.policy.FilterAction;
+pub const FilterConfig = proto.policy.FilterConfig;
+pub const Matcher = proto.policy.Matcher;
 
 pub const LogLevel = enum(u8) {
     debug,

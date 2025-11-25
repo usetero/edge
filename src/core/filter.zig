@@ -1,10 +1,13 @@
 const std = @import("std");
-const policy_pb = @import("proto");
+const proto = @import("proto");
 const policy_registry = @import("policy_registry.zig");
 
-const Policy = policy_pb.Policy;
-const TelemetryType = policy_pb.TelemetryType;
-const ActionType = policy_pb.ActionType;
+const Policy = proto.policy.Policy;
+const PolicyType = proto.policy.PolicyType;
+const TelemetryType = proto.policy.TelemetryType;
+const FilterAction = proto.policy.FilterAction;
+const FilterConfig = proto.policy.FilterConfig;
+const Matcher = proto.policy.Matcher;
 const PolicyRegistry = policy_registry.PolicyRegistry;
 
 /// FilterResult indicates whether to keep or drop the data
@@ -15,7 +18,6 @@ pub const FilterResult = enum {
 
 /// Filter evaluates JSON against policies from the centralized registry
 /// Uses lock-free snapshot reads for optimal performance
-/// Following DoD principles: reads from cache-friendly policy arrays
 pub const FilterEvaluator = struct {
     /// Reference to centralized policy registry
     registry: *const PolicyRegistry,
@@ -37,7 +39,6 @@ pub const FilterEvaluator = struct {
     /// If no policies match, defaults to FilterResult.keep
     ///
     /// Uses lock-free snapshot read for consistent view of policies
-    /// Cache-friendly: only iterates policies of requested telemetry type
     pub fn evaluate(
         self: *const FilterEvaluator,
         json_data: []const u8,
@@ -46,36 +47,33 @@ pub const FilterEvaluator = struct {
         // Get current policy snapshot (atomic, lock-free)
         const snapshot = self.registry.getSnapshot() orelse return FilterResult.keep;
 
-        // Select policies for requested telemetry type
-        const policies = switch (telemetry_type) {
-            .TELEMETRY_TYPE_LOG => snapshot.log_policies,
-            .TELEMETRY_TYPE_METRIC => snapshot.metric_policies,
-            .TELEMETRY_TYPE_SPAN => snapshot.span_policies,
-            else => return FilterResult.keep,
-        };
+        // Process policies in priority order - first match wins
+        for (snapshot.policies) |policy| {
+            // Skip disabled policies
+            if (!policy.enabled) continue;
 
-        // Process policies in order - first match wins
-        for (policies) |policy| {
-            // Only process filter policies for now
-            if (policy.policy_type != .POLICY_TYPE_FILTER) {
-                continue;
-            }
-            if (policy.action == null) {
-                continue;
-            }
+            // Only process LOG_FILTER policies
+            if (policy.policy_type != .POLICY_TYPE_LOG_FILTER) continue;
 
-            // Check if any regex matches the JSON data
-            const matches = try self.matchesAnyRegex(json_data, policy.regexes.items);
+            // Check if policy applies to requested telemetry type
+            if (!policyAppliesToType(policy, telemetry_type)) continue;
 
-            if (policy.action) |action| {
-                if (matches) {
-                    // Return the action from the matching policy
-                    return switch (action.type) {
-                        .ACTION_TYPE_KEEP => FilterResult.keep,
-                        .ACTION_TYPE_DROP => FilterResult.drop,
-                        else => FilterResult.keep, // Unknown actions default to keep
-                    };
-                }
+            // Get filter config
+            const config = if (policy.config) |cfg| switch (cfg) {
+                .filter => |f| f,
+                else => continue,
+            } else continue;
+
+            // Check if all matchers match the JSON data
+            const matches = self.matchesAllMatchers(json_data, config.matchers.items);
+
+            if (matches) {
+                // Return the action from the matching policy
+                return switch (config.action) {
+                    .FILTER_ACTION_KEEP => FilterResult.keep,
+                    .FILTER_ACTION_DROP => FilterResult.drop,
+                    else => FilterResult.keep, // Unknown actions default to keep
+                };
             }
         }
 
@@ -83,28 +81,39 @@ pub const FilterEvaluator = struct {
         return FilterResult.keep;
     }
 
-    /// Check if JSON data matches any of the provided regex patterns
-    /// Simple string matching for now - can be optimized with compiled regexes later
-    fn matchesAnyRegex(
+    /// Check if all matchers match the JSON data
+    /// For now uses simple substring matching - can be enhanced with JSONPath + regex later
+    fn matchesAllMatchers(
         self: *const FilterEvaluator,
         json_data: []const u8,
-        patterns: []const []const u8,
-    ) !bool {
+        matchers: []const Matcher,
+    ) bool {
         _ = self;
 
-        for (patterns) |pattern| {
-            // Simple substring matching for now
-            // TODO: Replace with proper regex matching when needed for performance
-            if (std.mem.indexOf(u8, json_data, pattern)) |_| {
-                return true;
-            }
+        if (matchers.len == 0) return false;
+
+        for (matchers) |matcher| {
+            // Simple substring matching on regex field for now
+            // TODO: Implement proper JSONPath extraction + regex matching
+            const found = std.mem.indexOf(u8, json_data, matcher.regex) != null;
+            const matches = if (matcher.negate) !found else found;
+
+            if (!matches) return false;
         }
 
-        return false;
+        return true;
     }
 };
 
-test "Filter.matchesAnyRegex finds substring matches" {
+/// Check if a policy applies to a specific telemetry type
+fn policyAppliesToType(policy: Policy, telemetry_type: TelemetryType) bool {
+    for (policy.telemetry_types.items) |tt| {
+        if (tt == telemetry_type) return true;
+    }
+    return false;
+}
+
+test "Filter.matchesAllMatchers finds substring matches" {
     const allocator = std.testing.allocator;
 
     // Create a dummy registry for testing
@@ -113,13 +122,28 @@ test "Filter.matchesAnyRegex finds substring matches" {
 
     const filter = FilterEvaluator.init(&registry);
 
-    const patterns = [_][]const u8{ "error", "warning", "critical" };
+    // Test with simple matchers
+    const matchers = [_]Matcher{
+        .{ .path = "$.message", .regex = "error" },
+    };
 
-    try std.testing.expect(try filter.matchesAnyRegex("error occurred", &patterns));
-    try std.testing.expect(try filter.matchesAnyRegex("warning message", &patterns));
-    try std.testing.expect(try filter.matchesAnyRegex("critical failure", &patterns));
-    try std.testing.expect(!try filter.matchesAnyRegex("info message", &patterns));
+    try std.testing.expect(filter.matchesAllMatchers("error occurred", &matchers));
+    try std.testing.expect(!filter.matchesAllMatchers("info message", &matchers));
 }
 
-// NOTE: Policy management tests live in policy_registry.zig
-// Integration tests for evaluation will be added separately
+test "Filter.matchesAllMatchers with negate" {
+    const allocator = std.testing.allocator;
+
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Test with negated matcher - match if "debug" is NOT present
+    const matchers = [_]Matcher{
+        .{ .path = "$.level", .regex = "debug", .negate = true },
+    };
+
+    try std.testing.expect(filter.matchesAllMatchers("error occurred", &matchers));
+    try std.testing.expect(!filter.matchesAllMatchers("debug message", &matchers));
+}

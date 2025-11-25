@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const proto = @import("proto");
 const policy_provider = @import("../../core/policy_provider.zig");
 const policy_source = @import("../../core/policy_source.zig");
 const parser = @import("../parser.zig");
 
+const Policy = proto.policy.Policy;
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
 const SourceType = policy_source.SourceType;
@@ -66,11 +68,9 @@ pub const FileProvider = struct {
 
         const policies = try parser.parsePoliciesFile(self.allocator, self.config_path);
         defer {
-            for (policies) |policy| {
-                self.allocator.free(policy.name);
-                for (policy.regexes.items) |regex| self.allocator.free(regex);
-                var regexes_mut = @constCast(&policy.regexes);
-                regexes_mut.deinit(self.allocator);
+            // Registry duplicates policies, so we must free our parsed copies
+            for (policies) |*policy| {
+                @constCast(policy).deinit(self.allocator);
             }
             self.allocator.free(policies);
         }
