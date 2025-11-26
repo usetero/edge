@@ -1,5 +1,6 @@
 const std = @import("std");
 const httpz = @import("httpz");
+const jsonpath = @import("../core/jsonpath.zig");
 
 /// Handles Datadog log ingestion
 /// Takes an httpz.Request object and decompressed data buffer, processes the logs, and returns them
@@ -38,12 +39,22 @@ fn getContentType(request: *httpz.Request) []const u8 {
     return "text/plain";
 }
 
-/// Process JSON formatted logs
+/// Process JSON formatted logs using jsonpath
 fn processJsonLogs(allocator: std.mem.Allocator, data: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
-    defer parsed.deinit();
-    // Validation only - just check that JSON is well-formed
-    _ = parsed.value;
+    _ = allocator;
+
+    // Parse and query using jsonpath
+    const doc = jsonpath.JsonDoc.parse(data) catch |err| {
+        std.debug.print("JSON parse error: {any}\n", .{err});
+        return err;
+    };
+    defer doc.deinit();
+
+    // Query all top-level elements
+    const result = try doc.query("$.*");
+    defer result.deinit();
+
+    std.debug.print("JSONPath query '$.*' returned {d} results\n", .{result.count()});
 }
 
 /// Process logplex formatted logs

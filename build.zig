@@ -60,6 +60,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "proto", .module = proto_mod },
         },
     });
+    // Add C include paths and source for jsonpath module which uses jsoncons via cImport
+    mod.addIncludePath(b.path("wrapper"));
+    mod.addIncludePath(b.path("vendor/jsoncons/include"));
+    mod.addCSourceFile(.{
+        .file = b.path("wrapper/jsoncons_wrapper.cpp"),
+        .flags = &.{"-std=c++14"},
+    });
+    mod.link_libc = true;
+    mod.link_libcpp = true;
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -102,15 +111,19 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Note: jsoncons C++ source is added via mod (edge module), but include paths
+    // need to be added to root_module as well for cImport to work
+    exe.root_module.addIncludePath(b.path("wrapper"));
+    exe.root_module.addIncludePath(b.path("vendor/jsoncons/include"));
     exe.root_module.addImport("httpz", httpz.module("httpz"));
     exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
     exe.root_module.addImport("proto", proto_mod);
 
     // Link zlib for gzip compression
-    exe.linkLibC();
-    exe.linkSystemLibrary("z");
-    exe.linkSystemLibrary("zstd");
     exe.root_module.link_libc = true;
+    exe.root_module.link_libcpp = true;
+    exe.root_module.linkSystemLibrary("z", .{});
+    exe.root_module.linkSystemLibrary("zstd", .{});
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -147,43 +160,43 @@ pub fn build(b: *std.Build) void {
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
+    // Note: jsoncons C++ source and includes are inherited from mod
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
-    mod_tests.linkLibC();
-    mod_tests.linkSystemLibrary("z");
-    mod_tests.linkSystemLibrary("zstd");
-    // Link zlib for tests too
     mod_tests.root_module.link_libc = true;
+    mod_tests.root_module.link_libcpp = true;
     mod_tests.root_module.linkSystemLibrary("z", .{});
     mod_tests.root_module.linkSystemLibrary("zstd", .{});
 
+    // Creates a separate test step for jsonpath tests which require C++ linkage.
+    // This is separate from mod_tests because adding C++ sources to a module
+    // would cause duplicate symbol errors when exe also links the same sources.
+    const jsonpath_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/jsonpath.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jsonpath_tests = b.addTest(.{
+        .root_module = jsonpath_mod,
+    });
+    jsonpath_tests.addCSourceFile(.{
+        .file = b.path("wrapper/jsoncons_wrapper.cpp"),
+        .flags = &.{"-std=c++14"},
+    });
+    jsonpath_tests.addIncludePath(b.path("wrapper"));
+    jsonpath_tests.addIncludePath(b.path("vendor/jsoncons/include"));
+    jsonpath_tests.linkLibC();
+    jsonpath_tests.linkLibCpp();
+
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    const run_jsonpath_tests = b.addRunArtifact(jsonpath_tests);
 
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module. Note that test executables only test one module at a time,
-    // hence why we have to create two separate ones.
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-    exe_tests.linkLibC();
-    exe_tests.linkSystemLibrary("z");
-    exe_tests.linkSystemLibrary("zstd");
-    // Link zlib for exe tests too
-    exe_tests.root_module.link_libc = true;
-    exe_tests.root_module.linkSystemLibrary("z", .{});
-    exe_tests.root_module.linkSystemLibrary("zstd", .{});
-
-    // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
+    // A top level step for running all tests.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_jsonpath_tests.step);
 
     const gen_proto = b.step("gen-proto", "generates zig files from protocol buffer definitions");
 

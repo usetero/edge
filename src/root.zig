@@ -23,6 +23,8 @@ test "basic add functionality" {
 }
 
 // Import modules to include their tests
+// Note: jsonpath.zig is tested separately via jsonpath_tests in build.zig
+// because it requires C++ linkage that would conflict with the exe build
 test {
     _ = @import("config/types.zig");
     _ = @import("config/parser.zig");
