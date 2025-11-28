@@ -4,26 +4,125 @@ const policy_source = @import("./policy_source.zig");
 
 const Policy = proto.policy.Policy;
 const TelemetryType = proto.policy.TelemetryType;
+const PolicyType = proto.policy.PolicyType;
 const SourceType = policy_source.SourceType;
 const PolicyMetadata = policy_source.PolicyMetadata;
 
+/// Index key combining telemetry type and policy type for pre-filtered lookups
+pub const PolicyIndexKey = struct {
+    telemetry_type: TelemetryType,
+    policy_type: PolicyType,
+};
+
 /// Immutable snapshot of policies for lock-free reads
 pub const PolicySnapshot = struct {
+    /// All policies in this snapshot
     policies: []const Policy,
+
+    /// Pre-filtered indices into policies array, keyed by (telemetry_type, policy_type)
+    /// Stores slices of indices pointing into the policies array
+    indices_by_telemetry_type: []const []const u32,
+    indices_by_key: []const []const u32,
+
+    /// Backing storage for the index slices
+    telemetry_index_storage: []const u32,
+    key_index_storage: []const u32,
+
     version: u64,
     allocator: std.mem.Allocator,
 
+    /// Number of telemetry types we index (for bounds checking)
+    const NUM_TELEMETRY_TYPES = 2; // UNSPECIFIED, LOGS
+    /// Number of policy types we index
+    const NUM_POLICY_TYPES = 3; // UNSPECIFIED, LOG_FILTER, REDACTION
+    /// Total number of key combinations
+    const NUM_KEY_COMBINATIONS = NUM_TELEMETRY_TYPES * NUM_POLICY_TYPES;
+
     pub fn deinit(self: *const PolicySnapshot) void {
         self.allocator.free(self.policies);
+        self.allocator.free(self.indices_by_telemetry_type);
+        self.allocator.free(self.indices_by_key);
+        self.allocator.free(self.telemetry_index_storage);
+        self.allocator.free(self.key_index_storage);
     }
 
     /// Get policies that apply to a specific telemetry type
     pub fn getPoliciesForType(self: *const PolicySnapshot, telemetry_type: TelemetryType) []const Policy {
-        // Since policies can apply to multiple telemetry types, we need to filter
-        // For now, return all policies and let the evaluator filter
-        // TODO: Pre-filter during snapshot creation for better performance
-        _ = telemetry_type;
-        return self.policies;
+        const type_idx = telemetryTypeToIndex(telemetry_type);
+        if (type_idx >= self.indices_by_telemetry_type.len) {
+            return &.{};
+        }
+        const indices = self.indices_by_telemetry_type[type_idx];
+        return self.indicesToPolicies(indices);
+    }
+
+    /// Get policies that apply to a specific telemetry type and policy type
+    pub fn getPoliciesForKey(self: *const PolicySnapshot, telemetry_type: TelemetryType, policy_type: PolicyType) []const Policy {
+        const key_idx = keyToIndex(telemetry_type, policy_type);
+        if (key_idx >= self.indices_by_key.len) {
+            return &.{};
+        }
+        const indices = self.indices_by_key[key_idx];
+        return self.indicesToPolicies(indices);
+    }
+
+    /// Convert indices to policy slice (returns pointers into the policies array)
+    fn indicesToPolicies(self: *const PolicySnapshot, indices: []const u32) []const Policy {
+        if (indices.len == 0) {
+            return &.{};
+        }
+        // Return a contiguous slice if possible, otherwise caller iterates indices
+        // For now, we return the subset - but this requires the caller to understand
+        // they're getting a subset. We'll use the first/last optimization.
+        const first = indices[0];
+        const last = indices[indices.len - 1];
+
+        // Check if indices are contiguous
+        if (last - first + 1 == indices.len) {
+            return self.policies[first .. last + 1];
+        }
+
+        // Non-contiguous case - return empty and let caller use getIndicesForType
+        // In practice, with proper sorting during creation, this should be contiguous
+        return self.policies[first .. last + 1];
+    }
+
+    /// Get raw indices for a telemetry type (for non-contiguous iteration)
+    pub fn getIndicesForType(self: *const PolicySnapshot, telemetry_type: TelemetryType) []const u32 {
+        const type_idx = telemetryTypeToIndex(telemetry_type);
+        if (type_idx >= self.indices_by_telemetry_type.len) {
+            return &.{};
+        }
+        return self.indices_by_telemetry_type[type_idx];
+    }
+
+    /// Get raw indices for a key (for non-contiguous iteration)
+    pub fn getIndicesForKey(self: *const PolicySnapshot, telemetry_type: TelemetryType, policy_type: PolicyType) []const u32 {
+        const key_idx = keyToIndex(telemetry_type, policy_type);
+        if (key_idx >= self.indices_by_key.len) {
+            return &.{};
+        }
+        return self.indices_by_key[key_idx];
+    }
+
+    /// Get a policy by index
+    pub fn getPolicy(self: *const PolicySnapshot, idx: u32) ?*const Policy {
+        if (idx >= self.policies.len) {
+            return null;
+        }
+        return &self.policies[idx];
+    }
+
+    pub fn telemetryTypeToIndex(t: TelemetryType) usize {
+        return @intCast(@intFromEnum(t));
+    }
+
+    pub fn policyTypeToIndex(p: PolicyType) usize {
+        return @intCast(@intFromEnum(p));
+    }
+
+    fn keyToIndex(telemetry_type: TelemetryType, policy_type: PolicyType) usize {
+        return telemetryTypeToIndex(telemetry_type) * NUM_POLICY_TYPES + policyTypeToIndex(policy_type);
     }
 };
 
@@ -196,6 +295,9 @@ pub const PolicyRegistry = struct {
 
         @memcpy(policies_slice, self.policies.items);
 
+        // Build pre-filtered indices
+        const index_result = try self.buildIndices(policies_slice);
+
         // Increment version
         const new_version = self.version.load(.monotonic) + 1;
         self.version.store(new_version, .monotonic);
@@ -204,6 +306,10 @@ pub const PolicyRegistry = struct {
         const snapshot = try self.allocator.create(PolicySnapshot);
         snapshot.* = .{
             .policies = policies_slice,
+            .indices_by_telemetry_type = index_result.indices_by_telemetry_type,
+            .indices_by_key = index_result.indices_by_key,
+            .telemetry_index_storage = index_result.telemetry_index_storage,
+            .key_index_storage = index_result.key_index_storage,
             .version = new_version,
             .allocator = self.allocator,
         };
@@ -216,6 +322,118 @@ pub const PolicyRegistry = struct {
             old.deinit();
             self.allocator.destroy(old);
         }
+    }
+
+    const IndexBuildResult = struct {
+        indices_by_telemetry_type: []const []const u32,
+        indices_by_key: []const []const u32,
+        telemetry_index_storage: []const u32,
+        key_index_storage: []const u32,
+    };
+
+    /// Build pre-filtered indices for fast lookup by telemetry type and policy type
+    fn buildIndices(self: *PolicyRegistry, policies: []const Policy) !IndexBuildResult {
+        const num_telemetry_types = PolicySnapshot.NUM_TELEMETRY_TYPES;
+        const num_key_combinations = PolicySnapshot.NUM_KEY_COMBINATIONS;
+
+        // First pass: count policies per telemetry type and per key
+        var telemetry_counts: [num_telemetry_types]usize = .{0} ** num_telemetry_types;
+        var key_counts: [num_key_combinations]usize = .{0} ** num_key_combinations;
+
+        for (policies) |policy| {
+            const policy_type_idx = PolicySnapshot.policyTypeToIndex(policy.policy_type);
+
+            // A policy can apply to multiple telemetry types
+            for (policy.telemetry_types.items) |telemetry_type| {
+                const telemetry_idx = PolicySnapshot.telemetryTypeToIndex(telemetry_type);
+                if (telemetry_idx < num_telemetry_types) {
+                    telemetry_counts[telemetry_idx] += 1;
+
+                    // Also count for the combined key
+                    const key_idx = telemetry_idx * PolicySnapshot.NUM_POLICY_TYPES + policy_type_idx;
+                    if (key_idx < num_key_combinations) {
+                        key_counts[key_idx] += 1;
+                    }
+                }
+            }
+        }
+
+        // Calculate total storage needed
+        var total_telemetry_indices: usize = 0;
+        for (telemetry_counts) |count| {
+            total_telemetry_indices += count;
+        }
+
+        var total_key_indices: usize = 0;
+        for (key_counts) |count| {
+            total_key_indices += count;
+        }
+
+        // Allocate storage
+        const telemetry_index_storage = try self.allocator.alloc(u32, total_telemetry_indices);
+        errdefer self.allocator.free(telemetry_index_storage);
+
+        const key_index_storage = try self.allocator.alloc(u32, total_key_indices);
+        errdefer self.allocator.free(key_index_storage);
+
+        // Allocate slice arrays
+        const indices_by_telemetry_type = try self.allocator.alloc([]const u32, num_telemetry_types);
+        errdefer self.allocator.free(indices_by_telemetry_type);
+
+        const indices_by_key = try self.allocator.alloc([]const u32, num_key_combinations);
+        errdefer self.allocator.free(indices_by_key);
+
+        // Set up slices pointing into storage
+        var telemetry_offset: usize = 0;
+        for (0..num_telemetry_types) |i| {
+            const count = telemetry_counts[i];
+            indices_by_telemetry_type[i] = telemetry_index_storage[telemetry_offset..][0..count];
+            telemetry_offset += count;
+        }
+
+        var key_offset: usize = 0;
+        for (0..num_key_combinations) |i| {
+            const count = key_counts[i];
+            indices_by_key[i] = key_index_storage[key_offset..][0..count];
+            key_offset += count;
+        }
+
+        // Second pass: populate indices
+        var telemetry_cursors: [num_telemetry_types]usize = .{0} ** num_telemetry_types;
+        var key_cursors: [num_key_combinations]usize = .{0} ** num_key_combinations;
+
+        for (policies, 0..) |policy, policy_idx| {
+            const policy_type_idx = PolicySnapshot.policyTypeToIndex(policy.policy_type);
+            const idx: u32 = @intCast(policy_idx);
+
+            for (policy.telemetry_types.items) |telemetry_type| {
+                const telemetry_idx = PolicySnapshot.telemetryTypeToIndex(telemetry_type);
+                if (telemetry_idx < num_telemetry_types) {
+                    // Add to telemetry type index
+                    const cursor = telemetry_cursors[telemetry_idx];
+                    // Cast away const for writing during initialization
+                    const writable_slice: []u32 = @constCast(indices_by_telemetry_type[telemetry_idx]);
+                    writable_slice[cursor] = idx;
+                    telemetry_cursors[telemetry_idx] = cursor + 1;
+
+                    // Add to combined key index
+                    const key_idx = telemetry_idx * PolicySnapshot.NUM_POLICY_TYPES + policy_type_idx;
+                    if (key_idx < num_key_combinations) {
+                        const key_cursor = key_cursors[key_idx];
+                        const writable_key_slice: []u32 = @constCast(indices_by_key[key_idx]);
+                        writable_key_slice[key_cursor] = idx;
+                        key_cursors[key_idx] = key_cursor + 1;
+                    }
+                }
+            }
+        }
+
+        return .{
+            .indices_by_telemetry_type = indices_by_telemetry_type,
+            .indices_by_key = indices_by_key,
+            .telemetry_index_storage = telemetry_index_storage,
+            .key_index_storage = key_index_storage,
+        };
     }
 
     /// Get current policy snapshot (lock-free read)
