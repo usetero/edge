@@ -86,8 +86,14 @@ fn getContentType(req: *httpz.Request) []const u8 {
     return "text/plain";
 }
 
+/// Context passed to handler functions
+const HandlerContext = struct {
+    req: *httpz.Request,
+    filter: *const filter_mod.FilterEvaluator,
+};
+
 /// Handler function signature that modifies request body in place
-const HandlerFn = *const fn (req: *httpz.Request, decompressed_body: []const u8) anyerror![]const u8;
+const HandlerFn = *const fn (ctx: HandlerContext, decompressed_body: []const u8) anyerror![]const u8;
 
 /// Generic wrapper that handles compression/decompression for any handler
 /// This wrapper:
@@ -95,7 +101,8 @@ const HandlerFn = *const fn (req: *httpz.Request, decompressed_body: []const u8)
 /// 2. Calls the handler with decompressed data
 /// 3. Updates the request body buffer with the modified data
 /// 4. Recompresses if the original request was compressed
-fn withCompressionHandling(req: *httpz.Request, handler: HandlerFn) !void {
+fn withCompressionHandling(ctx: HandlerContext, handler: HandlerFn) !void {
+    const req = ctx.req;
     const allocator = req.arena;
 
     const original_body = req.body() orelse {
@@ -114,7 +121,7 @@ fn withCompressionHandling(req: *httpz.Request, handler: HandlerFn) !void {
     defer allocator.free(decompressed_body);
 
     // Step 2: Call the handler to process the data
-    const processed_data = handler(req, decompressed_body) catch |err| {
+    const processed_data = handler(ctx, decompressed_body) catch |err| {
         std.log.err("Handler failed: {}", .{err});
         return err;
     };
@@ -149,8 +156,8 @@ fn withCompressionHandling(req: *httpz.Request, handler: HandlerFn) !void {
 }
 
 /// Handle Datadog v2 logs requests
-fn handleDatadogLogs(req: *httpz.Request, decompressed_body: []const u8) ![]const u8 {
-    return try datadog_v2_logs.processDatadogLogs(req, decompressed_body);
+fn handleDatadogLogs(ctx: HandlerContext, decompressed_body: []const u8) ![]const u8 {
+    return try datadog_v2_logs.processDatadogLogs(ctx.req, ctx.filter, decompressed_body);
 }
 
 const ProxyContext = struct {
@@ -180,11 +187,25 @@ const ProxyContext = struct {
         // Check if this is a Datadog v2 logs request
         if (std.mem.eql(u8, req.url.path, "/api/v2/logs")) {
             // Process with compression handling (modifies request body in place)
-            try withCompressionHandling(req, handleDatadogLogs);
+            const ctx = HandlerContext{
+                .req = req,
+                .filter = self.filter,
+            };
+            try withCompressionHandling(ctx, handleDatadogLogs);
         }
 
         try action(self, req, res);
         return;
+    }
+
+    pub fn uncaughtError(_: *ProxyContext, req: *httpz.Request, res: *httpz.Response, err: anyerror) void {
+        std.log.err("Uncaught error for {s} {s}: {}", .{
+            @tagName(req.method),
+            req.url.path,
+            err,
+        });
+        res.status = 500;
+        res.body = "Internal Server Error";
     }
 };
 
@@ -246,6 +267,12 @@ pub const HttpzProxyServer = struct {
             addr[2],
             addr[3],
         }) catch unreachable;
+    }
+
+    fn errorHandler(req: *httpz.Request, res: *httpz.Response, err: anyerror) void {
+        res.status = 500;
+        res.body = "Internal Server Error";
+        std.log.warn("httpz: unhandled exception for request: {s}\nErr: {}", .{ req.url.raw, err });
     }
 
     fn proxyHandler(ctx: *ProxyContext, req: *httpz.Request, res: *httpz.Response) !void {

@@ -1,6 +1,13 @@
 {
   "policies": [
     {
+      "name": "drop-echo-logs",
+      "policy_type": "filter",
+      "telemetry_types": ["logs"],
+      "matchers": [{ "path": "$.*.ddsource", "regex": "nginx" }],
+      "action": "drop"
+    },
+    {
       "name": "drop-debug-logs",
       "policy_type": "filter",
       "telemetry_types": ["logs"],

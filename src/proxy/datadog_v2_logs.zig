@@ -1,19 +1,23 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const jsonpath = @import("../core/jsonpath.zig");
+const filter_mod = @import("../core/filter.zig");
+
+const FilterEvaluator = filter_mod.FilterEvaluator;
 
 /// Handles Datadog log ingestion
-/// Takes an httpz.Request object and decompressed data buffer, processes the logs, and returns them
+/// Takes an httpz.Request object, filter evaluator, and decompressed data buffer, processes the logs, and returns them
 /// Uses the request's arena allocator for all temporary allocations
 /// NOTE: Compression/decompression is now handled by the caller (httpz_server.zig)
-pub fn processDatadogLogs(req: *httpz.Request, data: []const u8) ![]u8 {
+pub fn processDatadogLogs(req: *httpz.Request, filter: *const FilterEvaluator, data: []const u8) ![]u8 {
     const allocator = req.arena;
-
     // Determine the content type
     const contentType = getContentType(req);
 
     // Process based on content type
     if (std.mem.indexOf(u8, contentType, "application/json") != null) {
+        const res = filter.evaluate(data, .TELEMETRY_TYPE_LOGS);
+        std.log.info("Filter result: {any}\n", .{res});
         // Parse and log JSON data
         try processJsonLogs(allocator, data);
     } else if (std.mem.indexOf(u8, contentType, "application/logplex") != null) {
