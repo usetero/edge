@@ -4,6 +4,8 @@ const jsonpath = @import("../core/jsonpath.zig");
 const filter_mod = @import("../core/filter.zig");
 
 const FilterEvaluator = filter_mod.FilterEvaluator;
+const FilterResult = filter_mod.FilterResult;
+const JsonDoc = jsonpath.JsonDoc;
 
 /// Handles Datadog log ingestion
 /// Takes an httpz.Request object, filter evaluator, and decompressed data buffer, processes the logs, and returns them
@@ -16,15 +18,13 @@ pub fn processDatadogLogs(req: *httpz.Request, filter: *const FilterEvaluator, d
 
     // Process based on content type
     if (std.mem.indexOf(u8, contentType, "application/json") != null) {
-        const res = filter.evaluate(data, .TELEMETRY_TYPE_LOGS);
-        std.log.info("Filter result: {any}\n", .{res});
-        // Parse and log JSON data
-        try processJsonLogs(allocator, data);
+        // Parse JSON and apply filter policies
+        return processJsonLogsWithFilter(allocator, filter, data);
     } else if (std.mem.indexOf(u8, contentType, "application/logplex") != null) {
-        // Handle logplex format
+        // Handle logplex format (no filtering for now)
         try processLogplexLogs(data);
     } else {
-        // Handle raw text logs
+        // Handle raw text logs (no filtering for now)
         try processRawLogs(data);
     }
 
@@ -33,6 +33,88 @@ pub fn processDatadogLogs(req: *httpz.Request, filter: *const FilterEvaluator, d
     @memcpy(result, data);
 
     return result;
+}
+
+/// Process JSON logs with filter evaluation
+/// Detects if input is an array or single object, applies filter to each log
+fn processJsonLogsWithFilter(allocator: std.mem.Allocator, filter: *const FilterEvaluator, data: []const u8) ![]u8 {
+    // Parse the JSON using std.json
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch {
+        // If JSON parsing fails, return data unchanged (fail-open)
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return result;
+    };
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .array => |arr| {
+            // Process array of logs
+            var kept_logs: std.ArrayList(std.json.Value) = try .initCapacity(allocator, arr.capacity);
+            defer kept_logs.deinit(allocator);
+
+            for (arr.items) |log_value| {
+                // Stringify the log entry for JsonDoc parsing
+                var out: std.Io.Writer.Allocating = .init(allocator);
+                defer out.deinit();
+                var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+                log_value.jsonStringify(&jws) catch {
+                    // If stringify fails, keep the log (fail-open)
+                    try kept_logs.append(allocator, log_value);
+                    continue;
+                };
+
+                // Parse with JsonDoc for filter evaluation
+                const log_doc = JsonDoc.parse(out.written()) catch {
+                    // If parsing fails, keep the log (fail-open)
+                    try kept_logs.append(allocator, log_value);
+                    continue;
+                };
+                defer log_doc.deinit();
+
+                const filter_result = filter.evaluateJson(log_doc, .TELEMETRY_TYPE_LOGS);
+                if (filter_result == .keep) {
+                    try kept_logs.append(allocator, log_value);
+                } else {
+                    std.log.info("Dropped log: {}", .{log_value});
+                }
+            }
+
+            // Build output JSON array
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            try std.json.Stringify.value(kept_logs.items, .{}, &out.writer);
+            return try out.toOwnedSlice();
+        },
+        .object => {
+            // Process single log object - use the already parsed JsonDoc
+            const doc = JsonDoc.parse(data) catch {
+                // If JsonDoc parsing fails, return data unchanged (fail-open)
+                const result = try allocator.alloc(u8, data.len);
+                @memcpy(result, data);
+                return result;
+            };
+            defer doc.deinit();
+
+            const filter_result = filter.evaluateJson(doc, .TELEMETRY_TYPE_LOGS);
+            if (filter_result == .drop) {
+                // Return empty array for dropped single log
+                const result = try allocator.alloc(u8, 2);
+                result[0] = '[';
+                result[1] = ']';
+                return result;
+            }
+            // Keep the log - return as-is
+            const result = try allocator.alloc(u8, data.len);
+            @memcpy(result, data);
+            return result;
+        },
+        else => {
+            // Not an array or object, return unchanged
+            const result = try allocator.alloc(u8, data.len);
+            @memcpy(result, data);
+            return result;
+        },
+    }
 }
 
 /// Get the content type from request headers using httpz.Request
@@ -561,4 +643,196 @@ test "processLogplexLogs - rapid successive calls" {
     for (0..100) |_| {
         try processLogplexLogs(log);
     }
+}
+
+// ============================================================================
+// TESTS FOR processJsonLogsWithFilter
+// ============================================================================
+
+const policy_registry = @import("../core/policy_registry.zig");
+const PolicyRegistry = policy_registry.PolicyRegistry;
+const proto = @import("proto");
+
+test "processJsonLogsWithFilter - no policies keeps all logs in array" {
+    const allocator = std.testing.allocator;
+
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const logs =
+        \\[{"level": "INFO", "message": "test1"}, {"level": "ERROR", "message": "test2"}]
+    ;
+
+    const result = try processJsonLogsWithFilter(allocator, &filter, logs);
+    defer allocator.free(result);
+
+    // With no policies, all logs should be kept
+    try std.testing.expect(std.mem.indexOf(u8, result, "test1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "test2") != null);
+}
+
+test "processJsonLogsWithFilter - no policies keeps single object" {
+    const allocator = std.testing.allocator;
+
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const log =
+        \\{"level": "INFO", "message": "single log"}
+    ;
+
+    const result = try processJsonLogsWithFilter(allocator, &filter, log);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "single log") != null);
+}
+
+test "processJsonLogsWithFilter - DROP policy filters logs from array" {
+    const allocator = std.testing.allocator;
+
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create a DROP policy for DEBUG logs
+    var drop_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .policy_type = .POLICY_TYPE_LOG_FILTER,
+        .enabled = true,
+        .config = .{
+            .filter = .{
+                .action = .FILTER_ACTION_DROP,
+            },
+        },
+    };
+    try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
+    try drop_policy.config.?.filter.matchers.append(allocator, .{
+        .path = try allocator.dupe(u8, "$.level"),
+        .regex = try allocator.dupe(u8, "DEBUG"),
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const logs =
+        \\[{"level": "DEBUG", "message": "debug msg"}, {"level": "ERROR", "message": "error msg"}]
+    ;
+
+    const result = try processJsonLogsWithFilter(allocator, &filter, logs);
+    defer allocator.free(result);
+
+    // DEBUG log should be dropped, ERROR log should remain
+    try std.testing.expect(std.mem.indexOf(u8, result, "debug msg") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "error msg") != null);
+}
+
+test "processJsonLogsWithFilter - DROP policy drops single object" {
+    const allocator = std.testing.allocator;
+
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create a DROP policy for DEBUG logs
+    var drop_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .policy_type = .POLICY_TYPE_LOG_FILTER,
+        .enabled = true,
+        .config = .{
+            .filter = .{
+                .action = .FILTER_ACTION_DROP,
+            },
+        },
+    };
+    try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
+    try drop_policy.config.?.filter.matchers.append(allocator, .{
+        .path = try allocator.dupe(u8, "$.level"),
+        .regex = try allocator.dupe(u8, "DEBUG"),
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const log =
+        \\{"level": "DEBUG", "message": "debug msg"}
+    ;
+
+    const result = try processJsonLogsWithFilter(allocator, &filter, log);
+    defer allocator.free(result);
+
+    // Single dropped log returns empty array
+    try std.testing.expectEqualStrings("[]", result);
+}
+
+test "processJsonLogsWithFilter - all logs dropped returns empty array" {
+    const allocator = std.testing.allocator;
+
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create a DROP policy that matches everything
+    var drop_all = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-all"),
+        .policy_type = .POLICY_TYPE_LOG_FILTER,
+        .enabled = true,
+        .config = .{
+            .filter = .{
+                .action = .FILTER_ACTION_DROP,
+            },
+        },
+    };
+    try drop_all.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
+    try drop_all.config.?.filter.matchers.append(allocator, .{
+        .path = try allocator.dupe(u8, "$.level"),
+        .regex = try allocator.dupe(u8, ""), // Empty regex matches everything
+    });
+    defer drop_all.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_all}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const logs =
+        \\[{"level": "INFO", "message": "msg1"}, {"level": "ERROR", "message": "msg2"}]
+    ;
+
+    const result = try processJsonLogsWithFilter(allocator, &filter, logs);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("[]", result);
+}
+
+test "processJsonLogsWithFilter - malformed JSON returns unchanged (fail-open)" {
+    const allocator = std.testing.allocator;
+
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const invalid = "{ not valid json }";
+    const result = try processJsonLogsWithFilter(allocator, &filter, invalid);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings(invalid, result);
+}
+
+test "processJsonLogsWithFilter - empty array returns empty array" {
+    const allocator = std.testing.allocator;
+
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const result = try processJsonLogsWithFilter(allocator, &filter, "[]");
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("[]", result);
 }

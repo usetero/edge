@@ -94,6 +94,56 @@ pub const FilterEvaluator = struct {
         return FilterResult.keep;
     }
 
+    /// Evaluate a pre-parsed JSON document against policies for a specific telemetry type
+    /// Returns FilterResult.keep or FilterResult.drop based on first matching policy
+    /// If no policies match, defaults to FilterResult.keep
+    ///
+    /// This method is more efficient when you already have a parsed JsonDoc,
+    /// avoiding redundant parsing when processing multiple logs from an array.
+    pub fn evaluateJson(
+        self: *const FilterEvaluator,
+        doc: JsonDoc,
+        telemetry_type: TelemetryType,
+    ) FilterResult {
+        // Get current policy snapshot (atomic, lock-free)
+        const snapshot = self.registry.getSnapshot() orelse return FilterResult.keep;
+
+        // Use pre-filtered index to get only LOG_FILTER policies for this telemetry type
+        const policy_indices = snapshot.getIndicesForKey(telemetry_type, .POLICY_TYPE_LOG_FILTER);
+
+        // No policies to evaluate
+        if (policy_indices.len == 0) return FilterResult.keep;
+
+        // Process policies in priority order - first match wins
+        for (policy_indices) |idx| {
+            const policy = snapshot.getPolicy(idx) orelse continue;
+
+            // Skip disabled policies
+            if (!policy.enabled) continue;
+
+            // Get filter config
+            const config = if (policy.config) |cfg| switch (cfg) {
+                .filter => |f| f,
+                else => continue,
+            } else continue;
+
+            // Check if all matchers match the JSON data
+            const matches = self.matchesAllMatchers(doc, config.matchers.items);
+
+            if (matches) {
+                // Return the action from the matching policy
+                return switch (config.action) {
+                    .FILTER_ACTION_KEEP => FilterResult.keep,
+                    .FILTER_ACTION_DROP => FilterResult.drop,
+                    else => FilterResult.keep, // Unknown actions default to keep
+                };
+            }
+        }
+
+        // Default to keep if no policies match
+        return FilterResult.keep;
+    }
+
     /// Check if all matchers match the JSON document
     /// Uses JSONPath to extract values and substring matching on the regex field
     /// All matchers must match for the overall result to be true (AND logic)
@@ -533,4 +583,203 @@ test "FilterEvaluator.evaluate with multiple matchers (AND logic)" {
         \\{"level": "ERROR", "service": "payment", "message": "failed"}
     ;
     try testing.expectEqual(FilterResult.keep, filter.evaluate(payment_error, .TELEMETRY_TYPE_LOGS));
+}
+
+// =============================================================================
+// Tests for evaluateJson (pre-parsed JsonDoc)
+// =============================================================================
+
+test "FilterEvaluator.evaluateJson with LOG_FILTER policy drops matching logs" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create a DROP policy for debug logs
+    var drop_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .policy_type = .POLICY_TYPE_LOG_FILTER,
+        .enabled = true,
+        .config = .{
+            .filter = .{
+                .action = .FILTER_ACTION_DROP,
+            },
+        },
+    };
+    try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
+    try drop_policy.config.?.filter.matchers.append(allocator, .{
+        .path = try allocator.dupe(u8, "$.level"),
+        .regex = try allocator.dupe(u8, "DEBUG"),
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Debug log should be dropped
+    const debug_log =
+        \\{"level": "DEBUG", "message": "verbose info"}
+    ;
+    const debug_doc = try JsonDoc.parse(debug_log);
+    defer debug_doc.deinit();
+    try testing.expectEqual(FilterResult.drop, filter.evaluateJson(debug_doc, .TELEMETRY_TYPE_LOGS));
+
+    // Error log should be kept (doesn't match)
+    const error_log =
+        \\{"level": "ERROR", "message": "something failed"}
+    ;
+    const error_doc = try JsonDoc.parse(error_log);
+    defer error_doc.deinit();
+    try testing.expectEqual(FilterResult.keep, filter.evaluateJson(error_doc, .TELEMETRY_TYPE_LOGS));
+}
+
+test "FilterEvaluator.evaluateJson returns keep when no policies" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const log =
+        \\{"level": "INFO", "message": "test"}
+    ;
+    const doc = try JsonDoc.parse(log);
+    defer doc.deinit();
+    try testing.expectEqual(FilterResult.keep, filter.evaluateJson(doc, .TELEMETRY_TYPE_LOGS));
+}
+
+test "FilterEvaluator.evaluateJson skips disabled policies" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create a disabled DROP policy
+    var disabled_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "disabled-drop"),
+        .policy_type = .POLICY_TYPE_LOG_FILTER,
+        .enabled = false, // disabled!
+        .config = .{
+            .filter = .{
+                .action = .FILTER_ACTION_DROP,
+            },
+        },
+    };
+    try disabled_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
+    try disabled_policy.config.?.filter.matchers.append(allocator, .{
+        .path = try allocator.dupe(u8, "$.level"),
+        .regex = try allocator.dupe(u8, "ERROR"),
+    });
+    defer disabled_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{disabled_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Error log would match, but policy is disabled, so keep
+    const error_log =
+        \\{"level": "ERROR", "message": "something failed"}
+    ;
+    const doc = try JsonDoc.parse(error_log);
+    defer doc.deinit();
+    try testing.expectEqual(FilterResult.keep, filter.evaluateJson(doc, .TELEMETRY_TYPE_LOGS));
+}
+
+test "FilterEvaluator.evaluateJson with Datadog log format" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Drop logs from staging environment
+    var drop_staging = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-staging"),
+        .policy_type = .POLICY_TYPE_LOG_FILTER,
+        .enabled = true,
+        .config = .{
+            .filter = .{
+                .action = .FILTER_ACTION_DROP,
+            },
+        },
+    };
+    try drop_staging.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
+    try drop_staging.config.?.filter.matchers.append(allocator, .{
+        .path = try allocator.dupe(u8, "$.ddtags"),
+        .regex = try allocator.dupe(u8, "env:staging"),
+    });
+    defer drop_staging.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_staging}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Staging log should be dropped
+    const staging_log =
+        \\{"ddsource": "nginx", "ddtags": "env:staging,version:5.1", "hostname": "i-012345678", "message": "request completed", "service": "payment"}
+    ;
+    const staging_doc = try JsonDoc.parse(staging_log);
+    defer staging_doc.deinit();
+    try testing.expectEqual(FilterResult.drop, filter.evaluateJson(staging_doc, .TELEMETRY_TYPE_LOGS));
+
+    // Production log should be kept
+    const prod_log =
+        \\{"ddsource": "nginx", "ddtags": "env:production,version:5.1", "hostname": "i-987654321", "message": "request completed", "service": "payment"}
+    ;
+    const prod_doc = try JsonDoc.parse(prod_log);
+    defer prod_doc.deinit();
+    try testing.expectEqual(FilterResult.keep, filter.evaluateJson(prod_doc, .TELEMETRY_TYPE_LOGS));
+}
+
+test "FilterEvaluator.evaluateJson with multiple matchers (AND logic)" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Drop DEBUG logs from payment service only
+    var policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-payment-debug"),
+        .policy_type = .POLICY_TYPE_LOG_FILTER,
+        .enabled = true,
+        .config = .{
+            .filter = .{
+                .action = .FILTER_ACTION_DROP,
+            },
+        },
+    };
+    try policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
+    try policy.config.?.filter.matchers.append(allocator, .{
+        .path = try allocator.dupe(u8, "$.level"),
+        .regex = try allocator.dupe(u8, "DEBUG"),
+    });
+    try policy.config.?.filter.matchers.append(allocator, .{
+        .path = try allocator.dupe(u8, "$.service"),
+        .regex = try allocator.dupe(u8, "payment"),
+    });
+    defer policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // DEBUG from payment = dropped
+    const payment_debug =
+        \\{"level": "DEBUG", "service": "payment", "message": "processing"}
+    ;
+    const payment_debug_doc = try JsonDoc.parse(payment_debug);
+    defer payment_debug_doc.deinit();
+    try testing.expectEqual(FilterResult.drop, filter.evaluateJson(payment_debug_doc, .TELEMETRY_TYPE_LOGS));
+
+    // DEBUG from auth = kept (service doesn't match)
+    const auth_debug =
+        \\{"level": "DEBUG", "service": "auth", "message": "login attempt"}
+    ;
+    const auth_debug_doc = try JsonDoc.parse(auth_debug);
+    defer auth_debug_doc.deinit();
+    try testing.expectEqual(FilterResult.keep, filter.evaluateJson(auth_debug_doc, .TELEMETRY_TYPE_LOGS));
+
+    // ERROR from payment = kept (level doesn't match)
+    const payment_error =
+        \\{"level": "ERROR", "service": "payment", "message": "failed"}
+    ;
+    const payment_error_doc = try JsonDoc.parse(payment_error);
+    defer payment_error_doc.deinit();
+    try testing.expectEqual(FilterResult.keep, filter.evaluateJson(payment_error_doc, .TELEMETRY_TYPE_LOGS));
 }

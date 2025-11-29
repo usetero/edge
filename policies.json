@@ -4,7 +4,7 @@
       "name": "drop-echo-logs",
       "policy_type": "filter",
       "telemetry_types": ["logs"],
-      "matchers": [{ "path": "$.*.ddsource", "regex": "nginx" }],
+      "matchers": [{ "path": "$.ddsource", "regex": "nginx" }],
       "action": "drop"
     },
     {
