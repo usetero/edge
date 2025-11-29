@@ -417,55 +417,48 @@ pub const HttpzProxyServer = struct {
         }
         std.log.info("-------------------------", .{});
 
-        // Read response body
-        var body_writer = std.Io.Writer.Allocating.init(req.arena);
-        defer body_writer.deinit();
-
+        // Stream response body directly from upstream to httpz response
+        // No additional memory allocation needed - we stream through a fixed buffer
         const max_size = current_config.max_body_size;
         var read_buffer: [8192]u8 = undefined;
         var upstream_body_reader = upstream_res.reader(&read_buffer);
 
-        // Stream the entire response body with size limit
-        var total_bytes_read: usize = 0;
-        while (total_bytes_read < max_size) {
-            const bytes_read = upstream_body_reader.stream(&body_writer.writer, std.io.Limit.limited(max_size - total_bytes_read)) catch |err| switch (err) {
+        // Get httpz response writer - httpz manages its own buffering
+        const response_writer = res.writer();
+
+        // Stream directly from upstream reader to response writer
+        var total_bytes_streamed: usize = 0;
+        while (total_bytes_streamed < max_size) {
+            const bytes_streamed = upstream_body_reader.stream(response_writer, std.Io.Limit.limited(max_size - total_bytes_streamed)) catch |err| switch (err) {
                 error.EndOfStream => {
                     // Normal end of HTTP response body
                     std.log.debug("Reached end of response body", .{});
                     break;
                 },
                 else => {
-                    std.log.err("Error reading upstream response: {} (error set: {s}, total_bytes_read: {})", .{
+                    std.log.err("Error streaming upstream response: {} (total_bytes_streamed: {})", .{
                         err,
-                        @errorName(err),
-                        total_bytes_read,
+                        total_bytes_streamed,
                     });
                     res.status = 502; // Bad Gateway
                     res.body = "Error reading upstream response";
-                    client.deinit();
                     return err;
                 },
             };
 
-            if (bytes_read == 0) break;
-            total_bytes_read += bytes_read;
+            if (bytes_streamed == 0) break;
+            total_bytes_streamed += bytes_streamed;
         }
 
-        if (total_bytes_read >= max_size) {
+        if (total_bytes_streamed >= max_size) {
             std.log.warn("Response body reached max size limit of {} bytes", .{max_size});
         }
-
-        // Copy the body to arena memory before deinit invalidates it
-        const temp_body = body_writer.written();
-        const body = try req.arena.dupe(u8, temp_body);
-        std.log.info("Body ({} bytes): {s}", .{ body.len, body });
-        res.body = body;
 
         std.log.info("{s} {s} <- {} ({} bytes)\nxxxxxxxxxxxxxxxxxxxxxxxx", .{
             @tagName(req.method),
             req.url.path,
             res.status,
-            body.len,
+            total_bytes_streamed,
         });
     }
 };
