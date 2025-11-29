@@ -48,6 +48,7 @@ jobs:
           token: ${{ steps.generate-token.outputs.token }}
           ref: ${{ github.head_ref || github.ref }}
           fetch-depth: 0
+          submodules: "true"
       - uses: cashapp/activate-hermit@v1
 
       - run: git config --global url.https://x-access-token:${{ steps.generate-token.outputs.token }}@github.com/.insteadOf https://github.com/
