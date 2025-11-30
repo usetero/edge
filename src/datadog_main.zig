@@ -1,31 +1,46 @@
+//! Datadog Distribution Entry Point
+//!
+//! A focused edge proxy distribution for Datadog log ingestion with filtering.
+//! Handles /api/v2/logs with policy-based filtering, passes all other requests through.
+//!
+//! Features:
+//! - Policy-based log filtering (DROP/KEEP actions)
+//! - Fail-open behavior (errors pass logs through unchanged)
+//! - Thread-safe, stateless request processing
+//! - Lock-free policy updates via atomic snapshots
+//! - Graceful shutdown with signal handling
+
 const std = @import("std");
 const builtin = @import("builtin");
-const config_types = @import("config/types.zig");
-const config_parser = @import("config/parser.zig");
-const server_mod = @import("proxy/server.zig");
-const proxy_module = @import("core/proxy_module.zig");
-const passthrough_mod = @import("modules/passthrough/module.zig");
-const datadog_mod = @import("modules/datadog/module.zig");
-const filter_mod = @import("./core/filter.zig");
-const policy_registry_mod = @import("./core/policy_registry.zig");
-const policy_provider = @import("./core/policy_provider.zig");
-const FileProvider = @import("config/providers/file_provider.zig").FileProvider;
-const HttpProvider = @import("config/providers/http_provider.zig").HttpProvider;
+
+const edge = @import("root.zig");
+const config_parser = edge.config_parser;
+const server_mod = edge.server;
+const proxy_module = edge.proxy_module;
+const passthrough_mod = edge.passthrough;
+const datadog_mod = edge.datadog;
+const filter_mod = edge.filter;
+const policy_registry_mod = edge.policy_registry;
+const policy_provider_mod = edge.policy_provider;
+const FileProvider = edge.FileProvider;
+const HttpProvider = edge.HttpProvider;
 
 const ProxyServer = server_mod.ProxyServer;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const PassthroughModule = passthrough_mod.PassthroughModule;
 const DatadogModule = datadog_mod.DatadogModule;
 const DatadogConfig = datadog_mod.DatadogConfig;
+const PolicyRegistry = policy_registry_mod.PolicyRegistry;
+const FilterEvaluator = filter_mod.FilterEvaluator;
 
-/// Global server instance for signal handler
+// =============================================================================
+// Global state for signal handlers
+// =============================================================================
+
 var server_instance: ?*ProxyServer = null;
-
-/// Global provider lists for signal handler
 var global_file_providers: ?*std.ArrayList(*FileProvider) = null;
 var global_http_providers: ?*std.ArrayList(*HttpProvider) = null;
 
-/// Signal handler for graceful shutdown
 fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     _ = sig;
     std.log.info("Shutdown signal received, stopping server...", .{});
@@ -49,7 +64,6 @@ fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     }
 }
 
-/// Install SIGINT and SIGTERM handlers
 fn installShutdownHandlers() void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
         std.log.warn("Signal handling not supported on this platform", .{});
@@ -68,11 +82,14 @@ fn installShutdownHandlers() void {
     std.log.debug("Installed signal handlers for SIGINT and SIGTERM", .{});
 }
 
-/// Context for policy update callback
-const PolicyCallbackContext = struct {
-    registry: *policy_registry_mod.PolicyRegistry,
+// =============================================================================
+// Policy callback
+// =============================================================================
 
-    fn handleUpdate(context: *anyopaque, update: policy_provider.PolicyUpdate) !void {
+const PolicyCallbackContext = struct {
+    registry: *PolicyRegistry,
+
+    fn handleUpdate(context: *anyopaque, update: policy_provider_mod.PolicyUpdate) !void {
         const self: *PolicyCallbackContext = @ptrCast(@alignCast(context));
         try self.registry.updatePolicies(update.policies, update.source);
         std.log.info("Policy registry updated from {s} source with {} policies", .{
@@ -81,6 +98,10 @@ const PolicyCallbackContext = struct {
         });
     }
 };
+
+// =============================================================================
+// Main entry point
+// =============================================================================
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -92,10 +113,9 @@ pub fn main() !void {
     defer args.deinit();
 
     _ = args.next(); // Skip program name
-
     const config_path = args.next() orelse "config.json";
 
-    std.log.info("Tero Edge HTTP Proxy starting...", .{});
+    std.log.info("Tero Edge - Datadog Distribution starting...", .{});
     std.log.info("Configuration file: {s}", .{config_path});
 
     // Parse configuration
@@ -103,7 +123,6 @@ pub fn main() !void {
     defer {
         allocator.free(config.upstream_url);
         allocator.free(config.workspace_id);
-        // Free policy providers
         for (config.policy_providers) |provider_config| {
             if (provider_config.path) |path| allocator.free(path);
             if (provider_config.url) |url| allocator.free(url);
@@ -122,17 +141,17 @@ pub fn main() !void {
     std.log.info("Upstream URL: {s}", .{config.upstream_url});
 
     // Create centralized policy registry
-    var registry = policy_registry_mod.PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
     // Create callback context for policy updates
     var callback_context = PolicyCallbackContext{ .registry = &registry };
-    const callback = policy_provider.PolicyCallback{
+    const callback = policy_provider_mod.PolicyCallback{
         .context = @ptrCast(&callback_context),
         .onUpdate = PolicyCallbackContext.handleUpdate,
     };
 
-    // Initialize providers from config (keep pointers for cleanup)
+    // Initialize providers from config
     var file_providers: std.ArrayList(*FileProvider) = .empty;
     defer {
         for (file_providers.items) |provider| {
@@ -187,7 +206,7 @@ pub fn main() !void {
     std.log.info("Policy count: {}", .{registry.getPolicyCount()});
 
     // Create filter evaluator with reference to registry
-    var filter_evaluator = filter_mod.FilterEvaluator.init(&registry);
+    var filter_evaluator = FilterEvaluator.init(&registry);
     defer filter_evaluator.deinit();
 
     // Install signal handlers
@@ -237,7 +256,7 @@ pub fn main() !void {
     server_instance = &proxy;
     defer server_instance = null;
 
-    std.log.info("Proxy ready. Waiting for connections...", .{});
+    std.log.info("Datadog proxy ready. Waiting for connections...", .{});
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
         std.log.info("To shutdown: kill -s INT {d}", .{std.c.getpid()});
     }
@@ -246,12 +265,4 @@ pub fn main() !void {
     try proxy.listen();
 
     std.log.info("Server stopped gracefully.", .{});
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa);
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
 }

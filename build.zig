@@ -131,6 +131,45 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // ==========================================================================
+    // Datadog Distribution
+    // ==========================================================================
+    // A focused distribution for Datadog log ingestion with filtering.
+    // Build with: zig build datadog
+    // Run with: zig build run-datadog
+    const datadog_exe = b.addExecutable(.{
+        .name = "edge-datadog",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/datadog_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    datadog_exe.root_module.addIncludePath(b.path("wrapper"));
+    datadog_exe.root_module.addIncludePath(b.path("vendor/jsoncons/include"));
+    datadog_exe.root_module.addCSourceFile(.{
+        .file = b.path("wrapper/jsoncons_wrapper.cpp"),
+        .flags = &.{"-std=c++14"},
+    });
+    datadog_exe.root_module.addImport("httpz", httpz.module("httpz"));
+    datadog_exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
+    datadog_exe.root_module.addImport("proto", proto_mod);
+    datadog_exe.root_module.link_libc = true;
+    datadog_exe.root_module.link_libcpp = true;
+    datadog_exe.root_module.linkSystemLibrary("z", .{});
+    datadog_exe.root_module.linkSystemLibrary("zstd", .{});
+
+    const datadog_step = b.step("datadog", "Build the Datadog distribution");
+    datadog_step.dependOn(&b.addInstallArtifact(datadog_exe, .{}).step);
+
+    const run_datadog_step = b.step("run-datadog", "Run the Datadog distribution");
+    const run_datadog_cmd = b.addRunArtifact(datadog_exe);
+    run_datadog_step.dependOn(&run_datadog_cmd.step);
+    run_datadog_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_datadog_cmd.addArgs(args);
+    }
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

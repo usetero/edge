@@ -18,6 +18,13 @@
       "action": "drop"
     },
     {
+      "name": "drop-debug-level",
+      "policy_type": "filter",
+      "telemetry_types": ["logs"],
+      "matchers": [{ "path": "$.level", "regex": "DEBUG" }],
+      "action": "drop"
+    },
+    {
       "name": "keep-error-logs",
       "policy_type": "filter",
       "telemetry_types": ["logs"],
