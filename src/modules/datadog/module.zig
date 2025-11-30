@@ -82,6 +82,8 @@ pub const DatadogModule = struct {
             return ModuleResult.unchanged();
         };
 
+        std.log.info("Dropped Logs: {d} Processed Logs: {d}", .{ result.dropped_count, result.original_count });
+
         // If all logs were dropped, return empty array with 202 (Datadog expects this)
         if (result.allDropped()) {
             allocator.free(result.data);
