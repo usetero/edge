@@ -32,7 +32,14 @@ test {
     _ = @import("core/policy_source.zig");
     _ = @import("core/policy_registry.zig");
     _ = @import("core/policy_provider.zig");
+    _ = @import("core/proxy_module.zig");
     _ = @import("proxy/datadog_v2_logs.zig");
     _ = @import("proxy/compress.zig");
+    _ = @import("proxy/router.zig");
+    _ = @import("proxy/upstream_client.zig");
+    // Note: proxy/server.zig requires httpz which is only available in exe build
+    _ = @import("modules/passthrough/module.zig");
+    _ = @import("modules/datadog/module.zig");
+    _ = @import("modules/datadog/logs_v2.zig");
     _ = @import("json/pretty_print.zig");
 }

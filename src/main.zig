@@ -2,15 +2,24 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
-const httpz_server = @import("proxy/httpz_server.zig");
+const server_mod = @import("proxy/server.zig");
+const proxy_module = @import("core/proxy_module.zig");
+const passthrough_mod = @import("modules/passthrough/module.zig");
+const datadog_mod = @import("modules/datadog/module.zig");
 const filter_mod = @import("./core/filter.zig");
 const policy_registry_mod = @import("./core/policy_registry.zig");
 const policy_provider = @import("./core/policy_provider.zig");
 const FileProvider = @import("config/providers/file_provider.zig").FileProvider;
 const HttpProvider = @import("config/providers/http_provider.zig").HttpProvider;
 
+const ProxyServer = server_mod.ProxyServer;
+const ModuleRegistration = proxy_module.ModuleRegistration;
+const PassthroughModule = passthrough_mod.PassthroughModule;
+const DatadogModule = datadog_mod.DatadogModule;
+const DatadogConfig = datadog_mod.DatadogConfig;
+
 /// Global server instance for signal handler
-var server_instance: ?*httpz_server.HttpzProxyServer = null;
+var server_instance: ?*ProxyServer = null;
 
 /// Global provider lists for signal handler
 var global_file_providers: ?*std.ArrayList(*FileProvider) = null;
@@ -184,11 +193,43 @@ pub fn main() !void {
     // Install signal handlers
     installShutdownHandlers();
 
-    // Create httpz proxy server
-    var proxy = try httpz_server.HttpzProxyServer.init(
+    // Create Datadog module configuration
+    var datadog_config = DatadogConfig{
+        .filter = &filter_evaluator,
+    };
+
+    // Create modules
+    var datadog_module = DatadogModule{};
+    var passthrough_module = PassthroughModule{};
+
+    // Register modules (order matters - first match wins)
+    const module_registrations = [_]ModuleRegistration{
+        // Datadog module - handles /api/v2/logs with filtering
+        .{
+            .module = datadog_module.asProxyModule(),
+            .routes = &datadog_mod.routes,
+            .upstream_url = config.upstream_url,
+            .max_request_body = config.max_body_size,
+            .max_response_body = config.max_body_size,
+            .module_data = @ptrCast(&datadog_config),
+        },
+        // Passthrough module - handles all other requests
+        .{
+            .module = passthrough_module.asProxyModule(),
+            .routes = &passthrough_mod.default_routes,
+            .upstream_url = config.upstream_url,
+            .max_request_body = config.max_body_size,
+            .max_response_body = config.max_body_size,
+            .module_data = null,
+        },
+    };
+
+    // Create proxy server with modules
+    var proxy = try ProxyServer.init(
         allocator,
-        config,
-        &filter_evaluator,
+        config.listen_address,
+        config.listen_port,
+        &module_registrations,
     );
     defer proxy.deinit();
 
