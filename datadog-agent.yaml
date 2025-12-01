@@ -1,15 +1,139 @@
-kind: "DatadogAgent"
-apiVersion: "datadoghq.com/v2alpha1"
+---
+# Tero Edge ConfigMap
+# Contains configuration and policies for the edge proxy
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: "datadog"
+  name: tero-edge-config
+data:
+  config.json: |
+    {
+      "listen_address": "0.0.0.0",
+      "listen_port": 8080,
+      "upstream_url": "https://agent-http-intake.logs.us5.datadoghq.com",
+      "workspace_id": "90A6EFC2-27B8-41BC-9343-43BFB1DF0732",
+      "log_level": "info",
+      "pretty_print_json": true,
+      "max_body_size": 1048576,
+      "policy_providers": [
+        {
+          "type": "file",
+          "path": "/etc/tero/policies.json"
+        }
+      ]
+    }
+  policies.json: |
+    {
+      "policies": [
+        {
+          "name": "drop-echo-logs",
+          "policy_type": "filter",
+          "telemetry_types": ["logs"],
+          "matchers": [{ "path": "$.ddsource", "regex": "nginx" }],
+          "action": "drop"
+        },
+        {
+          "name": "drop-debug-logs",
+          "policy_type": "filter",
+          "telemetry_types": ["logs"],
+          "matchers": [
+            { "path": "$.body", "regex": "debug" },
+            { "path": "$.body", "regex": "trace" }
+          ],
+          "action": "drop"
+        },
+        {
+          "name": "drop-debug-level",
+          "policy_type": "filter",
+          "telemetry_types": ["logs"],
+          "matchers": [{ "path": "$.level", "regex": "DEBUG" }],
+          "action": "drop"
+        },
+        {
+          "name": "keep-error-logs",
+          "policy_type": "filter",
+          "telemetry_types": ["logs"],
+          "matchers": [
+            { "path": "$.severity_text", "regex": "error" },
+            { "path": "$.severity_text", "regex": "critical" },
+            { "path": "$.severity_text", "regex": "fatal" }
+          ],
+          "action": "keep"
+        }
+      ]
+    }
+---
+# Tero Edge DaemonSet
+# Runs the edge proxy on each node alongside the Datadog Agent
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tero-edge
+  labels:
+    app: tero-edge
+spec:
+  selector:
+    matchLabels:
+      app: tero-edge
+  template:
+    metadata:
+      labels:
+        app: tero-edge
+    spec:
+      containers:
+        - name: tero-edge
+          image: tero-edge-datadog:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - /etc/tero/config.json
+          ports:
+            - containerPort: 8080
+              hostPort: 8080
+              name: http
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          volumeMounts:
+            - name: tero-edge-config
+              mountPath: /etc/tero
+              readOnly: true
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: tero-edge-config
+          configMap:
+            name: tero-edge-config
+      tolerations:
+        # Run on all nodes including control plane
+        - operator: Exists
+---
+# DatadogAgent CRD
+# Configures the Datadog Agent to send logs through Tero Edge
+apiVersion: datadoghq.com/v2alpha1
+kind: DatadogAgent
+metadata:
+  name: datadog
 spec:
   global:
-    site: "us5.datadoghq.com"
+    site: us5.datadoghq.com
     credentials:
       apiSecret:
-        secretName: "datadog-secret"
-        keyName: "api-key"
-    clusterName: "jacob-local"
+        secretName: datadog-secret
+        keyName: api-key
+    clusterName: jacob-local
     tags:
       - "env:staging"
   features:
@@ -18,6 +142,14 @@ spec:
       containerCollectAll: true
   override:
     nodeAgent:
+      # Point logs to Tero Edge running on the same node via hostPort
       env:
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
         - name: DD_LOGS_CONFIG_LOGS_DD_URL
-          value: "http://host.docker.internal:8080" # <-- your custom logs dd url
+          value: "http://$(HOST_IP):8080"
+      # Ensure agent runs on same nodes as Tero Edge
+      tolerations:
+        - operator: Exists
