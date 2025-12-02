@@ -219,18 +219,13 @@ test "DatadogModule filters logs with DROP policy" {
     // Create DROP policy for DEBUG logs
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-debug"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = true,
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_DROP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try drop_policy.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
-        .regex = try allocator.dupe(u8, "DEBUG"),
+    try drop_policy.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
 
@@ -289,18 +284,13 @@ test "DatadogModule returns 202 when all logs dropped" {
     // Create DROP policy that matches everything
     var drop_all = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-all"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = true,
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_DROP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_all.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try drop_all.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
-        .regex = try allocator.dupe(u8, ""),
+    try drop_all.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "") } },
     });
     defer drop_all.deinit(allocator);
 

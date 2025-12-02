@@ -27,15 +27,11 @@ data:
       "policies": [
         {
           "name": "drop-echo-logs",
-          "policy_type": "filter",
-          "telemetry_types": ["logs"],
           "matchers": [{ "match_type": "log_attribute", "key": "ddsource", "regex": "nginx" }],
           "action": "drop"
         },
         {
           "name": "drop-no-such-file-or-directory-logs",
-          "policy_type": "filter",
-          "telemetry_types": ["logs"],
           "matchers": [
             { "match_type": "log_body", "regex": "no such file or directory" }
           ],
@@ -43,15 +39,11 @@ data:
         },
         {
           "name": "drop-debug-level",
-          "policy_type": "filter",
-          "telemetry_types": ["logs"],
           "matchers": [{ "match_type": "log_severity_text", "regex": "DEBUG" }],
           "action": "drop"
         },
         {
           "name": "keep-error-logs",
-          "policy_type": "filter",
-          "telemetry_types": ["logs"],
           "matchers": [
             { "match_type": "log_severity_text", "regex": "error" },
             { "match_type": "log_severity_text", "regex": "critical" },
