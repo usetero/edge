@@ -55,11 +55,8 @@ pub const FilterEvaluator = struct {
         // Get current policy snapshot (atomic, lock-free)
         const snapshot = self.registry.getSnapshot() orelse return FilterResult.keep;
 
-        // No policies to evaluate
-        if (snapshot.policies.len == 0) return FilterResult.keep;
-
         // Process policies in priority order - first match wins
-        for (snapshot.policies) |policy| {
+        for (snapshot.getLogFilterPolicies()) |policy| {
             // Skip disabled policies
             if (!policy.enabled) continue;
 

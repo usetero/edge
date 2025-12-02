@@ -6,16 +6,37 @@ const Policy = proto.policy.Policy;
 const SourceType = policy_source.SourceType;
 const PolicyMetadata = policy_source.PolicyMetadata;
 
+/// Policy config types - derived from the Policy.config oneof field
+pub const PolicyConfigType = enum {
+    /// Policy has a LogFilterConfig (filter field set)
+    log_filter,
+    /// Policy has no config set
+    none,
+
+    /// Get the config type from a policy
+    pub fn fromPolicy(policy: *const Policy) PolicyConfigType {
+        if (policy.filter != null) {
+            return .log_filter;
+        }
+        return .none;
+    }
+};
+
 /// Immutable snapshot of policies for lock-free reads
 pub const PolicySnapshot = struct {
     /// All policies in this snapshot
     policies: []const Policy,
+
+    /// Indices into policies array for each config type
+    /// Allows efficient lookup of policies by their config type
+    log_filter_indices: []const u32,
 
     version: u64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *const PolicySnapshot) void {
         self.allocator.free(self.policies);
+        self.allocator.free(self.log_filter_indices);
     }
 
     /// Get a policy by index
@@ -25,6 +46,42 @@ pub const PolicySnapshot = struct {
         }
         return &self.policies[idx];
     }
+
+    /// Get all log filter policies
+    pub fn getLogFilterPolicies(self: *const PolicySnapshot) []const Policy {
+        if (self.log_filter_indices.len == 0) {
+            return &.{};
+        }
+        // Return a slice view - caller iterates using indices
+        return self.policies;
+    }
+
+    /// Get log filter policy indices for iteration
+    pub fn getLogFilterIndices(self: *const PolicySnapshot) []const u32 {
+        return self.log_filter_indices;
+    }
+
+    /// Iterator for log filter policies
+    pub fn iterateLogFilterPolicies(self: *const PolicySnapshot) LogFilterPolicyIterator {
+        return .{
+            .snapshot = self,
+            .index = 0,
+        };
+    }
+
+    pub const LogFilterPolicyIterator = struct {
+        snapshot: *const PolicySnapshot,
+        index: usize,
+
+        pub fn next(self: *LogFilterPolicyIterator) ?*const Policy {
+            if (self.index >= self.snapshot.log_filter_indices.len) {
+                return null;
+            }
+            const policy_idx = self.snapshot.log_filter_indices[self.index];
+            self.index += 1;
+            return &self.snapshot.policies[policy_idx];
+        }
+    };
 };
 
 /// Centralized policy registry with multi-source support
@@ -199,16 +256,43 @@ pub const PolicyRegistry = struct {
 
         @memcpy(policies_slice, self.policies.items);
 
+        // Build indices by config type
+        // First pass: count policies of each type
+        var log_filter_count: usize = 0;
+        for (policies_slice) |*policy| {
+            const config_type = PolicyConfigType.fromPolicy(policy);
+            switch (config_type) {
+                .log_filter => log_filter_count += 1,
+                .none => {},
+            }
+        }
+
+        // Allocate index arrays
+        const log_filter_indices = try self.allocator.alloc(u32, log_filter_count);
+        errdefer self.allocator.free(log_filter_indices);
+
+        // Second pass: populate indices
+        var log_filter_idx: usize = 0;
+        for (policies_slice, 0..) |*policy, i| {
+            const config_type = PolicyConfigType.fromPolicy(policy);
+            switch (config_type) {
+                .log_filter => {
+                    log_filter_indices[log_filter_idx] = @intCast(i);
+                    log_filter_idx += 1;
+                },
+                .none => {},
+            }
+        }
+
         // Increment version
         const new_version = self.version.load(.monotonic) + 1;
         self.version.store(new_version, .monotonic);
 
-        // Create new snapshot
-        // TODO: In the future we should do organization and filtering here based
-        // on the labels in the policies.
+        // Create new snapshot with indices
         const snapshot = try self.allocator.create(PolicySnapshot);
         snapshot.* = .{
             .policies = policies_slice,
+            .log_filter_indices = log_filter_indices,
             .version = new_version,
             .allocator = self.allocator,
         };
@@ -891,4 +975,214 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
         @as(i32, 2),
         registry.getSnapshot().?.policies[0].priority,
     );
+}
+
+// -----------------------------------------------------------------------------
+// Policy Config Type Indexing Tests
+// -----------------------------------------------------------------------------
+
+const LogFilterConfig = proto.policy.LogFilterConfig;
+
+/// Helper to create a test policy with a log filter config
+fn createTestPolicyWithFilter(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+) !Policy {
+    var policy = Policy{
+        .name = try allocator.dupe(u8, name),
+        .enabled = true,
+        .filter = LogFilterConfig{
+            .matchers = .empty,
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    _ = &policy;
+
+    return policy;
+}
+
+test "PolicyConfigType: fromPolicy returns log_filter when filter is set" {
+    const allocator = testing.allocator;
+
+    var policy = try createTestPolicyWithFilter(allocator, "filter-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const config_type = PolicyConfigType.fromPolicy(&policy);
+    try testing.expectEqual(PolicyConfigType.log_filter, config_type);
+}
+
+test "PolicyConfigType: fromPolicy returns none when filter is null" {
+    const allocator = testing.allocator;
+
+    var policy = try createTestPolicy(allocator, "no-filter-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const config_type = PolicyConfigType.fromPolicy(&policy);
+    try testing.expectEqual(PolicyConfigType.none, config_type);
+}
+
+test "PolicySnapshot: log_filter_indices contains only filter policies" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create mix of policies with and without filters
+    var policy_no_filter = try createTestPolicy(allocator, "no-filter");
+    defer freeTestPolicy(allocator, &policy_no_filter);
+
+    var policy_with_filter = try createTestPolicyWithFilter(allocator, "with-filter");
+    defer freeTestPolicy(allocator, &policy_with_filter);
+
+    var another_no_filter = try createTestPolicy(allocator, "another-no-filter");
+    defer freeTestPolicy(allocator, &another_no_filter);
+
+    try registry.updatePolicies(&.{ policy_no_filter, policy_with_filter, another_no_filter }, .file);
+
+    const snapshot = registry.getSnapshot();
+    try testing.expect(snapshot != null);
+
+    // Should have 3 total policies but only 1 log filter index
+    try testing.expectEqual(@as(usize, 3), snapshot.?.policies.len);
+    try testing.expectEqual(@as(usize, 1), snapshot.?.log_filter_indices.len);
+
+    // The indexed policy should be the one with filter
+    const indexed_policy = snapshot.?.policies[snapshot.?.log_filter_indices[0]];
+    try testing.expectEqualStrings("with-filter", indexed_policy.name);
+    try testing.expect(indexed_policy.filter != null);
+}
+
+test "PolicySnapshot: multiple filter policies are indexed" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    var filter1 = try createTestPolicyWithFilter(allocator, "filter-1");
+    defer freeTestPolicy(allocator, &filter1);
+
+    var filter2 = try createTestPolicyWithFilter(allocator, "filter-2");
+    defer freeTestPolicy(allocator, &filter2);
+
+    var filter3 = try createTestPolicyWithFilter(allocator, "filter-3");
+    defer freeTestPolicy(allocator, &filter3);
+
+    try registry.updatePolicies(&.{ filter1, filter2, filter3 }, .file);
+
+    const snapshot = registry.getSnapshot();
+    try testing.expect(snapshot != null);
+
+    // All 3 policies should be indexed
+    try testing.expectEqual(@as(usize, 3), snapshot.?.policies.len);
+    try testing.expectEqual(@as(usize, 3), snapshot.?.log_filter_indices.len);
+}
+
+test "PolicySnapshot: empty when no filter policies" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    var policy1 = try createTestPolicy(allocator, "policy-1");
+    defer freeTestPolicy(allocator, &policy1);
+
+    var policy2 = try createTestPolicy(allocator, "policy-2");
+    defer freeTestPolicy(allocator, &policy2);
+
+    try registry.updatePolicies(&.{ policy1, policy2 }, .file);
+
+    const snapshot = registry.getSnapshot();
+    try testing.expect(snapshot != null);
+
+    // No filter indices
+    try testing.expectEqual(@as(usize, 2), snapshot.?.policies.len);
+    try testing.expectEqual(@as(usize, 0), snapshot.?.log_filter_indices.len);
+}
+
+test "PolicySnapshot: iterateLogFilterPolicies returns all filter policies" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    var no_filter = try createTestPolicy(allocator, "no-filter");
+    defer freeTestPolicy(allocator, &no_filter);
+
+    var filter1 = try createTestPolicyWithFilter(allocator, "filter-1");
+    defer freeTestPolicy(allocator, &filter1);
+
+    var filter2 = try createTestPolicyWithFilter(allocator, "filter-2");
+    defer freeTestPolicy(allocator, &filter2);
+
+    try registry.updatePolicies(&.{ no_filter, filter1, filter2 }, .file);
+
+    const snapshot = registry.getSnapshot();
+    try testing.expect(snapshot != null);
+
+    // Iterate and collect names
+    var iter = snapshot.?.iterateLogFilterPolicies();
+    var count: usize = 0;
+    var found_filter1 = false;
+    var found_filter2 = false;
+
+    while (iter.next()) |policy| {
+        count += 1;
+        try testing.expect(policy.filter != null);
+
+        if (std.mem.eql(u8, policy.name, "filter-1")) {
+            found_filter1 = true;
+        } else if (std.mem.eql(u8, policy.name, "filter-2")) {
+            found_filter2 = true;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(found_filter1);
+    try testing.expect(found_filter2);
+}
+
+test "PolicySnapshot: iterator returns null when no filter policies" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    var policy = try createTestPolicy(allocator, "no-filter");
+    defer freeTestPolicy(allocator, &policy);
+
+    try registry.updatePolicies(&.{policy}, .file);
+
+    const snapshot = registry.getSnapshot();
+    try testing.expect(snapshot != null);
+
+    var iter = snapshot.?.iterateLogFilterPolicies();
+    try testing.expect(iter.next() == null);
+}
+
+test "PolicySnapshot: indices update when policies change" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Start with one filter policy
+    var filter1 = try createTestPolicyWithFilter(allocator, "filter-1");
+    defer freeTestPolicy(allocator, &filter1);
+
+    try registry.updatePolicies(&.{filter1}, .file);
+
+    var snapshot = registry.getSnapshot();
+    try testing.expectEqual(@as(usize, 1), snapshot.?.log_filter_indices.len);
+
+    // Add another filter policy
+    var filter2 = try createTestPolicyWithFilter(allocator, "filter-2");
+    defer freeTestPolicy(allocator, &filter2);
+
+    try registry.updatePolicies(&.{ filter1, filter2 }, .file);
+
+    snapshot = registry.getSnapshot();
+    try testing.expectEqual(@as(usize, 2), snapshot.?.log_filter_indices.len);
+
+    // Remove filter policies, add non-filter
+    var no_filter = try createTestPolicy(allocator, "no-filter");
+    defer freeTestPolicy(allocator, &no_filter);
+
+    try registry.updatePolicies(&.{no_filter}, .file);
+
+    snapshot = registry.getSnapshot();
+    try testing.expectEqual(@as(usize, 0), snapshot.?.log_filter_indices.len);
 }
