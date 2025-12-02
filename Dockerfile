@@ -29,8 +29,6 @@ WORKDIR /build
 # Copy source code
 COPY build.zig build.zig.zon ./
 COPY src/ src/
-COPY wrapper/ wrapper/
-COPY vendor/ vendor/
 COPY proto/ proto/
 
 # Build argument for distribution selection

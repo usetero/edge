@@ -8,10 +8,12 @@ const TelemetryType = types.TelemetryType;
 const FilterAction = types.FilterAction;
 const FilterConfig = types.FilterConfig;
 const Matcher = types.Matcher;
+const MatchType = types.MatchType;
 
 /// JSON schema for a matcher
 const MatcherJson = struct {
-    path: []const u8,
+    match_type: []const u8,
+    key: []const u8 = "",
     regex: []const u8,
     negate: bool = false,
 };
@@ -165,13 +167,13 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
                 try matchers.ensureTotalCapacity(allocator, json_matchers.len);
                 for (json_matchers) |jm| {
                     matchers.appendAssumeCapacity(.{
-                        .path = try allocator.dupe(u8, jm.path),
+                        .match_type = try parseMatchType(jm.match_type),
+                        .key = if (jm.key.len > 0) try allocator.dupe(u8, jm.key) else &.{},
                         .regex = try allocator.dupe(u8, jm.regex),
                         .negate = jm.negate,
                     });
                 }
             }
-
             // Parse action
             const action = if (json_policy.action) |a| try parseFilterAction(a) else .FILTER_ACTION_UNSPECIFIED;
 
@@ -256,6 +258,25 @@ fn parseFilterAction(s: []const u8) !FilterAction {
     if (std.mem.eql(u8, s, "keep")) return .FILTER_ACTION_KEEP;
     if (std.mem.eql(u8, s, "drop")) return .FILTER_ACTION_DROP;
     return error.InvalidAction;
+}
+
+/// Parse MatchType from string
+fn parseMatchType(s: []const u8) !MatchType {
+    if (std.mem.eql(u8, s, "log_body")) return .MATCH_TYPE_LOG_BODY;
+    if (std.mem.eql(u8, s, "log_severity_text")) return .MATCH_TYPE_LOG_SEVERITY_TEXT;
+    if (std.mem.eql(u8, s, "log_severity_number")) return .MATCH_TYPE_LOG_SEVERITY_NUMBER;
+    if (std.mem.eql(u8, s, "log_attribute")) return .MATCH_TYPE_LOG_ATTRIBUTE;
+    if (std.mem.eql(u8, s, "resource_attribute")) return .MATCH_TYPE_RESOURCE_ATTRIBUTE;
+    if (std.mem.eql(u8, s, "scope_name")) return .MATCH_TYPE_SCOPE_NAME;
+    if (std.mem.eql(u8, s, "scope_version")) return .MATCH_TYPE_SCOPE_VERSION;
+    if (std.mem.eql(u8, s, "scope_attribute")) return .MATCH_TYPE_SCOPE_ATTRIBUTE;
+    if (std.mem.eql(u8, s, "metric_name")) return .MATCH_TYPE_METRIC_NAME;
+    if (std.mem.eql(u8, s, "metric_attribute")) return .MATCH_TYPE_METRIC_ATTRIBUTE;
+    if (std.mem.eql(u8, s, "span_name")) return .MATCH_TYPE_SPAN_NAME;
+    if (std.mem.eql(u8, s, "span_kind")) return .MATCH_TYPE_SPAN_KIND;
+    if (std.mem.eql(u8, s, "span_status")) return .MATCH_TYPE_SPAN_STATUS;
+    if (std.mem.eql(u8, s, "span_attribute")) return .MATCH_TYPE_SPAN_ATTRIBUTE;
+    return error.InvalidMatchType;
 }
 
 fn parseIpv4(s: []const u8) ![4]u8 {

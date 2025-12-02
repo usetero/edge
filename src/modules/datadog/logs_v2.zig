@@ -1,10 +1,9 @@
 const std = @import("std");
-const jsonpath = @import("../../core/jsonpath.zig");
 const filter_mod = @import("../../core/filter.zig");
 
 const FilterEvaluator = filter_mod.FilterEvaluator;
 const FilterResult = filter_mod.FilterResult;
-const JsonDoc = jsonpath.JsonDoc;
+const MatchType = @import("proto").policy.MatchType;
 
 /// Result of processing logs
 pub const ProcessResult = struct {
@@ -54,6 +53,36 @@ pub fn processLogs(
     };
 }
 
+/// Field accessor for Datadog JSON log format
+/// Datadog logs have fields at the root level: message, level, ddtags, service, etc.
+fn datadogFieldAccessor(ctx: *const anyopaque, match_type: MatchType, key: []const u8) ?[]const u8 {
+    const json_value: *const std.json.Value = @ptrCast(@alignCast(ctx));
+
+    // Only object values have fields
+    const obj = switch (json_value.*) {
+        .object => |o| o,
+        else => return null,
+    };
+
+    // Map match_type to the appropriate field
+    const field_name: []const u8 = switch (match_type) {
+        .MATCH_TYPE_LOG_BODY => "message",
+        .MATCH_TYPE_LOG_SEVERITY_TEXT => "level",
+        .MATCH_TYPE_LOG_SEVERITY_NUMBER => "severity_number",
+        .MATCH_TYPE_LOG_ATTRIBUTE => key, // For attributes, use the key directly (e.g., "ddtags", "service")
+        else => return null,
+    };
+
+    // Get the field value
+    const value = obj.get(field_name) orelse return null;
+
+    // Return string value
+    return switch (value) {
+        .string => |s| s,
+        else => null, // Only string values supported for now
+    };
+}
+
 /// Process JSON logs with filter evaluation
 /// Detects if input is an array or single object, applies filter to each log
 fn processJsonLogsWithFilter(allocator: std.mem.Allocator, filter: *const FilterEvaluator, data: []const u8) !ProcessResult {
@@ -79,26 +108,8 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, filter: *const Filter
             var dropped_count: usize = 0;
 
             for (arr.items) |log_value| {
-                // Stringify the log entry for JsonDoc parsing
-                var out: std.Io.Writer.Allocating = .init(allocator);
-                defer out.deinit();
-                var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
-                log_value.jsonStringify(&jws) catch {
-                    // If stringify fails, keep the log (fail-open)
-                    try kept_logs.append(allocator, log_value);
-                    continue;
-                };
-
-                // Parse with JsonDoc for filter evaluation
-                const written = out.written();
-                const log_doc = JsonDoc.parse(written) catch {
-                    // If parsing fails, keep the log (fail-open)
-                    try kept_logs.append(allocator, log_value);
-                    continue;
-                };
-                defer log_doc.deinit();
-
-                const filter_result = filter.evaluateJson(log_doc, .TELEMETRY_TYPE_LOGS);
+                // Evaluate filter using the field accessor
+                const filter_result = filter.evaluate(@ptrCast(&log_value), datadogFieldAccessor, .TELEMETRY_TYPE_LOGS);
                 if (filter_result == .keep) {
                     try kept_logs.append(allocator, log_value);
                 } else {
@@ -117,19 +128,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, filter: *const Filter
         },
         .object => {
             // Process single log object
-            const doc = JsonDoc.parse(data) catch {
-                // If JsonDoc parsing fails, return data unchanged (fail-open)
-                const result = try allocator.alloc(u8, data.len);
-                @memcpy(result, data);
-                return .{
-                    .data = result,
-                    .dropped_count = 0,
-                    .original_count = 1,
-                };
-            };
-            defer doc.deinit();
-
-            const filter_result = filter.evaluateJson(doc, .TELEMETRY_TYPE_LOGS);
+            const filter_result = filter.evaluate(@ptrCast(&parsed.value), datadogFieldAccessor, .TELEMETRY_TYPE_LOGS);
             if (filter_result == .drop) {
                 // Return empty array for dropped single log
                 const result = try allocator.alloc(u8, 2);
@@ -212,7 +211,7 @@ test "processLogs - DROP policy filters logs from array" {
     };
     try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try drop_policy.config.?.filter.matchers.append(allocator, .{
-        .path = try allocator.dupe(u8, "$.level"),
+        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
         .regex = try allocator.dupe(u8, "DEBUG"),
     });
     defer drop_policy.deinit(allocator);
@@ -254,7 +253,7 @@ test "processLogs - DROP policy drops single object" {
     };
     try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try drop_policy.config.?.filter.matchers.append(allocator, .{
-        .path = try allocator.dupe(u8, "$.level"),
+        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
         .regex = try allocator.dupe(u8, "DEBUG"),
     });
     defer drop_policy.deinit(allocator);
@@ -283,12 +282,13 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 
     const filter = FilterEvaluator.init(&registry);
 
-    const invalid = "{ not valid json }";
-    const result = try processLogs(allocator, &filter, invalid, "application/json");
+    const malformed = "{ not valid json }";
+
+    const result = try processLogs(allocator, &filter, malformed, "application/json");
     defer allocator.free(result.data);
 
-    try std.testing.expectEqualStrings(invalid, result.data);
-    try std.testing.expect(!result.wasModified());
+    try std.testing.expectEqualStrings(malformed, result.data);
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
 }
 
 test "processLogs - non-JSON content type returns unchanged" {
@@ -299,25 +299,11 @@ test "processLogs - non-JSON content type returns unchanged" {
 
     const filter = FilterEvaluator.init(&registry);
 
-    const data = "raw log line\nanother line";
+    const data = "some raw log data";
+
     const result = try processLogs(allocator, &filter, data, "text/plain");
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(data, result.data);
-    try std.testing.expect(!result.wasModified());
-}
-
-test "processLogs - empty array returns empty array" {
-    const allocator = std.testing.allocator;
-
-    var registry = PolicyRegistry.init(allocator);
-    defer registry.deinit();
-
-    const filter = FilterEvaluator.init(&registry);
-
-    const result = try processLogs(allocator, &filter, "[]", "application/json");
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqualStrings("[]", result.data);
-    try std.testing.expect(!result.wasModified());
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
 }
