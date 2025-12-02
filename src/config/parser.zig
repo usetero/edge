@@ -41,6 +41,13 @@ const ProviderJson = struct {
     poll_interval: ?u64 = null,
 };
 
+/// JSON schema for service metadata
+const ServiceJson = struct {
+    name: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+};
+
 /// JSON schema for configuration file
 const ConfigJson = struct {
     listen_address: []const u8,
@@ -51,6 +58,7 @@ const ConfigJson = struct {
     pretty_print_json: bool,
     max_body_size: u32,
     policy_providers: ?[]ProviderJson = null,
+    service: ?ServiceJson = null,
 };
 
 /// Parse JSON configuration file into ProxyConfig
@@ -126,6 +134,19 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
     if (json_config.policy_providers) |json_providers| {
         const providers = try parseProviders(allocator, json_providers);
         config.policy_providers = providers;
+    }
+
+    // Parse service metadata if present
+    if (json_config.service) |service_json| {
+        if (service_json.name) |name| {
+            config.service.name = try allocator.dupe(u8, name);
+        }
+        if (service_json.namespace) |namespace| {
+            config.service.namespace = try allocator.dupe(u8, namespace);
+        }
+        if (service_json.version) |version| {
+            config.service.version = try allocator.dupe(u8, version);
+        }
     }
 
     // Allocate and return config
