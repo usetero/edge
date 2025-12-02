@@ -53,7 +53,7 @@ pub const FilterEvaluator = struct {
     ///
     /// The field_accessor function is called to retrieve field values from the data.
     /// The ctx pointer is passed through to the accessor for accessing the actual data structure.
-    pub fn evaluate(
+    pub fn evaluateWithHyperscan(
         self: *const FilterEvaluator,
         ctx: *const anyopaque,
         field_accessor: FieldAccessor,
@@ -79,6 +79,43 @@ pub const FilterEvaluator = struct {
                 regex_idx,
                 filter_config.matchers.items,
             );
+
+            if (all_match) {
+                return switch (filter_config.action) {
+                    .FILTER_ACTION_KEEP => FilterResult.keep,
+                    .FILTER_ACTION_DROP => FilterResult.drop,
+                    else => FilterResult.keep,
+                };
+            }
+        }
+
+        // Default to keep if no policies match
+        return FilterResult.keep;
+    }
+
+    /// Evaluate data against log filter policies using simple substring matching (no Hyperscan)
+    /// Returns FilterResult.keep or FilterResult.drop based on first matching policy
+    /// If no policies match, defaults to FilterResult.keep
+    pub fn evaluate(
+        self: *const FilterEvaluator,
+        ctx: *const anyopaque,
+        field_accessor: FieldAccessor,
+    ) FilterResult {
+        // Get current policy snapshot (atomic, lock-free)
+        const snapshot = self.registry.getSnapshot() orelse return FilterResult.keep;
+        const policies = snapshot.getLogFilterPolicies();
+
+        // Process policies in order - first fully matching policy wins
+        for (snapshot.log_filter_indices) |policy_idx| {
+            const policy = &policies[policy_idx];
+
+            // Skip disabled policies
+            if (!policy.enabled) continue;
+
+            const filter_config = policy.filter orelse continue;
+
+            // Check if all matchers match using simple substring matching
+            const all_match = matchesAllMatchers(ctx, field_accessor, filter_config.matchers.items);
 
             if (all_match) {
                 return switch (filter_config.action) {
@@ -156,6 +193,18 @@ fn matchSingleMatcherWithHyperscan(
     // If negate=true: we want TRUE when the pattern is NOT found
     // If negate=false: we want TRUE when the pattern IS found
     return if (matcher.negate) !scan_result.matched else scan_result.matched;
+}
+
+/// Check if all matchers match using simple substring matching
+/// All matchers must match for the overall result to be true (AND logic)
+fn matchesAllMatchers(ctx: *const anyopaque, field_accessor: FieldAccessor, matchers: []const LogMatcher) bool {
+    if (matchers.len == 0) return false;
+
+    for (matchers) |matcher| {
+        if (!matchSingleMatcher(ctx, field_accessor, matcher)) return false;
+    }
+
+    return true;
 }
 
 /// Check if a single matcher matches using the field accessor

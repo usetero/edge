@@ -666,6 +666,38 @@ pub const Database = struct {
         return found;
     }
 
+    /// Find the first matching pattern and return its ID
+    /// Returns null if no pattern matches
+    pub fn findFirstMatch(self: *const Self, scratch: *Scratch, data: []const u8) Error!?u32 {
+        const Context = struct {
+            found: bool = false,
+            pattern_id: u32 = 0,
+        };
+        var ctx = Context{};
+
+        const rc = c.hs_scan(
+            self.handle,
+            data.ptr,
+            @intCast(data.len),
+            0,
+            scratch.handle,
+            struct {
+                fn handler(id: c_uint, _: c_ulonglong, _: c_ulonglong, _: c_uint, context: ?*anyopaque) callconv(.c) c_int {
+                    const ptr: *Context = @ptrCast(@alignCast(context));
+                    ptr.found = true;
+                    ptr.pattern_id = id;
+                    return 1; // Stop scanning after first match
+                }
+            }.handler,
+            &ctx,
+        );
+
+        if (rc == c.HS_SCAN_TERMINATED) return ctx.pattern_id;
+        if (rc != c.HS_SUCCESS) return mapError(rc);
+        if (ctx.found) return ctx.pattern_id;
+        return null;
+    }
+
     /// Open a stream for incremental scanning (streaming mode only)
     pub fn openStream(self: *const Self) Error!Stream {
         var stream: ?*c.hs_stream_t = null;

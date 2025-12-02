@@ -39,8 +39,10 @@ pub const PatternInfo = struct {
 pub const RegexDatabase = struct {
     /// The compiled Hyperscan database
     db: hyperscan.Database,
-    /// Scratch space for scanning (one per DB, can be cloned for threads)
+    /// Scratch space for scanning - protected by mutex for thread-safety
     scratch: hyperscan.Scratch,
+    /// Mutex to protect scratch space access (Hyperscan scratch is not thread-safe)
+    mutex: std.Thread.Mutex,
     /// Maps Hyperscan pattern ID -> PatternInfo
     pattern_infos: []const PatternInfo,
     /// Allocator used for pattern_infos
@@ -345,6 +347,7 @@ fn compilePatterns(
     regex_db.* = .{
         .db = db,
         .scratch = scratch,
+        .mutex = .{},
         .pattern_infos = pattern_infos,
         .allocator = allocator,
     };
@@ -366,6 +369,9 @@ pub const ScanResult = struct {
 
 /// Scan a value against a regex database
 /// Returns the first match found (for short-circuit evaluation)
+///
+/// Uses a mutex to protect the scratch space, as Hyperscan scratch spaces
+/// cannot be used concurrently from multiple threads.
 pub fn scanValue(
     db: *const RegexDatabase,
     value: []const u8,
@@ -375,11 +381,20 @@ pub fn scanValue(
         .pattern_info = null,
     };
 
-    // Use Hyperscan's matches() for quick check, or scan for details
-    var scanner = db.db.scan(@constCast(&db.scratch), value);
-    if (scanner.next()) |match| {
+    // Lock mutex for thread-safe scratch access
+    // We need to cast away const because the mutex needs to be modified
+    const mutable_db = @constCast(db);
+    mutable_db.mutex.lock();
+    defer mutable_db.mutex.unlock();
+
+    // Find first matching pattern
+    const match_id = db.db.findFirstMatch(&mutable_db.scratch, value) catch return result;
+
+    if (match_id) |id| {
         result.matched = true;
-        result.pattern_info = db.pattern_infos[match.id];
+        if (id < db.pattern_infos.len) {
+            result.pattern_info = db.pattern_infos[id];
+        }
     }
 
     return result;

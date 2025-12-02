@@ -64,6 +64,19 @@ fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     }
 }
 
+fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
+    _ = sig;
+    _ = ctx_ptr;
+
+    std.debug.print("\n=== SEGFAULT ===\n", .{});
+    std.debug.print("Faulting address: 0x{x}\n", .{@intFromPtr(info.addr)});
+    std.debug.print("Signal code: {d}\n", .{info.code});
+    std.debug.print("Stack trace:\n", .{});
+    std.debug.dumpCurrentStackTrace(@returnAddress());
+
+    std.posix.abort();
+}
+
 fn installShutdownHandlers() void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
         std.log.warn("Signal handling not supported on this platform", .{});
@@ -79,7 +92,15 @@ fn installShutdownHandlers() void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 
-    std.log.debug("Installed signal handlers for SIGINT and SIGTERM", .{});
+    // Install SIGSEGV handler to capture crash info
+    const segv_act = std.posix.Sigaction{
+        .handler = .{ .sigaction = handleSegfault },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.SIGINFO,
+    };
+    std.posix.sigaction(std.posix.SIG.SEGV, &segv_act, null);
+
+    std.log.debug("Installed signal handlers for SIGINT, SIGTERM, and SIGSEGV", .{});
 }
 
 // =============================================================================
