@@ -175,12 +175,10 @@ pub const HttpProvider = struct {
         const uri = try std.Uri.parse(self.config_url);
 
         // Create SyncRequest with metadata
-        var sync_request = SyncRequest{
+        const sync_request = SyncRequest{
             .client_metadata = ClientMetadata{
-                .client_id = self.edge_id,
-                .client_version = self.version,
-                .workspace_id = self.workspace_id,
                 .last_sync_timestamp_unix_nano = @intCast(self.last_sync_timestamp),
+                .resource_attributes = .{},
             },
         };
 

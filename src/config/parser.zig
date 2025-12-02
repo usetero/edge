@@ -4,11 +4,9 @@ const ProxyConfig = types.ProxyConfig;
 const LogLevel = types.LogLevel;
 const Policy = types.Policy;
 const PolicyType = types.PolicyType;
-const TelemetryType = types.TelemetryType;
 const FilterAction = types.FilterAction;
-const FilterConfig = types.FilterConfig;
-const Matcher = types.Matcher;
-const MatchType = types.MatchType;
+const LogFilterConfig = types.LogFilterConfig;
+const LogMatcher = types.LogMatcher;
 
 /// JSON schema for a matcher
 const MatcherJson = struct {
@@ -23,8 +21,6 @@ const PolicyJson = struct {
     id: ?[]const u8 = null,
     name: []const u8,
     description: ?[]const u8 = null,
-    policy_type: []const u8,
-    telemetry_types: [][]const u8,
     priority: i32 = 0,
     enabled: bool = true,
     // For filter policies
@@ -143,45 +139,29 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
     var policies = try allocator.alloc(Policy, json_policies.len);
 
     for (json_policies, 0..) |json_policy, i| {
-        // Parse policy type
-        const policy_type = try parsePolicyType(json_policy.policy_type);
-
-        // Parse telemetry types
-        var telemetry_types = std.ArrayListUnmanaged(TelemetryType){};
-        try telemetry_types.ensureTotalCapacity(allocator, json_policy.telemetry_types.len);
-        for (json_policy.telemetry_types) |tt| {
-            telemetry_types.appendAssumeCapacity(try parseTelemetryType(tt));
-        }
-
         // Allocate and copy strings
         const id = if (json_policy.id) |id| try allocator.dupe(u8, id) else &.{};
         const name = try allocator.dupe(u8, json_policy.name);
         const description = if (json_policy.description) |desc| try allocator.dupe(u8, desc) else &.{};
 
-        // Build config based on policy type
-        var config: ?Policy.config_union = null;
-        if (policy_type == .POLICY_TYPE_LOG_FILTER) {
+        // Build filter config
+        var filter: ?LogFilterConfig = null;
+        if (json_policy.matchers != null or json_policy.action != null) {
             // Parse matchers
-            var matchers = std.ArrayListUnmanaged(Matcher){};
+            var matchers = std.ArrayListUnmanaged(LogMatcher){};
             if (json_policy.matchers) |json_matchers| {
                 try matchers.ensureTotalCapacity(allocator, json_matchers.len);
                 for (json_matchers) |jm| {
-                    matchers.appendAssumeCapacity(.{
-                        .match_type = try parseMatchType(jm.match_type),
-                        .key = if (jm.key.len > 0) try allocator.dupe(u8, jm.key) else &.{},
-                        .regex = try allocator.dupe(u8, jm.regex),
-                        .negate = jm.negate,
-                    });
+                    const matcher = try parseLogMatcher(allocator, jm);
+                    matchers.appendAssumeCapacity(matcher);
                 }
             }
             // Parse action
             const action = if (json_policy.action) |a| try parseFilterAction(a) else .FILTER_ACTION_UNSPECIFIED;
 
-            config = .{
-                .filter = FilterConfig{
-                    .matchers = matchers,
-                    .action = action,
-                },
+            filter = LogFilterConfig{
+                .matchers = matchers,
+                .action = action,
             };
         }
 
@@ -189,15 +169,41 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
             .id = id,
             .name = name,
             .description = description,
-            .policy_type = policy_type,
-            .telemetry_types = telemetry_types,
             .priority = json_policy.priority,
             .enabled = json_policy.enabled,
-            .config = config,
+            .filter = filter,
         };
     }
 
     return policies;
+}
+
+/// Parse a LogMatcher from JSON
+fn parseLogMatcher(allocator: std.mem.Allocator, jm: MatcherJson) !LogMatcher {
+    // Validate match_type before allocating to avoid leaks on error
+    const match_case: enum { log_body, log_severity_text, log_attribute, resource_attribute, resource_schema_url, scope_name, scope_version, scope_attribute, scope_schema_url } =
+        if (std.mem.eql(u8, jm.match_type, "log_body")) .log_body else if (std.mem.eql(u8, jm.match_type, "log_severity_text")) .log_severity_text else if (std.mem.eql(u8, jm.match_type, "log_attribute")) .log_attribute else if (std.mem.eql(u8, jm.match_type, "resource_attribute")) .resource_attribute else if (std.mem.eql(u8, jm.match_type, "resource_schema_url")) .resource_schema_url else if (std.mem.eql(u8, jm.match_type, "scope_name")) .scope_name else if (std.mem.eql(u8, jm.match_type, "scope_version")) .scope_version else if (std.mem.eql(u8, jm.match_type, "scope_attribute")) .scope_attribute else if (std.mem.eql(u8, jm.match_type, "scope_schema_url")) .scope_schema_url else return error.InvalidMatchType;
+
+    const regex = try allocator.dupe(u8, jm.regex);
+    const key = if (jm.key.len > 0) try allocator.dupe(u8, jm.key) else &.{};
+
+    // Map match_type string to the appropriate union variant
+    const match: LogMatcher.match_union = switch (match_case) {
+        .log_body => .{ .log_body = .{ .regex = regex } },
+        .log_severity_text => .{ .log_severity_text = .{ .regex = regex } },
+        .log_attribute => .{ .log_attribute = .{ .key = key, .regex = regex } },
+        .resource_attribute => .{ .resource_attribute = .{ .key = key, .regex = regex } },
+        .resource_schema_url => .{ .resource_schema_url = .{ .regex = regex } },
+        .scope_name => .{ .scope_name = .{ .regex = regex } },
+        .scope_version => .{ .scope_version = .{ .regex = regex } },
+        .scope_attribute => .{ .scope_attribute = .{ .key = key, .regex = regex } },
+        .scope_schema_url => .{ .scope_schema_url = .{ .regex = regex } },
+    };
+
+    return LogMatcher{
+        .negate = jm.negate,
+        .match = match,
+    };
 }
 
 /// Parse provider configurations from JSON array
@@ -240,43 +246,11 @@ fn parseProviderType(s: []const u8) !types.ProviderType {
     return error.InvalidProviderType;
 }
 
-/// Parse PolicyType from string
-fn parsePolicyType(s: []const u8) !PolicyType {
-    if (std.mem.eql(u8, s, "filter") or std.mem.eql(u8, s, "log_filter")) return .POLICY_TYPE_LOG_FILTER;
-    if (std.mem.eql(u8, s, "redaction") or std.mem.eql(u8, s, "redact")) return .POLICY_TYPE_REDACTION;
-    return error.InvalidPolicyType;
-}
-
-/// Parse TelemetryType from string
-fn parseTelemetryType(s: []const u8) !TelemetryType {
-    if (std.mem.eql(u8, s, "log") or std.mem.eql(u8, s, "logs")) return .TELEMETRY_TYPE_LOGS;
-    return error.InvalidTelemetryType;
-}
-
 /// Parse FilterAction from string
 fn parseFilterAction(s: []const u8) !FilterAction {
     if (std.mem.eql(u8, s, "keep")) return .FILTER_ACTION_KEEP;
     if (std.mem.eql(u8, s, "drop")) return .FILTER_ACTION_DROP;
     return error.InvalidAction;
-}
-
-/// Parse MatchType from string
-fn parseMatchType(s: []const u8) !MatchType {
-    if (std.mem.eql(u8, s, "log_body")) return .MATCH_TYPE_LOG_BODY;
-    if (std.mem.eql(u8, s, "log_severity_text")) return .MATCH_TYPE_LOG_SEVERITY_TEXT;
-    if (std.mem.eql(u8, s, "log_severity_number")) return .MATCH_TYPE_LOG_SEVERITY_NUMBER;
-    if (std.mem.eql(u8, s, "log_attribute")) return .MATCH_TYPE_LOG_ATTRIBUTE;
-    if (std.mem.eql(u8, s, "resource_attribute")) return .MATCH_TYPE_RESOURCE_ATTRIBUTE;
-    if (std.mem.eql(u8, s, "scope_name")) return .MATCH_TYPE_SCOPE_NAME;
-    if (std.mem.eql(u8, s, "scope_version")) return .MATCH_TYPE_SCOPE_VERSION;
-    if (std.mem.eql(u8, s, "scope_attribute")) return .MATCH_TYPE_SCOPE_ATTRIBUTE;
-    if (std.mem.eql(u8, s, "metric_name")) return .MATCH_TYPE_METRIC_NAME;
-    if (std.mem.eql(u8, s, "metric_attribute")) return .MATCH_TYPE_METRIC_ATTRIBUTE;
-    if (std.mem.eql(u8, s, "span_name")) return .MATCH_TYPE_SPAN_NAME;
-    if (std.mem.eql(u8, s, "span_kind")) return .MATCH_TYPE_SPAN_KIND;
-    if (std.mem.eql(u8, s, "span_status")) return .MATCH_TYPE_SPAN_STATUS;
-    if (std.mem.eql(u8, s, "span_attribute")) return .MATCH_TYPE_SPAN_ATTRIBUTE;
-    return error.InvalidMatchType;
 }
 
 fn parseIpv4(s: []const u8) ![4]u8 {
@@ -347,22 +321,58 @@ test "parseConfigFile with JSON" {
     try std.testing.expectEqual(@as(usize, 0), config.policy_providers.len);
 }
 
-test "parsePolicyType" {
-    try std.testing.expect(try parsePolicyType("filter") == .POLICY_TYPE_LOG_FILTER);
-    try std.testing.expect(try parsePolicyType("log_filter") == .POLICY_TYPE_LOG_FILTER);
-    try std.testing.expect(try parsePolicyType("redaction") == .POLICY_TYPE_REDACTION);
-    try std.testing.expect(try parsePolicyType("redact") == .POLICY_TYPE_REDACTION);
-    try std.testing.expectError(error.InvalidPolicyType, parsePolicyType("invalid"));
-}
-
-test "parseTelemetryType" {
-    try std.testing.expect(try parseTelemetryType("log") == .TELEMETRY_TYPE_LOGS);
-    try std.testing.expect(try parseTelemetryType("logs") == .TELEMETRY_TYPE_LOGS);
-    try std.testing.expectError(error.InvalidTelemetryType, parseTelemetryType("invalid"));
-}
-
 test "parseFilterAction" {
     try std.testing.expect(try parseFilterAction("keep") == .FILTER_ACTION_KEEP);
     try std.testing.expect(try parseFilterAction("drop") == .FILTER_ACTION_DROP);
     try std.testing.expectError(error.InvalidAction, parseFilterAction("invalid"));
+}
+
+test "parseLogMatcher" {
+    const allocator = std.testing.allocator;
+
+    // Test log_body matcher
+    const body_matcher = try parseLogMatcher(allocator, .{
+        .match_type = "log_body",
+        .regex = "test.*",
+    });
+    defer {
+        if (body_matcher.match) |m| {
+            switch (m) {
+                .log_body => |b| allocator.free(b.regex),
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(body_matcher.match != null);
+    try std.testing.expect(body_matcher.match.? == .log_body);
+    try std.testing.expectEqualStrings("test.*", body_matcher.match.?.log_body.regex);
+
+    // Test log_attribute matcher with key
+    const attr_matcher = try parseLogMatcher(allocator, .{
+        .match_type = "log_attribute",
+        .key = "service.name",
+        .regex = "payment.*",
+        .negate = true,
+    });
+    defer {
+        if (attr_matcher.match) |m| {
+            switch (m) {
+                .log_attribute => |a| {
+                    allocator.free(a.key);
+                    allocator.free(a.regex);
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(attr_matcher.negate == true);
+    try std.testing.expect(attr_matcher.match.? == .log_attribute);
+    try std.testing.expectEqualStrings("service.name", attr_matcher.match.?.log_attribute.key);
+    try std.testing.expectEqualStrings("payment.*", attr_matcher.match.?.log_attribute.regex);
+
+    // Test invalid match type
+    try std.testing.expectError(error.InvalidMatchType, parseLogMatcher(allocator, .{
+        .match_type = "invalid_type",
+        .regex = "test",
+    }));
 }

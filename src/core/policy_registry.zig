@@ -3,106 +3,19 @@ const proto = @import("proto");
 const policy_source = @import("./policy_source.zig");
 
 const Policy = proto.policy.Policy;
-const TelemetryType = proto.policy.TelemetryType;
-const PolicyType = proto.policy.PolicyType;
 const SourceType = policy_source.SourceType;
 const PolicyMetadata = policy_source.PolicyMetadata;
-
-/// Index key combining telemetry type and policy type for pre-filtered lookups
-pub const PolicyIndexKey = struct {
-    telemetry_type: TelemetryType,
-    policy_type: PolicyType,
-};
 
 /// Immutable snapshot of policies for lock-free reads
 pub const PolicySnapshot = struct {
     /// All policies in this snapshot
     policies: []const Policy,
 
-    /// Pre-filtered indices into policies array, keyed by (telemetry_type, policy_type)
-    /// Stores slices of indices pointing into the policies array
-    indices_by_telemetry_type: []const []const u32,
-    indices_by_key: []const []const u32,
-
-    /// Backing storage for the index slices
-    telemetry_index_storage: []const u32,
-    key_index_storage: []const u32,
-
     version: u64,
     allocator: std.mem.Allocator,
 
-    /// Number of telemetry types we index (for bounds checking)
-    const NUM_TELEMETRY_TYPES = 2; // UNSPECIFIED, LOGS
-    /// Number of policy types we index
-    const NUM_POLICY_TYPES = 3; // UNSPECIFIED, LOG_FILTER, REDACTION
-    /// Total number of key combinations
-    const NUM_KEY_COMBINATIONS = NUM_TELEMETRY_TYPES * NUM_POLICY_TYPES;
-
     pub fn deinit(self: *const PolicySnapshot) void {
         self.allocator.free(self.policies);
-        self.allocator.free(self.indices_by_telemetry_type);
-        self.allocator.free(self.indices_by_key);
-        self.allocator.free(self.telemetry_index_storage);
-        self.allocator.free(self.key_index_storage);
-    }
-
-    /// Get policies that apply to a specific telemetry type
-    pub fn getPoliciesForType(self: *const PolicySnapshot, telemetry_type: TelemetryType) []const Policy {
-        const type_idx = telemetryTypeToIndex(telemetry_type);
-        if (type_idx >= self.indices_by_telemetry_type.len) {
-            return &.{};
-        }
-        const indices = self.indices_by_telemetry_type[type_idx];
-        return self.indicesToPolicies(indices);
-    }
-
-    /// Get policies that apply to a specific telemetry type and policy type
-    pub fn getPoliciesForKey(self: *const PolicySnapshot, telemetry_type: TelemetryType, policy_type: PolicyType) []const Policy {
-        const key_idx = keyToIndex(telemetry_type, policy_type);
-        if (key_idx >= self.indices_by_key.len) {
-            return &.{};
-        }
-        const indices = self.indices_by_key[key_idx];
-        return self.indicesToPolicies(indices);
-    }
-
-    /// Convert indices to policy slice (returns pointers into the policies array)
-    fn indicesToPolicies(self: *const PolicySnapshot, indices: []const u32) []const Policy {
-        if (indices.len == 0) {
-            return &.{};
-        }
-        // Return a contiguous slice if possible, otherwise caller iterates indices
-        // For now, we return the subset - but this requires the caller to understand
-        // they're getting a subset. We'll use the first/last optimization.
-        const first = indices[0];
-        const last = indices[indices.len - 1];
-
-        // Check if indices are contiguous
-        if (last - first + 1 == indices.len) {
-            return self.policies[first .. last + 1];
-        }
-
-        // Non-contiguous case - return empty and let caller use getIndicesForType
-        // In practice, with proper sorting during creation, this should be contiguous
-        return self.policies[first .. last + 1];
-    }
-
-    /// Get raw indices for a telemetry type (for non-contiguous iteration)
-    pub fn getIndicesForType(self: *const PolicySnapshot, telemetry_type: TelemetryType) []const u32 {
-        const type_idx = telemetryTypeToIndex(telemetry_type);
-        if (type_idx >= self.indices_by_telemetry_type.len) {
-            return &.{};
-        }
-        return self.indices_by_telemetry_type[type_idx];
-    }
-
-    /// Get raw indices for a key (for non-contiguous iteration)
-    pub fn getIndicesForKey(self: *const PolicySnapshot, telemetry_type: TelemetryType, policy_type: PolicyType) []const u32 {
-        const key_idx = keyToIndex(telemetry_type, policy_type);
-        if (key_idx >= self.indices_by_key.len) {
-            return &.{};
-        }
-        return self.indices_by_key[key_idx];
     }
 
     /// Get a policy by index
@@ -111,18 +24,6 @@ pub const PolicySnapshot = struct {
             return null;
         }
         return &self.policies[idx];
-    }
-
-    pub fn telemetryTypeToIndex(t: TelemetryType) usize {
-        return @intCast(@intFromEnum(t));
-    }
-
-    pub fn policyTypeToIndex(p: PolicyType) usize {
-        return @intCast(@intFromEnum(p));
-    }
-
-    fn keyToIndex(telemetry_type: TelemetryType, policy_type: PolicyType) usize {
-        return telemetryTypeToIndex(telemetry_type) * NUM_POLICY_TYPES + policyTypeToIndex(policy_type);
     }
 };
 
@@ -298,21 +199,16 @@ pub const PolicyRegistry = struct {
 
         @memcpy(policies_slice, self.policies.items);
 
-        // Build pre-filtered indices
-        const index_result = try self.buildIndices(policies_slice);
-
         // Increment version
         const new_version = self.version.load(.monotonic) + 1;
         self.version.store(new_version, .monotonic);
 
         // Create new snapshot
+        // TODO: In the future we should do organization and filtering here based
+        // on the labels in the policies.
         const snapshot = try self.allocator.create(PolicySnapshot);
         snapshot.* = .{
             .policies = policies_slice,
-            .indices_by_telemetry_type = index_result.indices_by_telemetry_type,
-            .indices_by_key = index_result.indices_by_key,
-            .telemetry_index_storage = index_result.telemetry_index_storage,
-            .key_index_storage = index_result.key_index_storage,
             .version = new_version,
             .allocator = self.allocator,
         };
@@ -325,118 +221,6 @@ pub const PolicyRegistry = struct {
             old.deinit();
             self.allocator.destroy(old);
         }
-    }
-
-    const IndexBuildResult = struct {
-        indices_by_telemetry_type: []const []const u32,
-        indices_by_key: []const []const u32,
-        telemetry_index_storage: []const u32,
-        key_index_storage: []const u32,
-    };
-
-    /// Build pre-filtered indices for fast lookup by telemetry type and policy type
-    fn buildIndices(self: *PolicyRegistry, policies: []const Policy) !IndexBuildResult {
-        const num_telemetry_types = PolicySnapshot.NUM_TELEMETRY_TYPES;
-        const num_key_combinations = PolicySnapshot.NUM_KEY_COMBINATIONS;
-
-        // First pass: count policies per telemetry type and per key
-        var telemetry_counts: [num_telemetry_types]usize = .{0} ** num_telemetry_types;
-        var key_counts: [num_key_combinations]usize = .{0} ** num_key_combinations;
-
-        for (policies) |policy| {
-            const policy_type_idx = PolicySnapshot.policyTypeToIndex(policy.policy_type);
-
-            // A policy can apply to multiple telemetry types
-            for (policy.telemetry_types.items) |telemetry_type| {
-                const telemetry_idx = PolicySnapshot.telemetryTypeToIndex(telemetry_type);
-                if (telemetry_idx < num_telemetry_types) {
-                    telemetry_counts[telemetry_idx] += 1;
-
-                    // Also count for the combined key
-                    const key_idx = telemetry_idx * PolicySnapshot.NUM_POLICY_TYPES + policy_type_idx;
-                    if (key_idx < num_key_combinations) {
-                        key_counts[key_idx] += 1;
-                    }
-                }
-            }
-        }
-
-        // Calculate total storage needed
-        var total_telemetry_indices: usize = 0;
-        for (telemetry_counts) |count| {
-            total_telemetry_indices += count;
-        }
-
-        var total_key_indices: usize = 0;
-        for (key_counts) |count| {
-            total_key_indices += count;
-        }
-
-        // Allocate storage
-        const telemetry_index_storage = try self.allocator.alloc(u32, total_telemetry_indices);
-        errdefer self.allocator.free(telemetry_index_storage);
-
-        const key_index_storage = try self.allocator.alloc(u32, total_key_indices);
-        errdefer self.allocator.free(key_index_storage);
-
-        // Allocate slice arrays
-        const indices_by_telemetry_type = try self.allocator.alloc([]const u32, num_telemetry_types);
-        errdefer self.allocator.free(indices_by_telemetry_type);
-
-        const indices_by_key = try self.allocator.alloc([]const u32, num_key_combinations);
-        errdefer self.allocator.free(indices_by_key);
-
-        // Set up slices pointing into storage
-        var telemetry_offset: usize = 0;
-        for (0..num_telemetry_types) |i| {
-            const count = telemetry_counts[i];
-            indices_by_telemetry_type[i] = telemetry_index_storage[telemetry_offset..][0..count];
-            telemetry_offset += count;
-        }
-
-        var key_offset: usize = 0;
-        for (0..num_key_combinations) |i| {
-            const count = key_counts[i];
-            indices_by_key[i] = key_index_storage[key_offset..][0..count];
-            key_offset += count;
-        }
-
-        // Second pass: populate indices
-        var telemetry_cursors: [num_telemetry_types]usize = .{0} ** num_telemetry_types;
-        var key_cursors: [num_key_combinations]usize = .{0} ** num_key_combinations;
-
-        for (policies, 0..) |policy, policy_idx| {
-            const policy_type_idx = PolicySnapshot.policyTypeToIndex(policy.policy_type);
-            const idx: u32 = @intCast(policy_idx);
-
-            for (policy.telemetry_types.items) |telemetry_type| {
-                const telemetry_idx = PolicySnapshot.telemetryTypeToIndex(telemetry_type);
-                if (telemetry_idx < num_telemetry_types) {
-                    // Add to telemetry type index
-                    const cursor = telemetry_cursors[telemetry_idx];
-                    // Cast away const for writing during initialization
-                    const writable_slice: []u32 = @constCast(indices_by_telemetry_type[telemetry_idx]);
-                    writable_slice[cursor] = idx;
-                    telemetry_cursors[telemetry_idx] = cursor + 1;
-
-                    // Add to combined key index
-                    const key_idx = telemetry_idx * PolicySnapshot.NUM_POLICY_TYPES + policy_type_idx;
-                    if (key_idx < num_key_combinations) {
-                        const key_cursor = key_cursors[key_idx];
-                        const writable_key_slice: []u32 = @constCast(indices_by_key[key_idx]);
-                        writable_key_slice[key_cursor] = idx;
-                        key_cursors[key_idx] = key_cursor + 1;
-                    }
-                }
-            }
-        }
-
-        return .{
-            .indices_by_telemetry_type = indices_by_telemetry_type,
-            .indices_by_key = indices_by_key,
-            .telemetry_index_storage = telemetry_index_storage,
-            .key_index_storage = key_index_storage,
-        };
     }
 
     /// Get current policy snapshot (lock-free read)
@@ -568,18 +352,12 @@ pub const TestPolicyProvider = struct {
 fn createTestPolicy(
     allocator: std.mem.Allocator,
     name: []const u8,
-    policy_type: PolicyType,
-    telemetry_types: []const TelemetryType,
 ) !Policy {
     var policy = Policy{
         .name = try allocator.dupe(u8, name),
-        .policy_type = policy_type,
         .enabled = true,
     };
-
-    for (telemetry_types) |tt| {
-        try policy.telemetry_types.append(allocator, tt);
-    }
+    _ = &policy;
 
     return policy;
 }
@@ -607,12 +385,7 @@ test "PolicyRegistry: add single policy" {
     var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
-    var policy = try createTestPolicy(
-        allocator,
-        "test-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy = try createTestPolicy(allocator, "test-policy");
     defer freeTestPolicy(allocator, &policy);
 
     try registry.updatePolicies(&.{policy}, .file);
@@ -630,28 +403,13 @@ test "PolicyRegistry: add multiple policies" {
     var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
-    var policy1 = try createTestPolicy(
-        allocator,
-        "policy-1",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy1 = try createTestPolicy(allocator, "policy-1");
     defer freeTestPolicy(allocator, &policy1);
 
-    var policy2 = try createTestPolicy(
-        allocator,
-        "policy-2",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy2 = try createTestPolicy(allocator, "policy-2");
     defer freeTestPolicy(allocator, &policy2);
 
-    var policy3 = try createTestPolicy(
-        allocator,
-        "policy-3",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_UNSPECIFIED},
-    );
+    var policy3 = try createTestPolicy(allocator, "policy-3");
     defer freeTestPolicy(allocator, &policy3);
 
     try registry.updatePolicies(&.{ policy1, policy2, policy3 }, .file);
@@ -669,24 +427,15 @@ test "PolicyRegistry: update existing policy from same source" {
     defer registry.deinit();
 
     // Add initial policy
-    var policy1 = try createTestPolicy(
-        allocator,
-        "test-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy1 = try createTestPolicy(allocator, "test-policy");
     defer freeTestPolicy(allocator, &policy1);
 
     try registry.updatePolicies(&.{policy1}, .file);
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
-    // Update with same name, different type
-    var policy2 = try createTestPolicy(
-        allocator,
-        "test-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    // Update with same name
+    var policy2 = try createTestPolicy(allocator, "test-policy");
+    policy2.priority = 10; // Different priority
     defer freeTestPolicy(allocator, &policy2);
 
     try registry.updatePolicies(&.{policy2}, .file);
@@ -696,7 +445,7 @@ test "PolicyRegistry: update existing policy from same source" {
 
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
-    try testing.expectEqual(PolicyType.POLICY_TYPE_REDACTION, snapshot.?.policies[0].policy_type);
+    try testing.expectEqual(@as(i32, 10), snapshot.?.policies[0].priority);
 }
 
 // -----------------------------------------------------------------------------
@@ -709,23 +458,15 @@ test "PolicyRegistry: HTTP source takes priority over file source" {
     defer registry.deinit();
 
     // Add policy from HTTP source
-    var http_policy = try createTestPolicy(
-        allocator,
-        "shared-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var http_policy = try createTestPolicy(allocator, "shared-policy");
+    http_policy.priority = 1;
     defer freeTestPolicy(allocator, &http_policy);
 
     try registry.updatePolicies(&.{http_policy}, .http);
 
     // Try to update with file source (should be ignored)
-    var file_policy = try createTestPolicy(
-        allocator,
-        "shared-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var file_policy = try createTestPolicy(allocator, "shared-policy");
+    file_policy.priority = 2;
     defer freeTestPolicy(allocator, &file_policy);
 
     try registry.updatePolicies(&.{file_policy}, .file);
@@ -734,7 +475,7 @@ test "PolicyRegistry: HTTP source takes priority over file source" {
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
     try testing.expectEqual(@as(usize, 1), snapshot.?.policies.len);
-    try testing.expectEqual(PolicyType.POLICY_TYPE_LOG_FILTER, snapshot.?.policies[0].policy_type);
+    try testing.expectEqual(@as(i32, 1), snapshot.?.policies[0].priority);
 }
 
 test "PolicyRegistry: HTTP source can update file source policy" {
@@ -743,23 +484,15 @@ test "PolicyRegistry: HTTP source can update file source policy" {
     defer registry.deinit();
 
     // Add policy from file source
-    var file_policy = try createTestPolicy(
-        allocator,
-        "shared-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var file_policy = try createTestPolicy(allocator, "shared-policy");
+    file_policy.priority = 1;
     defer freeTestPolicy(allocator, &file_policy);
 
     try registry.updatePolicies(&.{file_policy}, .file);
 
     // Update with HTTP source (should replace)
-    var http_policy = try createTestPolicy(
-        allocator,
-        "shared-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var http_policy = try createTestPolicy(allocator, "shared-policy");
+    http_policy.priority = 2;
     defer freeTestPolicy(allocator, &http_policy);
 
     try registry.updatePolicies(&.{http_policy}, .http);
@@ -768,7 +501,7 @@ test "PolicyRegistry: HTTP source can update file source policy" {
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
     try testing.expectEqual(@as(usize, 1), snapshot.?.policies.len);
-    try testing.expectEqual(PolicyType.POLICY_TYPE_REDACTION, snapshot.?.policies[0].policy_type);
+    try testing.expectEqual(@as(i32, 2), snapshot.?.policies[0].priority);
 }
 
 test "PolicyRegistry: multiple sources with different policies" {
@@ -777,23 +510,13 @@ test "PolicyRegistry: multiple sources with different policies" {
     defer registry.deinit();
 
     // Add policies from file source
-    var file_policy = try createTestPolicy(
-        allocator,
-        "file-only-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var file_policy = try createTestPolicy(allocator, "file-only-policy");
     defer freeTestPolicy(allocator, &file_policy);
 
     try registry.updatePolicies(&.{file_policy}, .file);
 
     // Add policies from HTTP source
-    var http_policy = try createTestPolicy(
-        allocator,
-        "http-only-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var http_policy = try createTestPolicy(allocator, "http-only-policy");
     defer freeTestPolicy(allocator, &http_policy);
 
     try registry.updatePolicies(&.{http_policy}, .http);
@@ -812,20 +535,10 @@ test "PolicyRegistry: stale policies are removed when source updates" {
     defer registry.deinit();
 
     // Add two policies from file source
-    var policy1 = try createTestPolicy(
-        allocator,
-        "policy-1",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy1 = try createTestPolicy(allocator, "policy-1");
     defer freeTestPolicy(allocator, &policy1);
 
-    var policy2 = try createTestPolicy(
-        allocator,
-        "policy-2",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy2 = try createTestPolicy(allocator, "policy-2");
     defer freeTestPolicy(allocator, &policy2);
 
     try registry.updatePolicies(&.{ policy1, policy2 }, .file);
@@ -846,23 +559,13 @@ test "PolicyRegistry: stale removal only affects same source" {
     defer registry.deinit();
 
     // Add policy from file source
-    var file_policy = try createTestPolicy(
-        allocator,
-        "file-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var file_policy = try createTestPolicy(allocator, "file-policy");
     defer freeTestPolicy(allocator, &file_policy);
 
     try registry.updatePolicies(&.{file_policy}, .file);
 
     // Add policy from HTTP source
-    var http_policy = try createTestPolicy(
-        allocator,
-        "http-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var http_policy = try createTestPolicy(allocator, "http-policy");
     defer freeTestPolicy(allocator, &http_policy);
 
     try registry.updatePolicies(&.{http_policy}, .http);
@@ -883,20 +586,10 @@ test "PolicyRegistry: clearSource removes all policies from source" {
     defer registry.deinit();
 
     // Add policies from both sources
-    var file_policy = try createTestPolicy(
-        allocator,
-        "file-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var file_policy = try createTestPolicy(allocator, "file-policy");
     defer freeTestPolicy(allocator, &file_policy);
 
-    var http_policy = try createTestPolicy(
-        allocator,
-        "http-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var http_policy = try createTestPolicy(allocator, "http-policy");
     defer freeTestPolicy(allocator, &http_policy);
 
     try registry.updatePolicies(&.{file_policy}, .file);
@@ -913,134 +606,6 @@ test "PolicyRegistry: clearSource removes all policies from source" {
 }
 
 // -----------------------------------------------------------------------------
-// Pre-filtered Snapshot Index Tests
-// -----------------------------------------------------------------------------
-
-test "PolicySnapshot: getPoliciesForType returns correct policies" {
-    const allocator = testing.allocator;
-    var registry = PolicyRegistry.init(allocator);
-    defer registry.deinit();
-
-    // Create policies with different telemetry types
-    var logs_policy = try createTestPolicy(
-        allocator,
-        "logs-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
-    defer freeTestPolicy(allocator, &logs_policy);
-
-    var unspecified_policy = try createTestPolicy(
-        allocator,
-        "unspecified-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_UNSPECIFIED},
-    );
-    defer freeTestPolicy(allocator, &unspecified_policy);
-
-    try registry.updatePolicies(&.{ logs_policy, unspecified_policy }, .file);
-
-    const snapshot = registry.getSnapshot();
-    try testing.expect(snapshot != null);
-
-    // Check LOGS type returns correct policy
-    const logs_indices = snapshot.?.getIndicesForType(.TELEMETRY_TYPE_LOGS);
-    try testing.expectEqual(@as(usize, 1), logs_indices.len);
-
-    // Check UNSPECIFIED type returns correct policy
-    const unspecified_indices = snapshot.?.getIndicesForType(.TELEMETRY_TYPE_UNSPECIFIED);
-    try testing.expectEqual(@as(usize, 1), unspecified_indices.len);
-}
-
-test "PolicySnapshot: getPoliciesForKey returns correct policies" {
-    const allocator = testing.allocator;
-    var registry = PolicyRegistry.init(allocator);
-    defer registry.deinit();
-
-    // Create policies with different types
-    var filter_policy = try createTestPolicy(
-        allocator,
-        "filter-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
-    defer freeTestPolicy(allocator, &filter_policy);
-
-    var redaction_policy = try createTestPolicy(
-        allocator,
-        "redaction-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
-    defer freeTestPolicy(allocator, &redaction_policy);
-
-    try registry.updatePolicies(&.{ filter_policy, redaction_policy }, .file);
-
-    const snapshot = registry.getSnapshot();
-    try testing.expect(snapshot != null);
-
-    // Check filter policies for LOGS
-    const filter_indices = snapshot.?.getIndicesForKey(.TELEMETRY_TYPE_LOGS, .POLICY_TYPE_LOG_FILTER);
-    try testing.expectEqual(@as(usize, 1), filter_indices.len);
-
-    // Check redaction policies for LOGS
-    const redaction_indices = snapshot.?.getIndicesForKey(.TELEMETRY_TYPE_LOGS, .POLICY_TYPE_REDACTION);
-    try testing.expectEqual(@as(usize, 1), redaction_indices.len);
-
-    // Check that wrong combination returns empty
-    const wrong_indices = snapshot.?.getIndicesForKey(.TELEMETRY_TYPE_UNSPECIFIED, .POLICY_TYPE_LOG_FILTER);
-    try testing.expectEqual(@as(usize, 0), wrong_indices.len);
-}
-
-test "PolicySnapshot: policy with multiple telemetry types indexed correctly" {
-    const allocator = testing.allocator;
-    var registry = PolicyRegistry.init(allocator);
-    defer registry.deinit();
-
-    // Create policy that applies to multiple telemetry types
-    var multi_policy = Policy{
-        .name = try allocator.dupe(u8, "multi-telemetry-policy"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
-        .enabled = true,
-    };
-    try multi_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try multi_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_UNSPECIFIED);
-    defer multi_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{multi_policy}, .file);
-
-    const snapshot = registry.getSnapshot();
-    try testing.expect(snapshot != null);
-
-    // Should appear in both telemetry type indices
-    const logs_indices = snapshot.?.getIndicesForType(.TELEMETRY_TYPE_LOGS);
-    try testing.expectEqual(@as(usize, 1), logs_indices.len);
-
-    const unspecified_indices = snapshot.?.getIndicesForType(.TELEMETRY_TYPE_UNSPECIFIED);
-    try testing.expectEqual(@as(usize, 1), unspecified_indices.len);
-}
-
-test "PolicySnapshot: empty snapshot has empty indices" {
-    const allocator = testing.allocator;
-    var registry = PolicyRegistry.init(allocator);
-    defer registry.deinit();
-
-    // Create snapshot with no policies
-    try registry.updatePolicies(&.{}, .file);
-
-    const snapshot = registry.getSnapshot();
-    try testing.expect(snapshot != null);
-    try testing.expectEqual(@as(usize, 0), snapshot.?.policies.len);
-
-    // All indices should be empty
-    const logs_indices = snapshot.?.getIndicesForType(.TELEMETRY_TYPE_LOGS);
-    try testing.expectEqual(@as(usize, 0), logs_indices.len);
-
-    const filter_indices = snapshot.?.getIndicesForKey(.TELEMETRY_TYPE_LOGS, .POLICY_TYPE_LOG_FILTER);
-    try testing.expectEqual(@as(usize, 0), filter_indices.len);
-}
-
-// -----------------------------------------------------------------------------
 // Snapshot Versioning Tests
 // -----------------------------------------------------------------------------
 
@@ -1049,12 +614,7 @@ test "PolicyRegistry: snapshot version increments on update" {
     var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
-    var policy = try createTestPolicy(
-        allocator,
-        "test-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy = try createTestPolicy(allocator, "test-policy");
     defer freeTestPolicy(allocator, &policy);
 
     // First update
@@ -1081,12 +641,7 @@ test "PolicyRegistry: clearSource increments version" {
     var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
-    var policy = try createTestPolicy(
-        allocator,
-        "test-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy = try createTestPolicy(allocator, "test-policy");
     defer freeTestPolicy(allocator, &policy);
 
     try registry.updatePolicies(&.{policy}, .file);
@@ -1105,24 +660,19 @@ test "PolicyRegistry: clearSource increments version" {
 test "TestPolicyProvider: basic functionality" {
     const allocator = testing.allocator;
 
-    var provider = TestPolicyProvider.init(allocator, .file);
-    defer provider.deinit();
+    var prov = TestPolicyProvider.init(allocator, .file);
+    defer prov.deinit();
 
     // Add a policy
-    var policy = try createTestPolicy(
-        allocator,
-        "provider-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy = try createTestPolicy(allocator, "provider-policy");
     defer freeTestPolicy(allocator, &policy);
 
-    try provider.addPolicy(policy);
-    try testing.expectEqual(@as(usize, 1), provider.policies.items.len);
+    try prov.addPolicy(policy);
+    try testing.expectEqual(@as(usize, 1), prov.policies.items.len);
 
     // Remove the policy
-    provider.removePolicy("provider-policy");
-    try testing.expectEqual(@as(usize, 0), provider.policies.items.len);
+    prov.removePolicy("provider-policy");
+    try testing.expectEqual(@as(usize, 0), prov.policies.items.len);
 }
 
 test "TestPolicyProvider: integrates with PolicyRegistry" {
@@ -1135,12 +685,7 @@ test "TestPolicyProvider: integrates with PolicyRegistry" {
     defer file_provider.deinit();
 
     // Add policy to provider
-    var policy = try createTestPolicy(
-        allocator,
-        "provider-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy = try createTestPolicy(allocator, "provider-policy");
     defer freeTestPolicy(allocator, &policy);
 
     try file_provider.addPolicy(policy);
@@ -1183,20 +728,10 @@ test "TestPolicyProvider: multiple providers with different sources" {
     defer http_provider.deinit();
 
     // Add policies to providers
-    var file_policy = try createTestPolicy(
-        allocator,
-        "file-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var file_policy = try createTestPolicy(allocator, "file-policy");
     defer freeTestPolicy(allocator, &file_policy);
 
-    var http_policy = try createTestPolicy(
-        allocator,
-        "http-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var http_policy = try createTestPolicy(allocator, "http-policy");
     defer freeTestPolicy(allocator, &http_policy);
 
     try file_provider.addPolicy(file_policy);
@@ -1232,8 +767,8 @@ test "TestPolicyProvider: notifySubscribers updates registry" {
     var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
-    var provider = TestPolicyProvider.init(allocator, .file);
-    defer provider.deinit();
+    var prov = TestPolicyProvider.init(allocator, .file);
+    defer prov.deinit();
 
     // Create and subscribe callback
     const Ctx = struct {
@@ -1251,40 +786,30 @@ test "TestPolicyProvider: notifySubscribers updates registry" {
         .onUpdate = Ctx.onUpdate,
     };
 
-    try provider.subscribe(callback);
+    try prov.subscribe(callback);
     try testing.expectEqual(@as(usize, 0), registry.getPolicyCount());
 
     // Add policy and notify
-    var policy1 = try createTestPolicy(
-        allocator,
-        "policy-1",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy1 = try createTestPolicy(allocator, "policy-1");
     defer freeTestPolicy(allocator, &policy1);
 
-    try provider.addPolicy(policy1);
-    try provider.notifySubscribers();
+    try prov.addPolicy(policy1);
+    try prov.notifySubscribers();
 
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
     // Add another policy and notify
-    var policy2 = try createTestPolicy(
-        allocator,
-        "policy-2",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var policy2 = try createTestPolicy(allocator, "policy-2");
     defer freeTestPolicy(allocator, &policy2);
 
-    try provider.addPolicy(policy2);
-    try provider.notifySubscribers();
+    try prov.addPolicy(policy2);
+    try prov.notifySubscribers();
 
     try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
 
     // Remove policy and notify
-    provider.removePolicy("policy-1");
-    try provider.notifySubscribers();
+    prov.removePolicy("policy-1");
+    try prov.notifySubscribers();
 
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
@@ -1322,12 +847,8 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
     };
 
     // Add same-named policy to file provider first
-    var file_policy = try createTestPolicy(
-        allocator,
-        "shared-policy",
-        .POLICY_TYPE_LOG_FILTER,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var file_policy = try createTestPolicy(allocator, "shared-policy");
+    file_policy.priority = 1;
     defer freeTestPolicy(allocator, &file_policy);
 
     try file_provider.addPolicy(file_policy);
@@ -1336,17 +857,13 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
     // Verify file policy is in registry
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
     try testing.expectEqual(
-        PolicyType.POLICY_TYPE_LOG_FILTER,
-        registry.getSnapshot().?.policies[0].policy_type,
+        @as(i32, 1),
+        registry.getSnapshot().?.policies[0].priority,
     );
 
     // Add same-named policy to HTTP provider (should override)
-    var http_policy = try createTestPolicy(
-        allocator,
-        "shared-policy",
-        .POLICY_TYPE_REDACTION,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var http_policy = try createTestPolicy(allocator, "shared-policy");
+    http_policy.priority = 2;
     defer freeTestPolicy(allocator, &http_policy);
 
     try http_provider.addPolicy(http_policy);
@@ -1355,18 +872,14 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
     // Verify HTTP policy replaced file policy
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
     try testing.expectEqual(
-        PolicyType.POLICY_TYPE_REDACTION,
-        registry.getSnapshot().?.policies[0].policy_type,
+        @as(i32, 2),
+        registry.getSnapshot().?.policies[0].priority,
     );
 
     // Update file provider - should NOT override HTTP
     file_provider.clearPolicies();
-    var file_policy2 = try createTestPolicy(
-        allocator,
-        "shared-policy",
-        .POLICY_TYPE_UNSPECIFIED,
-        &.{.TELEMETRY_TYPE_LOGS},
-    );
+    var file_policy2 = try createTestPolicy(allocator, "shared-policy");
+    file_policy2.priority = 3;
     defer freeTestPolicy(allocator, &file_policy2);
 
     try file_provider.addPolicy(file_policy2);
@@ -1375,7 +888,7 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
     // Should still have HTTP version
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
     try testing.expectEqual(
-        PolicyType.POLICY_TYPE_REDACTION,
-        registry.getSnapshot().?.policies[0].policy_type,
+        @as(i32, 2),
+        registry.getSnapshot().?.policies[0].priority,
     );
 }

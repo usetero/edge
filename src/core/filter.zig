@@ -4,11 +4,10 @@ const policy_registry = @import("policy_registry.zig");
 
 const Policy = proto.policy.Policy;
 const PolicyType = proto.policy.PolicyType;
-const TelemetryType = proto.policy.TelemetryType;
 const FilterAction = proto.policy.FilterAction;
-const FilterConfig = proto.policy.FilterConfig;
-const Matcher = proto.policy.Matcher;
-pub const MatchCase = Matcher._match_case;
+const LogFilterConfig = proto.policy.LogFilterConfig;
+const LogMatcher = proto.policy.LogMatcher;
+pub const MatchCase = LogMatcher._match_case;
 const PolicyRegistry = policy_registry.PolicyRegistry;
 const PolicySnapshot = policy_registry.PolicySnapshot;
 
@@ -40,12 +39,11 @@ pub const FilterEvaluator = struct {
         _ = self;
     }
 
-    /// Evaluate data against policies for a specific telemetry type using a field accessor
+    /// Evaluate data against log filter policies using a field accessor
     /// Returns FilterResult.keep or FilterResult.drop based on first matching policy
     /// If no policies match, defaults to FilterResult.keep
     ///
     /// Uses lock-free snapshot read for consistent view of policies
-    /// Uses pre-filtered indices for O(1) lookup of relevant policies
     ///
     /// The field_accessor function is called to retrieve field values from the data.
     /// The ctx pointer is passed through to the accessor for accessing the actual data structure.
@@ -53,36 +51,27 @@ pub const FilterEvaluator = struct {
         self: *const FilterEvaluator,
         ctx: *const anyopaque,
         field_accessor: FieldAccessor,
-        telemetry_type: TelemetryType,
     ) FilterResult {
         // Get current policy snapshot (atomic, lock-free)
         const snapshot = self.registry.getSnapshot() orelse return FilterResult.keep;
 
-        // Use pre-filtered index to get only LOG_FILTER policies for this telemetry type
-        const policy_indices = snapshot.getIndicesForKey(telemetry_type, .POLICY_TYPE_LOG_FILTER);
-
         // No policies to evaluate
-        if (policy_indices.len == 0) return FilterResult.keep;
+        if (snapshot.policies.len == 0) return FilterResult.keep;
 
         // Process policies in priority order - first match wins
-        for (policy_indices) |idx| {
-            const policy = snapshot.getPolicy(idx) orelse continue;
-
+        for (snapshot.policies) |policy| {
             // Skip disabled policies
             if (!policy.enabled) continue;
 
             // Get filter config
-            const config = if (policy.config) |cfg| switch (cfg) {
-                .filter => |f| f,
-                else => continue,
-            } else continue;
+            const filter_config = policy.filter orelse continue;
 
             // Check if all matchers match the data
-            const matches = matchesAllMatchers(ctx, field_accessor, config.matchers.items);
+            const matches = matchesAllMatchers(ctx, field_accessor, filter_config.matchers.items);
 
             if (matches) {
                 // Return the action from the matching policy
-                return switch (config.action) {
+                return switch (filter_config.action) {
                     .FILTER_ACTION_KEEP => FilterResult.keep,
                     .FILTER_ACTION_DROP => FilterResult.drop,
                     else => FilterResult.keep, // Unknown actions default to keep
@@ -100,7 +89,7 @@ pub const FilterEvaluator = struct {
 fn matchesAllMatchers(
     ctx: *const anyopaque,
     field_accessor: FieldAccessor,
-    matchers: []const Matcher,
+    matchers: []const LogMatcher,
 ) bool {
     if (matchers.len == 0) return false;
 
@@ -114,13 +103,15 @@ fn matchesAllMatchers(
 
 /// Check if a single matcher matches using the field accessor
 /// Returns true if the matcher matches (considering negate flag)
-fn matchSingleMatcher(ctx: *const anyopaque, field_accessor: FieldAccessor, matcher: Matcher) bool {
+fn matchSingleMatcher(ctx: *const anyopaque, field_accessor: FieldAccessor, matcher: LogMatcher) bool {
     const match = matcher.match orelse return false;
 
     // Extract the match case, key, and regex based on the union variant
     const match_case: MatchCase = match;
     const key: []const u8, const regex: []const u8 = switch (match) {
+        .resource_schema_url => |m| .{ "", m.regex },
         .resource_attribute => |m| .{ m.key, m.regex },
+        .scope_schema_url => |m| .{ "", m.regex },
         .scope_name => |m| .{ "", m.regex },
         .scope_version => |m| .{ "", m.regex },
         .scope_attribute => |m| .{ m.key, m.regex },
@@ -128,12 +119,6 @@ fn matchSingleMatcher(ctx: *const anyopaque, field_accessor: FieldAccessor, matc
         .log_severity_text => |m| .{ "", m.regex },
         .log_severity_number => return false, // Not supported yet (uses min/max, not regex)
         .log_attribute => |m| .{ m.key, m.regex },
-        .metric_name => |m| .{ "", m.regex },
-        .metric_attribute => |m| .{ m.key, m.regex },
-        .span_name => |m| .{ "", m.regex },
-        .span_kind => return false, // Not supported yet (uses enum, not regex)
-        .span_status => return false, // Not supported yet (uses enum, not regex)
-        .span_attribute => |m| .{ m.key, m.regex },
     };
 
     // Get the field value using the accessor
@@ -192,11 +177,11 @@ test "matchSingleMatcher matches field value" {
     };
 
     // Match on message field containing "error"
-    const matcher = Matcher{ .match = .{ .log_body = .{ .regex = "error" } } };
+    const matcher = LogMatcher{ .match = .{ .log_body = .{ .regex = "error" } } };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, matcher));
 
     // No match when pattern not found
-    const no_match = Matcher{ .match = .{ .log_body = .{ .regex = "warning" } } };
+    const no_match = LogMatcher{ .match = .{ .log_body = .{ .regex = "warning" } } };
     try testing.expect(!matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, no_match));
 }
 
@@ -207,11 +192,11 @@ test "matchSingleMatcher with negate" {
     };
 
     // Negated match - true if "ERROR" is NOT in level
-    const matcher = Matcher{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } }, .negate = true };
+    const matcher = LogMatcher{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } }, .negate = true };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, matcher));
 
     // Negated match - false if "INFO" IS in level
-    const no_match = Matcher{ .match = .{ .log_severity_text = .{ .regex = "INFO" } }, .negate = true };
+    const no_match = LogMatcher{ .match = .{ .log_severity_text = .{ .regex = "INFO" } }, .negate = true };
     try testing.expect(!matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, no_match));
 }
 
@@ -223,11 +208,11 @@ test "matchSingleMatcher with log attribute" {
     };
 
     // Match log attribute (service field)
-    const matcher = Matcher{ .match = .{ .log_attribute = .{ .key = "service", .regex = "payment" } } };
+    const matcher = LogMatcher{ .match = .{ .log_attribute = .{ .key = "service", .regex = "payment" } } };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, matcher));
 
     // No match for non-existent service
-    const no_match = Matcher{ .match = .{ .log_attribute = .{ .key = "service", .regex = "auth" } } };
+    const no_match = LogMatcher{ .match = .{ .log_attribute = .{ .key = "service", .regex = "auth" } } };
     try testing.expect(!matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, no_match));
 }
 
@@ -237,11 +222,11 @@ test "matchSingleMatcher with non-existent field" {
     };
 
     // Non-existent attribute returns null, so no match
-    const matcher = Matcher{ .match = .{ .log_attribute = .{ .key = "nonexistent", .regex = "hello" } } };
+    const matcher = LogMatcher{ .match = .{ .log_attribute = .{ .key = "nonexistent", .regex = "hello" } } };
     try testing.expect(!matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, matcher));
 
     // With negate, non-existent field means "pattern not found" = true
-    const negated = Matcher{ .match = .{ .log_attribute = .{ .key = "nonexistent", .regex = "hello" } }, .negate = true };
+    const negated = LogMatcher{ .match = .{ .log_attribute = .{ .key = "nonexistent", .regex = "hello" } }, .negate = true };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, negated));
 }
 
@@ -253,14 +238,14 @@ test "matchesAllMatchers with multiple matchers (AND logic)" {
     };
 
     // All matchers must match
-    const matchers_all_match = [_]Matcher{
+    const matchers_all_match = [_]LogMatcher{
         .{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } } },
         .{ .match = .{ .log_attribute = .{ .key = "service", .regex = "payment" } } },
     };
     try testing.expect(matchesAllMatchers(@ptrCast(&log), TestLogContext.fieldAccessor, &matchers_all_match));
 
     // One matcher fails = overall false
-    const matchers_one_fails = [_]Matcher{
+    const matchers_one_fails = [_]LogMatcher{
         .{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } } },
         .{ .match = .{ .log_attribute = .{ .key = "service", .regex = "auth" } } }, // doesn't match
     };
@@ -272,7 +257,7 @@ test "matchesAllMatchers with empty matchers returns false" {
         .message = "test",
     };
 
-    const empty_matchers = [_]Matcher{};
+    const empty_matchers = [_]LogMatcher{};
     try testing.expect(!matchesAllMatchers(@ptrCast(&log), TestLogContext.fieldAccessor, &empty_matchers));
 }
 
@@ -284,16 +269,12 @@ test "FilterEvaluator.evaluate with LOG_FILTER policy drops matching logs" {
     // Create a DROP policy for debug logs
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-debug"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = true,
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_DROP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try drop_policy.config.?.filter.matchers.append(allocator, .{
+    try drop_policy.filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
@@ -304,11 +285,11 @@ test "FilterEvaluator.evaluate with LOG_FILTER policy drops matching logs" {
 
     // Debug log should be dropped
     const debug_log = TestLogContext{ .level = "DEBUG", .message = "verbose info" };
-    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&debug_log), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&debug_log), TestLogContext.fieldAccessor));
 
     // Error log should be kept (doesn't match)
     const error_log = TestLogContext{ .level = "ERROR", .message = "something failed" };
-    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor));
 }
 
 test "FilterEvaluator.evaluate with LOG_FILTER policy keeps matching logs" {
@@ -319,16 +300,12 @@ test "FilterEvaluator.evaluate with LOG_FILTER policy keeps matching logs" {
     // Create a KEEP policy for error logs
     var keep_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "keep-errors"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = true,
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_KEEP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_KEEP,
         },
     };
-    try keep_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try keep_policy.config.?.filter.matchers.append(allocator, .{
+    try keep_policy.filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer keep_policy.deinit(allocator);
@@ -339,7 +316,7 @@ test "FilterEvaluator.evaluate with LOG_FILTER policy keeps matching logs" {
 
     // Error log matches KEEP policy
     const error_log = TestLogContext{ .level = "ERROR", .message = "something failed" };
-    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor));
 }
 
 test "FilterEvaluator.evaluate returns keep when no policies" {
@@ -350,7 +327,7 @@ test "FilterEvaluator.evaluate returns keep when no policies" {
     const filter = FilterEvaluator.init(&registry);
 
     const log = TestLogContext{ .level = "INFO", .message = "test" };
-    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&log), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&log), TestLogContext.fieldAccessor));
 }
 
 test "FilterEvaluator.evaluate skips disabled policies" {
@@ -361,16 +338,12 @@ test "FilterEvaluator.evaluate skips disabled policies" {
     // Create a disabled DROP policy
     var disabled_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "disabled-drop"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = false, // disabled!
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_DROP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
         },
     };
-    try disabled_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try disabled_policy.config.?.filter.matchers.append(allocator, .{
+    try disabled_policy.filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer disabled_policy.deinit(allocator);
@@ -381,7 +354,7 @@ test "FilterEvaluator.evaluate skips disabled policies" {
 
     // Error log would match, but policy is disabled, so keep
     const error_log = TestLogContext{ .level = "ERROR", .message = "something failed" };
-    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor));
 }
 
 test "FilterEvaluator.evaluate with Datadog log format" {
@@ -392,16 +365,12 @@ test "FilterEvaluator.evaluate with Datadog log format" {
     // Drop logs from staging environment
     var drop_staging = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-staging"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = true,
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_DROP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_staging.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try drop_staging.config.?.filter.matchers.append(allocator, .{
+    try drop_staging.filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "ddtags"),
             .regex = try allocator.dupe(u8, "env:staging"),
@@ -419,7 +388,7 @@ test "FilterEvaluator.evaluate with Datadog log format" {
         .message = "request completed",
         .service = "payment",
     };
-    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&staging_log), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&staging_log), TestLogContext.fieldAccessor));
 
     // Production log should be kept
     const prod_log = TestLogContext{
@@ -427,7 +396,7 @@ test "FilterEvaluator.evaluate with Datadog log format" {
         .message = "request completed",
         .service = "payment",
     };
-    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&prod_log), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&prod_log), TestLogContext.fieldAccessor));
 }
 
 test "FilterEvaluator.evaluate with multiple matchers (AND logic)" {
@@ -438,19 +407,15 @@ test "FilterEvaluator.evaluate with multiple matchers (AND logic)" {
     // Drop DEBUG logs from payment service only
     var policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-payment-debug"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = true,
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_DROP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try policy.config.?.filter.matchers.append(allocator, .{
+    try policy.filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
-    try policy.config.?.filter.matchers.append(allocator, .{
+    try policy.filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "service"),
             .regex = try allocator.dupe(u8, "payment"),
@@ -464,13 +429,13 @@ test "FilterEvaluator.evaluate with multiple matchers (AND logic)" {
 
     // DEBUG from payment = dropped
     const payment_debug = TestLogContext{ .level = "DEBUG", .service = "payment", .message = "processing" };
-    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&payment_debug), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&payment_debug), TestLogContext.fieldAccessor));
 
     // DEBUG from auth = kept (service doesn't match)
     const auth_debug = TestLogContext{ .level = "DEBUG", .service = "auth", .message = "login attempt" };
-    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&auth_debug), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&auth_debug), TestLogContext.fieldAccessor));
 
     // ERROR from payment = kept (level doesn't match)
     const payment_error = TestLogContext{ .level = "ERROR", .service = "payment", .message = "failed" };
-    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&payment_error), TestLogContext.fieldAccessor, .TELEMETRY_TYPE_LOGS));
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&payment_error), TestLogContext.fieldAccessor));
 }

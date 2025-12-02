@@ -70,6 +70,13 @@ fn datadogFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []con
         .log_severity_text => "level",
         .log_severity_number => "severity_number",
         .log_attribute => key, // For attributes, use the key directly (e.g., "ddtags", "service")
+        // TODO: These are unsupported today.
+        // resource_schema_url
+        // resource_attribute
+        // scope_schema_url
+        // scope_name
+        // scope_version
+        // scope_attribute
         else => return null,
     };
 
@@ -109,7 +116,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, filter: *const Filter
 
             for (arr.items) |log_value| {
                 // Evaluate filter using the field accessor
-                const filter_result = filter.evaluate(@ptrCast(&log_value), datadogFieldAccessor, .TELEMETRY_TYPE_LOGS);
+                const filter_result = filter.evaluate(@ptrCast(&log_value), datadogFieldAccessor);
                 if (filter_result == .keep) {
                     try kept_logs.append(allocator, log_value);
                 } else {
@@ -128,7 +135,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, filter: *const Filter
         },
         .object => {
             // Process single log object
-            const filter_result = filter.evaluate(@ptrCast(&parsed.value), datadogFieldAccessor, .TELEMETRY_TYPE_LOGS);
+            const filter_result = filter.evaluate(@ptrCast(&parsed.value), datadogFieldAccessor);
             if (filter_result == .drop) {
                 // Return empty array for dropped single log
                 const result = try allocator.alloc(u8, 2);
@@ -201,16 +208,12 @@ test "processLogs - DROP policy filters logs from array" {
     // Create a DROP policy for DEBUG logs
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-debug"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = true,
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_DROP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try drop_policy.config.?.filter.matchers.append(allocator, .{
+    try drop_policy.filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
@@ -242,16 +245,12 @@ test "processLogs - DROP policy drops single object" {
 
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-debug"),
-        .policy_type = .POLICY_TYPE_LOG_FILTER,
         .enabled = true,
-        .config = .{
-            .filter = .{
-                .action = .FILTER_ACTION_DROP,
-            },
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
-    try drop_policy.config.?.filter.matchers.append(allocator, .{
+    try drop_policy.filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);

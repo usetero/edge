@@ -3,11 +3,9 @@ const proto = @import("proto");
 
 pub const Policy = proto.policy.Policy;
 pub const PolicyType = proto.policy.PolicyType;
-pub const TelemetryType = proto.policy.TelemetryType;
 pub const FilterAction = proto.policy.FilterAction;
-pub const FilterConfig = proto.policy.FilterConfig;
-pub const Matcher = proto.policy.Matcher;
-pub const MatchType = proto.policy.MatchType;
+pub const LogFilterConfig = proto.policy.LogFilterConfig;
+pub const LogMatcher = proto.policy.LogMatcher;
 
 pub const LogLevel = enum(u8) {
     debug,
