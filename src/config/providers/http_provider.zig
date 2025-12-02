@@ -11,6 +11,9 @@ const SourceType = policy_source.SourceType;
 const SyncRequest = proto.policy.SyncRequest;
 const SyncResponse = proto.policy.SyncResponse;
 const ClientMetadata = proto.policy.ClientMetadata;
+const KeyValue = proto.common.KeyValue;
+const AnyValue = proto.common.AnyValue;
+const ServiceMetadata = types.ServiceMetadata;
 
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {
@@ -23,9 +26,8 @@ pub const HttpProvider = struct {
     shutdown_flag: std.atomic.Value(bool),
     last_etag: ?[]u8,
 
-    // Edge metadata for sync requests
-    edge_id: []const u8,
-    version: []const u8,
+    // Service metadata for sync requests (not owned, references config)
+    service: ServiceMetadata,
     workspace_id: []const u8,
     last_sync_timestamp: i64,
 
@@ -34,25 +36,13 @@ pub const HttpProvider = struct {
         config_url: []const u8,
         poll_interval_seconds: u64,
         workspace_id: []const u8,
+        service: ServiceMetadata,
     ) !*HttpProvider {
         const self = try allocator.create(HttpProvider);
         errdefer allocator.destroy(self);
 
         const url_copy = try allocator.dupe(u8, config_url);
         errdefer allocator.free(url_copy);
-
-        // Generate edge ID (could be from config or generated)
-        // For now, use a simple UUID-like identifier
-        var edge_id_buf: [36]u8 = undefined;
-        const edge_id = try std.fmt.bufPrint(&edge_id_buf, "edge-{d}", .{std.time.milliTimestamp()});
-        const edge_id_copy = try allocator.dupe(u8, edge_id);
-        errdefer allocator.free(edge_id_copy);
-
-        const version_copy = try allocator.dupe(u8, "0.1.0");
-        errdefer allocator.free(version_copy);
-
-        const workspace_id_copy = try allocator.dupe(u8, workspace_id);
-        errdefer allocator.free(workspace_id_copy);
 
         self.* = .{
             .allocator = allocator,
@@ -63,9 +53,8 @@ pub const HttpProvider = struct {
             .poll_thread = null,
             .shutdown_flag = std.atomic.Value(bool).init(false),
             .last_etag = null,
-            .edge_id = edge_id_copy,
-            .version = version_copy,
-            .workspace_id = workspace_id_copy,
+            .service = service,
+            .workspace_id = workspace_id,
             .last_sync_timestamp = 0,
         };
 
@@ -103,9 +92,7 @@ pub const HttpProvider = struct {
 
         self.http_client.deinit();
         self.allocator.free(self.config_url);
-        self.allocator.free(self.edge_id);
-        self.allocator.free(self.version);
-        self.allocator.free(self.workspace_id);
+
         self.allocator.destroy(self);
     }
 
@@ -174,13 +161,30 @@ pub const HttpProvider = struct {
     fn fetchPolicies(self: *HttpProvider, out_etag: *?[]u8) !?std.json.Parsed(SyncResponse) {
         const uri = try std.Uri.parse(self.config_url);
 
+        // Build resource_attributes with required fields:
+        // - service.name
+        // - service.instance.id
+        // - service.version
+        // - service.namespace
+        const resource_attributes = [_]KeyValue{
+            .{ .key = "service.name", .value = .{ .value = .{ .string_value = self.service.name } } },
+            .{ .key = "service.instance.id", .value = .{ .value = .{ .string_value = self.service.instance_id } } },
+            .{ .key = "service.version", .value = .{ .value = .{ .string_value = self.service.version } } },
+            .{ .key = "service.namespace", .value = .{ .value = .{ .string_value = self.service.namespace } } },
+        };
+
+        // Build labels with required fields:
+        // - workspace.id
+        const labels = [_]KeyValue{
+            .{ .key = "workspace.id", .value = .{ .value = .{ .string_value = self.workspace_id } } },
+        };
+
         // Create SyncRequest with metadata
-        var sync_request = SyncRequest{
+        const sync_request = SyncRequest{
             .client_metadata = ClientMetadata{
-                .client_id = self.edge_id,
-                .client_version = self.version,
-                .workspace_id = self.workspace_id,
                 .last_sync_timestamp_unix_nano = @intCast(self.last_sync_timestamp),
+                .resource_attributes = .{ .items = @constCast(&resource_attributes), .capacity = resource_attributes.len },
+                .labels = .{ .items = @constCast(&labels), .capacity = labels.len },
             },
         };
 

@@ -3,11 +3,9 @@ const proto = @import("proto");
 
 pub const Policy = proto.policy.Policy;
 pub const PolicyType = proto.policy.PolicyType;
-pub const TelemetryType = proto.policy.TelemetryType;
 pub const FilterAction = proto.policy.FilterAction;
-pub const FilterConfig = proto.policy.FilterConfig;
-pub const Matcher = proto.policy.Matcher;
-pub const MatchType = proto.policy.MatchType;
+pub const LogFilterConfig = proto.policy.LogFilterConfig;
+pub const LogMatcher = proto.policy.LogMatcher;
 
 pub const LogLevel = enum(u8) {
     debug,
@@ -38,6 +36,19 @@ pub const ProviderConfig = struct {
     poll_interval: ?u64 = null, // seconds
 };
 
+/// Service metadata for identifying this edge instance
+pub const ServiceMetadata = struct {
+    /// Service name (e.g., "tero-edge")
+    name: []const u8 = "tero-edge",
+    /// Service namespace (e.g., "tero")
+    namespace: []const u8 = "tero",
+    /// Service version (e.g., "0.1.0", defaults to "latest")
+    version: []const u8 = "latest",
+    /// Service instance ID - generated at startup, not configurable
+    /// This field is set by the runtime, not from config
+    instance_id: []const u8 = "",
+};
+
 pub const ProxyConfig = struct {
     // Network config
     listen_address: [4]u8,
@@ -46,6 +57,9 @@ pub const ProxyConfig = struct {
 
     // Edge metadata
     workspace_id: []const u8,
+
+    // Service identity metadata
+    service: ServiceMetadata,
 
     // Inspection config
     log_level: LogLevel,
@@ -61,6 +75,7 @@ pub const ProxyConfig = struct {
             .listen_port = 8080,
             .upstream_url = "http://127.0.0.1:80",
             .workspace_id = "90A6EFC2-27B8-41BC-9343-43BFB1DF0732",
+            .service = .{},
             .log_level = .info,
             .pretty_print_json = true,
             .max_body_size = 1024 * 1024, // 1MB

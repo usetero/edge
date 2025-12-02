@@ -112,6 +112,18 @@ pub fn main() !void {
         allocator.destroy(config);
     }
 
+    // Generate service instance ID (UUID-like identifier for this instance's lifetime)
+    var instance_id_buf: [64]u8 = undefined;
+    const instance_id = try std.fmt.bufPrint(&instance_id_buf, "edge-{d}-{d}", .{
+        std.time.milliTimestamp(),
+        std.Thread.getCurrentId(),
+    });
+    const instance_id_copy = try allocator.dupe(u8, instance_id);
+    defer allocator.free(instance_id_copy);
+
+    // Set the instance_id in service metadata
+    config.service.instance_id = instance_id_copy;
+
     std.log.info("Listen address: {}.{}.{}.{}:{}", .{
         config.listen_address[0],
         config.listen_address[1],
@@ -120,6 +132,12 @@ pub fn main() !void {
         config.listen_port,
     });
     std.log.info("Upstream URL: {s}", .{config.upstream_url});
+    std.log.info("Service: {s}/{s} (instance: {s}, version: {s})", .{
+        config.service.namespace,
+        config.service.name,
+        config.service.instance_id,
+        config.service.version,
+    });
 
     // Create centralized policy registry
     var registry = policy_registry_mod.PolicyRegistry.init(allocator);
@@ -175,7 +193,13 @@ pub fn main() !void {
                 const poll_interval = provider_config.poll_interval orelse 60;
                 std.log.info("  - HTTP provider: {s} (poll interval: {}s)", .{ url, poll_interval });
 
-                const http_provider = try HttpProvider.init(allocator, url, poll_interval, config.workspace_id);
+                const http_provider = try HttpProvider.init(
+                    allocator,
+                    url,
+                    poll_interval,
+                    config.workspace_id,
+                    config.service,
+                );
                 errdefer http_provider.deinit();
 
                 try http_provider.subscribe(callback);
