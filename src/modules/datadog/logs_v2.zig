@@ -3,7 +3,7 @@ const filter_mod = @import("../../core/filter.zig");
 
 const FilterEvaluator = filter_mod.FilterEvaluator;
 const FilterResult = filter_mod.FilterResult;
-const MatchType = @import("proto").policy.MatchType;
+const MatchCase = filter_mod.MatchCase;
 
 /// Result of processing logs
 pub const ProcessResult = struct {
@@ -55,7 +55,7 @@ pub fn processLogs(
 
 /// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, level, ddtags, service, etc.
-fn datadogFieldAccessor(ctx: *const anyopaque, match_type: MatchType, key: []const u8) ?[]const u8 {
+fn datadogFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8 {
     const json_value: *const std.json.Value = @ptrCast(@alignCast(ctx));
 
     // Only object values have fields
@@ -64,12 +64,12 @@ fn datadogFieldAccessor(ctx: *const anyopaque, match_type: MatchType, key: []con
         else => return null,
     };
 
-    // Map match_type to the appropriate field
-    const field_name: []const u8 = switch (match_type) {
-        .MATCH_TYPE_LOG_BODY => "message",
-        .MATCH_TYPE_LOG_SEVERITY_TEXT => "level",
-        .MATCH_TYPE_LOG_SEVERITY_NUMBER => "severity_number",
-        .MATCH_TYPE_LOG_ATTRIBUTE => key, // For attributes, use the key directly (e.g., "ddtags", "service")
+    // Map match_case to the appropriate field
+    const field_name: []const u8 = switch (match_case) {
+        .log_body => "message",
+        .log_severity_text => "level",
+        .log_severity_number => "severity_number",
+        .log_attribute => key, // For attributes, use the key directly (e.g., "ddtags", "service")
         else => return null,
     };
 
@@ -211,8 +211,7 @@ test "processLogs - DROP policy filters logs from array" {
     };
     try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try drop_policy.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
-        .regex = try allocator.dupe(u8, "DEBUG"),
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
 
@@ -253,8 +252,7 @@ test "processLogs - DROP policy drops single object" {
     };
     try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try drop_policy.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
-        .regex = try allocator.dupe(u8, "DEBUG"),
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
 

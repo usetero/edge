@@ -8,7 +8,7 @@ const TelemetryType = proto.policy.TelemetryType;
 const FilterAction = proto.policy.FilterAction;
 const FilterConfig = proto.policy.FilterConfig;
 const Matcher = proto.policy.Matcher;
-const MatchType = proto.policy.MatchType;
+pub const MatchCase = Matcher._match_case;
 const PolicyRegistry = policy_registry.PolicyRegistry;
 const PolicySnapshot = policy_registry.PolicySnapshot;
 
@@ -19,8 +19,8 @@ pub const FilterResult = enum {
 };
 
 /// Field accessor function type
-/// Given a MatchType and key, returns the field value as a string slice, or null if not found
-pub const FieldAccessor = *const fn (ctx: *const anyopaque, match_type: MatchType, key: []const u8) ?[]const u8;
+/// Given a MatchCase and key, returns the field value as a string slice, or null if not found
+pub const FieldAccessor = *const fn (ctx: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8;
 
 /// Filter evaluates data against policies from the centralized registry
 /// Uses lock-free snapshot reads for optimal performance
@@ -115,13 +115,33 @@ fn matchesAllMatchers(
 /// Check if a single matcher matches using the field accessor
 /// Returns true if the matcher matches (considering negate flag)
 fn matchSingleMatcher(ctx: *const anyopaque, field_accessor: FieldAccessor, matcher: Matcher) bool {
-    std.debug.print("Matching {any} {s} with {s}\n", .{ matcher.match_type, matcher.key, matcher.regex });
+    const match = matcher.match orelse return false;
+
+    // Extract the match case, key, and regex based on the union variant
+    const match_case: MatchCase = match;
+    const key: []const u8, const regex: []const u8 = switch (match) {
+        .resource_attribute => |m| .{ m.key, m.regex },
+        .scope_name => |m| .{ "", m.regex },
+        .scope_version => |m| .{ "", m.regex },
+        .scope_attribute => |m| .{ m.key, m.regex },
+        .log_body => |m| .{ "", m.regex },
+        .log_severity_text => |m| .{ "", m.regex },
+        .log_severity_number => return false, // Not supported yet (uses min/max, not regex)
+        .log_attribute => |m| .{ m.key, m.regex },
+        .metric_name => |m| .{ "", m.regex },
+        .metric_attribute => |m| .{ m.key, m.regex },
+        .span_name => |m| .{ "", m.regex },
+        .span_kind => return false, // Not supported yet (uses enum, not regex)
+        .span_status => return false, // Not supported yet (uses enum, not regex)
+        .span_attribute => |m| .{ m.key, m.regex },
+    };
+
     // Get the field value using the accessor
-    const value = field_accessor(ctx, matcher.match_type, matcher.key);
+    const value = field_accessor(ctx, match_case, key);
 
     // Check if the value matches the pattern
     const found = if (value) |v|
-        matchesPattern(v, matcher.regex)
+        matchesPattern(v, regex)
     else
         false;
 
@@ -149,12 +169,12 @@ const TestLogContext = struct {
     service: ?[]const u8 = null,
     ddtags: ?[]const u8 = null,
 
-    fn fieldAccessor(ctx: *const anyopaque, match_type: MatchType, key: []const u8) ?[]const u8 {
+    fn fieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8 {
         const self: *const TestLogContext = @ptrCast(@alignCast(ctx));
-        return switch (match_type) {
-            .MATCH_TYPE_LOG_BODY => self.message,
-            .MATCH_TYPE_LOG_SEVERITY_TEXT => self.level,
-            .MATCH_TYPE_LOG_ATTRIBUTE => {
+        return switch (match_case) {
+            .log_body => self.message,
+            .log_severity_text => self.level,
+            .log_attribute => {
                 if (std.mem.eql(u8, key, "service")) return self.service;
                 if (std.mem.eql(u8, key, "ddtags")) return self.ddtags;
                 if (std.mem.eql(u8, key, "message")) return self.message;
@@ -172,11 +192,11 @@ test "matchSingleMatcher matches field value" {
     };
 
     // Match on message field containing "error"
-    const matcher = Matcher{ .match_type = .MATCH_TYPE_LOG_BODY, .regex = "error" };
+    const matcher = Matcher{ .match = .{ .log_body = .{ .regex = "error" } } };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, matcher));
 
     // No match when pattern not found
-    const no_match = Matcher{ .match_type = .MATCH_TYPE_LOG_BODY, .regex = "warning" };
+    const no_match = Matcher{ .match = .{ .log_body = .{ .regex = "warning" } } };
     try testing.expect(!matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, no_match));
 }
 
@@ -187,11 +207,11 @@ test "matchSingleMatcher with negate" {
     };
 
     // Negated match - true if "ERROR" is NOT in level
-    const matcher = Matcher{ .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT, .regex = "ERROR", .negate = true };
+    const matcher = Matcher{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } }, .negate = true };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, matcher));
 
     // Negated match - false if "INFO" IS in level
-    const no_match = Matcher{ .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT, .regex = "INFO", .negate = true };
+    const no_match = Matcher{ .match = .{ .log_severity_text = .{ .regex = "INFO" } }, .negate = true };
     try testing.expect(!matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, no_match));
 }
 
@@ -203,11 +223,11 @@ test "matchSingleMatcher with log attribute" {
     };
 
     // Match log attribute (service field)
-    const matcher = Matcher{ .match_type = .MATCH_TYPE_LOG_ATTRIBUTE, .key = "service", .regex = "payment" };
+    const matcher = Matcher{ .match = .{ .log_attribute = .{ .key = "service", .regex = "payment" } } };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, matcher));
 
     // No match for non-existent service
-    const no_match = Matcher{ .match_type = .MATCH_TYPE_LOG_ATTRIBUTE, .key = "service", .regex = "auth" };
+    const no_match = Matcher{ .match = .{ .log_attribute = .{ .key = "service", .regex = "auth" } } };
     try testing.expect(!matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, no_match));
 }
 
@@ -217,11 +237,11 @@ test "matchSingleMatcher with non-existent field" {
     };
 
     // Non-existent attribute returns null, so no match
-    const matcher = Matcher{ .match_type = .MATCH_TYPE_LOG_ATTRIBUTE, .key = "nonexistent", .regex = "hello" };
+    const matcher = Matcher{ .match = .{ .log_attribute = .{ .key = "nonexistent", .regex = "hello" } } };
     try testing.expect(!matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, matcher));
 
     // With negate, non-existent field means "pattern not found" = true
-    const negated = Matcher{ .match_type = .MATCH_TYPE_LOG_ATTRIBUTE, .key = "nonexistent", .regex = "hello", .negate = true };
+    const negated = Matcher{ .match = .{ .log_attribute = .{ .key = "nonexistent", .regex = "hello" } }, .negate = true };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, negated));
 }
 
@@ -234,15 +254,15 @@ test "matchesAllMatchers with multiple matchers (AND logic)" {
 
     // All matchers must match
     const matchers_all_match = [_]Matcher{
-        .{ .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT, .regex = "ERROR" },
-        .{ .match_type = .MATCH_TYPE_LOG_ATTRIBUTE, .key = "service", .regex = "payment" },
+        .{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } } },
+        .{ .match = .{ .log_attribute = .{ .key = "service", .regex = "payment" } } },
     };
     try testing.expect(matchesAllMatchers(@ptrCast(&log), TestLogContext.fieldAccessor, &matchers_all_match));
 
     // One matcher fails = overall false
     const matchers_one_fails = [_]Matcher{
-        .{ .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT, .regex = "ERROR" },
-        .{ .match_type = .MATCH_TYPE_LOG_ATTRIBUTE, .key = "service", .regex = "auth" }, // doesn't match
+        .{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } } },
+        .{ .match = .{ .log_attribute = .{ .key = "service", .regex = "auth" } } }, // doesn't match
     };
     try testing.expect(!matchesAllMatchers(@ptrCast(&log), TestLogContext.fieldAccessor, &matchers_one_fails));
 }
@@ -274,8 +294,7 @@ test "FilterEvaluator.evaluate with LOG_FILTER policy drops matching logs" {
     };
     try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try drop_policy.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
-        .regex = try allocator.dupe(u8, "DEBUG"),
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
 
@@ -310,8 +329,7 @@ test "FilterEvaluator.evaluate with LOG_FILTER policy keeps matching logs" {
     };
     try keep_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try keep_policy.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
-        .regex = try allocator.dupe(u8, "ERROR"),
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer keep_policy.deinit(allocator);
 
@@ -353,8 +371,7 @@ test "FilterEvaluator.evaluate skips disabled policies" {
     };
     try disabled_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try disabled_policy.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
-        .regex = try allocator.dupe(u8, "ERROR"),
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer disabled_policy.deinit(allocator);
 
@@ -385,9 +402,10 @@ test "FilterEvaluator.evaluate with Datadog log format" {
     };
     try drop_staging.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try drop_staging.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_ATTRIBUTE,
-        .key = try allocator.dupe(u8, "ddtags"),
-        .regex = try allocator.dupe(u8, "env:staging"),
+        .match = .{ .log_attribute = .{
+            .key = try allocator.dupe(u8, "ddtags"),
+            .regex = try allocator.dupe(u8, "env:staging"),
+        } },
     });
     defer drop_staging.deinit(allocator);
 
@@ -430,13 +448,13 @@ test "FilterEvaluator.evaluate with multiple matchers (AND logic)" {
     };
     try policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try policy.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
-        .regex = try allocator.dupe(u8, "DEBUG"),
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     try policy.config.?.filter.matchers.append(allocator, .{
-        .match_type = .MATCH_TYPE_LOG_ATTRIBUTE,
-        .key = try allocator.dupe(u8, "service"),
-        .regex = try allocator.dupe(u8, "payment"),
+        .match = .{ .log_attribute = .{
+            .key = try allocator.dupe(u8, "service"),
+            .regex = try allocator.dupe(u8, "payment"),
+        } },
     });
     defer policy.deinit(allocator);
 

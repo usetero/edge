@@ -10,105 +10,189 @@ option java_multiple_files = true;
 option java_package = "io.opentelemetry.proto.policy.v1";
 
 // =============================================================================
-// Core Policy Types
-// =============================================================================
-
-// PolicyType identifies the specific use case for a policy.
-// Policies of the same type can be merged; different types cannot.
-enum PolicyType {
-  POLICY_TYPE_UNSPECIFIED = 0;
-  POLICY_TYPE_LOG_FILTER = 1; // Define how logs are filtered (keep/drop)
-  POLICY_TYPE_REDACTION = 2; // Define data needing redaction/removal
-}
-
-// TelemetryType specifies what kind of telemetry data a policy applies to.
-enum TelemetryType {
-  TELEMETRY_TYPE_UNSPECIFIED = 0;
-  TELEMETRY_TYPE_LOGS = 1;
-}
-
-// =============================================================================
 // Matching
 // =============================================================================
 
-// MatchType specifies the category of telemetry field to match against.
-// Each match type is only valid for certain TelemetryTypes:
-//   - RESOURCE, RESOURCE_ATTRIBUTE, SCOPE, SCOPE_ATTRIBUTE: all telemetry types
-//   - LOG_BODY, LOG_SEVERITY, LOG_ATTRIBUTE: TELEMETRY_TYPE_LOGS only
-//   - METRIC_NAME, METRIC_ATTRIBUTE: TELEMETRY_TYPE_METRICS only (future)
-//   - SPAN_NAME, SPAN_KIND, SPAN_STATUS, SPAN_ATTRIBUTE: TELEMETRY_TYPE_TRACES only (future)
-enum MatchType {
-  MATCH_TYPE_UNSPECIFIED = 0;
-
-  // Resource-level matching (applies to all telemetry types)
-  MATCH_TYPE_RESOURCE_ATTRIBUTE = 1; // Match resource attribute by key (e.g., "service.name")
-
-  // Scope-level matching (applies to all telemetry types)
-  MATCH_TYPE_SCOPE_NAME = 2; // Match instrumentation scope name
-  MATCH_TYPE_SCOPE_VERSION = 3; // Match instrumentation scope version
-  MATCH_TYPE_SCOPE_ATTRIBUTE = 4; // Match scope attribute by key
-
-  // Log-specific matching (requires TELEMETRY_TYPE_LOGS)
-  MATCH_TYPE_LOG_BODY = 10; // Match log body content
-  MATCH_TYPE_LOG_SEVERITY_TEXT = 11; // Match severity text (e.g., "ERROR", "WARN")
-  MATCH_TYPE_LOG_SEVERITY_NUMBER = 12; // Match severity number (1-24)
-  MATCH_TYPE_LOG_ATTRIBUTE = 13; // Match log record attribute by key
-
-  // Metric-specific matching (requires TELEMETRY_TYPE_METRICS - future)
-  MATCH_TYPE_METRIC_NAME = 20; // Match metric name
-  MATCH_TYPE_METRIC_ATTRIBUTE = 21; // Match metric data point attribute by key
-
-  // Trace-specific matching (requires TELEMETRY_TYPE_TRACES - future)
-  MATCH_TYPE_SPAN_NAME = 30; // Match span name
-  MATCH_TYPE_SPAN_KIND = 31; // Match span kind (CLIENT, SERVER, etc.)
-  MATCH_TYPE_SPAN_STATUS = 32; // Match span status code (OK, ERROR, UNSET)
-  MATCH_TYPE_SPAN_ATTRIBUTE = 33; // Match span attribute by key
-}
-
-// Matcher provides a unified way to match against telemetry data using known fields.
+// LogMatcher provides a way to match against log telemetry data using known fields.
 //
 // IMPORTANT CONSTRAINTS:
 // - Multiple matchers are ANDed together: all matchers must match for the
 //   overall match to succeed.
-// - The match_type must be valid for the policy's telemetry_types. For example,
-//   MATCH_TYPE_LOG_BODY is only valid when TELEMETRY_TYPE_LOGS is in the
-//   policy's telemetry_types list.
 // - The list of matchers should uniquely identify a specific pattern of telemetry
 //   for that policy. Matchers should NOT be used as a catch-all; they should be
 //   specific enough to target the intended telemetry precisely.
 //
-// The regex uses RE2 syntax for consistency across implementations.
+// All regex fields use RE2 syntax for consistency across implementations.
 //
 // Examples:
 //   Match logs from payment service with ERROR severity:
 //     matchers: [
-//       {match_type: RESOURCE_ATTRIBUTE, key: "service.name", regex: "^payment-service$"},
-//       {match_type: LOG_SEVERITY_TEXT, regex: "^ERROR$"}
+//       {resource_attribute: {key: "service.name", regex: "^payment-service$"}},
+//       {log_severity_text: {regex: "^ERROR$"}}
 //     ]
 //
 //   Match logs containing PII in body from any service in prod:
 //     matchers: [
-//       {match_type: RESOURCE_ATTRIBUTE, key: "deployment.environment", regex: "^prod.*"},
-//       {match_type: LOG_BODY, regex: "\\b[0-9]{3}-[0-9]{2}-[0-9]{4}\\b"}
+//       {resource_attribute: {key: "deployment.environment", regex: "^prod.*"}},
+//       {log_body: {regex: "\\b[0-9]{3}-[0-9]{2}-[0-9]{4}\\b"}}
 //     ]
-message Matcher {
-  // The type of field to match against. Determines which telemetry field
-  // is selected for matching.
-  MatchType match_type = 1;
+message LogMatcher {
+  // If true, inverts the match (matches when the field does NOT match)
+  bool negate = 1;
 
-  // Key for attribute-based match types (RESOURCE_ATTRIBUTE, SCOPE_ATTRIBUTE,
-  // LOG_ATTRIBUTE, METRIC_ATTRIBUTE, SPAN_ATTRIBUTE).
-  // For example: "service.name", "http.method", "user.id"
-  // Ignored for non-attribute match types.
-  string key = 2;
+  // The field to match against. Exactly one must be set.
+  oneof match {
+    // Resource-level matching
+    ResourceSchemaUrlMatch resource_schema_url = 10;
+    ResourceAttributeMatch resource_attribute = 11;
 
-  // Regular expression pattern to match the field value against.
-  // Uses RE2 syntax. An empty regex matches any value (existence check).
-  string regex = 3;
+    // Scope-level matching
+    ScopeSchemaUrlMatch scope_schema_url = 12;
+    ScopeNameMatch scope_name = 13;
+    ScopeVersionMatch scope_version = 14;
+    ScopeAttributeMatch scope_attribute = 15;
 
-  // If true, inverts the match (matches when regex does NOT match)
-  bool negate = 4;
+    // Log-specific matching
+    LogBodyMatch log_body = 20;
+    LogSeverityTextMatch log_severity_text = 21;
+    LogSeverityNumberMatch log_severity_number = 22;
+    LogAttributeMatch log_attribute = 23;
+  }
 }
+
+// =============================================================================
+// Resource and Scope Matchers (apply to all telemetry types)
+// =============================================================================
+
+// ResourceSchemaUrlMatch matches against the resource schema URL.
+message ResourceSchemaUrlMatch {
+  // Regex pattern to match the resource schema URL.
+  string regex = 1;
+}
+
+// ResourceAttributeMatch matches against a resource attribute by key.
+message ResourceAttributeMatch {
+  // The attribute key to match (e.g., "service.name", "deployment.environment")
+  string key = 1;
+
+  // Regex pattern to match the attribute value. Empty matches any value (existence check).
+  string regex = 2;
+}
+
+// ScopeNameMatch matches against the instrumentation scope name.
+message ScopeNameMatch {
+  // Regex pattern to match the scope name.
+  string regex = 1;
+}
+
+// ScopeVersionMatch matches against the instrumentation scope version.
+message ScopeVersionMatch {
+  // Regex pattern to match the scope version.
+  string regex = 1;
+}
+
+// ScopeAttributeMatch matches against a scope attribute by key.
+message ScopeAttributeMatch {
+  // The attribute key to match.
+  string key = 1;
+
+  // Regex pattern to match the attribute value. Empty matches any value (existence check).
+  string regex = 2;
+}
+
+// ScopeSchemaUrlMatch matches against the instrumentation scope schema URL.
+message ScopeSchemaUrlMatch {
+  // Regex pattern to match the scope schema URL.
+  string regex = 1;
+}
+
+// =============================================================================
+// Log Matchers
+// =============================================================================
+
+// LogBodyMatch matches against the log record body.
+message LogBodyMatch {
+  // Regex pattern to match the log body content.
+  string regex = 1;
+}
+
+// LogSeverityTextMatch matches against the log severity text.
+message LogSeverityTextMatch {
+  // Regex pattern to match the severity text (e.g., "ERROR", "WARN", "INFO").
+  string regex = 1;
+}
+
+// LogSeverityNumberMatch matches against the log severity number.
+message LogSeverityNumberMatch {
+  // Minimum severity number (inclusive). Range: 1-24.
+  int32 min = 1;
+
+  // Maximum severity number (inclusive). Range: 1-24.
+  // If 0, only min is used for exact match.
+  int32 max = 2;
+}
+
+// LogAttributeMatch matches against a log record attribute by key.
+message LogAttributeMatch {
+  // The attribute key to match (e.g., "user.id", "http.method").
+  string key = 1;
+
+  // Regex pattern to match the attribute value. Empty matches any value (existence check).
+  string regex = 2;
+}
+
+// =============================================================================
+// Metric Matchers (future)
+// =============================================================================
+
+// // MetricNameMatch matches against the metric name.
+// message MetricNameMatch {
+//   // Regex pattern to match the metric name.
+//   string regex = 1;
+// }
+
+// // MetricAttributeMatch matches against a metric data point attribute by key.
+// message MetricAttributeMatch {
+//   // The attribute key to match.
+//   string key = 1;
+
+//   // Regex pattern to match the attribute value. Empty matches any value (existence check).
+//   string regex = 2;
+// }
+
+// =============================================================================
+// Span Matchers (future)
+// =============================================================================
+
+// // SpanNameMatch matches against the span name.
+// message SpanNameMatch {
+//   // Regex pattern to match the span name.
+//   string regex = 1;
+// }
+
+// // SpanKindMatch matches against the span kind.
+// message SpanKindMatch {
+//   // The span kind to match.
+//   // See opentelemetry.proto.trace.v1.Span.SpanKind for valid values.
+//   opentelemetry.proto.trace.v1.Span.SpanKind kind = 1;
+// }
+
+// // SpanStatusMatch matches against the span status code.
+// // Uses opentelemetry.proto.trace.v1.Status.StatusCode from the trace proto.
+// message SpanStatusMatch {
+//   // The status code to match.
+//   // See opentelemetry.proto.trace.v1.Status.StatusCode for valid values.
+//   opentelemetry.proto.trace.v1.Status.StatusCode code = 1;
+// }
+
+// // SpanAttributeMatch matches against a span attribute by key.
+// message SpanAttributeMatch {
+//   // The attribute key to match.
+//   string key = 1;
+
+//   // Regex pattern to match the attribute value. Empty matches any value (existence check).
+//   string regex = 2;
+// }
 
 // =============================================================================
 // Policy Type Configurations
@@ -117,48 +201,18 @@ message Matcher {
 // FilterAction specifies what to do with matched logs.
 enum FilterAction {
   FILTER_ACTION_UNSPECIFIED = 0;
-  FILTER_ACTION_KEEP = 1; // Keep logs that match
-  FILTER_ACTION_DROP = 2; // Drop logs that match
+  FILTER_ACTION_KEEP = 1;
+  FILTER_ACTION_DROP = 2;
 }
 
-// FilterConfig defines configuration for LOG_FILTER policies.
+// LogFilterConfig defines configuration for log filter policies.
 // Matches logs based on conditions and keeps or drops them.
-message FilterConfig {
+message LogFilterConfig {
   // Matchers to identify which logs this filter applies to (AND logic)
-  repeated Matcher matchers = 1;
+  repeated LogMatcher matchers = 1;
 
   // Action to take on matched logs
   FilterAction action = 2;
-}
-
-// RedactionRule defines a single find/replace redaction operation.
-// Similar to sed's s/pattern/replacement/ syntax.
-message RedactionRule {
-  // JSONPath to the field to apply redaction to.
-  // Example: "$.body", "$.attributes.user.email", "$.attributes.*"
-  string path = 1;
-
-  // Regular expression pattern to find (RE2 syntax).
-  // Example: "[0-9]{3}-[0-9]{2}-[0-9]{4}" for SSN
-  // Example: "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}" for email
-  string pattern = 2;
-
-  // Replacement string. Supports capture group references ($1, $2, etc.)
-  // Example: "[REDACTED]"
-  // Example: "$1-****-$3" to partially mask
-  // Default: "[REDACTED]"
-  string replacement = 3;
-}
-
-// RedactionConfig defines configuration for REDACTION policies.
-// Applies sed-like find/replace redaction rules to matched logs.
-message RedactionConfig {
-  // Matchers to identify which logs to apply redaction to (AND logic)
-  // If empty, redaction applies to all logs
-  repeated Matcher matchers = 1;
-
-  // Redaction rules to apply (applied in order)
-  repeated RedactionRule rules = 2;
 }
 
 // =============================================================================
@@ -167,14 +221,13 @@ message RedactionConfig {
 
 // Policy represents a complete telemetry policy definition.
 // Policies are designed to be:
-// - Typed: Self-identifies its type; same types can merge
 // - Implementation Agnostic: Works in SDK, Collector, or any component
 // - Standalone: No need to understand pipeline configuration
 // - Dynamic: Can be updated post-instantiation
 // - Idempotent: Safe to apply to multiple components
 // - Fail-Open: Does not interfere with telemetry on failure
 //
-// Merge Strategy: Policies of the same type are merged using priority.
+// Merge Strategy: Policies are merged using priority.
 // Higher priority values take precedence when rules conflict.
 message Policy {
   // Unique identifier for this policy
@@ -186,32 +239,28 @@ message Policy {
   // Optional description
   string description = 3;
 
-  // The type of policy (must match the config oneof field used)
-  PolicyType policy_type = 4;
-
-  // Telemetry types this policy applies to
-  repeated TelemetryType telemetry_types = 5;
-
   // Priority for merge conflict resolution (higher = more important)
-  int32 priority = 6;
-
-  // Policy configuration based on policy_type
-  oneof config {
-    FilterConfig filter = 7;
-    RedactionConfig redaction = 8;
-  }
+  int32 priority = 4;
 
   // Whether this policy is enabled
-  bool enabled = 9;
-
-  // Metadata labels for organization and filtering
-  repeated opentelemetry.proto.common.v1.KeyValue labels = 10;
+  bool enabled = 5;
 
   // Timestamp when this policy was created (Unix epoch nanoseconds)
-  fixed64 created_at_unix_nano = 11;
+  fixed64 created_at_unix_nano = 6;
 
   // Timestamp when this policy was last modified (Unix epoch nanoseconds)
-  fixed64 modified_at_unix_nano = 12;
+  fixed64 modified_at_unix_nano = 7;
+
+  // These labels can be used by an implementation to intelligently
+  // compile and route telemetry.
+  // Labels MAY contain metadata about the telemetry types this policy applies to.
+  // The key could be telemetry.types="type1,type2,type3"
+  repeated opentelemetry.proto.common.v1.KeyValue labels = 8;
+
+  // Policy configuration. Exactly one must be set.
+  oneof config {
+    LogFilterConfig filter = 9;
+  }
 }
 
 // =============================================================================
@@ -219,6 +268,11 @@ message Policy {
 // =============================================================================
 
 // PolicySet represents a collection of policies from a single source/provider.
+// If the sync type is full_sync, the entire policy set will be sent.
+// If the sync type is incremental, only the policies that have changed will be sent.
+// If the sync is incremental, the implementation MUST recalculate the hash and verify
+// that the hash matches the policy set hash. The hash is calculated by hashing the
+// entire policy set using the provided protobuf hash function.
 message PolicySet {
   // Unique identifier for this policy set
   string id = 1;
@@ -229,8 +283,8 @@ message PolicySet {
   // The policies in this set
   repeated Policy policies = 3;
 
-  // Version/hash of the entire set (for change detection)
-  string version = 4;
+  // Hash of the entire set (for change detection)
+  string hash = 4;
 
   // Source identifier (which provider supplied this)
   string source = 5;
@@ -240,33 +294,39 @@ message PolicySet {
 }
 
 // =============================================================================
+// Core Policy Types
+// =============================================================================
+
+// PolicyType identifies the specific use case for a policy.
+// Policies of the same type can be merged; different types cannot.
+enum PolicyType {
+  POLICY_TYPE_UNSPECIFIED = 0;
+  POLICY_TYPE_LOG_FILTER = 1; // Define how logs are filtered (keep/drop)
+}
+
+// =============================================================================
 // Sync Protocol (for Policy Providers)
 // =============================================================================
 
 // ClientMetadata contains information about the client requesting policies.
 message ClientMetadata {
-  // Unique identifier for the client instance
-  string client_id = 1;
-
-  // Version of the client software
-  string client_version = 2;
-
-  // Identifier for the workspace/tenant
-  string workspace_id = 3;
-
   // Last sync timestamp (Unix epoch nanoseconds)
   fixed64 last_sync_timestamp_unix_nano = 4;
 
   // Policy types this client supports/wants
   repeated PolicyType supported_policy_types = 5;
 
-  // Telemetry types this client handles
-  repeated TelemetryType supported_telemetry_types = 6;
-
   // Additional metadata labels
+  // NOTE FOR TERO:
+  // * workspace.id is required for usage.
   repeated opentelemetry.proto.common.v1.KeyValue labels = 7;
 
   // Resource attributes describing this client's identity
+  // REQUIRED:
+  // * service.instance.id
+  // * service.name
+  // * service.namespace
+  // * service.version
   repeated opentelemetry.proto.common.v1.KeyValue resource_attributes = 8;
 }
 
@@ -275,8 +335,29 @@ message SyncRequest {
   // Client identification and capabilities
   ClientMetadata client_metadata = 1;
 
-  // Request full sync (ignore last_policy_version)
+  // Request full sync (ignore synced_policy_sets)
   bool full_sync = 2;
+
+  // Last synced policy set state, keyed by policy set ID.
+  // The value is the hash/version of that policy set.
+  map<string, string> synced_policy_sets = 3;
+
+  // Error messages for specific policies, keyed by policy ID.
+  map<string, PolicyErrors> policy_errors = 4;
+}
+
+// PolicyErrors contains error messages for a specific policy.
+message PolicyErrors {
+  // List of error messages encountered for this policy.
+  repeated string messages = 1;
+}
+
+enum SyncType {
+  SYNC_TYPE_UNSPECIFIED = 0;
+  SYNC_TYPE_FULL = 1;
+  SYNC_TYPE_ADD = 2;
+  SYNC_TYPE_REMOVE = 3;
+  SYNC_TYPE_UPDATE = 4;
 }
 
 // SyncResponse contains policy updates for the client.
@@ -291,7 +372,7 @@ message SyncResponse {
   uint32 recommended_sync_interval_seconds = 3;
 
   // Whether this is a full replacement or incremental update
-  bool is_full_sync = 4;
+  SyncType sync_type = 4;
 
   // Error message if sync failed
   string error_message = 5;
