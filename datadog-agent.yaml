@@ -37,7 +37,7 @@ data:
           "policy_type": "filter",
           "telemetry_types": ["logs"],
           "matchers": [
-            { "match_type": "log_body", "regex": "^.*no such file or directory$" }
+            { "match_type": "log_body", "regex": "no such file or directory" }
           ],
           "action": "drop"
         },
@@ -147,10 +147,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        # - name: DD_LOGS_CONFIG_LOGS_DD_URL
-        #   value: "http://$(HOST_IP):8080"
         - name: DD_LOGS_CONFIG_LOGS_DD_URL
-          value: "http://host.docker.internal:8080"
+          value: "http://$(HOST_IP):8080"
+        # - name: DD_LOGS_CONFIG_LOGS_DD_URL
+        #   value: "http://host.docker.internal:8080"
       # Ensure agent runs on same nodes as Tero Edge
       tolerations:
         - operator: Exists
