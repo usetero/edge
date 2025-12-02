@@ -22,10 +22,10 @@
 //!
 //! ## Multi-pattern matching
 //! ```zig
-//! var db = try hs.Database.compileMulti(&.{
-//!     .{ .pattern = "error", .id = 1 },
-//!     .{ .pattern = "warn", .id = 2 },
-//!     .{ .pattern = "info", .id = 3 },
+//! var db = try hs.Database.compileMulti(allocator, &.{
+//!     .{ .expression = "error", .id = 1 },
+//!     .{ .expression = "warn", .id = 2 },
+//!     .{ .expression = "info", .id = 3 },
 //! }, .{});
 //! ```
 
@@ -415,19 +415,26 @@ pub const Database = struct {
     }
 
     /// Compile multiple patterns into a single database
-    pub fn compileMulti(patterns: []const Pattern, options: CompileOptions) Error!Self {
+    ///
+    /// The allocator is used for temporary storage during compilation and
+    /// is not retained after this function returns.
+    pub fn compileMulti(
+        allocator: std.mem.Allocator,
+        patterns: []const Pattern,
+        options: CompileOptions,
+    ) (Error || std.mem.Allocator.Error)!Self {
         if (patterns.len == 0) return error.Invalid;
         if (patterns.len > std.math.maxInt(c_uint)) return error.Invalid;
 
         // Allocate temporary arrays for C API
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        const expressions = alloc.alloc([*:0]const u8, patterns.len) catch return error.OutOfMemory;
-        const flags = alloc.alloc(c_uint, patterns.len) catch return error.OutOfMemory;
-        const ids = alloc.alloc(c_uint, patterns.len) catch return error.OutOfMemory;
-        const pattern_bufs = alloc.alloc([4096]u8, patterns.len) catch return error.OutOfMemory;
+        const expressions = try alloc.alloc([*:0]const u8, patterns.len);
+        const flags = try alloc.alloc(c_uint, patterns.len);
+        const ids = try alloc.alloc(c_uint, patterns.len);
+        const pattern_bufs = try alloc.alloc([4096]u8, patterns.len);
 
         for (patterns, 0..) |pat, i| {
             if (pat.expression.len >= 4096) return error.Invalid;
@@ -488,18 +495,25 @@ pub const Database = struct {
     }
 
     /// Compile multiple literal patterns
-    pub fn compileLiteralMulti(patterns: []const Pattern, options: CompileOptions) Error!Self {
+    ///
+    /// The allocator is used for temporary storage during compilation and
+    /// is not retained after this function returns.
+    pub fn compileLiteralMulti(
+        allocator: std.mem.Allocator,
+        patterns: []const Pattern,
+        options: CompileOptions,
+    ) (Error || std.mem.Allocator.Error)!Self {
         if (patterns.len == 0) return error.Invalid;
         if (patterns.len > std.math.maxInt(c_uint)) return error.Invalid;
 
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        const expressions = alloc.alloc([*]const u8, patterns.len) catch return error.OutOfMemory;
-        const flags = alloc.alloc(c_uint, patterns.len) catch return error.OutOfMemory;
-        const ids = alloc.alloc(c_uint, patterns.len) catch return error.OutOfMemory;
-        const lens = alloc.alloc(usize, patterns.len) catch return error.OutOfMemory;
+        const expressions = try alloc.alloc([*]const u8, patterns.len);
+        const flags = try alloc.alloc(c_uint, patterns.len);
+        const ids = try alloc.alloc(c_uint, patterns.len);
+        const lens = try alloc.alloc(usize, patterns.len);
 
         for (patterns, 0..) |pat, i| {
             expressions[i] = pat.expression.ptr;
@@ -975,7 +989,7 @@ test "compile with flags" {
 }
 
 test "compile multi-pattern" {
-    var db = try Database.compileMulti(&.{
+    var db = try Database.compileMulti(std.testing.allocator, &.{
         .{ .expression = "error", .id = 1 },
         .{ .expression = "warn", .id = 2 },
         .{ .expression = "info", .id = 3 },
@@ -1047,7 +1061,7 @@ test "matches helper" {
 }
 
 test "multi-pattern scan" {
-    var db = try Database.compileMulti(&.{
+    var db = try Database.compileMulti(std.testing.allocator, &.{
         .{ .expression = "error", .id = 1 },
         .{ .expression = "warn", .id = 2 },
         .{ .expression = "info", .id = 3 },
