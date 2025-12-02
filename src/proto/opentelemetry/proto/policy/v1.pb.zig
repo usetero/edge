@@ -25,6 +25,31 @@ pub const TelemetryType = enum(i32) {
     _,
 };
 
+/// MatchType specifies the category of telemetry field to match against.
+/// Each match type is only valid for certain TelemetryTypes:
+/// - RESOURCE, RESOURCE_ATTRIBUTE, SCOPE, SCOPE_ATTRIBUTE: all telemetry types
+/// - LOG_BODY, LOG_SEVERITY, LOG_ATTRIBUTE: TELEMETRY_TYPE_LOGS only
+/// - METRIC_NAME, METRIC_ATTRIBUTE: TELEMETRY_TYPE_METRICS only (future)
+/// - SPAN_NAME, SPAN_KIND, SPAN_STATUS, SPAN_ATTRIBUTE: TELEMETRY_TYPE_TRACES only (future)
+pub const MatchType = enum(i32) {
+    MATCH_TYPE_UNSPECIFIED = 0,
+    MATCH_TYPE_RESOURCE_ATTRIBUTE = 1,
+    MATCH_TYPE_SCOPE_NAME = 2,
+    MATCH_TYPE_SCOPE_VERSION = 3,
+    MATCH_TYPE_SCOPE_ATTRIBUTE = 4,
+    MATCH_TYPE_LOG_BODY = 10,
+    MATCH_TYPE_LOG_SEVERITY_TEXT = 11,
+    MATCH_TYPE_LOG_SEVERITY_NUMBER = 12,
+    MATCH_TYPE_LOG_ATTRIBUTE = 13,
+    MATCH_TYPE_METRIC_NAME = 20,
+    MATCH_TYPE_METRIC_ATTRIBUTE = 21,
+    MATCH_TYPE_SPAN_NAME = 30,
+    MATCH_TYPE_SPAN_KIND = 31,
+    MATCH_TYPE_SPAN_STATUS = 32,
+    MATCH_TYPE_SPAN_ATTRIBUTE = 33,
+    _,
+};
+
 /// FilterAction specifies what to do with matched logs.
 pub const FilterAction = enum(i32) {
     FILTER_ACTION_UNSPECIFIED = 0,
@@ -33,28 +58,43 @@ pub const FilterAction = enum(i32) {
     _,
 };
 
-/// Matcher provides a unified way to match against any telemetry data.
-/// Uses JSONPath syntax to access fields and regex for value matching.
+/// Matcher provides a unified way to match against telemetry data using known fields.
 ///
-/// Example paths for logs:
-/// - "$.resource.attributes.service.name"     -> service name
-/// - "$.resource.attributes.deployment.env"   -> deployment environment
-/// - "$.attributes.user.id"                   -> log attribute
-/// - "$.body"                                 -> log body
-/// - "$.severity_text"                        -> log severity (e.g., "ERROR")
-/// - "$.severity_number"                      -> log severity number
-/// - "$.attributes.*"                         -> any attribute key
+/// IMPORTANT CONSTRAINTS:
+/// - Multiple matchers are ANDed together: all matchers must match for the
+/// overall match to succeed.
+/// - The match_type must be valid for the policy's telemetry_types. For example,
+/// MATCH_TYPE_LOG_BODY is only valid when TELEMETRY_TYPE_LOGS is in the
+/// policy's telemetry_types list.
+/// - The list of matchers should uniquely identify a specific pattern of telemetry
+/// for that policy. Matchers should NOT be used as a catch-all; they should be
+/// specific enough to target the intended telemetry precisely.
 ///
 /// The regex uses RE2 syntax for consistency across implementations.
+///
+/// Examples:
+/// Match logs from payment service with ERROR severity:
+/// matchers: [
+/// {match_type: RESOURCE_ATTRIBUTE, key: "service.name", regex: "^payment-service$"},
+/// {match_type: LOG_SEVERITY_TEXT, regex: "^ERROR$"}
+/// ]
+///
+/// Match logs containing PII in body from any service in prod:
+/// matchers: [
+/// {match_type: RESOURCE_ATTRIBUTE, key: "deployment.environment", regex: "^prod.*"},
+/// {match_type: LOG_BODY, regex: "\\b[0-9]{3}-[0-9]{2}-[0-9]{4}\\b"}
+/// ]
 pub const Matcher = struct {
-    path: []const u8 = &.{},
+    match_type: MatchType = @enumFromInt(0),
+    key: []const u8 = &.{},
     regex: []const u8 = &.{},
     negate: bool = false,
 
     pub const _desc_table = .{
-        .path = fd(1, .{ .scalar = .string }),
-        .regex = fd(2, .{ .scalar = .string }),
-        .negate = fd(3, .{ .scalar = .bool }),
+        .match_type = fd(1, .@"enum"),
+        .key = fd(2, .{ .scalar = .string }),
+        .regex = fd(3, .{ .scalar = .string }),
+        .negate = fd(4, .{ .scalar = .bool }),
     };
 
     /// Encodes the message to the writer

@@ -229,7 +229,7 @@ test "DatadogModule filters logs with DROP policy" {
     };
     try drop_policy.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try drop_policy.config.?.filter.matchers.append(allocator, .{
-        .path = try allocator.dupe(u8, "$.level"),
+        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
         .regex = try allocator.dupe(u8, "DEBUG"),
     });
     defer drop_policy.deinit(allocator);
@@ -299,7 +299,7 @@ test "DatadogModule returns 202 when all logs dropped" {
     };
     try drop_all.telemetry_types.append(allocator, .TELEMETRY_TYPE_LOGS);
     try drop_all.config.?.filter.matchers.append(allocator, .{
-        .path = try allocator.dupe(u8, "$.level"),
+        .match_type = .MATCH_TYPE_LOG_SEVERITY_TEXT,
         .regex = try allocator.dupe(u8, ""),
     });
     defer drop_all.deinit(allocator);

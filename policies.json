@@ -4,7 +4,9 @@
       "name": "drop-echo-logs",
       "policy_type": "filter",
       "telemetry_types": ["logs"],
-      "matchers": [{ "path": "$.ddsource", "regex": "nginx" }],
+      "matchers": [
+        { "match_type": "log_attribute", "key": "ddsource", "regex": "nginx" }
+      ],
       "action": "drop"
     },
     {
@@ -12,8 +14,17 @@
       "policy_type": "filter",
       "telemetry_types": ["logs"],
       "matchers": [
-        { "path": "$.body", "regex": "debug" },
-        { "path": "$.body", "regex": "trace" }
+        { "match_type": "log_body", "regex": "debug" },
+        { "match_type": "log_body", "regex": "trace" }
+      ],
+      "action": "drop"
+    },
+    {
+      "name": "drop-no-such-file-or-directory-logs",
+      "policy_type": "filter",
+      "telemetry_types": ["logs"],
+      "matchers": [
+        { "match_type": "log_body", "regex": "^.*no such file or directory$" }
       ],
       "action": "drop"
     },
@@ -21,7 +32,7 @@
       "name": "drop-debug-level",
       "policy_type": "filter",
       "telemetry_types": ["logs"],
-      "matchers": [{ "path": "$.level", "regex": "DEBUG" }],
+      "matchers": [{ "match_type": "log_severity_text", "regex": "DEBUG" }],
       "action": "drop"
     },
     {
@@ -29,9 +40,9 @@
       "policy_type": "filter",
       "telemetry_types": ["logs"],
       "matchers": [
-        { "path": "$.severity_text", "regex": "error" },
-        { "path": "$.severity_text", "regex": "critical" },
-        { "path": "$.severity_text", "regex": "fatal" }
+        { "match_type": "log_severity_text", "regex": "error" },
+        { "match_type": "log_severity_text", "regex": "critical" },
+        { "match_type": "log_severity_text", "regex": "fatal" }
       ],
       "action": "keep"
     }
