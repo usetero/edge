@@ -75,4 +75,5 @@ test {
     _ = @import("modules/datadog/logs_v2.zig");
     _ = @import("json/pretty_print.zig");
     _ = @import("hyperscan/hyperscan.zig");
+    _ = @import("core/regex_index.zig");
 }
