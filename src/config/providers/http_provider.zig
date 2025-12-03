@@ -4,6 +4,7 @@ const policy_source = @import("../../core/policy_source.zig");
 const parser = @import("../parser.zig");
 const types = @import("../types.zig");
 const proto = @import("proto");
+const protobuf = @import("protobuf");
 
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
@@ -382,13 +383,10 @@ pub const HttpProvider = struct {
             .policy_set_statuses = policy_set_statuses_list,
         };
 
-        // Encode SyncRequest to JSON using std.Io.Writer.Allocating
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-
-        try std.json.Stringify.value(sync_request, .{}, &out.writer);
-
-        const request_body = out.written();
+        // Encode SyncRequest to JSON
+        protobuf.json.pb_options.emit_oneof_field_name = false;
+        const request_body = try sync_request.jsonEncode(.{}, self.allocator);
+        defer self.allocator.free(request_body);
 
         std.log.debug("Sending SyncRequest: {s}", .{request_body});
 
