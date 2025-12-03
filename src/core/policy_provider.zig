@@ -30,6 +30,7 @@ pub const PolicyProvider = struct {
 
     pub const VTable = struct {
         subscribe: *const fn (ptr: *anyopaque, callback: PolicyCallback) anyerror!void,
+        recordPolicyError: *const fn (ptr: *anyopaque, policy_id: []const u8, error_message: []const u8) void,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -40,30 +41,47 @@ pub const PolicyProvider = struct {
         try self.vtable.subscribe(self.ptr, callback);
     }
 
+    /// Report an error encountered when applying a policy.
+    /// How this is handled depends on the provider:
+    /// - HttpProvider: Records error to send in next sync request
+    /// - FileProvider: Logs error to stderr
+    pub fn recordPolicyError(self: PolicyProvider, policy_id: []const u8, error_message: []const u8) void {
+        self.vtable.recordPolicyError(self.ptr, policy_id, error_message);
+    }
+
     /// Cleanup provider resources
     pub fn deinit(self: PolicyProvider) void {
         self.vtable.deinit(self.ptr);
     }
 
     /// Create a PolicyProvider from a concrete provider implementation
-    /// Provider must implement: subscribe(*Self, PolicyCallback) !void and deinit(*Self) void
+    /// Provider must implement:
+    /// - subscribe(*Self, PolicyCallback) !void
+    /// - recordPolicyError(*Self, []const u8, []const u8) void
+    /// - deinit(*Self) void
     pub fn init(provider: anytype) PolicyProvider {
         const Ptr = @TypeOf(provider);
         const ptr_info = @typeInfo(Ptr);
 
-        if (ptr_info != .Pointer) @compileError("provider must be a pointer");
-        if (ptr_info.Pointer.size != .One) @compileError("provider must be single-item pointer");
+        if (ptr_info != .pointer) @compileError("provider must be a pointer");
+        if (ptr_info.pointer.size != .one) @compileError("provider must be single-item pointer");
 
-        const T = ptr_info.Pointer.child;
+        const T = ptr_info.pointer.child;
 
         // Verify provider has required methods
         if (!@hasDecl(T, "subscribe")) @compileError("provider must have subscribe method");
+        if (!@hasDecl(T, "recordPolicyError")) @compileError("provider must have recordPolicyError method");
         if (!@hasDecl(T, "deinit")) @compileError("provider must have deinit method");
 
         const gen = struct {
             fn subscribeImpl(ptr: *anyopaque, callback: PolicyCallback) anyerror!void {
                 const self: Ptr = @ptrCast(@alignCast(ptr));
                 return self.subscribe(callback);
+            }
+
+            fn recordPolicyErrorImpl(ptr: *anyopaque, policy_id: []const u8, error_message: []const u8) void {
+                const self: Ptr = @ptrCast(@alignCast(ptr));
+                self.recordPolicyError(policy_id, error_message);
             }
 
             fn deinitImpl(ptr: *anyopaque) void {
@@ -73,6 +91,7 @@ pub const PolicyProvider = struct {
 
             const vtable = VTable{
                 .subscribe = subscribeImpl,
+                .recordPolicyError = recordPolicyErrorImpl,
                 .deinit = deinitImpl,
             };
         };

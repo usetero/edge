@@ -63,6 +63,13 @@ pub const FileProvider = struct {
         self.allocator.destroy(self);
     }
 
+    /// Report an error encountered when applying a policy.
+    /// For file provider, this logs to stderr since there's no remote server to report to.
+    pub fn recordPolicyError(self: *FileProvider, policy_id: []const u8, error_message: []const u8) void {
+        _ = self;
+        std.log.err("Policy error [{s}]: {s}", .{ policy_id, error_message });
+    }
+
     fn loadAndNotify(self: *FileProvider) !void {
         std.log.info("Loading policies from file: {s}", .{self.config_path});
 

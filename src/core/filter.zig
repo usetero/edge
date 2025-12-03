@@ -70,7 +70,7 @@ pub const FilterEvaluator = struct {
             // Skip disabled policies
             if (!policy.enabled) continue;
 
-            const filter_config = policy.filter orelse continue;
+            const filter_config = policy.log_filter orelse continue;
 
             // Check if all matchers match using Hyperscan
             const all_match = checkAllMatchersWithHyperscan(
@@ -308,11 +308,11 @@ test "FilterEvaluator.evaluate with LOG_FILTER policy drops matching logs" {
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.filter.?.matchers.append(allocator, .{
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
@@ -339,11 +339,11 @@ test "FilterEvaluator.evaluate with LOG_FILTER policy keeps matching logs" {
     var keep_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "keep-errors"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_KEEP,
         },
     };
-    try keep_policy.filter.?.matchers.append(allocator, .{
+    try keep_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer keep_policy.deinit(allocator);
@@ -377,11 +377,11 @@ test "FilterEvaluator.evaluate skips disabled policies" {
     var disabled_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "disabled-drop"),
         .enabled = false, // disabled!
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try disabled_policy.filter.?.matchers.append(allocator, .{
+    try disabled_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer disabled_policy.deinit(allocator);
@@ -404,11 +404,11 @@ test "FilterEvaluator.evaluate with Datadog log format" {
     var drop_staging = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-staging"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_staging.filter.?.matchers.append(allocator, .{
+    try drop_staging.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "ddtags"),
             .regex = try allocator.dupe(u8, "env:staging"),
@@ -446,14 +446,14 @@ test "FilterEvaluator.evaluate with multiple matchers (AND logic)" {
     var policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-payment-debug"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "service"),
             .regex = try allocator.dupe(u8, "payment"),
@@ -491,11 +491,11 @@ test "evaluateWithHyperscan: drops matching logs" {
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-errors"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.filter.?.matchers.append(allocator, .{
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer drop_policy.deinit(allocator);
@@ -522,11 +522,11 @@ test "evaluateWithHyperscan: keeps matching logs" {
     var keep_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "keep-errors"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_KEEP,
         },
     };
-    try keep_policy.filter.?.matchers.append(allocator, .{
+    try keep_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer keep_policy.deinit(allocator);
@@ -560,11 +560,11 @@ test "evaluateWithHyperscan: with log_attribute matches" {
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-payment"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.filter.?.matchers.append(allocator, .{
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "service"),
             .regex = try allocator.dupe(u8, "payment"),
@@ -594,11 +594,11 @@ test "evaluateWithHyperscan: with negate flag" {
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-non-important"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.filter.?.matchers.append(allocator, .{
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "important") } },
         .negate = true,
     });
@@ -626,14 +626,14 @@ test "evaluateWithHyperscan: multiple matchers AND logic" {
     var policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-payment-debug"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "service"),
             .regex = try allocator.dupe(u8, "payment"),
@@ -667,11 +667,11 @@ test "evaluateWithHyperscan: regex pattern matching" {
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-error-pattern"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.filter.?.matchers.append(allocator, .{
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
         // Regex pattern: matches "error" or "Error" or "ERROR"
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "[Ee]rror") } },
     });
@@ -702,11 +702,11 @@ test "evaluateWithHyperscan: skips disabled policies" {
     var disabled_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "disabled-drop"),
         .enabled = false, // disabled!
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try disabled_policy.filter.?.matchers.append(allocator, .{
+    try disabled_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer disabled_policy.deinit(allocator);

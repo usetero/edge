@@ -192,7 +192,7 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
             .description = description,
             .priority = json_policy.priority,
             .enabled = json_policy.enabled,
-            .filter = filter,
+            .log_filter = filter,
         };
     }
 

@@ -220,11 +220,11 @@ test "DatadogModule filters logs with DROP policy" {
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.filter.?.matchers.append(allocator, .{
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
@@ -285,11 +285,11 @@ test "DatadogModule returns 202 when all logs dropped" {
     var drop_all = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_all.filter.?.matchers.append(allocator, .{
+    try drop_all.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "") } },
     });
     defer drop_all.deinit(allocator);

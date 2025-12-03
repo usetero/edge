@@ -163,7 +163,7 @@ pub const CompiledRegexIndex = struct {
 
         // First pass: collect all patterns
         for (policies, 0..) |*policy, policy_idx| {
-            const filter_config = policy.filter orelse continue;
+            const filter_config = policy.log_filter orelse continue;
 
             for (filter_config.matchers.items, 0..) |matcher, matcher_idx| {
                 const match = matcher.match orelse continue;
@@ -422,11 +422,11 @@ test "CompiledRegexIndex: build with single log_body pattern" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
     });
     defer policy.deinit(allocator);
@@ -452,14 +452,14 @@ test "CompiledRegexIndex: build with multiple match types" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "multi-match"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer policy.deinit(allocator);
@@ -478,17 +478,17 @@ test "CompiledRegexIndex: build with log_attribute (keyed)" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "attr-policy"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "service"),
             .regex = try allocator.dupe(u8, "payment"),
         } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "env"),
             .regex = try allocator.dupe(u8, "staging"),
@@ -519,11 +519,11 @@ test "CompiledRegexIndex: multiple policies same match type" {
     var policy1 = Policy{
         .name = try allocator.dupe(u8, "policy-1"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy1.filter.?.matchers.append(allocator, .{
+    try policy1.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
     });
     defer policy1.deinit(allocator);
@@ -531,11 +531,11 @@ test "CompiledRegexIndex: multiple policies same match type" {
     var policy2 = Policy{
         .name = try allocator.dupe(u8, "policy-2"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_KEEP,
         },
     };
-    try policy2.filter.?.matchers.append(allocator, .{
+    try policy2.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "warning") } },
     });
     defer policy2.deinit(allocator);
@@ -561,11 +561,11 @@ test "CompiledRegexIndex: negate flag preserved" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "negate-policy"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "success") } },
         .negate = true,
     });
@@ -585,11 +585,11 @@ test "CompiledRegexIndex: scan matches value" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "scan-test"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
     });
     defer policy.deinit(allocator);
@@ -617,11 +617,11 @@ test "CompiledRegexIndex: scan with multiple patterns" {
     var policy1 = Policy{
         .name = try allocator.dupe(u8, "error-policy"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy1.filter.?.matchers.append(allocator, .{
+    try policy1.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
     });
     defer policy1.deinit(allocator);
@@ -629,11 +629,11 @@ test "CompiledRegexIndex: scan with multiple patterns" {
     var policy2 = Policy{
         .name = try allocator.dupe(u8, "warn-policy"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_KEEP,
         },
     };
-    try policy2.filter.?.matchers.append(allocator, .{
+    try policy2.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "warning") } },
     });
     defer policy2.deinit(allocator);
@@ -664,28 +664,28 @@ test "CompiledRegexIndex: all simple match types" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "all-types"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
 
     // Add a matcher for each simple type
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .resource_schema_url = .{ .regex = try allocator.dupe(u8, "schema") } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .scope_schema_url = .{ .regex = try allocator.dupe(u8, "scope_schema") } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .scope_name = .{ .regex = try allocator.dupe(u8, "scope_name") } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .scope_version = .{ .regex = try allocator.dupe(u8, "v1") } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "body") } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
     });
     defer policy.deinit(allocator);
@@ -713,24 +713,24 @@ test "CompiledRegexIndex: all keyed match types" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "keyed-types"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
 
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .resource_attribute = .{
             .key = try allocator.dupe(u8, "service.name"),
             .regex = try allocator.dupe(u8, "payment"),
         } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .scope_attribute = .{
             .key = try allocator.dupe(u8, "library"),
             .regex = try allocator.dupe(u8, "opentelemetry"),
         } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "user_id"),
             .regex = try allocator.dupe(u8, "admin"),
@@ -755,19 +755,19 @@ test "CompiledRegexIndex: same key different match types" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "same-key"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
 
     // Same key "name" but different match types
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .resource_attribute = .{
             .key = try allocator.dupe(u8, "name"),
             .regex = try allocator.dupe(u8, "resource"),
         } },
     });
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_attribute = .{
             .key = try allocator.dupe(u8, "name"),
             .regex = try allocator.dupe(u8, "log"),
@@ -795,18 +795,18 @@ test "CompiledRegexIndex: policies without filter config ignored" {
     var policy_no_filter = Policy{
         .name = try allocator.dupe(u8, "no-filter"),
         .enabled = true,
-        .filter = null, // No filter config
+        .log_filter = null, // No log_filter config
     };
     defer policy_no_filter.deinit(allocator);
 
     var policy_with_filter = Policy{
         .name = try allocator.dupe(u8, "with-filter"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try policy_with_filter.filter.?.matchers.append(allocator, .{
+    try policy_with_filter.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "test") } },
     });
     defer policy_with_filter.deinit(allocator);
@@ -829,16 +829,16 @@ test "CompiledRegexIndex: empty regex patterns skipped" {
     var policy = Policy{
         .name = try allocator.dupe(u8, "empty-regex"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
     // Empty regex
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "") } },
     });
     // Non-empty regex
-    try policy.filter.?.matchers.append(allocator, .{
+    try policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "valid") } },
     });
     defer policy.deinit(allocator);
