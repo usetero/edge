@@ -13,7 +13,7 @@
     },
     {
       "type": "http",
-      "url": "http://localhost:9090/v1/policy/sync"
+      "url": "http://localhost:9091/tero.edge.policy.PolicySync/Sync"
     }
   ]
 }

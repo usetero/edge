@@ -259,12 +259,12 @@ pub const HttpProvider = struct {
         std.log.debug("Fetching policies from HTTP: {s}", .{self.config_url});
 
         var new_etag: ?[]u8 = null;
-        var maybe_parsed = try self.fetchPolicies(&new_etag);
+        var maybe_decoded = try self.fetchPolicies(&new_etag);
 
-        if (maybe_parsed) |*parsed| {
-            defer parsed.deinit();
+        if (maybe_decoded) |*decoded| {
+            defer decoded.deinit();
 
-            const response = parsed.value;
+            const response = decoded.value;
 
             // Update ETag
             if (self.last_etag) |old_etag| {
@@ -309,7 +309,18 @@ pub const HttpProvider = struct {
         }
     }
 
-    fn fetchPolicies(self: *HttpProvider, out_etag: *?[]u8) !?std.json.Parsed(SyncResponse) {
+    /// Decoded SyncResponse wrapper that manages memory
+    const DecodedSyncResponse = struct {
+        value: SyncResponse,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *DecodedSyncResponse) void {
+            var response = self.value;
+            response.deinit(self.allocator);
+        }
+    };
+
+    fn fetchPolicies(self: *HttpProvider, out_etag: *?[]u8) !?DecodedSyncResponse {
         const uri = try std.Uri.parse(self.config_url);
 
         // Build resource_attributes with required fields:
@@ -318,16 +329,16 @@ pub const HttpProvider = struct {
         // - service.version
         // - service.namespace
         const resource_attributes = [_]KeyValue{
-            .{ .key = "service.name", .value = .{ .string_value = self.service.name } },
-            .{ .key = "service.instance.id", .value = .{ .string_value = self.service.instance_id } },
-            .{ .key = "service.version", .value = .{ .string_value = self.service.version } },
-            .{ .key = "service.namespace", .value = .{ .string_value = self.service.namespace } },
+            .{ .key = "service.name", .value = .{ .value = .{ .string_value = self.service.name } } },
+            .{ .key = "service.instance.id", .value = .{ .value = .{ .string_value = self.service.instance_id } } },
+            .{ .key = "service.version", .value = .{ .value = .{ .string_value = self.service.version } } },
+            .{ .key = "service.namespace", .value = .{ .value = .{ .string_value = self.service.namespace } } },
         };
 
         // Build labels with required fields:
         // - workspace.id
         const labels = [_]KeyValue{
-            .{ .key = "workspace.id", .value = .{ .string_value = self.workspace_id } },
+            .{ .key = "workspace.id", .value = .{ .value = .{ .string_value = self.workspace_id } } },
         };
 
         // Build supported_policy_types
@@ -382,19 +393,28 @@ pub const HttpProvider = struct {
             .policy_set_statuses = policy_set_statuses_list,
         };
 
-        // Encode SyncRequest to JSON
-        const request_body = try sync_request.jsonEncode(.{}, self.allocator);
-        defer self.allocator.free(request_body);
+        // Encode SyncRequest to protobuf binary format
+        var request_body_writer = std.Io.Writer.Allocating.init(self.allocator);
+        defer request_body_writer.deinit();
 
-        std.log.debug("Sending SyncRequest: {s}", .{request_body});
+        try sync_request.encode(&request_body_writer.writer, self.allocator);
+        const request_body = request_body_writer.written();
+
+        std.log.debug("Sending SyncRequest ({} bytes)", .{request_body.len});
 
         // Prepare headers
-        var headers_buffer: [2]std.http.Header = undefined;
+        var headers_buffer: [3]std.http.Header = undefined;
         var headers_count: usize = 0;
 
         headers_buffer[headers_count] = .{
             .name = "content-type",
-            .value = "application/json",
+            .value = "application/grpc",
+        };
+        headers_count += 1;
+
+        headers_buffer[headers_count] = .{
+            .name = "accept",
+            .value = "application/x-protobuf",
         };
         headers_count += 1;
 
@@ -444,22 +464,35 @@ pub const HttpProvider = struct {
             }
         }
 
-        // Read response body using allocating writer
+        // Read response body
         var body_writer = std.Io.Writer.Allocating.init(self.allocator);
-        defer body_writer.deinit();
+        errdefer body_writer.deinit();
 
         // Buffer for streaming response
         var read_buffer: [4096]u8 = undefined;
         const body_reader = response.reader(&read_buffer);
 
         // Stream response to allocating writer
-        _ = try body_reader.stream(&body_writer.writer, std.io.Limit.limited(std.math.maxInt(usize)));
+        _ = try body_reader.stream(&body_writer.writer, .unlimited);
 
         const response_body = body_writer.written();
 
-        // Decode SyncResponse from JSON
-        const parsed = try SyncResponse.jsonDecode(response_body, .{}, self.allocator);
+        std.log.debug("Received SyncResponse ({} bytes)", .{response_body.len});
 
-        return parsed;
+        // Decode SyncResponse from protobuf binary format
+        // Create a reader from the response body
+        var response_reader = std.Io.Reader.fixed(response_body);
+
+        const decoded = try SyncResponse.decode(&response_reader, self.allocator);
+
+        // Transfer ownership of body_writer to caller (they'll free via deinit)
+        // Actually we need to keep the response_body alive since decoded references it
+        // The protobuf decoder dupes strings, so we can free body_writer
+        body_writer.deinit();
+
+        return DecodedSyncResponse{
+            .value = decoded,
+            .allocator = self.allocator,
+        };
     }
 };
