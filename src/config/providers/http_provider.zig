@@ -318,16 +318,16 @@ pub const HttpProvider = struct {
         // - service.version
         // - service.namespace
         const resource_attributes = [_]KeyValue{
-            .{ .key = "service.name", .value = .{ .string_value = self.service.name } },
-            .{ .key = "service.instance.id", .value = .{ .string_value = self.service.instance_id } },
-            .{ .key = "service.version", .value = .{ .string_value = self.service.version } },
-            .{ .key = "service.namespace", .value = .{ .string_value = self.service.namespace } },
+            .{ .key = "service.name", .value = .{ .value = .{ .string_value = self.service.name } } },
+            .{ .key = "service.instance.id", .value = .{ .value = .{ .string_value = self.service.instance_id } } },
+            .{ .key = "service.version", .value = .{ .value = .{ .string_value = self.service.version } } },
+            .{ .key = "service.namespace", .value = .{ .value = .{ .string_value = self.service.namespace } } },
         };
 
         // Build labels with required fields:
         // - workspace.id
         const labels = [_]KeyValue{
-            .{ .key = "workspace.id", .value = .{ .string_value = self.workspace_id } },
+            .{ .key = "workspace.id", .value = .{ .value = .{ .string_value = self.workspace_id } } },
         };
 
         // Build supported_policy_types
@@ -382,9 +382,13 @@ pub const HttpProvider = struct {
             .policy_set_statuses = policy_set_statuses_list,
         };
 
-        // Encode SyncRequest to JSON
-        const request_body = try sync_request.jsonEncode(.{}, self.allocator);
-        defer self.allocator.free(request_body);
+        // Encode SyncRequest to JSON using std.Io.Writer.Allocating
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+
+        try std.json.Stringify.value(sync_request, .{}, &out.writer);
+
+        const request_body = out.written();
 
         std.log.debug("Sending SyncRequest: {s}", .{request_body});
 
