@@ -28,6 +28,8 @@ pub const ProviderType = enum {
 };
 
 pub const ProviderConfig = struct {
+    /// Unique identifier for this provider (used to track which policies came from where)
+    id: []const u8,
     type: ProviderType,
     // For file provider
     path: ?[]const u8 = null,

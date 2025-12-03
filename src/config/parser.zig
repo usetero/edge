@@ -35,6 +35,7 @@ const PoliciesFileJson = struct {
 
 /// JSON schema for policy provider configuration
 const ProviderJson = struct {
+    id: []const u8,
     type: []const u8,
     path: ?[]const u8 = null,
     url: ?[]const u8 = null,
@@ -236,6 +237,7 @@ fn parseProviders(allocator: std.mem.Allocator, json_providers: []ProviderJson) 
         const provider_type = try parseProviderType(json_provider.type);
 
         providers[i] = types.ProviderConfig{
+            .id = try allocator.dupe(u8, json_provider.id),
             .type = provider_type,
             .path = if (json_provider.path) |p| try allocator.dupe(u8, p) else null,
             .url = if (json_provider.url) |u| try allocator.dupe(u8, u) else null,

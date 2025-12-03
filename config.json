@@ -8,10 +8,12 @@
   "max_body_size": 1048576,
   "policy_providers": [
     {
+      "id": "file",
       "type": "file",
       "path": "policies.json"
     },
     {
+      "id": "http",
       "type": "http",
       "url": "http://localhost:9090/v1/policy/sync"
     }

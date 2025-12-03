@@ -264,36 +264,6 @@ message Policy {
 }
 
 // =============================================================================
-// Policy Collections and Management
-// =============================================================================
-
-// PolicySet represents a collection of policies from a single source/provider.
-// If the sync type is full_sync, the entire policy set will be sent.
-// If the sync type is incremental, only the policies that have changed will be sent.
-// If the sync is incremental, the implementation MUST recalculate the hash and verify
-// that the hash matches the policy set hash. The hash is calculated by hashing the
-// entire policy set using the provided protobuf hash function.
-message PolicySet {
-  // Unique identifier for this policy set
-  string id = 1;
-
-  // Human-readable name
-  string name = 2;
-
-  // The policies in this set
-  repeated Policy policies = 3;
-
-  // Hash of the entire set (for change detection)
-  string hash = 4;
-
-  // Source identifier (which provider supplied this)
-  string source = 5;
-
-  // Timestamp of this policy set (Unix epoch nanoseconds)
-  fixed64 timestamp_unix_nano = 6;
-}
-
-// =============================================================================
 // Core Policy Types
 // =============================================================================
 
@@ -343,62 +313,53 @@ message PolicySyncStatus {
   repeated string errors = 4;
 }
 
-// PolicySetSyncStatus reports the sync state of a policy set.
-// Used to communicate the last known state of a policy set to the provider.
-message PolicySetSyncStatus {
-  // The policy set ID this status refers to.
-  string id = 1;
-
-  // The hash of the policy set as last received by the client.
-  string hash = 2;
-
-  // The provider for this policy set.
-  string provider = 3;
-
-  // Status of individual policies within this set.
-  repeated PolicySyncStatus policy_statuses = 4;
-}
-
 // SyncRequest is sent by clients to request policy updates.
 message SyncRequest {
   // Client identification and capabilities
   ClientMetadata client_metadata = 1;
 
-  // Request full sync (ignore policy_set_statuses)
+  // Request full sync (ignore policy_statuses)
   bool full_sync = 2;
 
   // Last sync timestamp (Unix epoch nanoseconds)
   fixed64 last_sync_timestamp_unix_nano = 3;
 
-  // Status of policy sets currently held by the client.
-  // Includes hash for change detection and per-policy metrics/errors.
-  repeated PolicySetSyncStatus policy_set_statuses = 4;
+  // The hash of the policy list as last received by the client.
+  string last_successful_hash = 4;
+
+  // Status of individual policies within this set.
+  repeated PolicySyncStatus policy_statuses = 5;
 }
 
 enum SyncType {
   SYNC_TYPE_UNSPECIFIED = 0;
   SYNC_TYPE_FULL = 1;
-  SYNC_TYPE_ADD = 2;
-  SYNC_TYPE_REMOVE = 3;
-  SYNC_TYPE_UPDATE = 4;
+
+  // These are future fields for when we may want to support diffing.
+  // SYNC_TYPE_ADD = 2;
+  // SYNC_TYPE_REMOVE = 3;
+  // SYNC_TYPE_UPDATE = 4;
 }
 
 // SyncResponse contains policy updates for the client.
 message SyncResponse {
-  // The complete policy set to apply
-  PolicySet policy_set = 1;
+  // The policies to sync
+  repeated Policy policies = 1;
+
+  // Hash of the entire list of policies (for change detection)
+  string hash = 2;
 
   // Timestamp of this sync (Unix epoch nanoseconds)
-  fixed64 sync_timestamp_unix_nano = 2;
+  fixed64 sync_timestamp_unix_nano = 3;
 
   // Suggested interval before next sync (in seconds)
-  uint32 recommended_sync_interval_seconds = 3;
+  uint32 recommended_sync_interval_seconds = 4;
 
   // Whether this is a full replacement or incremental update
-  SyncType sync_type = 4;
+  SyncType sync_type = 5;
 
   // Error message if sync failed
-  string error_message = 5;
+  string error_message = 6;
 }
 
 // =============================================================================

@@ -17,6 +17,7 @@ data:
       "max_body_size": 1048576,
       "policy_providers": [
         {
+          "id": "file",
           "type": "file",
           "path": "/etc/tero/policies.json"
         }

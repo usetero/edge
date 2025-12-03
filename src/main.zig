@@ -105,6 +105,7 @@ pub fn main() !void {
         allocator.free(config.workspace_id);
         // Free policy providers
         for (config.policy_providers) |provider_config| {
+            allocator.free(provider_config.id);
             if (provider_config.path) |path| allocator.free(path);
             if (provider_config.url) |url| allocator.free(url);
         }
