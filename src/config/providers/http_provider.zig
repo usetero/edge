@@ -11,9 +11,30 @@ const SourceType = policy_source.SourceType;
 const SyncRequest = proto.policy.SyncRequest;
 const SyncResponse = proto.policy.SyncResponse;
 const ClientMetadata = proto.policy.ClientMetadata;
+const PolicyErrors = proto.policy.PolicyErrors;
 const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
 const ServiceMetadata = types.ServiceMetadata;
+
+/// Tracks the sync state for a policy set
+const SyncedPolicySet = struct {
+    id: []const u8,
+    hash: []const u8,
+};
+
+/// Tracks errors for a specific policy
+const PolicyError = struct {
+    policy_id: []const u8,
+    messages: std.ArrayListUnmanaged([]const u8),
+
+    fn deinit(self: *PolicyError, allocator: std.mem.Allocator) void {
+        allocator.free(self.policy_id);
+        for (self.messages.items) |msg| {
+            allocator.free(msg);
+        }
+        self.messages.deinit(allocator);
+    }
+};
 
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {
@@ -30,6 +51,17 @@ pub const HttpProvider = struct {
     service: ServiceMetadata,
     workspace_id: []const u8,
     last_sync_timestamp: i64,
+
+    // Synced policy set tracking: maps policy_set_id -> hash
+    // Used to report which policy sets we have synced to the server
+    synced_policy_sets: std.StringHashMapUnmanaged([]const u8),
+
+    // Policy error tracking: maps policy_id -> list of error messages
+    // Used to report errors encountered when applying policies
+    policy_errors: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
+
+    // Mutex for thread-safe access to synced state
+    sync_state_mutex: std.Thread.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -56,9 +88,96 @@ pub const HttpProvider = struct {
             .service = service,
             .workspace_id = workspace_id,
             .last_sync_timestamp = 0,
+            .synced_policy_sets = .{},
+            .policy_errors = .{},
+            .sync_state_mutex = .{},
         };
 
         return self;
+    }
+
+    /// Record a successfully synced policy set with its hash.
+    /// This information will be sent in subsequent sync requests.
+    pub fn recordSyncedPolicySet(self: *HttpProvider, policy_set_id: []const u8, hash: []const u8) !void {
+        self.sync_state_mutex.lock();
+        defer self.sync_state_mutex.unlock();
+
+        // Remove old entry if exists
+        if (self.synced_policy_sets.fetchRemove(policy_set_id)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
+        }
+
+        // Add new entry
+        const id_copy = try self.allocator.dupe(u8, policy_set_id);
+        errdefer self.allocator.free(id_copy);
+
+        const hash_copy = try self.allocator.dupe(u8, hash);
+        errdefer self.allocator.free(hash_copy);
+
+        try self.synced_policy_sets.put(self.allocator, id_copy, hash_copy);
+    }
+
+    /// Record an error for a specific policy.
+    /// These errors will be sent in subsequent sync requests.
+    /// Conforms to PolicyProvider interface (void return, logs errors internally).
+    pub fn recordPolicyError(self: *HttpProvider, policy_id: []const u8, error_message: []const u8) void {
+        self.sync_state_mutex.lock();
+        defer self.sync_state_mutex.unlock();
+
+        const msg_copy = self.allocator.dupe(u8, error_message) catch {
+            std.log.err("Failed to record policy error for {s}: out of memory", .{policy_id});
+            return;
+        };
+
+        if (self.policy_errors.getPtr(policy_id)) |errors| {
+            // Append to existing error list
+            errors.append(self.allocator, msg_copy) catch {
+                self.allocator.free(msg_copy);
+                std.log.err("Failed to append policy error for {s}: out of memory", .{policy_id});
+                return;
+            };
+        } else {
+            // Create new entry
+            const id_copy = self.allocator.dupe(u8, policy_id) catch {
+                self.allocator.free(msg_copy);
+                std.log.err("Failed to record policy error for {s}: out of memory", .{policy_id});
+                return;
+            };
+
+            var errors = std.ArrayListUnmanaged([]const u8){};
+            errors.append(self.allocator, msg_copy) catch {
+                self.allocator.free(msg_copy);
+                self.allocator.free(id_copy);
+                std.log.err("Failed to record policy error for {s}: out of memory", .{policy_id});
+                return;
+            };
+
+            self.policy_errors.put(self.allocator, id_copy, errors) catch {
+                self.allocator.free(msg_copy);
+                self.allocator.free(id_copy);
+                errors.deinit(self.allocator);
+                std.log.err("Failed to record policy error for {s}: out of memory", .{policy_id});
+                return;
+            };
+        }
+    }
+
+    /// Clear all recorded policy errors.
+    /// Call this after errors have been successfully reported to the server.
+    pub fn clearPolicyErrors(self: *HttpProvider) void {
+        self.sync_state_mutex.lock();
+        defer self.sync_state_mutex.unlock();
+
+        var it = self.policy_errors.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.items) |msg| {
+                self.allocator.free(msg);
+            }
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.policy_errors.clearRetainingCapacity();
     }
 
     pub fn subscribe(self: *HttpProvider, callback: PolicyCallback) !void {
@@ -89,6 +208,25 @@ pub const HttpProvider = struct {
         if (self.last_etag) |etag| {
             self.allocator.free(etag);
         }
+
+        // Free synced policy sets
+        var ps_it = self.synced_policy_sets.iterator();
+        while (ps_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.synced_policy_sets.deinit(self.allocator);
+
+        // Free policy errors
+        var pe_it = self.policy_errors.iterator();
+        while (pe_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.items) |msg| {
+                self.allocator.free(msg);
+            }
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.policy_errors.deinit(self.allocator);
 
         self.http_client.deinit();
         self.allocator.free(self.config_url);
@@ -144,6 +282,15 @@ pub const HttpProvider = struct {
                     });
                 }
 
+                // Record the synced policy set with its hash for future sync requests
+                if (policy_set.id.len > 0 and policy_set.hash.len > 0) {
+                    try self.recordSyncedPolicySet(policy_set.id, policy_set.hash);
+                    std.log.debug("Recorded synced policy set: id={s}, hash={s}", .{
+                        policy_set.id,
+                        policy_set.hash,
+                    });
+                }
+
                 std.log.info("Loaded {} policies from {s} (sync_timestamp: {})", .{
                     policy_set.policies.items.len,
                     self.config_url,
@@ -179,13 +326,47 @@ pub const HttpProvider = struct {
             .{ .key = "workspace.id", .value = .{ .value = .{ .string_value = self.workspace_id } } },
         };
 
-        // Create SyncRequest with metadata
+        // Build synced_policy_sets entries from our tracked state
+        var synced_policy_sets_list = std.ArrayListUnmanaged(SyncRequest.SyncedPolicySetsEntry){};
+        defer synced_policy_sets_list.deinit(self.allocator);
+
+        // Build policy_errors entries from our tracked state
+        var policy_errors_list = std.ArrayListUnmanaged(SyncRequest.PolicyErrorsEntry){};
+        defer policy_errors_list.deinit(self.allocator);
+
+        // Lock to read sync state
+        self.sync_state_mutex.lock();
+        defer self.sync_state_mutex.unlock();
+
+        // Populate synced_policy_sets
+        var ps_it = self.synced_policy_sets.iterator();
+        while (ps_it.next()) |entry| {
+            try synced_policy_sets_list.append(self.allocator, .{
+                .key = entry.key_ptr.*,
+                .value = entry.value_ptr.*,
+            });
+        }
+
+        // Populate policy_errors
+        var pe_it = self.policy_errors.iterator();
+        while (pe_it.next()) |entry| {
+            try policy_errors_list.append(self.allocator, .{
+                .key = entry.key_ptr.*,
+                .value = PolicyErrors{
+                    .messages = entry.value_ptr.*,
+                },
+            });
+        }
+
+        // Create SyncRequest with metadata, synced_policy_sets, and policy_errors
         const sync_request = SyncRequest{
             .client_metadata = ClientMetadata{
                 .last_sync_timestamp_unix_nano = @intCast(self.last_sync_timestamp),
                 .resource_attributes = .{ .items = @constCast(&resource_attributes), .capacity = resource_attributes.len },
                 .labels = .{ .items = @constCast(&labels), .capacity = labels.len },
             },
+            .synced_policy_sets = synced_policy_sets_list,
+            .policy_errors = policy_errors_list,
         };
 
         // Encode SyncRequest to JSON

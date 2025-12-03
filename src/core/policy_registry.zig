@@ -97,7 +97,7 @@ pub const PolicyRegistry = struct {
     policies: std.ArrayListUnmanaged(Policy),
 
     // Source tracking for deduplication and priority
-    // Key: policy name, Value: PolicyMetadata
+    // Key: policy id, Value: PolicyMetadata
     policy_sources: std.StringHashMap(PolicyMetadata),
 
     // Synchronization
@@ -108,6 +108,13 @@ pub const PolicyRegistry = struct {
     // Current immutable snapshot for lock-free reads
     current_snapshot: std.atomic.Value(?*const PolicySnapshot),
 
+    // Provider references for error routing
+    // These are not owned by the registry - caller must ensure they outlive the registry
+    providers: struct {
+        file: ?*policy_provider.PolicyProvider = null,
+        http: ?*policy_provider.PolicyProvider = null,
+    },
+
     pub fn init(allocator: std.mem.Allocator) PolicyRegistry {
         return .{
             .policies = .empty,
@@ -116,7 +123,40 @@ pub const PolicyRegistry = struct {
             .allocator = allocator,
             .version = std.atomic.Value(u64).init(0),
             .current_snapshot = std.atomic.Value(?*const PolicySnapshot).init(null),
+            .providers = .{},
         };
+    }
+
+    /// Register a provider for error routing.
+    /// The provider must outlive the registry.
+    pub fn registerProvider(self: *PolicyRegistry, source: SourceType, provider: *policy_provider.PolicyProvider) void {
+        switch (source) {
+            .file => self.providers.file = provider,
+            .http => self.providers.http = provider,
+        }
+    }
+
+    /// Report an error encountered when applying a policy.
+    /// Routes the error to the appropriate provider based on the policy's source.
+    pub fn recordPolicyError(self: *PolicyRegistry, policy_id: []const u8, error_message: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.policy_sources.get(policy_id)) |metadata| {
+            const provider: ?*policy_provider.PolicyProvider = switch (metadata.source) {
+                .file => self.providers.file,
+                .http => self.providers.http,
+            };
+            if (provider) |p| {
+                p.recordPolicyError(policy_id, error_message);
+            } else {
+                // No provider registered, log to stderr as fallback
+                std.log.err("Policy error [{s}]: {s} (no provider registered for source)", .{ policy_id, error_message });
+            }
+        } else {
+            // Policy not found, log to stderr
+            std.log.err("Policy error [{s}]: {s} (policy not found in registry)", .{ policy_id, error_message });
+        }
     }
 
     pub fn deinit(self: *PolicyRegistry) void {
@@ -141,7 +181,7 @@ pub const PolicyRegistry = struct {
     }
 
     /// Update policies from a specific source
-    /// Deduplicates by name and applies priority rules
+    /// Deduplicates by id and applies priority rules
     pub fn updatePolicies(
         self: *PolicyRegistry,
         policies: []const Policy,
@@ -150,31 +190,31 @@ pub const PolicyRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Track which policies from this source are in the new set
-        var new_policy_names = std.StringHashMap(void).init(self.allocator);
+        // Track which policy ids from this source are in the new set
+        var new_policy_ids = std.StringHashMap(void).init(self.allocator);
         defer {
-            var it = new_policy_names.keyIterator();
+            var it = new_policy_ids.keyIterator();
             while (it.next()) |key| {
                 self.allocator.free(key.*);
             }
-            new_policy_names.deinit();
+            new_policy_ids.deinit();
         }
 
         // Process each incoming policy
         for (policies) |policy| {
-            const name_copy = try self.allocator.dupe(u8, policy.name);
-            errdefer self.allocator.free(name_copy);
+            const id_copy = try self.allocator.dupe(u8, policy.id);
+            errdefer self.allocator.free(id_copy);
 
-            // Track this name as present in new set
-            try new_policy_names.put(name_copy, {});
+            // Track this id as present in new set
+            try new_policy_ids.put(id_copy, {});
 
             // Check if policy already exists
-            if (self.policy_sources.get(policy.name)) |existing_meta| {
+            if (self.policy_sources.get(policy.id)) |existing_meta| {
                 // Apply priority rules
                 if (existing_meta.shouldReplace(source)) {
                     // Remove old policy and its source tracking
-                    self.removePolicyByName(policy.name);
-                    if (self.policy_sources.fetchRemove(policy.name)) |kv| {
+                    self.removePolicyById(policy.id);
+                    if (self.policy_sources.fetchRemove(policy.id)) |kv| {
                         self.allocator.free(kv.key);
                     }
 
@@ -189,7 +229,7 @@ pub const PolicyRegistry = struct {
         }
 
         // Remove policies from this source that are no longer present
-        try self.removeStalePolicies(source, &new_policy_names);
+        try self.removeStalePolicies(source, &new_policy_ids);
 
         // Create new immutable snapshot
         try self.createSnapshot();
@@ -206,15 +246,15 @@ pub const PolicyRegistry = struct {
         const policy_copy = try policy.dupe(self.allocator);
         try self.policies.append(self.allocator, policy_copy);
 
-        // Track source metadata (name is already copied in policy_copy)
-        const name_key = try self.allocator.dupe(u8, policy.name);
-        try self.policy_sources.put(name_key, PolicyMetadata.init(source));
+        // Track source metadata by policy id
+        const id_key = try self.allocator.dupe(u8, policy.id);
+        try self.policy_sources.put(id_key, PolicyMetadata.init(source));
     }
 
-    /// Remove a policy by name and free its memory
-    fn removePolicyByName(self: *PolicyRegistry, name: []const u8) void {
+    /// Remove a policy by id and free its memory
+    fn removePolicyById(self: *PolicyRegistry, id: []const u8) void {
         for (self.policies.items, 0..) |*policy, i| {
-            if (std.mem.eql(u8, policy.name, name)) {
+            if (std.mem.eql(u8, policy.id, id)) {
                 policy.deinit(self.allocator);
                 _ = self.policies.swapRemove(i);
                 break;
@@ -226,33 +266,33 @@ pub const PolicyRegistry = struct {
     fn removeStalePolicies(
         self: *PolicyRegistry,
         source: SourceType,
-        new_names: *const std.StringHashMap(void),
+        new_ids: *const std.StringHashMap(void),
     ) !void {
-        var names_to_remove = std.ArrayListUnmanaged([]const u8){};
-        defer names_to_remove.deinit(self.allocator);
+        var ids_to_remove = std.ArrayListUnmanaged([]const u8){};
+        defer ids_to_remove.deinit(self.allocator);
 
         // Find policies from this source not in new set
         var it = self.policy_sources.iterator();
         while (it.next()) |entry| {
-            const name = entry.key_ptr.*;
+            const id = entry.key_ptr.*;
             const metadata = entry.value_ptr.*;
 
             // Only consider policies from this source
             if (metadata.source != source) continue;
 
             // If not in new set, mark for removal
-            if (!new_names.contains(name)) {
-                try names_to_remove.append(self.allocator, name);
+            if (!new_ids.contains(id)) {
+                try ids_to_remove.append(self.allocator, id);
             }
         }
 
         // Remove stale policies
-        for (names_to_remove.items) |name| {
-            self.removePolicyByName(name);
+        for (ids_to_remove.items) |id| {
+            self.removePolicyById(id);
 
             // Remove from source tracking
-            _ = self.policy_sources.remove(name);
-            self.allocator.free(name);
+            _ = self.policy_sources.remove(id);
+            self.allocator.free(id);
         }
     }
 
@@ -329,22 +369,22 @@ pub const PolicyRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var names_to_remove = std.ArrayListUnmanaged([]const u8){};
-        defer names_to_remove.deinit(self.allocator);
+        var ids_to_remove = std.ArrayListUnmanaged([]const u8){};
+        defer ids_to_remove.deinit(self.allocator);
 
         // Find all policies from this source
         var it = self.policy_sources.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.source == source) {
-                try names_to_remove.append(self.allocator, entry.key_ptr.*);
+                try ids_to_remove.append(self.allocator, entry.key_ptr.*);
             }
         }
 
         // Remove each policy
-        for (names_to_remove.items) |name| {
-            self.removePolicyByName(name);
-            _ = self.policy_sources.remove(name);
-            self.allocator.free(name);
+        for (ids_to_remove.items) |id| {
+            self.removePolicyById(id);
+            _ = self.policy_sources.remove(id);
+            self.allocator.free(id);
         }
 
         // Create new snapshot
@@ -450,6 +490,7 @@ fn createTestPolicy(
     name: []const u8,
 ) !Policy {
     var policy = Policy{
+        .id = try allocator.dupe(u8, name), // Use name as id for tests
         .name = try allocator.dupe(u8, name),
         .enabled = true,
     };
@@ -1001,6 +1042,7 @@ fn createTestPolicyWithFilter(
     name: []const u8,
 ) !Policy {
     var policy = Policy{
+        .id = try allocator.dupe(u8, name), // Use name as id for tests
         .name = try allocator.dupe(u8, name),
         .enabled = true,
         .filter = LogFilterConfig{
@@ -1197,4 +1239,232 @@ test "PolicySnapshot: indices update when policies change" {
 
     snapshot = registry.getSnapshot();
     try testing.expectEqual(@as(usize, 0), snapshot.?.log_filter_indices.len);
+}
+
+// -----------------------------------------------------------------------------
+// Policy Error Routing Tests
+// -----------------------------------------------------------------------------
+
+/// Mock provider that records errors for testing
+const MockErrorProvider = struct {
+    recorded_errors: std.ArrayListUnmanaged(struct { policy_id: []const u8, message: []const u8 }),
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) MockErrorProvider {
+        return .{
+            .recorded_errors = .{},
+            .allocator = allocator,
+        };
+    }
+
+    // Must be pub for PolicyProvider.init to find it
+    pub fn deinit(self: *MockErrorProvider) void {
+        for (self.recorded_errors.items) |entry| {
+            self.allocator.free(entry.policy_id);
+            self.allocator.free(entry.message);
+        }
+        self.recorded_errors.deinit(self.allocator);
+    }
+
+    pub fn subscribe(self: *MockErrorProvider, callback: PolicyCallback) !void {
+        _ = self;
+        _ = callback;
+    }
+
+    pub fn recordPolicyError(self: *MockErrorProvider, policy_id: []const u8, error_message: []const u8) void {
+        const id_copy = self.allocator.dupe(u8, policy_id) catch return;
+        const msg_copy = self.allocator.dupe(u8, error_message) catch {
+            self.allocator.free(id_copy);
+            return;
+        };
+        self.recorded_errors.append(self.allocator, .{
+            .policy_id = id_copy,
+            .message = msg_copy,
+        }) catch {
+            self.allocator.free(id_copy);
+            self.allocator.free(msg_copy);
+        };
+    }
+
+    fn getErrorCount(self: *MockErrorProvider) usize {
+        return self.recorded_errors.items.len;
+    }
+
+    fn hasError(self: *MockErrorProvider, policy_id: []const u8, message: []const u8) bool {
+        for (self.recorded_errors.items) |entry| {
+            if (std.mem.eql(u8, entry.policy_id, policy_id) and
+                std.mem.eql(u8, entry.message, message))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+test "PolicyRegistry: registerProvider and recordPolicyError routes to correct provider" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create mock providers
+    var file_mock = MockErrorProvider.init(allocator);
+    defer file_mock.deinit();
+
+    var http_mock = MockErrorProvider.init(allocator);
+    defer http_mock.deinit();
+
+    // Register providers
+    var file_provider = policy_provider.PolicyProvider.init(&file_mock);
+    var http_provider = policy_provider.PolicyProvider.init(&http_mock);
+
+    registry.registerProvider(.file, &file_provider);
+    registry.registerProvider(.http, &http_provider);
+
+    // Add policies from different sources
+    var file_policy = try createTestPolicy(allocator, "file-policy-1");
+    defer freeTestPolicy(allocator, &file_policy);
+
+    var http_policy = try createTestPolicy(allocator, "http-policy-1");
+    defer freeTestPolicy(allocator, &http_policy);
+
+    try registry.updatePolicies(&.{file_policy}, .file);
+    try registry.updatePolicies(&.{http_policy}, .http);
+
+    // Record errors
+    registry.recordPolicyError("file-policy-1", "Invalid regex in file policy");
+    registry.recordPolicyError("http-policy-1", "Invalid regex in http policy");
+
+    // Verify errors routed to correct providers
+    try testing.expectEqual(@as(usize, 1), file_mock.getErrorCount());
+    try testing.expectEqual(@as(usize, 1), http_mock.getErrorCount());
+
+    try testing.expect(file_mock.hasError("file-policy-1", "Invalid regex in file policy"));
+    try testing.expect(http_mock.hasError("http-policy-1", "Invalid regex in http policy"));
+
+    // Verify no cross-contamination
+    try testing.expect(!file_mock.hasError("http-policy-1", "Invalid regex in http policy"));
+    try testing.expect(!http_mock.hasError("file-policy-1", "Invalid regex in file policy"));
+}
+
+test "PolicyRegistry: recordPolicyError for unknown policy does not route to provider" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    var mock = MockErrorProvider.init(allocator);
+    defer mock.deinit();
+
+    var provider = policy_provider.PolicyProvider.init(&mock);
+    registry.registerProvider(.file, &provider);
+
+    // Add a real policy so we can test error routing works
+    var real_policy = try createTestPolicy(allocator, "real-policy");
+    defer freeTestPolicy(allocator, &real_policy);
+    try registry.updatePolicies(&.{real_policy}, .file);
+
+    // Record error for the real policy - should be routed
+    registry.recordPolicyError("real-policy", "Some error");
+
+    // Verify the error was recorded
+    try testing.expectEqual(@as(usize, 1), mock.getErrorCount());
+    try testing.expect(mock.hasError("real-policy", "Some error"));
+}
+
+test "PolicyRegistry: multiple errors for same policy accumulate" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    var mock = MockErrorProvider.init(allocator);
+    defer mock.deinit();
+
+    var provider = policy_provider.PolicyProvider.init(&mock);
+    registry.registerProvider(.file, &provider);
+
+    var policy = try createTestPolicy(allocator, "error-prone-policy");
+    defer freeTestPolicy(allocator, &policy);
+    try registry.updatePolicies(&.{policy}, .file);
+
+    // Record multiple errors for the same policy
+    registry.recordPolicyError("error-prone-policy", "First error");
+    registry.recordPolicyError("error-prone-policy", "Second error");
+    registry.recordPolicyError("error-prone-policy", "Third error");
+
+    // All errors should be recorded
+    try testing.expectEqual(@as(usize, 3), mock.getErrorCount());
+    try testing.expect(mock.hasError("error-prone-policy", "First error"));
+    try testing.expect(mock.hasError("error-prone-policy", "Second error"));
+    try testing.expect(mock.hasError("error-prone-policy", "Third error"));
+}
+
+test "PolicyRegistry: policies keyed by id not name" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create two policies with same name but different ids
+    var policy1 = Policy{
+        .id = try allocator.dupe(u8, "id-1"),
+        .name = try allocator.dupe(u8, "same-name"),
+        .enabled = true,
+        .priority = 1,
+    };
+    defer policy1.deinit(allocator);
+
+    var policy2 = Policy{
+        .id = try allocator.dupe(u8, "id-2"),
+        .name = try allocator.dupe(u8, "same-name"),
+        .enabled = true,
+        .priority = 2,
+    };
+    defer policy2.deinit(allocator);
+
+    // Both should be added (different ids)
+    try registry.updatePolicies(&.{ policy1, policy2 }, .file);
+
+    try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
+
+    const snapshot = registry.getSnapshot();
+    try testing.expect(snapshot != null);
+    try testing.expectEqual(@as(usize, 2), snapshot.?.policies.len);
+}
+
+test "PolicyRegistry: policy update by id replaces correctly" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Add initial policy
+    var policy_v1 = Policy{
+        .id = try allocator.dupe(u8, "policy-123"),
+        .name = try allocator.dupe(u8, "my-policy"),
+        .enabled = true,
+        .priority = 1,
+    };
+    defer policy_v1.deinit(allocator);
+
+    try registry.updatePolicies(&.{policy_v1}, .file);
+    try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
+
+    var snapshot = registry.getSnapshot();
+    try testing.expectEqual(@as(i32, 1), snapshot.?.policies[0].priority);
+
+    // Update with same id, different priority
+    var policy_v2 = Policy{
+        .id = try allocator.dupe(u8, "policy-123"),
+        .name = try allocator.dupe(u8, "my-policy-renamed"),
+        .enabled = true,
+        .priority = 10,
+    };
+    defer policy_v2.deinit(allocator);
+
+    try registry.updatePolicies(&.{policy_v2}, .file);
+
+    // Should still have 1 policy, but updated
+    try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
+
+    snapshot = registry.getSnapshot();
+    try testing.expectEqual(@as(i32, 10), snapshot.?.policies[0].priority);
+    try testing.expectEqualStrings("my-policy-renamed", snapshot.?.policies[0].name);
 }
