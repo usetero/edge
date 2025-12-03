@@ -115,7 +115,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, filter: *const Filter
             var dropped_count: usize = 0;
 
             for (arr.items) |log_value| {
-                // Evaluate filter using the field accessor
+                // Evaluate filter using Hyperscan-accelerated regex matching
                 const filter_result = filter.evaluate(@ptrCast(&log_value), datadogFieldAccessor);
                 if (filter_result == .keep) {
                     try kept_logs.append(allocator, log_value);

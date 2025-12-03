@@ -453,13 +453,18 @@ fn proxyToUpstream(
 
     std.log.debug("Proxying to: {s} {s}", .{ @tagName(method), upstream_uri_str });
 
-    // Create HTTP client for this request
-    var client = std.http.Client{ .allocator = req.arena };
-    defer client.deinit();
+    // Get shared HTTP client from upstream manager (thread-safe connection pooling)
+    const client = ctx.upstreams.getHttpClient();
 
     // Build headers array (single pass)
     var headers_buf: [64]std.http.Header = undefined;
     const headers = try buildHeadersArray(req, &headers_buf);
+
+    // Determine if we have a body to send
+    const has_body = body_to_send.len > 0 and switch (method) {
+        .POST, .PUT, .PATCH => true,
+        else => false,
+    };
 
     // Create upstream request
     var upstream_req = try client.request(method, uri, .{
@@ -468,14 +473,9 @@ fn proxyToUpstream(
     defer upstream_req.deinit();
 
     // Send body if present
-    if (body_to_send.len > 0) {
-        switch (method) {
-            .POST, .PUT, .PATCH => {
-                std.log.debug("Sending {} bytes to upstream", .{body_to_send.len});
-                try upstream_req.sendBodyComplete(@constCast(body_to_send));
-            },
-            else => try upstream_req.sendBodiless(),
-        }
+    if (has_body) {
+        std.log.debug("Sending {} bytes to upstream", .{body_to_send.len});
+        try upstream_req.sendBodyComplete(@constCast(body_to_send));
     } else {
         try upstream_req.sendBodiless();
     }
@@ -521,6 +521,9 @@ fn proxyToUpstream(
     if (total_bytes >= max_size) {
         std.log.warn("Response body reached max size limit of {} bytes", .{max_size});
     }
+
+    // Flush the response writer to ensure all data is sent to client
+    try response_writer.flush();
 
     std.log.info("{s} {s} <- {} ({} bytes)", .{
         @tagName(req.method),

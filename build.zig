@@ -110,6 +110,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("z", .{});
     exe.root_module.linkSystemLibrary("zstd", .{});
+    exe.root_module.linkSystemLibrary("hs", .{});
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -137,6 +138,7 @@ pub fn build(b: *std.Build) void {
     datadog_exe.root_module.link_libc = true;
     datadog_exe.root_module.linkSystemLibrary("z", .{});
     datadog_exe.root_module.linkSystemLibrary("zstd", .{});
+    datadog_exe.root_module.linkSystemLibrary("hs", .{});
 
     const datadog_step = b.step("datadog", "Build the Datadog distribution");
     datadog_step.dependOn(&b.addInstallArtifact(datadog_exe, .{}).step);
@@ -182,6 +184,7 @@ pub fn build(b: *std.Build) void {
     mod_tests.root_module.link_libc = true;
     mod_tests.root_module.linkSystemLibrary("z", .{});
     mod_tests.root_module.linkSystemLibrary("zstd", .{});
+    mod_tests.root_module.linkSystemLibrary("hs", .{});
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);

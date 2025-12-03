@@ -1,10 +1,12 @@
 const std = @import("std");
 const proto = @import("proto");
 const policy_source = @import("./policy_source.zig");
+const regex_index = @import("./regex_index.zig");
 
 const Policy = proto.policy.Policy;
 const SourceType = policy_source.SourceType;
 const PolicyMetadata = policy_source.PolicyMetadata;
+const CompiledRegexIndex = regex_index.CompiledRegexIndex;
 
 /// Policy config types - derived from the Policy.config oneof field
 pub const PolicyConfigType = enum {
@@ -31,10 +33,15 @@ pub const PolicySnapshot = struct {
     /// Allows efficient lookup of policies by their config type
     log_filter_indices: []const u32,
 
+    /// Compiled Hyperscan databases for regex matching
+    /// Grouped by match type for efficient scanning
+    compiled_regex_index: CompiledRegexIndex,
+
     version: u64,
     allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *const PolicySnapshot) void {
+    pub fn deinit(self: *PolicySnapshot) void {
+        self.compiled_regex_index.deinit();
         self.allocator.free(self.policies);
         self.allocator.free(self.log_filter_indices);
     }
@@ -128,7 +135,7 @@ pub const PolicyRegistry = struct {
 
         // Free current snapshot if exists
         if (self.current_snapshot.load(.acquire)) |snapshot| {
-            snapshot.deinit();
+            @constCast(snapshot).deinit();
             self.allocator.destroy(snapshot);
         }
     }
@@ -284,6 +291,10 @@ pub const PolicyRegistry = struct {
             }
         }
 
+        // Build compiled regex index for Hyperscan-based matching
+        var compiled_regex = try CompiledRegexIndex.build(self.allocator, policies_slice);
+        errdefer compiled_regex.deinit();
+
         // Increment version
         const new_version = self.version.load(.monotonic) + 1;
         self.version.store(new_version, .monotonic);
@@ -293,6 +304,7 @@ pub const PolicyRegistry = struct {
         snapshot.* = .{
             .policies = policies_slice,
             .log_filter_indices = log_filter_indices,
+            .compiled_regex_index = compiled_regex,
             .version = new_version,
             .allocator = self.allocator,
         };
@@ -302,7 +314,7 @@ pub const PolicyRegistry = struct {
 
         // Clean up old snapshot (TODO: RCU for grace period)
         if (old_snapshot) |old| {
-            old.deinit();
+            @constCast(old).deinit();
             self.allocator.destroy(old);
         }
     }

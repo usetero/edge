@@ -22,7 +22,10 @@ RUN apk add --no-cache \
     zstd-static \
     musl-dev \
     g++ \
-    linux-headers
+    linux-headers \
+    pkgconf \
+    vectorscan-dev \
+    vectorscan-static
 
 WORKDIR /build
 

@@ -4,6 +4,9 @@ const proxy_module = @import("../core/proxy_module.zig");
 const ModuleId = proxy_module.ModuleId;
 const UpstreamConfig = proxy_module.UpstreamConfig;
 
+/// Minimum buffer size required for TLS operations
+const tls_min_buffer = std.crypto.tls.max_ciphertext_record_len;
+
 /// Internal storage for upstream data
 const UpstreamData = struct {
     /// Pre-parsed URL components
@@ -20,22 +23,44 @@ const UpstreamData = struct {
     max_response_body: u32,
 };
 
-/// Manages upstream configurations, one per module
-/// Note: HTTP clients are created per-request since std.http.Client is not thread-safe
+/// Manages upstream configurations and a shared HTTP client pool.
+///
+/// The HTTP client is thread-safe for connection pooling:
+/// - Connection pool operations (acquire, release, find) are mutex-protected
+/// - Individual Request objects must be used by a single thread
+/// - The allocator passed here MUST be thread-safe (e.g., GeneralPurposeAllocator)
+///
+/// This enables connection reuse across requests, avoiding TCP/TLS handshake
+/// overhead for each request.
 pub const UpstreamClientManager = struct {
     /// SoA for all upstream configs
     upstreams: std.MultiArrayList(UpstreamData),
 
+    /// Shared HTTP client with connection pooling.
+    /// Thread-safe for creating requests; individual requests are not thread-safe.
+    http_client: std.http.Client,
+
+    /// Thread-safe allocator for HTTP client operations
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) UpstreamClientManager {
         return .{
             .upstreams = .{},
+            .http_client = .{
+                .allocator = allocator,
+                // TLS requires buffers of at least max_ciphertext_record_len for read/write
+                .tls_buffer_size = tls_min_buffer,
+                .read_buffer_size = tls_min_buffer,
+                .write_buffer_size = tls_min_buffer,
+            },
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *UpstreamClientManager) void {
+        // Deinit HTTP client first (closes all pooled connections)
+        self.http_client.deinit();
+
         const slice = self.upstreams.slice();
 
         // Free all allocated strings and buffers
@@ -47,6 +72,14 @@ pub const UpstreamClientManager = struct {
         }
 
         self.upstreams.deinit(self.allocator);
+    }
+
+    /// Get the shared HTTP client for making upstream requests.
+    /// The client is thread-safe for creating requests.
+    /// Individual Request objects returned by client.request() must be used
+    /// by a single thread only.
+    pub fn getHttpClient(self: *UpstreamClientManager) *std.http.Client {
+        return &self.http_client;
     }
 
     /// Create an upstream configuration from a URL

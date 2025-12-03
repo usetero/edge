@@ -1,6 +1,7 @@
 const std = @import("std");
 const proto = @import("proto");
 const policy_registry = @import("policy_registry.zig");
+const regex_index = @import("regex_index.zig");
 
 const Policy = proto.policy.Policy;
 const PolicyType = proto.policy.PolicyType;
@@ -10,6 +11,9 @@ const LogMatcher = proto.policy.LogMatcher;
 pub const MatchCase = LogMatcher._match_case;
 const PolicyRegistry = policy_registry.PolicyRegistry;
 const PolicySnapshot = policy_registry.PolicySnapshot;
+const CompiledRegexIndex = regex_index.CompiledRegexIndex;
+const RegexDatabase = regex_index.RegexDatabase;
+const PatternInfo = regex_index.PatternInfo;
 
 /// FilterResult indicates whether to keep or drop the data
 pub const FilterResult = enum {
@@ -39,11 +43,13 @@ pub const FilterEvaluator = struct {
         _ = self;
     }
 
-    /// Evaluate data against log filter policies using a field accessor
+    /// Evaluate data against log filter policies using Hyperscan-accelerated regex matching
     /// Returns FilterResult.keep or FilterResult.drop based on first matching policy
     /// If no policies match, defaults to FilterResult.keep
     ///
-    /// Uses lock-free snapshot read for consistent view of policies
+    /// Uses lock-free snapshot read for consistent view of policies.
+    /// Uses the compiled regex index from the snapshot for O(n) scanning
+    /// where n is the input size, regardless of number of patterns.
     ///
     /// The field_accessor function is called to retrieve field values from the data.
     /// The ctx pointer is passed through to the accessor for accessing the actual data structure.
@@ -54,24 +60,31 @@ pub const FilterEvaluator = struct {
     ) FilterResult {
         // Get current policy snapshot (atomic, lock-free)
         const snapshot = self.registry.getSnapshot() orelse return FilterResult.keep;
+        const policies = snapshot.getLogFilterPolicies();
+        const regex_idx = &snapshot.compiled_regex_index;
 
-        // Process policies in priority order - first match wins
-        for (snapshot.getLogFilterPolicies()) |policy| {
+        // Process policies in order - first fully matching policy wins
+        for (snapshot.log_filter_indices) |policy_idx| {
+            const policy = &policies[policy_idx];
+
             // Skip disabled policies
             if (!policy.enabled) continue;
 
-            // Get filter config
             const filter_config = policy.filter orelse continue;
 
-            // Check if all matchers match the data
-            const matches = matchesAllMatchers(ctx, field_accessor, filter_config.matchers.items);
+            // Check if all matchers match using Hyperscan
+            const all_match = checkAllMatchersWithHyperscan(
+                ctx,
+                field_accessor,
+                regex_idx,
+                filter_config.matchers.items,
+            );
 
-            if (matches) {
-                // Return the action from the matching policy
+            if (all_match) {
                 return switch (filter_config.action) {
                     .FILTER_ACTION_KEEP => FilterResult.keep,
                     .FILTER_ACTION_DROP => FilterResult.drop,
-                    else => FilterResult.keep, // Unknown actions default to keep
+                    else => FilterResult.keep,
                 };
             }
         }
@@ -81,18 +94,77 @@ pub const FilterEvaluator = struct {
     }
 };
 
-/// Check if all matchers match using the field accessor
+/// Check if all matchers match using Hyperscan-accelerated regex matching
 /// All matchers must match for the overall result to be true (AND logic)
-fn matchesAllMatchers(
+fn checkAllMatchersWithHyperscan(
     ctx: *const anyopaque,
     field_accessor: FieldAccessor,
+    regex_idx: *const CompiledRegexIndex,
     matchers: []const LogMatcher,
 ) bool {
     if (matchers.len == 0) return false;
 
     for (matchers) |matcher| {
-        const match_result = matchSingleMatcher(ctx, field_accessor, matcher);
+        const match_result = matchSingleMatcherWithHyperscan(ctx, field_accessor, regex_idx, matcher);
         if (!match_result) return false;
+    }
+
+    return true;
+}
+
+/// Check if a single matcher matches using Hyperscan
+/// Uses the compiled regex database for the match type
+fn matchSingleMatcherWithHyperscan(
+    ctx: *const anyopaque,
+    field_accessor: FieldAccessor,
+    regex_idx: *const CompiledRegexIndex,
+    matcher: LogMatcher,
+) bool {
+    const match = matcher.match orelse return false;
+
+    // Extract the match case, key, and regex
+    const match_case: MatchCase = match;
+    const key: []const u8 = switch (match) {
+        .resource_attribute => |m| m.key,
+        .scope_attribute => |m| m.key,
+        .log_attribute => |m| m.key,
+        else => "",
+    };
+
+    // Get the field value using the accessor
+    const value = field_accessor(ctx, match_case, key) orelse {
+        // No value found - if negate is true, this is a match (pattern not in non-existent field)
+        return matcher.negate;
+    };
+
+    // Get the appropriate Hyperscan database
+    const db: ?*const RegexDatabase = if (key.len > 0)
+        regex_idx.getKeyedDatabase(match_case, key)
+    else
+        regex_idx.getSimpleDatabase(match_case);
+
+    // If no database for this match type, fall back to substring matching
+    if (db == null) {
+        std.log.info("No database found for match type: {any}", .{match_case});
+        return matchSingleMatcher(ctx, field_accessor, matcher);
+    }
+
+    // Scan the value with Hyperscan
+    const scan_result = regex_index.scanValue(db.?, value);
+
+    // Apply negate flag
+    // If negate=true: we want TRUE when the pattern is NOT found
+    // If negate=false: we want TRUE when the pattern IS found
+    return if (matcher.negate) !scan_result.matched else scan_result.matched;
+}
+
+/// Check if all matchers match using simple substring matching
+/// All matchers must match for the overall result to be true (AND logic)
+fn matchesAllMatchers(ctx: *const anyopaque, field_accessor: FieldAccessor, matchers: []const LogMatcher) bool {
+    if (matchers.len == 0) return false;
+
+    for (matchers) |matcher| {
+        if (!matchSingleMatcher(ctx, field_accessor, matcher)) return false;
     }
 
     return true;
@@ -225,37 +297,6 @@ test "matchSingleMatcher with non-existent field" {
     // With negate, non-existent field means "pattern not found" = true
     const negated = LogMatcher{ .match = .{ .log_attribute = .{ .key = "nonexistent", .regex = "hello" } }, .negate = true };
     try testing.expect(matchSingleMatcher(@ptrCast(&log), TestLogContext.fieldAccessor, negated));
-}
-
-test "matchesAllMatchers with multiple matchers (AND logic)" {
-    const log = TestLogContext{
-        .level = "ERROR",
-        .service = "payment",
-        .message = "transaction failed",
-    };
-
-    // All matchers must match
-    const matchers_all_match = [_]LogMatcher{
-        .{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } } },
-        .{ .match = .{ .log_attribute = .{ .key = "service", .regex = "payment" } } },
-    };
-    try testing.expect(matchesAllMatchers(@ptrCast(&log), TestLogContext.fieldAccessor, &matchers_all_match));
-
-    // One matcher fails = overall false
-    const matchers_one_fails = [_]LogMatcher{
-        .{ .match = .{ .log_severity_text = .{ .regex = "ERROR" } } },
-        .{ .match = .{ .log_attribute = .{ .key = "service", .regex = "auth" } } }, // doesn't match
-    };
-    try testing.expect(!matchesAllMatchers(@ptrCast(&log), TestLogContext.fieldAccessor, &matchers_one_fails));
-}
-
-test "matchesAllMatchers with empty matchers returns false" {
-    const log = TestLogContext{
-        .message = "test",
-    };
-
-    const empty_matchers = [_]LogMatcher{};
-    try testing.expect(!matchesAllMatchers(@ptrCast(&log), TestLogContext.fieldAccessor, &empty_matchers));
 }
 
 test "FilterEvaluator.evaluate with LOG_FILTER policy drops matching logs" {
@@ -435,4 +476,246 @@ test "FilterEvaluator.evaluate with multiple matchers (AND logic)" {
     // ERROR from payment = kept (level doesn't match)
     const payment_error = TestLogContext{ .level = "ERROR", .service = "payment", .message = "failed" };
     try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&payment_error), TestLogContext.fieldAccessor));
+}
+
+// =============================================================================
+// Hyperscan-based Evaluation Tests
+// =============================================================================
+
+test "evaluateWithHyperscan: drops matching logs" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create a DROP policy for error logs
+    var drop_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    try drop_policy.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Error log should be dropped
+    const error_log = TestLogContext{ .level = "ERROR", .message = "something failed" };
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor));
+
+    // Info log should be kept
+    const info_log = TestLogContext{ .level = "INFO", .message = "all good" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&info_log), TestLogContext.fieldAccessor));
+}
+
+test "evaluateWithHyperscan: keeps matching logs" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create a KEEP policy for error logs
+    var keep_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "keep-errors"),
+        .enabled = true,
+        .filter = .{
+            .action = .FILTER_ACTION_KEEP,
+        },
+    };
+    try keep_policy.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
+    });
+    defer keep_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{keep_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Error log matches KEEP policy
+    const error_log = TestLogContext{ .level = "ERROR", .message = "something failed" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor));
+}
+
+test "evaluateWithHyperscan: returns keep when no policies" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    const filter = FilterEvaluator.init(&registry);
+
+    const log = TestLogContext{ .level = "INFO", .message = "test" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&log), TestLogContext.fieldAccessor));
+}
+
+test "evaluateWithHyperscan: with log_attribute matches" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Drop logs from payment service
+    var drop_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-payment"),
+        .enabled = true,
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    try drop_policy.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_attribute = .{
+            .key = try allocator.dupe(u8, "service"),
+            .regex = try allocator.dupe(u8, "payment"),
+        } },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Payment service log should be dropped
+    const payment_log = TestLogContext{ .service = "payment-api", .message = "processing" };
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&payment_log), TestLogContext.fieldAccessor));
+
+    // Auth service log should be kept
+    const auth_log = TestLogContext{ .service = "auth-api", .message = "login" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&auth_log), TestLogContext.fieldAccessor));
+}
+
+test "evaluateWithHyperscan: with negate flag" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Drop logs that do NOT contain "important"
+    var drop_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-non-important"),
+        .enabled = true,
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    try drop_policy.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "important") } },
+        .negate = true,
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Non-important log should be dropped (negate: pattern NOT found = match)
+    const boring_log = TestLogContext{ .message = "just a boring message" };
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&boring_log), TestLogContext.fieldAccessor));
+
+    // Important log should be kept (negate: pattern found = no match)
+    const important_log = TestLogContext{ .message = "this is important data" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&important_log), TestLogContext.fieldAccessor));
+}
+
+test "evaluateWithHyperscan: multiple matchers AND logic" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Drop DEBUG logs from payment service only
+    var policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-payment-debug"),
+        .enabled = true,
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    try policy.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
+    });
+    try policy.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_attribute = .{
+            .key = try allocator.dupe(u8, "service"),
+            .regex = try allocator.dupe(u8, "payment"),
+        } },
+    });
+    defer policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // DEBUG from payment = dropped (both matchers match)
+    const payment_debug = TestLogContext{ .level = "DEBUG", .service = "payment", .message = "processing" };
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&payment_debug), TestLogContext.fieldAccessor));
+
+    // DEBUG from auth = kept (service doesn't match)
+    const auth_debug = TestLogContext{ .level = "DEBUG", .service = "auth", .message = "login attempt" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&auth_debug), TestLogContext.fieldAccessor));
+
+    // ERROR from payment = kept (level doesn't match)
+    const payment_error = TestLogContext{ .level = "ERROR", .service = "payment", .message = "failed" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&payment_error), TestLogContext.fieldAccessor));
+}
+
+test "evaluateWithHyperscan: regex pattern matching" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Drop logs matching error pattern with regex
+    var drop_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "drop-error-pattern"),
+        .enabled = true,
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    try drop_policy.filter.?.matchers.append(allocator, .{
+        // Regex pattern: matches "error" or "Error" or "ERROR"
+        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "[Ee]rror") } },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Various error messages should be dropped
+    const error1 = TestLogContext{ .message = "an error occurred" };
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&error1), TestLogContext.fieldAccessor));
+
+    const error2 = TestLogContext{ .message = "Error: something went wrong" };
+    try testing.expectEqual(FilterResult.drop, filter.evaluate(@ptrCast(&error2), TestLogContext.fieldAccessor));
+
+    // Non-error message should be kept
+    const info = TestLogContext{ .message = "everything is fine" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&info), TestLogContext.fieldAccessor));
+}
+
+test "evaluateWithHyperscan: skips disabled policies" {
+    const allocator = testing.allocator;
+    var registry = PolicyRegistry.init(allocator);
+    defer registry.deinit();
+
+    // Create a disabled DROP policy
+    var disabled_policy = proto.policy.Policy{
+        .name = try allocator.dupe(u8, "disabled-drop"),
+        .enabled = false, // disabled!
+        .filter = .{
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    try disabled_policy.filter.?.matchers.append(allocator, .{
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "ERROR") } },
+    });
+    defer disabled_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{disabled_policy}, .file);
+
+    const filter = FilterEvaluator.init(&registry);
+
+    // Error log would match, but policy is disabled, so keep
+    const error_log = TestLogContext{ .level = "ERROR", .message = "something failed" };
+    try testing.expectEqual(FilterResult.keep, filter.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor));
 }

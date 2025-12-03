@@ -24,6 +24,9 @@ pub const server = @import("proxy/server.zig");
 pub const passthrough = @import("modules/passthrough/module.zig");
 pub const datadog = @import("modules/datadog/module.zig");
 
+// Hyperscan/Vectorscan bindings
+pub const hyperscan = @import("hyperscan/hyperscan.zig");
+
 // =============================================================================
 // Distribution entry points
 // =============================================================================
@@ -71,4 +74,6 @@ test {
     _ = @import("modules/datadog/module.zig");
     _ = @import("modules/datadog/logs_v2.zig");
     _ = @import("json/pretty_print.zig");
+    _ = @import("hyperscan/hyperscan.zig");
+    _ = @import("core/regex_index.zig");
 }

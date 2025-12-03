@@ -228,3 +228,46 @@ tasks:
     cmds:
       - buf export buf.build/tero/policy -o proto/policy
       - task: build:protos
+
+  ci:setup:
+    desc: "🔧 Install CI/development dependencies (idempotent, safe to run locally)"
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - |
+        echo "🔧 Setting up CI environment..."
+
+        # Clean up Docker resources to free disk space (important for CI with testcontainers)
+        if [ -n "$CI" ]; then
+          echo "🧹 Cleaning Docker resources in CI..."
+          docker system prune -af --volumes 2>/dev/null || true
+        fi
+
+        echo "🔧 Checking for required dependencies..."
+
+        # Check for hyperscan/vectorscan (needed for catalog service)
+        if ! pkg-config --exists libhs 2>/dev/null; then
+          echo "📦 Installing hyperscan..."
+          if [ "$(uname)" = "Darwin" ]; then
+            # macOS: use vectorscan (hyperscan replacement)
+            if command -v brew >/dev/null 2>&1; then
+              brew install vectorscan pkg-config
+            else
+              echo "⚠️  Homebrew not found. Install vectorscan manually or use Hermit."
+            fi
+          elif [ "$(uname)" = "Linux" ]; then
+            # Linux: use hyperscan
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y libhyperscan-dev pkg-config
+            elif command -v yum >/dev/null 2>&1; then
+              sudo yum install -y hyperscan-devel pkg-config
+            else
+              echo "⚠️  Unknown package manager. Install hyperscan manually."
+            fi
+          else
+            echo "⚠️  Unknown platform: $(uname)"
+          fi
+        else
+          echo "✅ Hyperscan already installed"
+        fi
+
+        echo "✅ CI setup complete"
