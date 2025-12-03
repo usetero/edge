@@ -259,7 +259,7 @@ message Policy {
 
   // Policy configuration. Exactly one must be set.
   oneof config {
-    LogFilterConfig filter = 9;
+    LogFilterConfig log_filter = 9;
   }
 }
 
@@ -310,16 +310,13 @@ enum PolicyType {
 
 // ClientMetadata contains information about the client requesting policies.
 message ClientMetadata {
-  // Last sync timestamp (Unix epoch nanoseconds)
-  fixed64 last_sync_timestamp_unix_nano = 4;
-
   // Policy types this client supports/wants
-  repeated PolicyType supported_policy_types = 5;
+  repeated PolicyType supported_policy_types = 1;
 
   // Additional metadata labels
   // NOTE FOR TERO:
   // * workspace.id is required for usage.
-  repeated opentelemetry.proto.common.v1.KeyValue labels = 7;
+  repeated opentelemetry.proto.common.v1.KeyValue labels = 2;
 
   // Resource attributes describing this client's identity
   // REQUIRED:
@@ -327,7 +324,39 @@ message ClientMetadata {
   // * service.name
   // * service.namespace
   // * service.version
-  repeated opentelemetry.proto.common.v1.KeyValue resource_attributes = 8;
+  repeated opentelemetry.proto.common.v1.KeyValue resource_attributes = 3;
+}
+
+// PolicySyncStatus reports the status of an individual policy during sync.
+// Used to communicate policy execution metrics and errors back to the provider.
+message PolicySyncStatus {
+  // The policy ID this status refers to.
+  string id = 1;
+
+  // Number of times this policy matched telemetry since the last sync.
+  int64 hits = 2;
+
+  // Number of times this policy was evaluated but did not match.
+  int64 misses = 3;
+
+  // Error messages encountered while applying this policy.
+  repeated string errors = 4;
+}
+
+// PolicySetSyncStatus reports the sync state of a policy set.
+// Used to communicate the last known state of a policy set to the provider.
+message PolicySetSyncStatus {
+  // The policy set ID this status refers to.
+  string id = 1;
+
+  // The hash of the policy set as last received by the client.
+  string hash = 2;
+
+  // The provider for this policy set.
+  string provider = 3;
+
+  // Status of individual policies within this set.
+  repeated PolicySyncStatus policy_statuses = 4;
 }
 
 // SyncRequest is sent by clients to request policy updates.
@@ -335,21 +364,15 @@ message SyncRequest {
   // Client identification and capabilities
   ClientMetadata client_metadata = 1;
 
-  // Request full sync (ignore synced_policy_sets)
+  // Request full sync (ignore policy_set_statuses)
   bool full_sync = 2;
 
-  // Last synced policy set state, keyed by policy set ID.
-  // The value is the hash/version of that policy set.
-  map<string, string> synced_policy_sets = 3;
+  // Last sync timestamp (Unix epoch nanoseconds)
+  fixed64 last_sync_timestamp_unix_nano = 3;
 
-  // Error messages for specific policies, keyed by policy ID.
-  map<string, PolicyErrors> policy_errors = 4;
-}
-
-// PolicyErrors contains error messages for a specific policy.
-message PolicyErrors {
-  // List of error messages encountered for this policy.
-  repeated string messages = 1;
+  // Status of policy sets currently held by the client.
+  // Includes hash for change detection and per-policy metrics/errors.
+  repeated PolicySetSyncStatus policy_set_statuses = 4;
 }
 
 enum SyncType {

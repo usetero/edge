@@ -17,7 +17,7 @@ pub const PolicyConfigType = enum {
 
     /// Get the config type from a policy
     pub fn fromPolicy(policy: *const Policy) PolicyConfigType {
-        if (policy.filter != null) {
+        if (policy.log_filter != null) {
             return .log_filter;
         }
         return .none;
@@ -1045,7 +1045,7 @@ fn createTestPolicyWithFilter(
         .id = try allocator.dupe(u8, name), // Use name as id for tests
         .name = try allocator.dupe(u8, name),
         .enabled = true,
-        .filter = LogFilterConfig{
+        .log_filter = LogFilterConfig{
             .matchers = .empty,
             .action = .FILTER_ACTION_DROP,
         },
@@ -1102,7 +1102,7 @@ test "PolicySnapshot: log_filter_indices contains only filter policies" {
     // The indexed policy should be the one with filter
     const indexed_policy = snapshot.?.policies[snapshot.?.log_filter_indices[0]];
     try testing.expectEqualStrings("with-filter", indexed_policy.name);
-    try testing.expect(indexed_policy.filter != null);
+    try testing.expect(indexed_policy.log_filter != null);
 }
 
 test "PolicySnapshot: multiple filter policies are indexed" {
@@ -1177,7 +1177,7 @@ test "PolicySnapshot: iterateLogFilterPolicies returns all filter policies" {
 
     while (iter.next()) |policy| {
         count += 1;
-        try testing.expect(policy.filter != null);
+        try testing.expect(policy.log_filter != null);
 
         if (std.mem.eql(u8, policy.name, "filter-1")) {
             found_filter1 = true;

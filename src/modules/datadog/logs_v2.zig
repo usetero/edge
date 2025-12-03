@@ -209,11 +209,11 @@ test "processLogs - DROP policy filters logs from array" {
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.filter.?.matchers.append(allocator, .{
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
@@ -246,11 +246,11 @@ test "processLogs - DROP policy drops single object" {
     var drop_policy = proto.policy.Policy{
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .filter = .{
+        .log_filter = .{
             .action = .FILTER_ACTION_DROP,
         },
     };
-    try drop_policy.filter.?.matchers.append(allocator, .{
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
         .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
     });
     defer drop_policy.deinit(allocator);
