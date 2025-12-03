@@ -32,6 +32,18 @@
       "action": "drop"
     },
     {
+      "id": "drop-edge-logs",
+      "name": "drop-edge-logs",
+      "matchers": [
+        {
+          "match_type": "resource_attribute",
+          "key": "service.name",
+          "regex": "^.*edge$"
+        }
+      ],
+      "action": "drop"
+    },
+    {
       "id": "keep-error-logs",
       "name": "keep-error-logs",
       "matchers": [

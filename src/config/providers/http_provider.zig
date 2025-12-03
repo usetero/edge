@@ -248,18 +248,32 @@ pub const HttpProvider = struct {
             // Update last sync timestamp
             self.last_sync_timestamp = response.sync_timestamp_unix_nano;
 
+            // Check if content has changed by comparing hashes
+            const hash_unchanged = blk: {
+                if (response.hash.len == 0) break :blk false;
+                if (self.last_successful_hash) |old_hash| {
+                    break :blk std.mem.eql(u8, old_hash, response.hash);
+                }
+                break :blk false;
+            };
+
+            if (hash_unchanged) {
+                std.log.debug("Policies unchanged (hash: {s}), skipping reload", .{response.hash});
+                return;
+            }
+
+            // Record the hash for future sync requests
+            if (response.hash.len > 0) {
+                try self.recordSyncedHash(response.hash);
+                std.log.info("Policy hash updated: {s}", .{response.hash});
+            }
+
             // Notify callback with policies from response
             if (self.callback) |cb| {
                 try cb.call(.{
                     .policies = response.policies.items,
                     .source = .http,
                 });
-            }
-
-            // Record the hash for future sync requests
-            if (response.hash.len > 0) {
-                try self.recordSyncedHash(response.hash);
-                std.log.debug("Recorded synced hash: {s}", .{response.hash});
             }
 
             std.log.info("Loaded {} policies from {s} (sync_timestamp: {})", .{

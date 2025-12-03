@@ -190,6 +190,9 @@ pub const PolicyRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Track if any changes were made
+        var changed = false;
+
         // Track which policy ids from this source are in the new set
         var new_policy_ids = std.StringHashMap(void).init(self.allocator);
         defer {
@@ -220,19 +223,28 @@ pub const PolicyRegistry = struct {
 
                     // Add new policy
                     try self.addPolicyInternal(policy, source);
+                    changed = true;
                 }
                 // else: HTTP has priority, keep existing
             } else {
                 // New policy, add it
                 try self.addPolicyInternal(policy, source);
+                changed = true;
             }
         }
 
         // Remove policies from this source that are no longer present
-        try self.removeStalePolicies(source, &new_policy_ids);
+        const removed = try self.removeStalePolicies(source, &new_policy_ids);
+        if (removed > 0) {
+            changed = true;
+        }
 
-        // Create new immutable snapshot
-        try self.createSnapshot();
+        // Only create new snapshot if something changed
+        if (changed) {
+            try self.createSnapshot();
+        } else {
+            std.log.debug("Policy registry unchanged, skipping snapshot rebuild", .{});
+        }
     }
 
     /// Add a policy and track its source
@@ -263,11 +275,12 @@ pub const PolicyRegistry = struct {
     }
 
     /// Remove policies from source that are no longer in the new set
+    /// Returns the number of policies removed
     fn removeStalePolicies(
         self: *PolicyRegistry,
         source: SourceType,
         new_ids: *const std.StringHashMap(void),
-    ) !void {
+    ) !usize {
         var ids_to_remove = std.ArrayListUnmanaged([]const u8){};
         defer ids_to_remove.deinit(self.allocator);
 
@@ -294,6 +307,8 @@ pub const PolicyRegistry = struct {
             _ = self.policy_sources.remove(id);
             self.allocator.free(id);
         }
+
+        return ids_to_remove.items.len;
     }
 
     /// Create immutable snapshot of current policies
