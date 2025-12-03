@@ -453,16 +453,8 @@ fn proxyToUpstream(
 
     std.log.debug("Proxying to: {s} {s}", .{ @tagName(method), upstream_uri_str });
 
-    // Create HTTP client for this request
-    // TLS requires buffers of at least max_ciphertext_record_len (16KB) for both read and write
-    const tls_min_buffer = std.crypto.tls.max_ciphertext_record_len;
-    var client = std.http.Client{
-        .allocator = req.arena,
-        .tls_buffer_size = tls_min_buffer,
-        .read_buffer_size = tls_min_buffer,
-        .write_buffer_size = tls_min_buffer,
-    };
-    defer client.deinit();
+    // Get shared HTTP client from upstream manager (thread-safe connection pooling)
+    const client = ctx.upstreams.getHttpClient();
 
     // Build headers array (single pass)
     var headers_buf: [64]std.http.Header = undefined;
