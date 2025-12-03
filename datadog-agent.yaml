@@ -27,11 +27,13 @@ data:
     {
       "policies": [
         {
+          "id": "drop-echo-logs",
           "name": "drop-echo-logs",
           "matchers": [{ "match_type": "log_attribute", "key": "ddsource", "regex": "nginx" }],
           "action": "drop"
         },
         {
+          "id": "drop-no-such-file-or-directory-logs",
           "name": "drop-no-such-file-or-directory-logs",
           "matchers": [
             { "match_type": "log_body", "regex": "no such file or directory" }
@@ -39,11 +41,13 @@ data:
           "action": "drop"
         },
         {
+          "id": "drop-debug-level",
           "name": "drop-debug-level",
           "matchers": [{ "match_type": "log_severity_text", "regex": "DEBUG" }],
           "action": "drop"
         },
         {
+          "id": "keep-error-logs",
           "name": "keep-error-logs",
           "matchers": [
             { "match_type": "log_severity_text", "regex": "error" },

@@ -18,7 +18,8 @@ const MatcherJson = struct {
 
 /// JSON schema for a policy
 const PolicyJson = struct {
-    id: ?[]const u8 = null,
+    /// Unique identifier for the policy (required)
+    id: []const u8,
     name: []const u8,
     description: ?[]const u8 = null,
     priority: i32 = 0,
@@ -162,7 +163,7 @@ fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) ![]P
 
     for (json_policies, 0..) |json_policy, i| {
         // Allocate and copy strings
-        const id = if (json_policy.id) |id| try allocator.dupe(u8, id) else &.{};
+        const id = try allocator.dupe(u8, json_policy.id);
         const name = try allocator.dupe(u8, json_policy.name);
         const description = if (json_policy.description) |desc| try allocator.dupe(u8, desc) else &.{};
 

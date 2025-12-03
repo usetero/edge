@@ -10,7 +10,6 @@ const ZSTD_CONTENTSIZE_UNKNOWN: u64 = @bitCast(@as(i64, -1));
 
 /// Compress data using zlib's gzip compression (actual gzip format)
 pub fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    std.debug.print("Compressing with zlib (gzip format)...\n", .{});
 
     // Calculate maximum compressed size
     const max_compressed_size = c.deflateBound(null, @intCast(data.len)) + 18; // Add extra for gzip headers
@@ -53,14 +52,11 @@ pub fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     // Resize to actual compressed size
     const final = try allocator.realloc(compressed, compressed_len);
 
-    std.debug.print("Compressed {d} bytes to {d} bytes\n", .{ data.len, compressed_len });
-
     return final;
 }
 
 /// Decompress gzip data using zlib
 pub fn decompressGzip(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
-    std.debug.print("Decompressing with zlib (gzip format)...\n", .{});
 
     // Start with a reasonable buffer size
     var decompressed_size: usize = compressed.len * 10; // Start with 10x the compressed size
@@ -106,14 +102,11 @@ pub fn decompressGzip(allocator: std.mem.Allocator, compressed: []const u8) ![]u
     // Resize to actual size
     const final = try allocator.realloc(decompressed, total_out);
 
-    std.debug.print("Decompressed {d} bytes to {d} bytes\n", .{ compressed.len, total_out });
-
     return final;
 }
 
 /// Compress data using zstd compression
 pub fn compressZstd(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    std.debug.print("Compressing with zstd...\n", .{});
 
     // Get the maximum compressed size bound
     const max_compressed_size = c.ZSTD_compressBound(data.len);
@@ -132,21 +125,18 @@ pub fn compressZstd(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     // Check for errors
     if (c.ZSTD_isError(compressed_size) != 0) {
         const error_name = c.ZSTD_getErrorName(compressed_size);
-        std.debug.print("Zstd compression error: {s}\n", .{error_name});
+        std.log.err("ZSTD compression failed: {s}", .{error_name});
         return error.CompressionFailed;
     }
 
     // Resize to actual compressed size
     const final = try allocator.realloc(compressed, compressed_size);
 
-    std.debug.print("Compressed {d} bytes to {d} bytes (zstd)\n", .{ data.len, compressed_size });
-
     return final;
 }
 
 /// Decompress zstd data
 pub fn decompressZstd(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
-    std.debug.print("Decompressing with zstd...\n", .{});
 
     // Get the decompressed size from the frame header
     const decompressed_size = c.ZSTD_getFrameContentSize(compressed.ptr, compressed.len);
@@ -176,25 +166,21 @@ pub fn decompressZstd(allocator: std.mem.Allocator, compressed: []const u8) ![]u
     // Check for errors
     if (c.ZSTD_isError(actual_size) != 0) {
         const error_name = c.ZSTD_getErrorName(actual_size);
-        std.debug.print("Zstd decompression error: {s}\n", .{error_name});
+        std.log.err("ZSTD decompression failed: {s}", .{error_name});
         return error.DecompressionFailed;
     }
 
     if (actual_size != decompressed_size) {
         // Resize if needed (shouldn't happen with known size)
         const final = try allocator.realloc(decompressed, actual_size);
-        std.debug.print("Decompressed {d} bytes to {d} bytes (zstd)\n", .{ compressed.len, actual_size });
         return final;
     }
-
-    std.debug.print("Decompressed {d} bytes to {d} bytes (zstd)\n", .{ compressed.len, actual_size });
 
     return decompressed;
 }
 
 /// Streaming decompression for when content size is unknown
 fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
-    std.debug.print("Using streaming decompression (size unknown)...\n", .{});
 
     // Create a decompression context
     const dctx = c.ZSTD_createDCtx();
@@ -233,7 +219,7 @@ fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8)
 
         if (c.ZSTD_isError(result) != 0) {
             const error_name = c.ZSTD_getErrorName(result);
-            std.debug.print("Zstd streaming decompression error: {s}\n", .{error_name});
+            std.log.err("ZSTD decompression failed: {s}", .{error_name});
             return error.DecompressionFailed;
         }
 
@@ -246,8 +232,6 @@ fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8)
     // Resize to actual size
     const final = try allocator.realloc(decompressed, out_buffer.pos);
 
-    std.debug.print("Decompressed {d} bytes to {d} bytes (zstd streaming)\n", .{ compressed.len, out_buffer.pos });
-
     return final;
 }
 
@@ -259,11 +243,8 @@ test "compressZstd and decompressZstd" {
     const originalData = "Test log message";
 
     // Compress the test data
-    std.debug.print("\n=== Testing zstd compression ===\n", .{});
     const compressed = try compressZstd(allocator, originalData);
     defer allocator.free(compressed);
-
-    std.debug.print("Compressed data length: {}\n", .{compressed.len});
 
     // Check for zstd magic number (0xFD2FB528 in little-endian)
     try std.testing.expect(compressed.len >= 4);
@@ -294,13 +275,9 @@ test "zstd compress and decompress JSON payload" {
         \\ ]
     ;
 
-    std.debug.print("\n=== Testing zstd with JSON ===\n", .{});
-
     // Compress the test data
     const compressed = try compressZstd(allocator, originalData);
     defer allocator.free(compressed);
-
-    std.debug.print("Original size: {d}, Compressed size: {d}\n", .{ originalData.len, compressed.len });
 
     // Compression ratio should be good for JSON
     try std.testing.expect(compressed.len < originalData.len);
@@ -317,8 +294,6 @@ test "zstd vs gzip compression comparison" {
 
     const testData = "a" ** 1000; // Highly compressible data
 
-    std.debug.print("\n=== Compression comparison ===\n", .{});
-
     // Compress with gzip
     const gzip_compressed = try compressGzip(allocator, testData);
     defer allocator.free(gzip_compressed);
@@ -326,10 +301,6 @@ test "zstd vs gzip compression comparison" {
     // Compress with zstd
     const zstd_compressed = try compressZstd(allocator, testData);
     defer allocator.free(zstd_compressed);
-
-    std.debug.print("Original: {d} bytes\n", .{testData.len});
-    std.debug.print("Gzip: {d} bytes\n", .{gzip_compressed.len});
-    std.debug.print("Zstd: {d} bytes\n", .{zstd_compressed.len});
 
     // Both should compress well
     try std.testing.expect(gzip_compressed.len < 50);
@@ -342,12 +313,8 @@ test "compressGzip and decompressGzip" {
     const originalData = "Test log message";
 
     // Compress the test data
-    std.debug.print("Compressing data...\n", .{});
     const compressed = try compressGzip(allocator, originalData);
-    std.debug.print("Successfully compressed data...\n", .{});
     defer allocator.free(compressed);
-
-    std.debug.print("Compressed data length: {}\n", .{compressed.len});
 
     // Check for gzip magic number
     try std.testing.expect(compressed.len >= 10);
@@ -355,7 +322,6 @@ test "compressGzip and decompressGzip" {
     try std.testing.expect(compressed[1] == 0x8b);
 
     // Decompress to verify
-    std.debug.print("Decompressing data...\n", .{});
     const decompressed = try decompressGzip(allocator, compressed);
     defer allocator.free(decompressed);
 
@@ -378,12 +344,8 @@ test "decompress json payload" {
     ;
 
     // Compress the test data
-    std.debug.print("Compressing data...\n", .{});
     const compressed = try compressGzip(allocator, originalData);
-    std.debug.print("Successfully compressed data...\n", .{});
     defer allocator.free(compressed);
-
-    std.debug.print("Compressed data length: {}\n", .{compressed.len});
 
     // Check for gzip magic number
     try std.testing.expect(compressed.len >= 10);
@@ -391,7 +353,6 @@ test "decompress json payload" {
     try std.testing.expect(compressed[1] == 0x8b);
 
     // Decompress to verify
-    std.debug.print("Decompressing data...\n", .{});
     const decompressed = try decompressGzip(allocator, compressed);
     defer allocator.free(decompressed);
 

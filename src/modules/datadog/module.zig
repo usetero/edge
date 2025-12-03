@@ -1,6 +1,6 @@
 const std = @import("std");
 const proxy_module = @import("../../core/proxy_module.zig");
-const filter_mod = @import("../../core/filter.zig");
+const policy_registry = @import("../../core/policy_registry.zig");
 const logs_v2 = @import("logs_v2.zig");
 
 const ProxyModule = proxy_module.ProxyModule;
@@ -9,19 +9,19 @@ const ModuleRequest = proxy_module.ModuleRequest;
 const ModuleResult = proxy_module.ModuleResult;
 const RoutePattern = proxy_module.RoutePattern;
 const MethodBitmask = proxy_module.MethodBitmask;
-const FilterEvaluator = filter_mod.FilterEvaluator;
+const PolicyRegistry = policy_registry.PolicyRegistry;
 
 /// Datadog module configuration
 pub const DatadogConfig = struct {
-    /// Reference to the filter evaluator
-    filter: *const FilterEvaluator,
+    /// Reference to the policy registry
+    registry: *const PolicyRegistry,
 };
 
 /// Datadog module - handles Datadog log ingestion with filtering
-/// STATELESS, THREAD-SAFE - only reads from filter (which uses lock-free snapshots)
+/// STATELESS, THREAD-SAFE - only reads from registry (which uses lock-free snapshots)
 pub const DatadogModule = struct {
-    /// Read-only reference to filter evaluator (set during init)
-    filter: *const FilterEvaluator = undefined,
+    /// Read-only reference to policy registry (set during init)
+    registry: *const PolicyRegistry = undefined,
 
     pub fn asProxyModule(self: *DatadogModule) ProxyModule {
         return .{
@@ -43,13 +43,13 @@ pub const DatadogModule = struct {
     ) anyerror!void {
         const self: *DatadogModule = @ptrCast(@alignCast(ptr));
 
-        // Get filter from module_data
+        // Get registry from module_data
         const dd_config: *const DatadogConfig = @ptrCast(@alignCast(config.module_data orelse
             return error.MissingDatadogConfig));
-        self.filter = dd_config.filter;
+        self.registry = dd_config.registry;
     }
 
-    /// THREAD-SAFE: No shared mutable state, only reads from filter
+    /// THREAD-SAFE: No shared mutable state, only reads from registry
     fn processRequest(
         ptr: *anyopaque,
         req: *const ModuleRequest,
@@ -74,7 +74,7 @@ pub const DatadogModule = struct {
         // FAIL OPEN: If processing fails, pass original through
         const result = logs_v2.processLogs(
             allocator,
-            self.filter,
+            self.registry,
             req.body,
             content_type,
         ) catch |err| {
@@ -115,8 +115,6 @@ pub const routes = [_]RoutePattern{
 // Tests
 // =============================================================================
 
-const policy_registry = @import("../../core/policy_registry.zig");
-const PolicyRegistry = policy_registry.PolicyRegistry;
 const proto = @import("proto");
 
 test "DatadogModule processes POST requests" {
@@ -125,9 +123,7 @@ test "DatadogModule processes POST requests" {
     var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
-    const filter = FilterEvaluator.init(&registry);
-
-    var dd_config = DatadogConfig{ .filter = &filter };
+    var dd_config = DatadogConfig{ .registry = &registry };
 
     var module = DatadogModule{};
     const pm = module.asProxyModule();
@@ -172,9 +168,7 @@ test "DatadogModule ignores GET requests" {
     var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
-    const filter = FilterEvaluator.init(&registry);
-
-    var dd_config = DatadogConfig{ .filter = &filter };
+    var dd_config = DatadogConfig{ .registry = &registry };
 
     var module = DatadogModule{};
     const pm = module.asProxyModule();
@@ -218,6 +212,7 @@ test "DatadogModule filters logs with DROP policy" {
 
     // Create DROP policy for DEBUG logs
     var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
         .log_filter = .{
@@ -231,9 +226,7 @@ test "DatadogModule filters logs with DROP policy" {
 
     try registry.updatePolicies(&.{drop_policy}, .file);
 
-    const filter = FilterEvaluator.init(&registry);
-
-    var dd_config = DatadogConfig{ .filter = &filter };
+    var dd_config = DatadogConfig{ .registry = &registry };
 
     var module = DatadogModule{};
     const pm = module.asProxyModule();
@@ -281,8 +274,9 @@ test "DatadogModule returns 202 when all logs dropped" {
     var registry = PolicyRegistry.init(allocator);
     defer registry.deinit();
 
-    // Create DROP policy that matches everything
+    // Create DROP policy that matches INFO logs (test data uses INFO)
     var drop_all = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
         .log_filter = .{
@@ -290,15 +284,13 @@ test "DatadogModule returns 202 when all logs dropped" {
         },
     };
     try drop_all.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "") } },
+        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "INFO") } },
     });
     defer drop_all.deinit(allocator);
 
     try registry.updatePolicies(&.{drop_all}, .file);
 
-    const filter = FilterEvaluator.init(&registry);
-
-    var dd_config = DatadogConfig{ .filter = &filter };
+    var dd_config = DatadogConfig{ .registry = &registry };
 
     var module = DatadogModule{};
     const pm = module.asProxyModule();

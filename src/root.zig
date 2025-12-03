@@ -12,7 +12,8 @@ pub const FileProvider = @import("config/providers/file_provider.zig").FileProvi
 pub const HttpProvider = @import("config/providers/http_provider.zig").HttpProvider;
 
 // Core modules
-pub const filter = @import("core/filter.zig");
+pub const filter_engine = @import("core/filter_engine.zig");
+pub const matcher_index = @import("core/matcher_index.zig");
 pub const policy_registry = @import("core/policy_registry.zig");
 pub const policy_provider = @import("core/policy_provider.zig");
 pub const proxy_module = @import("core/proxy_module.zig");
@@ -61,7 +62,8 @@ test "basic add functionality" {
 test {
     _ = @import("config/types.zig");
     _ = @import("config/parser.zig");
-    _ = @import("core/filter.zig");
+    _ = @import("core/filter_engine.zig");
+    _ = @import("core/matcher_index.zig");
     _ = @import("core/policy_source.zig");
     _ = @import("core/policy_registry.zig");
     _ = @import("core/policy_provider.zig");
@@ -75,5 +77,4 @@ test {
     _ = @import("modules/datadog/logs_v2.zig");
     _ = @import("json/pretty_print.zig");
     _ = @import("hyperscan/hyperscan.zig");
-    _ = @import("core/regex_index.zig");
 }

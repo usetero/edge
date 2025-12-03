@@ -13,13 +13,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const std_options: std.Options = .{
+    .log_level = .info,
+};
+
 const edge = @import("root.zig");
 const config_parser = edge.config_parser;
 const server_mod = edge.server;
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough;
 const datadog_mod = edge.datadog;
-const filter_mod = edge.filter;
 const policy_registry_mod = edge.policy_registry;
 const policy_provider_mod = edge.policy_provider;
 const FileProvider = edge.FileProvider;
@@ -31,7 +34,6 @@ const PassthroughModule = passthrough_mod.PassthroughModule;
 const DatadogModule = datadog_mod.DatadogModule;
 const DatadogConfig = datadog_mod.DatadogConfig;
 const PolicyRegistry = policy_registry_mod.PolicyRegistry;
-const FilterEvaluator = filter_mod.FilterEvaluator;
 
 // =============================================================================
 // Global state for signal handlers
@@ -251,16 +253,12 @@ pub fn main() !void {
 
     std.log.info("Policy count: {}", .{registry.getPolicyCount()});
 
-    // Create filter evaluator with reference to registry
-    var filter_evaluator = FilterEvaluator.init(&registry);
-    defer filter_evaluator.deinit();
-
     // Install signal handlers
     installShutdownHandlers();
 
     // Create Datadog module configuration
     var datadog_config = DatadogConfig{
-        .filter = &filter_evaluator,
+        .registry = &registry,
     };
 
     // Create modules
