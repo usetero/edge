@@ -7,6 +7,7 @@ const FilterEngine = filter_engine.FilterEngine;
 const FilterResult = filter_engine.FilterResult;
 const MatchCase = filter_engine.MatchCase;
 const PolicyRegistry = policy_registry.PolicyRegistry;
+const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
 /// Result of processing logs
@@ -37,13 +38,14 @@ pub const ProcessResult = struct {
 pub fn processLogs(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
+    bus: *EventBus,
     data: []const u8,
     content_type: []const u8,
 ) !ProcessResult {
     // Process based on content type
     if (std.mem.indexOf(u8, content_type, "application/json") != null) {
         // Parse JSON and apply filter policies
-        return processJsonLogsWithFilter(allocator, registry, data);
+        return processJsonLogsWithFilter(allocator, registry, bus, data);
     }
 
     // For non-JSON content types (logplex, raw), return unchanged
@@ -96,7 +98,7 @@ fn datadogFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []con
 
 /// Process JSON logs with filter evaluation
 /// Detects if input is an array or single object, applies filter to each log
-fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const PolicyRegistry, data: []const u8) !ProcessResult {
+fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const PolicyRegistry, bus: *EventBus, data: []const u8) !ProcessResult {
     // Parse the JSON using std.json
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch {
         // If JSON parsing fails, return data unchanged (fail-open)
@@ -114,7 +116,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
     const snapshot = registry.getSnapshot();
 
     // Create filter engine for evaluation
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, bus);
 
     switch (parsed.value) {
         .array => |arr| {
@@ -219,7 +221,7 @@ test "processLogs - no policies keeps all logs in array" {
         \\[{"level": "INFO", "message": "test1"}, {"level": "ERROR", "message": "test2"}]
     ;
 
-    const result = try processLogs(allocator, &registry, logs, "application/json");
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
     defer allocator.free(result.data);
 
     try std.testing.expect(std.mem.indexOf(u8, result.data, "test1") != null);
@@ -257,7 +259,7 @@ test "processLogs - DROP policy filters logs from array" {
         \\[{"level": "DEBUG", "message": "debug msg"}, {"level": "ERROR", "message": "error msg"}]
     ;
 
-    const result = try processLogs(allocator, &registry, logs, "application/json");
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
     defer allocator.free(result.data);
 
     // DEBUG log should be dropped, ERROR log should remain
@@ -295,7 +297,7 @@ test "processLogs - DROP policy drops single object" {
         \\{"level": "DEBUG", "message": "debug msg"}
     ;
 
-    const result = try processLogs(allocator, &registry, log, "application/json");
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), log, "application/json");
     defer allocator.free(result.data);
 
     // Single dropped log returns empty array
@@ -313,7 +315,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 
     const malformed = "{ not valid json }";
 
-    const result = try processLogs(allocator, &registry, malformed, "application/json");
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), malformed, "application/json");
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(malformed, result.data);
@@ -330,7 +332,7 @@ test "processLogs - non-JSON content type returns unchanged" {
 
     const data = "some raw log data";
 
-    const result = try processLogs(allocator, &registry, data, "text/plain");
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), data, "text/plain");
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(data, result.data);

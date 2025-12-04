@@ -370,7 +370,7 @@ pub const PolicyRegistry = struct {
         }
 
         // Build matcher index for Hyperscan-based matching
-        var idx = try MatcherIndex.build(self.allocator, policies_slice, self.bus);
+        var idx = try MatcherIndex.build(self.allocator, self.bus, policies_slice);
         errdefer idx.deinit();
 
         // Increment version

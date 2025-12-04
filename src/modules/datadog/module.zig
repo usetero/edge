@@ -90,6 +90,7 @@ pub const DatadogModule = struct {
         const result = logs_v2.processLogs(
             allocator,
             self.registry,
+            self.bus,
             req.body,
             content_type,
         ) catch |err| {

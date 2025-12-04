@@ -182,7 +182,7 @@ pub fn main() !void {
     var stdio_bus: o11y.StdioEventBus = undefined;
     stdio_bus.init();
     const bus = stdio_bus.eventBus();
-    bus.setLevel(.info);
+    bus.setLevel(.debug);
 
     // Set global event bus for signal handler
     global_event_bus = bus;

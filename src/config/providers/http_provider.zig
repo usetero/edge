@@ -20,9 +20,6 @@ const AnyValue = proto.common.AnyValue;
 const ServiceMetadata = types.ServiceMetadata;
 const EventBus = o11y.EventBus;
 
-// Keep scoped logger for verbose debug traces
-const log = std.log.scoped(.http_provider);
-
 // =============================================================================
 // Observability Events
 // =============================================================================
@@ -34,6 +31,9 @@ const HttpPoliciesUnchanged = struct { reason: []const u8 };
 const HttpPolicyHashUpdated = struct { hash: []const u8 };
 const HttpPoliciesLoaded = struct { count: usize, url: []const u8, sync_timestamp: u64 };
 const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
+const HTTPNotModified = struct {};
+const HTTPFetchStarted = struct {};
+const HTTPFetchCompleted = struct {};
 
 /// Tracks status for a specific policy (hits, misses, errors)
 const PolicyStatusRecord = struct {
@@ -251,9 +251,9 @@ pub const HttpProvider = struct {
     }
 
     fn fetchAndNotify(self: *HttpProvider) !void {
-        log.debug("Fetching policies from HTTP: {s}", .{self.config_url});
-
         var new_etag: ?[]u8 = null;
+        var span = self.bus.started(.debug, HTTPFetchStarted{});
+        defer span.completed(HTTPFetchCompleted{});
         var maybe_parsed = try self.fetchPolicies(&new_etag);
 
         if (maybe_parsed) |*parsed| {
@@ -373,8 +373,6 @@ pub const HttpProvider = struct {
         const request_body = try sync_request.jsonEncode(.{}, self.allocator);
         defer self.allocator.free(request_body);
 
-        log.debug("Sending SyncRequest: {s}", .{request_body});
-
         // Prepare headers
         var headers_buffer: [2]std.http.Header = undefined;
         var headers_count: usize = 0;
@@ -409,7 +407,7 @@ pub const HttpProvider = struct {
 
         // Check for 304 Not Modified
         if (response.head.status == .not_modified) {
-            log.debug("Policies unchanged (304 Not Modified)", .{});
+            self.bus.debug(HTTPNotModified{});
             return null;
         }
 
