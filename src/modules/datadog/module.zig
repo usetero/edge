@@ -2,6 +2,7 @@ const std = @import("std");
 const proxy_module = @import("../../core/proxy_module.zig");
 const policy_registry = @import("../../core/policy_registry.zig");
 const logs_v2 = @import("logs_v2.zig");
+const o11y = @import("../../observability/root.zig");
 
 const ProxyModule = proxy_module.ProxyModule;
 const ModuleConfig = proxy_module.ModuleConfig;
@@ -10,11 +11,21 @@ const ModuleResult = proxy_module.ModuleResult;
 const RoutePattern = proxy_module.RoutePattern;
 const MethodBitmask = proxy_module.MethodBitmask;
 const PolicyRegistry = policy_registry.PolicyRegistry;
+const EventBus = o11y.EventBus;
+
+// =============================================================================
+// Observability Events
+// =============================================================================
+
+const LogsProcessed = struct { dropped: usize, kept: usize };
+const LogsProcessingFailed = struct { err: []const u8 };
 
 /// Datadog module configuration
 pub const DatadogConfig = struct {
     /// Reference to the policy registry
     registry: *const PolicyRegistry,
+    /// Optional event bus for observability
+    bus: ?*EventBus = null,
 };
 
 /// Datadog module - handles Datadog log ingestion with filtering
@@ -22,6 +33,8 @@ pub const DatadogConfig = struct {
 pub const DatadogModule = struct {
     /// Read-only reference to policy registry (set during init)
     registry: *const PolicyRegistry = undefined,
+    /// Optional event bus for observability
+    bus: ?*EventBus = null,
 
     pub fn asProxyModule(self: *DatadogModule) ProxyModule {
         return .{
@@ -47,6 +60,7 @@ pub const DatadogModule = struct {
         const dd_config: *const DatadogConfig = @ptrCast(@alignCast(config.module_data orelse
             return error.MissingDatadogConfig));
         self.registry = dd_config.registry;
+        self.bus = dd_config.bus;
     }
 
     /// THREAD-SAFE: No shared mutable state, only reads from registry
@@ -78,11 +92,14 @@ pub const DatadogModule = struct {
             req.body,
             content_type,
         ) catch |err| {
-            std.log.warn("Failed to process Datadog logs (failing open): {}", .{err});
+            if (self.bus) |b| b.warn(LogsProcessingFailed{ .err = @errorName(err) });
             return ModuleResult.unchanged();
         };
 
-        std.log.info("Dropped Logs: {d} Processed Logs: {d}", .{ result.dropped_count, result.original_count });
+        if (self.bus) |b| b.info(LogsProcessed{
+            .dropped = result.dropped_count,
+            .kept = result.original_count - result.dropped_count,
+        });
 
         // If all logs were dropped, return empty array with 202 (Datadog expects this)
         if (result.allDropped()) {
@@ -120,7 +137,7 @@ const proto = @import("proto");
 test "DatadogModule processes POST requests" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     var dd_config = DatadogConfig{ .registry = &registry };
@@ -165,7 +182,7 @@ test "DatadogModule processes POST requests" {
 test "DatadogModule ignores GET requests" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     var dd_config = DatadogConfig{ .registry = &registry };
@@ -207,7 +224,7 @@ test "DatadogModule ignores GET requests" {
 test "DatadogModule filters logs with DROP policy" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     // Create DROP policy for DEBUG logs
@@ -271,7 +288,7 @@ test "DatadogModule filters logs with DROP policy" {
 test "DatadogModule returns 202 when all logs dropped" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     // Create DROP policy that matches INFO logs (test data uses INFO)

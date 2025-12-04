@@ -34,6 +34,10 @@ const DatadogModule = datadog_mod.DatadogModule;
 const DatadogConfig = datadog_mod.DatadogConfig;
 const PolicyRegistry = policy_registry_mod.PolicyRegistry;
 
+pub const std_options: std.Options = .{
+    .log_level = .info,
+};
+
 // =============================================================================
 // Observability Events
 // =============================================================================
@@ -178,7 +182,7 @@ pub fn main() !void {
     var stdio_bus: o11y.StdioEventBus = undefined;
     stdio_bus.init();
     const bus = stdio_bus.eventBus();
-    bus.setLevel(.debug);
+    bus.setLevel(.info);
 
     // Set global event bus for signal handler
     global_event_bus = bus;
@@ -239,7 +243,7 @@ pub fn main() !void {
     });
 
     // Create centralized policy registry
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, bus);
     defer registry.deinit();
 
     // Create callback context for policy updates
@@ -281,7 +285,7 @@ pub fn main() !void {
                 const path = provider_config.path orelse return error.FileProviderRequiresPath;
                 bus.info(FileProviderConfigured{ .path = path });
 
-                const file_provider = try FileProvider.init(allocator, path);
+                const file_provider = try FileProvider.init(allocator, bus, path);
                 errdefer file_provider.deinit();
 
                 try file_provider.subscribe(callback);
@@ -294,6 +298,7 @@ pub fn main() !void {
 
                 const http_provider = try HttpProvider.init(
                     allocator,
+                    bus,
                     url,
                     poll_interval,
                     config.workspace_id,
@@ -315,6 +320,7 @@ pub fn main() !void {
     // Create Datadog module configuration
     var datadog_config = DatadogConfig{
         .registry = &registry,
+        .bus = bus,
     };
 
     // Create modules
@@ -346,6 +352,7 @@ pub fn main() !void {
     // Create proxy server with modules
     var proxy = try ProxyServer.init(
         allocator,
+        bus,
         config.listen_address,
         config.listen_port,
         &module_registrations,

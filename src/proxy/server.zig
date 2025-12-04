@@ -4,6 +4,8 @@ const compress = @import("compress.zig");
 const proxy_module = @import("../core/proxy_module.zig");
 const router_mod = @import("router.zig");
 const upstream_client = @import("upstream_client.zig");
+const o11y = @import("../observability/root.zig");
+const EventBus = o11y.EventBus;
 
 const ModuleId = proxy_module.ModuleId;
 const ModuleConfig = proxy_module.ModuleConfig;
@@ -14,6 +16,62 @@ const ProxyModule = proxy_module.ProxyModule;
 const HttpMethod = proxy_module.HttpMethod;
 const Router = router_mod.Router;
 const UpstreamClientManager = upstream_client.UpstreamClientManager;
+
+// =============================================================================
+// Observability Events
+// =============================================================================
+
+const RequestStarted = struct {
+    method: []const u8,
+    path: []const u8,
+    body_len: usize,
+};
+
+const RequestCompleted = struct {
+    status: u16,
+    response_bytes: usize,
+};
+
+const RequestError = struct {
+    method: []const u8,
+    path: []const u8,
+    err: []const u8,
+};
+
+const DecompressError = struct {
+    err: []const u8,
+};
+
+const ModuleError = struct {
+    err: []const u8,
+};
+
+const CompressError = struct {
+    err: []const u8,
+};
+
+const UpstreamRequest = struct {
+    method: []const u8,
+    url: []const u8,
+};
+
+const UpstreamResponse = struct {
+    status: u16,
+    bytes: usize,
+};
+
+const UpstreamStreamError = struct {
+    err: []const u8,
+};
+
+const ResponseTruncated = struct {
+    max_size: usize,
+};
+
+const ServerListening = struct {
+    address: []const u8,
+    port: u16,
+};
 
 /// Represents the compression encoding used in a request or response
 pub const CompressionEncoding = enum {
@@ -88,47 +146,43 @@ const ServerContext = struct {
     /// Listen port
     listen_port: u16,
 
+    /// Event bus for observability
+    bus: *EventBus,
+
     allocator: std.mem.Allocator,
 
     /// Handle all requests directly - we do our own routing
     pub fn handle(self: *ServerContext, req: *httpz.Request, res: *httpz.Response) void {
-        // Log incoming request
-        std.log.info("{s} {s} -> ({} bytes)", .{
-            @tagName(req.method),
-            req.url.path,
-            req.body_len,
+        // Start request span
+        var span = self.bus.started(.info, RequestStarted{
+            .method = @tagName(req.method),
+            .path = req.url.path,
+            .body_len = req.body_len,
         });
 
-        var start = std.time.Timer.start() catch {
-            proxyHandler(self, req, res) catch |err| {
-                self.uncaughtError(req, res, err);
-            };
-            return;
-        };
-
-        // Call handler with timing
-        proxyHandler(self, req, res) catch |err| {
+        // Call handler
+        var response_bytes: usize = 0;
+        proxyHandler(self, req, res, &response_bytes) catch |err| {
             self.uncaughtError(req, res, err);
         };
 
-        const elapsed = start.lap() / 1000;
-        std.log.debug("ts={d} us={d} path={s}", .{
-            std.time.timestamp(),
-            elapsed,
-            req.url.path,
+        // Complete span with response info
+        span.completed(RequestCompleted{
+            .status = res.status,
+            .response_bytes = response_bytes,
         });
     }
 
     fn uncaughtError(
-        _: *ServerContext,
+        self: *ServerContext,
         req: *httpz.Request,
         res: *httpz.Response,
         err: anyerror,
     ) void {
-        std.log.err("Uncaught error for {s} {s}: {}", .{
-            @tagName(req.method),
-            req.url.path,
-            err,
+        self.bus.err(RequestError{
+            .method = @tagName(req.method),
+            .path = req.url.path,
+            .err = @errorName(err),
         });
         res.status = 500;
         res.body = "Internal Server Error";
@@ -148,6 +202,7 @@ pub const ProxyServer = struct {
     /// Initialize the proxy server with registered modules
     pub fn init(
         allocator: std.mem.Allocator,
+        bus: *EventBus,
         listen_address: [4]u8,
         listen_port: u16,
         module_registrations: []const ModuleRegistration,
@@ -156,6 +211,7 @@ pub const ProxyServer = struct {
         errdefer allocator.destroy(ctx);
 
         ctx.allocator = allocator;
+        ctx.bus = bus;
         ctx.upstreams = UpstreamClientManager.init(allocator);
         ctx.modules = .{ .modules = .{} };
 
@@ -230,9 +286,9 @@ pub const ProxyServer = struct {
     }
 
     pub fn listen(self: *ProxyServer) !void {
-        std.log.info("Proxy server listening on {s}:{d}", .{
-            self.context.listen_address,
-            self.context.listen_port,
+        self.context.bus.info(ServerListening{
+            .address = self.context.listen_address,
+            .port = self.context.listen_port,
         });
         try self.server.listen();
     }
@@ -344,7 +400,7 @@ fn buildHeadersArray(
 }
 
 /// Main proxy handler - catchall for all requests
-fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response) !void {
+fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, response_bytes: *usize) !void {
     const http_method = toHttpMethod(req.method);
 
     // Route request to appropriate module
@@ -375,7 +431,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response) 
 
     if (original_body.len > 0 and encoding != .none) {
         decompressed_body = decompressIfNeeded(req.arena, original_body, encoding) catch |err| blk: {
-            std.log.warn("Failed to decompress request (failing open): {}", .{err});
+            ctx.bus.warn(DecompressError{ .err = @errorName(err) });
             break :blk original_body; // Fall back to original
         };
         decompressed_allocated = (decompressed_body.ptr != original_body.ptr);
@@ -396,7 +452,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response) 
 
     // Call module's processRequest (FAIL OPEN on error)
     const module_result = module_entry.instance.processRequest(&module_req, req.arena) catch |err| blk: {
-        std.log.warn("Module error (failing open): {}", .{err});
+        ctx.bus.warn(ModuleError{ .err = @errorName(err) });
         break :blk ModuleResult.unchanged();
     };
 
@@ -405,12 +461,13 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response) 
         .respond_immediately => {
             res.status = module_result.status;
             res.body = module_result.response_body;
+            response_bytes.* = if (module_result.response_body.len > 0) module_result.response_body.len else 0;
             return;
         },
 
         .proxy_unchanged => {
             // Proxy original (potentially compressed) body to upstream
-            try proxyToUpstream(ctx, req, res, match.module_id, original_body);
+            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, original_body);
         },
 
         .proxy_modified => {
@@ -421,26 +478,27 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response) 
 
             if (encoding != .none) {
                 body_to_send = compressIfNeeded(req.arena, module_result.modified_body, encoding) catch |err| blk: {
-                    std.log.warn("Failed to compress modified body (failing open): {}", .{err});
+                    ctx.bus.warn(CompressError{ .err = @errorName(err) });
                     break :blk module_result.modified_body; // Fall back to uncompressed
                 };
                 compressed_allocated = (body_to_send.ptr != module_result.modified_body.ptr);
             }
             defer if (compressed_allocated) req.arena.free(body_to_send);
 
-            try proxyToUpstream(ctx, req, res, match.module_id, body_to_send);
+            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, body_to_send);
         },
     }
 }
 
 /// Forward request to upstream and stream response back
+/// Returns the number of bytes in the response body
 fn proxyToUpstream(
     ctx: *ServerContext,
     req: *httpz.Request,
     res: *httpz.Response,
     module_id: ModuleId,
     body_to_send: []const u8,
-) !void {
+) !usize {
     // Build upstream URI using pre-allocated buffer
     const upstream_uri_str = try ctx.upstreams.buildUpstreamUri(
         module_id,
@@ -451,7 +509,10 @@ fn proxyToUpstream(
     const uri = try std.Uri.parse(upstream_uri_str);
     const method = toStdHttpMethod(toHttpMethod(req.method));
 
-    std.log.debug("Proxying to: {s} {s}", .{ @tagName(method), upstream_uri_str });
+    ctx.bus.debug(UpstreamRequest{
+        .method = @tagName(method),
+        .url = upstream_uri_str,
+    });
 
     // Get shared HTTP client from upstream manager (thread-safe connection pooling)
     const client = ctx.upstreams.getHttpClient();
@@ -474,7 +535,6 @@ fn proxyToUpstream(
 
     // Send body if present
     if (has_body) {
-        std.log.debug("Sending {} bytes to upstream", .{body_to_send.len});
         try upstream_req.sendBodyComplete(@constCast(body_to_send));
     } else {
         try upstream_req.sendBodiless();
@@ -510,7 +570,7 @@ fn proxyToUpstream(
         ) catch |err| switch (err) {
             error.EndOfStream => break,
             else => {
-                std.log.err("Error streaming upstream response: {}", .{err});
+                ctx.bus.err(UpstreamStreamError{ .err = @errorName(err) });
                 return err;
             },
         };
@@ -519,18 +579,13 @@ fn proxyToUpstream(
     }
 
     if (total_bytes >= max_size) {
-        std.log.warn("Response body reached max size limit of {} bytes", .{max_size});
+        ctx.bus.warn(ResponseTruncated{ .max_size = max_size });
     }
 
     // Flush the response writer to ensure all data is sent to client
     try response_writer.flush();
 
-    std.log.info("{s} {s} <- {} ({} bytes)", .{
-        @tagName(req.method),
-        req.url.path,
-        res.status,
-        total_bytes,
-    });
+    return total_bytes;
 }
 
 // =============================================================================

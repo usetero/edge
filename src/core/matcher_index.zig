@@ -13,8 +13,18 @@
 const std = @import("std");
 const proto = @import("proto");
 const hyperscan = @import("../hyperscan/hyperscan.zig");
+const o11y = @import("../observability/root.zig");
+const EventBus = o11y.EventBus;
 
+// Keep scoped logger for verbose debug traces
 const log = std.log.scoped(.matcher_index);
+
+// =============================================================================
+// Observability Events (structured info-level events)
+// =============================================================================
+
+const MatcherIndexBuildStarted = struct { policy_count: usize };
+const MatcherIndexBuildCompleted = struct { database_count: usize, matcher_key_count: usize };
 
 const Policy = proto.policy.Policy;
 const LogMatcher = proto.policy.LogMatcher;
@@ -209,8 +219,8 @@ pub const MatcherIndex = struct {
     const Self = @This();
 
     /// Build a MatcherIndex from a slice of policies.
-    pub fn build(allocator: std.mem.Allocator, policies_slice: []const Policy) !Self {
-        log.info("Building MatcherIndex from {d} policies", .{policies_slice.len});
+    pub fn build(allocator: std.mem.Allocator, policies_slice: []const Policy, bus: ?*EventBus) !Self {
+        var span = if (bus) |b| b.started(.info, MatcherIndexBuildStarted{ .policy_count = policies_slice.len }) else null;
 
         var self = Self{
             .allocator = allocator,
@@ -332,8 +342,6 @@ pub const MatcherIndex = struct {
         }
 
         // Second pass: compile databases for each MatcherKey
-        log.info("Compiling {d} Hyperscan databases", .{patterns_by_key.count()});
-
         var keys_list = std.ArrayListUnmanaged(MatcherKey){};
         defer keys_list.deinit(allocator);
 
@@ -357,7 +365,10 @@ pub const MatcherIndex = struct {
         // Store matcher keys for iteration
         self.matcher_keys = try allocator.dupe(MatcherKey, keys_list.items);
 
-        log.info("MatcherIndex built: {d} databases, {d} policies, {d} matcher_keys", .{ self.databases.count(), self.policies.count(), self.matcher_keys.len });
+        if (span) |*s| s.completed(MatcherIndexBuildCompleted{
+            .database_count = self.databases.count(),
+            .matcher_key_count = self.matcher_keys.len,
+        });
 
         return self;
     }
@@ -553,7 +564,7 @@ test "MatcherKey: isKeyed" {
 test "MatcherIndex: build empty" {
     const allocator = testing.allocator;
 
-    var index = try MatcherIndex.build(allocator, &.{});
+    var index = try MatcherIndex.build(allocator, &.{}, null);
     defer index.deinit();
 
     try testing.expect(index.isEmpty());
@@ -578,7 +589,7 @@ test "MatcherIndex: build with single policy" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -622,7 +633,7 @@ test "MatcherIndex: build with keyed matchers" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     // Should have 2 databases (one per key)
@@ -665,7 +676,7 @@ test "MatcherIndex: multiple policies same matcher key" {
     });
     defer policy2.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 });
+    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 }, null);
     defer index.deinit();
 
     // Should have 1 database with 2 patterns
@@ -694,7 +705,7 @@ test "MatcherIndex: negated matcher tracking" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const policy_info = index.getPolicy("policy-1");
@@ -722,7 +733,7 @@ test "MatcherIndex: scan database" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     var db = index.getDatabase(.{ .match_case = .log_body, .key = "" }).?;
@@ -762,7 +773,7 @@ test "MatcherIndex: severity_number excluded from regex matchers" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     // Only 1 database (for log_body, not severity_number)

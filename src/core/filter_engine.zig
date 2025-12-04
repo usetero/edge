@@ -341,7 +341,7 @@ const TestLogContext = struct {
 test "FilterEngine: empty index returns keep" {
     const allocator = testing.allocator;
 
-    var index = try MatcherIndex.build(allocator, &.{});
+    var index = try MatcherIndex.build(allocator, &.{}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -369,7 +369,7 @@ test "FilterEngine: single policy drop match" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -400,7 +400,7 @@ test "FilterEngine: single policy keep match" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -434,7 +434,7 @@ test "FilterEngine: multiple matchers AND logic" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -471,7 +471,7 @@ test "FilterEngine: negated matcher" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -512,7 +512,7 @@ test "FilterEngine: mixed negated and non-negated matchers" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -569,7 +569,7 @@ test "FilterEngine: priority ordering - higher priority wins" {
     });
     defer high_priority.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{ low_priority, high_priority });
+    var index = try MatcherIndex.build(allocator, &.{ low_priority, high_priority }, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -600,7 +600,7 @@ test "FilterEngine: disabled policies are skipped" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -628,7 +628,7 @@ test "FilterEngine: regex pattern matching" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -667,7 +667,7 @@ test "FilterEngine: missing field with negated matcher succeeds" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var index = try MatcherIndex.build(allocator, &.{policy}, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -721,7 +721,7 @@ test "FilterEngine: multiple policies with different matcher keys" {
     });
     defer policy2.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 });
+    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 }, null);
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);

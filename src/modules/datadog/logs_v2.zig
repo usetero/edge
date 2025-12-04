@@ -208,7 +208,7 @@ const proto = @import("proto");
 test "processLogs - no policies keeps all logs in array" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     const logs =
@@ -228,7 +228,7 @@ test "processLogs - no policies keeps all logs in array" {
 test "processLogs - DROP policy filters logs from array" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     // Create a DROP policy for DEBUG logs
@@ -265,7 +265,7 @@ test "processLogs - DROP policy filters logs from array" {
 test "processLogs - DROP policy drops single object" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     var drop_policy = proto.policy.Policy{
@@ -298,7 +298,7 @@ test "processLogs - DROP policy drops single object" {
 test "processLogs - malformed JSON returns unchanged (fail-open)" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -313,7 +313,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 test "processLogs - non-JSON content type returns unchanged" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator);
+    var registry = PolicyRegistry.init(allocator, null);
     defer registry.deinit();
 
     const data = "some raw log data";
