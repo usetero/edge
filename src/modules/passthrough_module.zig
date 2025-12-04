@@ -1,5 +1,5 @@
 const std = @import("std");
-const proxy_module = @import("../../core/proxy_module.zig");
+const proxy_module = @import("./proxy_module.zig");
 
 const ProxyModule = proxy_module.ProxyModule;
 const ModuleConfig = proxy_module.ModuleConfig;

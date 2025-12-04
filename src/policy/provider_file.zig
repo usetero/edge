@@ -1,15 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const proto = @import("proto");
-const policy_provider = @import("../../core/policy_provider.zig");
-const policy_source = @import("../../core/policy_source.zig");
-const parser = @import("../parser.zig");
-const o11y = @import("../../observability/root.zig");
+const policy_provider = @import("./provider.zig");
+const parser = @import("./parser.zig");
+const o11y = @import("../observability/root.zig");
 
 const Policy = proto.policy.Policy;
 const PolicyCallback = policy_provider.PolicyCallback;
-const PolicyUpdate = policy_provider.PolicyUpdate;
-const SourceType = policy_source.SourceType;
 const EventBus = o11y.EventBus;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -19,6 +16,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 // =============================================================================
 
 const PolicyError = struct { policy_id: []const u8, message: []const u8 };
+const PolicyStats = struct { policy_id: []const u8, hits: i64, misses: i64 };
 const PoliciesLoading = struct { path: []const u8 };
 const PoliciesLoaded = struct { count: usize, path: []const u8 };
 const PoliciesUnchanged = struct { hash: []const u8 };
@@ -29,6 +27,8 @@ const PolicyReloadFailed = struct { err: []const u8 };
 /// File-based policy provider that watches a config file for changes
 pub const FileProvider = struct {
     allocator: std.mem.Allocator,
+    /// Unique identifier for this provider
+    id: []const u8,
     config_path: []const u8,
     callback: ?PolicyCallback,
     watch_thread: ?std.Thread,
@@ -38,15 +38,19 @@ pub const FileProvider = struct {
     /// Event bus for observability
     bus: *EventBus,
 
-    pub fn init(allocator: std.mem.Allocator, bus: *EventBus, config_path: []const u8) !*FileProvider {
+    pub fn init(allocator: std.mem.Allocator, bus: *EventBus, id: []const u8, config_path: []const u8) !*FileProvider {
         const self = try allocator.create(FileProvider);
         errdefer allocator.destroy(self);
+
+        const id_copy = try allocator.dupe(u8, id);
+        errdefer allocator.free(id_copy);
 
         const path_copy = try allocator.dupe(u8, config_path);
         errdefer allocator.free(path_copy);
 
         self.* = .{
             .allocator = allocator,
+            .id = id_copy,
             .config_path = path_copy,
             .callback = null,
             .watch_thread = null,
@@ -56,6 +60,11 @@ pub const FileProvider = struct {
         };
 
         return self;
+    }
+
+    /// Get the unique identifier for this provider
+    pub fn getId(self: *FileProvider) []const u8 {
+        return self.id;
     }
 
     pub fn subscribe(self: *FileProvider, callback: PolicyCallback) !void {
@@ -81,6 +90,7 @@ pub const FileProvider = struct {
         // Ensure shutdown is called first
         self.shutdown();
 
+        self.allocator.free(self.id);
         self.allocator.free(self.config_path);
         self.allocator.destroy(self);
     }
@@ -89,6 +99,12 @@ pub const FileProvider = struct {
     /// For file provider, this logs to stderr since there's no remote server to report to.
     pub fn recordPolicyError(self: *FileProvider, policy_id: []const u8, error_message: []const u8) void {
         self.bus.err(PolicyError{ .policy_id = policy_id, .message = error_message });
+    }
+
+    /// Report statistics about policy hits and misses.
+    /// For file provider, this logs to stdout since there's no remote server to report to.
+    pub fn recordPolicyStats(self: *FileProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+        self.bus.debug(PolicyStats{ .policy_id = policy_id, .hits = hits, .misses = misses });
     }
 
     fn loadAndNotify(self: *FileProvider) !void {
@@ -127,7 +143,7 @@ pub const FileProvider = struct {
         if (self.callback) |cb| {
             try cb.call(.{
                 .policies = policies,
-                .source = .file,
+                .provider_id = self.id,
             });
         }
 

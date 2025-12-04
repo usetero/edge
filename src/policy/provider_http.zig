@@ -1,15 +1,11 @@
 const std = @import("std");
-const policy_provider = @import("../../core/policy_provider.zig");
-const policy_source = @import("../../core/policy_source.zig");
-const parser = @import("../parser.zig");
-const types = @import("../types.zig");
+const policy_provider = @import("./provider.zig");
+const types = @import("./types.zig");
 const proto = @import("proto");
 const protobuf = @import("protobuf");
-const o11y = @import("../../observability/root.zig");
+const o11y = @import("../observability/root.zig");
 
 const PolicyCallback = policy_provider.PolicyCallback;
-const PolicyUpdate = policy_provider.PolicyUpdate;
-const SourceType = policy_source.SourceType;
 const SyncRequest = proto.policy.SyncRequest;
 const SyncResponse = proto.policy.SyncResponse;
 const ClientMetadata = proto.policy.ClientMetadata;
@@ -52,6 +48,8 @@ const PolicyStatusRecord = struct {
 /// HTTP-based policy provider that polls a remote endpoint
 pub const HttpProvider = struct {
     allocator: std.mem.Allocator,
+    /// Unique identifier for this provider
+    id: []const u8,
     http_client: std.http.Client,
     config_url: []const u8,
     poll_interval_ns: u64,
@@ -79,6 +77,7 @@ pub const HttpProvider = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         bus: *EventBus,
+        id: []const u8,
         config_url: []const u8,
         poll_interval_seconds: u64,
         workspace_id: []const u8,
@@ -87,11 +86,15 @@ pub const HttpProvider = struct {
         const self = try allocator.create(HttpProvider);
         errdefer allocator.destroy(self);
 
+        const id_copy = try allocator.dupe(u8, id);
+        errdefer allocator.free(id_copy);
+
         const url_copy = try allocator.dupe(u8, config_url);
         errdefer allocator.free(url_copy);
 
         self.* = .{
             .allocator = allocator,
+            .id = id_copy,
             .http_client = std.http.Client{ .allocator = allocator },
             .config_url = url_copy,
             .poll_interval_ns = poll_interval_seconds * std.time.ns_per_s,
@@ -109,6 +112,11 @@ pub const HttpProvider = struct {
         };
 
         return self;
+    }
+
+    /// Get the unique identifier for this provider
+    pub fn getId(self: *HttpProvider) []const u8 {
+        return self.id;
     }
 
     /// Record the hash from a successful sync.
@@ -164,6 +172,35 @@ pub const HttpProvider = struct {
                 self.allocator.free(msg_copy);
                 self.allocator.free(id_copy);
                 record.deinit(self.allocator);
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                return;
+            };
+        }
+    }
+
+    /// Record statistics about policy hits and misses.
+    /// These stats will be sent in subsequent sync requests.
+    /// Conforms to PolicyProvider interface (void return, logs errors internally).
+    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+        self.sync_state_mutex.lock();
+        defer self.sync_state_mutex.unlock();
+
+        if (self.policy_statuses.getPtr(policy_id)) |record| {
+            // Update existing record
+            record.hits += hits;
+            record.misses += misses;
+        } else {
+            // Create new entry
+            const id_copy = self.allocator.dupe(u8, policy_id) catch {
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                return;
+            };
+
+            self.policy_statuses.put(self.allocator, id_copy, .{
+                .hits = hits,
+                .misses = misses,
+            }) catch {
+                self.allocator.free(id_copy);
                 self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
@@ -226,6 +263,7 @@ pub const HttpProvider = struct {
         self.policy_statuses.deinit(self.allocator);
 
         self.http_client.deinit();
+        self.allocator.free(self.id);
         self.allocator.free(self.config_url);
 
         self.allocator.destroy(self);
@@ -294,7 +332,7 @@ pub const HttpProvider = struct {
             if (self.callback) |cb| {
                 try cb.call(.{
                     .policies = response.policies.items,
-                    .source = .http,
+                    .provider_id = self.id,
                 });
             }
 

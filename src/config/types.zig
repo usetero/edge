@@ -1,11 +1,8 @@
 const std = @import("std");
-const proto = @import("proto");
+const policy = @import("../policy/root.zig");
 
-pub const Policy = proto.policy.Policy;
-pub const PolicyType = proto.policy.PolicyType;
-pub const FilterAction = proto.policy.FilterAction;
-pub const LogFilterConfig = proto.policy.LogFilterConfig;
-pub const LogMatcher = proto.policy.LogMatcher;
+const ProviderConfig = policy.ProviderConfig;
+const ServiceMetadata = policy.ServiceMetadata;
 
 pub const LogLevel = enum(u8) {
     debug,
@@ -22,35 +19,6 @@ pub const LogLevel = enum(u8) {
     }
 };
 
-pub const ProviderType = enum {
-    file,
-    http,
-};
-
-pub const ProviderConfig = struct {
-    /// Unique identifier for this provider (used to track which policies came from where)
-    id: []const u8,
-    type: ProviderType,
-    // For file provider
-    path: ?[]const u8 = null,
-    // For http provider
-    url: ?[]const u8 = null,
-    poll_interval: ?u64 = null, // seconds
-};
-
-/// Service metadata for identifying this edge instance
-pub const ServiceMetadata = struct {
-    /// Service name (e.g., "tero-edge")
-    name: []const u8 = "tero-edge",
-    /// Service namespace (e.g., "tero")
-    namespace: []const u8 = "tero",
-    /// Service version (e.g., "0.1.0", defaults to "latest")
-    version: []const u8 = "latest",
-    /// Service instance ID - generated at startup, not configurable
-    /// This field is set by the runtime, not from config
-    instance_id: []const u8 = "",
-};
-
 pub const ProxyConfig = struct {
     // Network config
     listen_address: [4]u8,
@@ -65,7 +33,7 @@ pub const ProxyConfig = struct {
 
     // Inspection config
     log_level: LogLevel,
-    pretty_print_json: bool,
+
     max_body_size: u32,
 
     // Policy providers
@@ -79,7 +47,6 @@ pub const ProxyConfig = struct {
             .workspace_id = "90A6EFC2-27B8-41BC-9343-43BFB1DF0732",
             .service = .{},
             .log_level = .info,
-            .pretty_print_json = true,
             .max_body_size = 1024 * 1024, // 1MB
             .policy_providers = &.{},
         };
