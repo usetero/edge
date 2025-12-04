@@ -182,6 +182,25 @@ pub const PolicyRegistry = struct {
         }
     }
 
+    /// Report statistics about policy hits and misses.
+    /// Routes the stats to the appropriate provider based on the policy's source.
+    pub fn recordPolicyStats(self: *PolicyRegistry, policy_id: []const u8, hits: i64, misses: i64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.policy_sources.get(policy_id)) |metadata| {
+            const provider: ?*policy_provider.PolicyProvider = switch (metadata.source) {
+                .file => self.providers.file,
+                .http => self.providers.http,
+            };
+            if (provider) |p| {
+                p.recordPolicyStats(policy_id, hits, misses);
+            }
+            // No fallback logging for stats - silent drop if no provider
+        }
+        // Silent drop if policy not found - stats are best-effort
+    }
+
     pub fn deinit(self: *PolicyRegistry) void {
         // Free all stored policies (we own them via dupe)
         for (self.policies.items) |*policy| {

@@ -112,25 +112,11 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
     };
     defer parsed.deinit();
 
-    // Get the current policy snapshot (atomic, lock-free)
-    const snapshot = registry.getSnapshot();
-
-    // Create filter engine for evaluation
-    const engine = FilterEngine.init(allocator, bus);
+    // Create filter engine for evaluation (gets snapshot from registry internally)
+    const engine = FilterEngine.init(allocator, bus, @constCast(registry));
 
     switch (parsed.value) {
         .array => |arr| {
-            // If no snapshot (no policies), return data unchanged with count
-            if (snapshot == null) {
-                const result = try allocator.alloc(u8, data.len);
-                @memcpy(result, data);
-                return .{
-                    .data = result,
-                    .dropped_count = 0,
-                    .original_count = arr.items.len,
-                };
-            }
-
             // Process array of logs
             var kept_logs: std.ArrayList(std.json.Value) = try .initCapacity(allocator, arr.capacity);
             defer kept_logs.deinit(allocator);
@@ -139,7 +125,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
 
             for (arr.items) |log_value| {
                 // Evaluate filter using Hyperscan-accelerated regex matching
-                const filter_result = engine.evaluate(&snapshot.?.matcher_index, @ptrCast(&log_value), datadogFieldAccessor);
+                const filter_result = engine.evaluate(@ptrCast(&log_value), datadogFieldAccessor);
                 if (filter_result == .keep) {
                     try kept_logs.append(allocator, log_value);
                 } else {
@@ -157,19 +143,8 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             };
         },
         .object => {
-            // If no snapshot (no policies), return data unchanged
-            if (snapshot == null) {
-                const result = try allocator.alloc(u8, data.len);
-                @memcpy(result, data);
-                return .{
-                    .data = result,
-                    .dropped_count = 0,
-                    .original_count = 1,
-                };
-            }
-
             // Process single log object
-            const filter_result = engine.evaluate(&snapshot.?.matcher_index, @ptrCast(&parsed.value), datadogFieldAccessor);
+            const filter_result = engine.evaluate(@ptrCast(&parsed.value), datadogFieldAccessor);
             if (filter_result == .drop) {
                 // Return empty array for dropped single log
                 const result = try allocator.alloc(u8, 2);
