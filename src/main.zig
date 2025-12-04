@@ -1,53 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const observability = @import("observability/root.zig");
+const StdLogAdapter = observability.StdLogAdapter;
+const Level = observability.Level;
 
+/// Route std.log through our EventBus adapter
 pub const std_options: std.Options = .{
-    // Set to .debug to see debug logs, .info for normal operation
-    .log_level = .info,
-    .logFn = stdLogAdapter,
+    .log_level = .debug, // Allow all levels through, EventBus will filter
+    .logFn = StdLogAdapter.logFn,
 };
-
-/// Adapter to route std.log calls through our EventBus
-/// This provides timestamps and consistent formatting
-fn stdLogAdapter(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
-    const obs_level = observability.Level.fromStd(level);
-
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-
-    // Timestamp (HH:MM:SS)
-    const timestamp = std.time.timestamp();
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
-    const day_seconds = epoch_seconds.getDaySeconds();
-    pos += (std.fmt.bufPrint(buf[pos..], "{d:0>2}:{d:0>2}:{d:0>2} ", .{
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
-    }) catch return).len;
-
-    // Level and scope
-    pos += (std.fmt.bufPrint(buf[pos..], "[{s}] {s}", .{ obs_level.asText(), scope_prefix }) catch return).len;
-
-    // Message
-    pos += (std.fmt.bufPrint(buf[pos..], format ++ "\n", args) catch return).len;
-
-    // Write to stderr
-    std.debug.lockStdErr();
-    defer std.debug.unlockStdErr();
-
-    const stderr = std.fs.File.stderr();
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = stderr.writer(&stderr_buf);
-    stderr_writer.interface.writeAll(buf[0..pos]) catch return;
-    stderr_writer.interface.flush() catch return;
-}
 
 const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
@@ -135,11 +96,17 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize observability
+    // Initialize observability with log level from environment
     var stdio_bus: observability.StdioEventBus = undefined;
     stdio_bus.init();
     const bus = stdio_bus.eventBus();
-    bus.setLevel(.debug);
+
+    // Parse TERO_LOG_LEVEL env var (defaults to info)
+    bus.setLevel(Level.parseFromEnv("TERO_LOG_LEVEL", .info));
+
+    // Initialize std.log adapter to route through EventBus
+    StdLogAdapter.init(bus);
+    defer StdLogAdapter.deinit();
 
     // Parse command line arguments
     var args = try std.process.argsWithAllocator(allocator);

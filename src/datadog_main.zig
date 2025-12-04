@@ -26,6 +26,8 @@ const HttpProvider = edge.HttpProvider;
 
 const o11y = @import("observability/root.zig");
 const EventBus = o11y.EventBus;
+const StdLogAdapter = o11y.StdLogAdapter;
+const Level = o11y.Level;
 
 const ProxyServer = server_mod.ProxyServer;
 const ModuleRegistration = proxy_module.ModuleRegistration;
@@ -34,8 +36,10 @@ const DatadogModule = datadog_mod.DatadogModule;
 const DatadogConfig = datadog_mod.DatadogConfig;
 const PolicyRegistry = policy_registry_mod.PolicyRegistry;
 
+/// Route std.log through our EventBus adapter
 pub const std_options: std.Options = .{
-    .log_level = .info,
+    .log_level = .debug, // Allow all levels through, EventBus will filter
+    .logFn = StdLogAdapter.logFn,
 };
 
 // =============================================================================
@@ -178,11 +182,17 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize observability
+    // Initialize observability with log level from environment
     var stdio_bus: o11y.StdioEventBus = undefined;
     stdio_bus.init();
     const bus = stdio_bus.eventBus();
-    bus.setLevel(.debug);
+
+    // Parse TERO_LOG_LEVEL env var (defaults to info)
+    bus.setLevel(Level.parseFromEnv("TERO_LOG_LEVEL", .info));
+
+    // Initialize std.log adapter to route through EventBus
+    StdLogAdapter.init(bus);
+    defer StdLogAdapter.deinit();
 
     // Set global event bus for signal handler
     global_event_bus = bus;
