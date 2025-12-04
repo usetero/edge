@@ -73,12 +73,12 @@ pub const HttpProvider = struct {
     // Mutex for thread-safe access to synced state
     sync_state_mutex: std.Thread.Mutex,
 
-    // Optional event bus for observability
-    bus: ?*EventBus,
+    // Event bus for observability
+    bus: *EventBus,
 
     pub fn init(
         allocator: std.mem.Allocator,
-        bus: ?*EventBus,
+        bus: *EventBus,
         config_url: []const u8,
         poll_interval_seconds: u64,
         workspace_id: []const u8,
@@ -133,7 +133,7 @@ pub const HttpProvider = struct {
         defer self.sync_state_mutex.unlock();
 
         const msg_copy = self.allocator.dupe(u8, error_message) catch {
-            if (self.bus) |b| b.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+            self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
             return;
         };
 
@@ -141,14 +141,14 @@ pub const HttpProvider = struct {
             // Append to existing error list
             record.errors.append(self.allocator, msg_copy) catch {
                 self.allocator.free(msg_copy);
-                if (self.bus) |b| b.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
         } else {
             // Create new entry
             const id_copy = self.allocator.dupe(u8, policy_id) catch {
                 self.allocator.free(msg_copy);
-                if (self.bus) |b| b.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
 
@@ -156,7 +156,7 @@ pub const HttpProvider = struct {
             record.errors.append(self.allocator, msg_copy) catch {
                 self.allocator.free(msg_copy);
                 self.allocator.free(id_copy);
-                if (self.bus) |b| b.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
 
@@ -164,7 +164,7 @@ pub const HttpProvider = struct {
                 self.allocator.free(msg_copy);
                 self.allocator.free(id_copy);
                 record.deinit(self.allocator);
-                if (self.bus) |b| b.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
         }
@@ -189,7 +189,7 @@ pub const HttpProvider = struct {
 
         // Initial fetch and notify (non-fatal if it fails)
         self.fetchAndNotify() catch |err| {
-            if (self.bus) |b| b.warn(HttpInitialFetchFailed{ .err = @errorName(err) });
+            self.bus.warn(HttpInitialFetchFailed{ .err = @errorName(err) });
         };
 
         // Start polling
@@ -245,7 +245,7 @@ pub const HttpProvider = struct {
             if (self.shutdown_flag.load(.acquire)) break;
 
             self.fetchAndNotify() catch |err| {
-                if (self.bus) |b| b.err(HttpFetchFailed{ .url = self.config_url, .err = @errorName(err) });
+                self.bus.err(HttpFetchFailed{ .url = self.config_url, .err = @errorName(err) });
             };
         }
     }
@@ -280,14 +280,14 @@ pub const HttpProvider = struct {
             };
 
             if (hash_unchanged) {
-                if (self.bus) |b| b.debug(HttpPoliciesUnchanged{ .reason = "hash" });
+                self.bus.debug(HttpPoliciesUnchanged{ .reason = "hash" });
                 return;
             }
 
             // Record the hash for future sync requests
             if (response.hash.len > 0) {
                 try self.recordSyncedHash(response.hash);
-                if (self.bus) |b| b.info(HttpPolicyHashUpdated{ .hash = response.hash });
+                self.bus.info(HttpPolicyHashUpdated{ .hash = response.hash });
             }
 
             // Notify callback with policies from response
@@ -298,14 +298,14 @@ pub const HttpProvider = struct {
                 });
             }
 
-            if (self.bus) |b| b.info(HttpPoliciesLoaded{
+            self.bus.info(HttpPoliciesLoaded{
                 .count = response.policies.items.len,
                 .url = self.config_url,
                 .sync_timestamp = response.sync_timestamp_unix_nano,
             });
         } else {
             // 304 Not Modified
-            if (self.bus) |b| b.debug(HttpPoliciesUnchanged{ .reason = "304" });
+            self.bus.debug(HttpPoliciesUnchanged{ .reason = "304" });
         }
     }
 
@@ -415,7 +415,7 @@ pub const HttpProvider = struct {
 
         // Check status code
         if (response.head.status != .ok) {
-            if (self.bus) |b| b.err(HttpSyncRequestFailed{
+            self.bus.err(HttpSyncRequestFailed{
                 .url = self.config_url,
                 .status = @intFromEnum(response.head.status),
             });

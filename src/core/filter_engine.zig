@@ -18,6 +18,8 @@
 const std = @import("std");
 const proto = @import("proto");
 const matcher_index = @import("matcher_index.zig");
+const o11y = @import("../observability/root.zig");
+const NoopEventBus = o11y.NoopEventBus;
 
 const log = std.log.scoped(.filter_engine);
 
@@ -341,7 +343,9 @@ const TestLogContext = struct {
 test "FilterEngine: empty index returns keep" {
     const allocator = testing.allocator;
 
-    var index = try MatcherIndex.build(allocator, &.{}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -369,7 +373,9 @@ test "FilterEngine: single policy drop match" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -400,7 +406,9 @@ test "FilterEngine: single policy keep match" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -434,7 +442,9 @@ test "FilterEngine: multiple matchers AND logic" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -471,7 +481,9 @@ test "FilterEngine: negated matcher" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -512,7 +524,9 @@ test "FilterEngine: mixed negated and non-negated matchers" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -569,7 +583,9 @@ test "FilterEngine: priority ordering - higher priority wins" {
     });
     defer high_priority.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{ low_priority, high_priority }, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{ low_priority, high_priority }, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -600,7 +616,9 @@ test "FilterEngine: disabled policies are skipped" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -628,7 +646,9 @@ test "FilterEngine: regex pattern matching" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -667,7 +687,9 @@ test "FilterEngine: missing field with negated matcher succeeds" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);
@@ -721,7 +743,9 @@ test "FilterEngine: multiple policies with different matcher keys" {
     });
     defer policy2.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 }, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 }, noop_bus.eventBus());
     defer index.deinit();
 
     const engine = FilterEngine.init(allocator);

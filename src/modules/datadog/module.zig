@@ -12,6 +12,7 @@ const RoutePattern = proxy_module.RoutePattern;
 const MethodBitmask = proxy_module.MethodBitmask;
 const PolicyRegistry = policy_registry.PolicyRegistry;
 const EventBus = o11y.EventBus;
+const NoopEventBus = o11y.NoopEventBus;
 
 // =============================================================================
 // Observability Events
@@ -24,8 +25,8 @@ const LogsProcessingFailed = struct { err: []const u8 };
 pub const DatadogConfig = struct {
     /// Reference to the policy registry
     registry: *const PolicyRegistry,
-    /// Optional event bus for observability
-    bus: ?*EventBus = null,
+    /// Event bus for observability
+    bus: *EventBus,
 };
 
 /// Datadog module - handles Datadog log ingestion with filtering
@@ -33,8 +34,8 @@ pub const DatadogConfig = struct {
 pub const DatadogModule = struct {
     /// Read-only reference to policy registry (set during init)
     registry: *const PolicyRegistry = undefined,
-    /// Optional event bus for observability
-    bus: ?*EventBus = null,
+    /// Event bus for observability
+    bus: *EventBus = undefined,
 
     pub fn asProxyModule(self: *DatadogModule) ProxyModule {
         return .{
@@ -92,11 +93,11 @@ pub const DatadogModule = struct {
             req.body,
             content_type,
         ) catch |err| {
-            if (self.bus) |b| b.warn(LogsProcessingFailed{ .err = @errorName(err) });
+            self.bus.warn(LogsProcessingFailed{ .err = @errorName(err) });
             return ModuleResult.unchanged();
         };
 
-        if (self.bus) |b| b.info(LogsProcessed{
+        self.bus.info(LogsProcessed{
             .dropped = result.dropped_count,
             .kept = result.original_count - result.dropped_count,
         });
@@ -137,10 +138,12 @@ const proto = @import("proto");
 test "DatadogModule processes POST requests" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var dd_config = DatadogConfig{ .registry = &registry };
+    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
     const pm = module.asProxyModule();
@@ -182,10 +185,12 @@ test "DatadogModule processes POST requests" {
 test "DatadogModule ignores GET requests" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var dd_config = DatadogConfig{ .registry = &registry };
+    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
     const pm = module.asProxyModule();
@@ -224,7 +229,9 @@ test "DatadogModule ignores GET requests" {
 test "DatadogModule filters logs with DROP policy" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create DROP policy for DEBUG logs
@@ -243,7 +250,7 @@ test "DatadogModule filters logs with DROP policy" {
 
     try registry.updatePolicies(&.{drop_policy}, .file);
 
-    var dd_config = DatadogConfig{ .registry = &registry };
+    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
     const pm = module.asProxyModule();
@@ -288,7 +295,9 @@ test "DatadogModule filters logs with DROP policy" {
 test "DatadogModule returns 202 when all logs dropped" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create DROP policy that matches INFO logs (test data uses INFO)
@@ -307,7 +316,7 @@ test "DatadogModule returns 202 when all logs dropped" {
 
     try registry.updatePolicies(&.{drop_all}, .file);
 
-    var dd_config = DatadogConfig{ .registry = &registry };
+    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
     const pm = module.asProxyModule();

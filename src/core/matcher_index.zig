@@ -15,6 +15,7 @@ const proto = @import("proto");
 const hyperscan = @import("../hyperscan/hyperscan.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
+const NoopEventBus = o11y.NoopEventBus;
 
 // Keep scoped logger for verbose debug traces
 const log = std.log.scoped(.matcher_index);
@@ -219,8 +220,8 @@ pub const MatcherIndex = struct {
     const Self = @This();
 
     /// Build a MatcherIndex from a slice of policies.
-    pub fn build(allocator: std.mem.Allocator, policies_slice: []const Policy, bus: ?*EventBus) !Self {
-        var span = if (bus) |b| b.started(.info, MatcherIndexBuildStarted{ .policy_count = policies_slice.len }) else null;
+    pub fn build(allocator: std.mem.Allocator, policies_slice: []const Policy, bus: *EventBus) !Self {
+        var span = bus.started(.info, MatcherIndexBuildStarted{ .policy_count = policies_slice.len });
 
         var self = Self{
             .allocator = allocator,
@@ -365,7 +366,7 @@ pub const MatcherIndex = struct {
         // Store matcher keys for iteration
         self.matcher_keys = try allocator.dupe(MatcherKey, keys_list.items);
 
-        if (span) |*s| s.completed(MatcherIndexBuildCompleted{
+        span.completed(MatcherIndexBuildCompleted{
             .database_count = self.databases.count(),
             .matcher_key_count = self.matcher_keys.len,
         });
@@ -564,7 +565,9 @@ test "MatcherKey: isKeyed" {
 test "MatcherIndex: build empty" {
     const allocator = testing.allocator;
 
-    var index = try MatcherIndex.build(allocator, &.{}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{}, noop_bus.eventBus());
     defer index.deinit();
 
     try testing.expect(index.isEmpty());
@@ -589,7 +592,9 @@ test "MatcherIndex: build with single policy" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -633,7 +638,9 @@ test "MatcherIndex: build with keyed matchers" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     // Should have 2 databases (one per key)
@@ -676,7 +683,9 @@ test "MatcherIndex: multiple policies same matcher key" {
     });
     defer policy2.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 }, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 }, noop_bus.eventBus());
     defer index.deinit();
 
     // Should have 1 database with 2 patterns
@@ -705,7 +714,9 @@ test "MatcherIndex: negated matcher tracking" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     const policy_info = index.getPolicy("policy-1");
@@ -733,7 +744,9 @@ test "MatcherIndex: scan database" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     var db = index.getDatabase(.{ .match_case = .log_body, .key = "" }).?;
@@ -773,7 +786,9 @@ test "MatcherIndex: severity_number excluded from regex matchers" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy}, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, &.{policy}, noop_bus.eventBus());
     defer index.deinit();
 
     // Only 1 database (for log_body, not severity_number)

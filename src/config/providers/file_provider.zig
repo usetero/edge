@@ -35,10 +35,10 @@ pub const FileProvider = struct {
     shutdown_flag: std.atomic.Value(bool),
     /// SHA256 hash of the last loaded file contents
     content_hash: ?[Sha256.digest_length]u8,
-    /// Optional event bus for observability
-    bus: ?*EventBus,
+    /// Event bus for observability
+    bus: *EventBus,
 
-    pub fn init(allocator: std.mem.Allocator, bus: ?*EventBus, config_path: []const u8) !*FileProvider {
+    pub fn init(allocator: std.mem.Allocator, bus: *EventBus, config_path: []const u8) !*FileProvider {
         const self = try allocator.create(FileProvider);
         errdefer allocator.destroy(self);
 
@@ -88,11 +88,11 @@ pub const FileProvider = struct {
     /// Report an error encountered when applying a policy.
     /// For file provider, this logs to stderr since there's no remote server to report to.
     pub fn recordPolicyError(self: *FileProvider, policy_id: []const u8, error_message: []const u8) void {
-        if (self.bus) |b| b.err(PolicyError{ .policy_id = policy_id, .message = error_message });
+        self.bus.err(PolicyError{ .policy_id = policy_id, .message = error_message });
     }
 
     fn loadAndNotify(self: *FileProvider) !void {
-        if (self.bus) |b| b.info(PoliciesLoading{ .path = self.config_path });
+        self.bus.info(PoliciesLoading{ .path = self.config_path });
 
         // Read file contents and compute hash
         const file = try std.fs.cwd().openFile(self.config_path, .{});
@@ -107,7 +107,7 @@ pub const FileProvider = struct {
         // Check if content has changed
         if (self.content_hash) |old_hash| {
             if (std.mem.eql(u8, &old_hash, &new_hash)) {
-                if (self.bus) |b| b.debug(PoliciesUnchanged{ .hash = &new_hash });
+                self.bus.debug(PoliciesUnchanged{ .hash = &new_hash });
                 return;
             }
         }
@@ -131,16 +131,16 @@ pub const FileProvider = struct {
             });
         }
 
-        if (self.bus) |b| b.info(PoliciesLoaded{ .count = policies.len, .path = self.config_path });
+        self.bus.info(PoliciesLoaded{ .count = policies.len, .path = self.config_path });
     }
 
     fn watchLoop(self: *FileProvider) void {
         if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
             self.watchLoopPoll() catch |err| {
-                if (self.bus) |b| b.err(FileWatcherError{ .err = @errorName(err) });
+                self.bus.err(FileWatcherError{ .err = @errorName(err) });
             };
         } else {
-            if (self.bus) |b| b.warn(FileWatcherUnsupported{});
+            self.bus.warn(FileWatcherUnsupported{});
         }
     }
 
@@ -160,7 +160,7 @@ pub const FileProvider = struct {
                 last_mtime = stat.mtime;
                 // loadAndNotify will check content hash and skip if unchanged
                 self.loadAndNotify() catch |err| {
-                    if (self.bus) |b| b.err(PolicyReloadFailed{ .err = @errorName(err) });
+                    self.bus.err(PolicyReloadFailed{ .err = @errorName(err) });
                 };
             }
         }

@@ -1,11 +1,13 @@
 const std = @import("std");
 const filter_engine = @import("../../core/filter_engine.zig");
 const policy_registry = @import("../../core/policy_registry.zig");
+const o11y = @import("../../observability/root.zig");
 
 const FilterEngine = filter_engine.FilterEngine;
 const FilterResult = filter_engine.FilterResult;
 const MatchCase = filter_engine.MatchCase;
 const PolicyRegistry = policy_registry.PolicyRegistry;
+const NoopEventBus = o11y.NoopEventBus;
 
 /// Result of processing logs
 pub const ProcessResult = struct {
@@ -208,7 +210,9 @@ const proto = @import("proto");
 test "processLogs - no policies keeps all logs in array" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const logs =
@@ -228,7 +232,9 @@ test "processLogs - no policies keeps all logs in array" {
 test "processLogs - DROP policy filters logs from array" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for DEBUG logs
@@ -265,7 +271,9 @@ test "processLogs - DROP policy filters logs from array" {
 test "processLogs - DROP policy drops single object" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     var drop_policy = proto.policy.Policy{
@@ -298,7 +306,9 @@ test "processLogs - DROP policy drops single object" {
 test "processLogs - malformed JSON returns unchanged (fail-open)" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -313,7 +323,9 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 test "processLogs - non-JSON content type returns unchanged" {
     const allocator = std.testing.allocator;
 
-    var registry = PolicyRegistry.init(allocator, null);
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const data = "some raw log data";

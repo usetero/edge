@@ -65,6 +65,28 @@ fn eventName(comptime T: type) []const u8 {
 /// // Events within the span get timing automatically
 /// bus.withSpan(&span).info(StepCompleted{ .step = "validation" });
 /// ```
+/// No-op event bus that discards all events.
+/// Useful for tests where you need a non-null EventBus but don't care about output.
+///
+/// IMPORTANT: Like StdioEventBus, this struct must NOT be moved after init() is called.
+pub const NoopEventBus = struct {
+    bus: EventBus,
+    discarding: std.Io.Writer.Discarding,
+    buf: [64]u8,
+
+    /// Initialize an uninitialized NoopEventBus in place.
+    /// Call this on a variable that is already at its final address.
+    pub fn init(self: *NoopEventBus) void {
+        self.buf = undefined;
+        self.discarding = std.Io.Writer.Discarding.init(&self.buf);
+        self.bus = EventBus.init(&self.discarding.writer);
+    }
+
+    pub fn eventBus(self: *NoopEventBus) *EventBus {
+        return &self.bus;
+    }
+};
+
 /// Wrapper that owns stdout/stderr writers with buffers.
 /// Routes error-level events to stderr, everything else to stdout.
 ///
