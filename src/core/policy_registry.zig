@@ -1368,6 +1368,14 @@ const MockErrorProvider = struct {
         };
     }
 
+    pub fn recordPolicyStats(self: *MockErrorProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+        // No-op for mock - stats tracking not needed for error tests
+        _ = self;
+        _ = policy_id;
+        _ = hits;
+        _ = misses;
+    }
+
     fn getErrorCount(self: *MockErrorProvider) usize {
         return self.recorded_errors.items.len;
     }

@@ -31,6 +31,7 @@ pub const PolicyProvider = struct {
     pub const VTable = struct {
         subscribe: *const fn (ptr: *anyopaque, callback: PolicyCallback) anyerror!void,
         recordPolicyError: *const fn (ptr: *anyopaque, policy_id: []const u8, error_message: []const u8) void,
+        recordPolicyStats: *const fn (ptr: *anyopaque, policy_id: []const u8, hits: i64, misses: i64) void,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -49,6 +50,14 @@ pub const PolicyProvider = struct {
         self.vtable.recordPolicyError(self.ptr, policy_id, error_message);
     }
 
+    /// Report statistics about policy hits and misses.
+    /// How this is handled depends on the provider:
+    /// - HttpProvider: Records stats to send in next sync request
+    /// - FileProvider: Logs stats to stdout
+    pub fn recordPolicyStats(self: PolicyProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+        self.vtable.recordPolicyStats(self.ptr, policy_id, hits, misses);
+    }
+
     /// Cleanup provider resources
     pub fn deinit(self: PolicyProvider) void {
         self.vtable.deinit(self.ptr);
@@ -58,6 +67,7 @@ pub const PolicyProvider = struct {
     /// Provider must implement:
     /// - subscribe(*Self, PolicyCallback) !void
     /// - recordPolicyError(*Self, []const u8, []const u8) void
+    /// - recordPolicyStats(*Self, []const u8, i64, i64) void
     /// - deinit(*Self) void
     pub fn init(provider: anytype) PolicyProvider {
         const Ptr = @TypeOf(provider);
@@ -71,6 +81,7 @@ pub const PolicyProvider = struct {
         // Verify provider has required methods
         if (!@hasDecl(T, "subscribe")) @compileError("provider must have subscribe method");
         if (!@hasDecl(T, "recordPolicyError")) @compileError("provider must have recordPolicyError method");
+        if (!@hasDecl(T, "recordPolicyStats")) @compileError("provider must have recordPolicyStats method");
         if (!@hasDecl(T, "deinit")) @compileError("provider must have deinit method");
 
         const gen = struct {
@@ -84,6 +95,11 @@ pub const PolicyProvider = struct {
                 self.recordPolicyError(policy_id, error_message);
             }
 
+            fn recordPolicyStatsImpl(ptr: *anyopaque, policy_id: []const u8, hits: i64, misses: i64) void {
+                const self: Ptr = @ptrCast(@alignCast(ptr));
+                self.recordPolicyStats(policy_id, hits, misses);
+            }
+
             fn deinitImpl(ptr: *anyopaque) void {
                 const self: Ptr = @ptrCast(@alignCast(ptr));
                 self.deinit();
@@ -92,6 +108,7 @@ pub const PolicyProvider = struct {
             const vtable = VTable{
                 .subscribe = subscribeImpl,
                 .recordPolicyError = recordPolicyErrorImpl,
+                .recordPolicyStats = recordPolicyStatsImpl,
                 .deinit = deinitImpl,
             };
         };

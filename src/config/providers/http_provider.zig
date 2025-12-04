@@ -170,6 +170,35 @@ pub const HttpProvider = struct {
         }
     }
 
+    /// Record statistics about policy hits and misses.
+    /// These stats will be sent in subsequent sync requests.
+    /// Conforms to PolicyProvider interface (void return, logs errors internally).
+    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+        self.sync_state_mutex.lock();
+        defer self.sync_state_mutex.unlock();
+
+        if (self.policy_statuses.getPtr(policy_id)) |record| {
+            // Update existing record
+            record.hits += hits;
+            record.misses += misses;
+        } else {
+            // Create new entry
+            const id_copy = self.allocator.dupe(u8, policy_id) catch {
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                return;
+            };
+
+            self.policy_statuses.put(self.allocator, id_copy, .{
+                .hits = hits,
+                .misses = misses,
+            }) catch {
+                self.allocator.free(id_copy);
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
+                return;
+            };
+        }
+    }
+
     /// Clear all recorded policy statuses.
     /// Call this after statuses have been successfully reported to the server.
     pub fn clearPolicyStatuses(self: *HttpProvider) void {
