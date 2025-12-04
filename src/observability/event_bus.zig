@@ -67,21 +67,24 @@ fn eventName(comptime T: type) []const u8 {
 /// ```
 /// Wrapper that owns stdout/stderr writers with buffers.
 /// Routes error-level events to stderr, everything else to stdout.
+///
+/// IMPORTANT: This struct must NOT be moved after init() is called.
+/// The EventBus holds pointers to the writers inside this struct.
 pub const StdioEventBus = struct {
     stdout_writer: std.fs.File.Writer,
     stderr_writer: std.fs.File.Writer,
     bus: EventBus,
 
-    /// Buffers for writers - must be kept alive with the struct
+    /// Buffers for writers - static to avoid lifetime issues
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [4096]u8 = undefined;
 
-    pub fn init() StdioEventBus {
-        var self: StdioEventBus = undefined;
+    /// Initialize an uninitialized StdioEventBus in place.
+    /// Call this on a variable that is already at its final address.
+    pub fn init(self: *StdioEventBus) void {
         self.stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
         self.stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
         self.bus = EventBus.initDual(&self.stdout_writer.interface, &self.stderr_writer.interface);
-        return self;
     }
 
     /// Get a pointer to the EventBus for use
@@ -213,15 +216,24 @@ pub const EventBus = struct {
         // Select writer based on level (errors go to err_writer)
         const writer = self.writerForLevel(level);
 
-        // Timestamp (HH:MM:SS)
-        const timestamp = std.time.timestamp();
-        const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+        // Timestamp (ISO 8601 with milliseconds: 2025-12-03T14:30:45.123Z)
+        const millis = std.time.milliTimestamp();
+        const secs: u64 = @intCast(@divFloor(millis, 1000));
+        const ms: u64 = @intCast(@mod(millis, 1000));
+        const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
+        const epoch_day = epoch_seconds.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
         const day_seconds = epoch_seconds.getDaySeconds();
 
-        writer.print("{d:0>2}:{d:0>2}:{d:0>2} [{s}] {s}", .{
+        writer.print("{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z [{s}] {s}", .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
             day_seconds.getHoursIntoDay(),
             day_seconds.getMinutesIntoHour(),
             day_seconds.getSecondsIntoMinute(),
+            ms,
             level.asText(),
             name,
         }) catch return;

@@ -13,10 +13,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const std_options: std.Options = .{
-    .log_level = .info,
-};
-
 const edge = @import("root.zig");
 const config_parser = edge.config_parser;
 const server_mod = edge.server;
@@ -28,6 +24,9 @@ const policy_provider_mod = edge.policy_provider;
 const FileProvider = edge.FileProvider;
 const HttpProvider = edge.HttpProvider;
 
+const o11y = @import("observability/root.zig");
+const EventBus = o11y.EventBus;
+
 const ProxyServer = server_mod.ProxyServer;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const PassthroughModule = passthrough_mod.PassthroughModule;
@@ -36,16 +35,58 @@ const DatadogConfig = datadog_mod.DatadogConfig;
 const PolicyRegistry = policy_registry_mod.PolicyRegistry;
 
 // =============================================================================
+// Observability Events
+// =============================================================================
+
+const ShutdownSignalReceived = struct {};
+const SignalHandlersInstalled = struct {};
+const SignalHandlingNotSupported = struct { platform: []const u8 };
+
+const PolicyRegistryUpdated = struct {
+    source: []const u8,
+    policy_count: usize,
+};
+
+const ServerStarting = struct {};
+const ConfigurationLoaded = struct { path: []const u8 };
+const ListenAddressConfigured = struct {
+    address: []const u8,
+    port: u16,
+};
+const UpstreamConfigured = struct { url: []const u8 };
+const ServiceConfigured = struct {
+    namespace: []const u8,
+    name: []const u8,
+    instance_id: []const u8,
+    version: []const u8,
+};
+
+const PolicyProvidersInitializing = struct { count: usize };
+const FileProviderConfigured = struct { path: []const u8 };
+const HttpProviderConfigured = struct {
+    url: []const u8,
+    poll_interval: u64,
+};
+const PolicyCountLoaded = struct { count: usize };
+
+const ServerReady = struct {};
+const ShutdownHint = struct { pid: c_int };
+const ServerStopped = struct {};
+
+// =============================================================================
 // Global state for signal handlers
 // =============================================================================
 
 var server_instance: ?*ProxyServer = null;
 var global_file_providers: ?*std.ArrayList(*FileProvider) = null;
 var global_http_providers: ?*std.ArrayList(*HttpProvider) = null;
+var global_event_bus: ?*EventBus = null;
 
 fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     _ = sig;
-    std.log.info("Shutdown signal received, stopping server...", .{});
+    if (global_event_bus) |bus| {
+        bus.info(ShutdownSignalReceived{});
+    }
 
     // Shutdown all providers first
     if (global_file_providers) |providers| {
@@ -79,9 +120,9 @@ fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyop
     std.posix.abort();
 }
 
-fn installShutdownHandlers() void {
+fn installShutdownHandlers(bus: *EventBus) void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
-        std.log.warn("Signal handling not supported on this platform", .{});
+        bus.warn(SignalHandlingNotSupported{ .platform = @tagName(builtin.os.tag) });
         return;
     }
 
@@ -102,7 +143,7 @@ fn installShutdownHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.SEGV, &segv_act, null);
 
-    std.log.debug("Installed signal handlers for SIGINT, SIGTERM, and SIGSEGV", .{});
+    bus.debug(SignalHandlersInstalled{});
 }
 
 // =============================================================================
@@ -111,13 +152,14 @@ fn installShutdownHandlers() void {
 
 const PolicyCallbackContext = struct {
     registry: *PolicyRegistry,
+    bus: *EventBus,
 
     fn handleUpdate(context: *anyopaque, update: policy_provider_mod.PolicyUpdate) !void {
         const self: *PolicyCallbackContext = @ptrCast(@alignCast(context));
         try self.registry.updatePolicies(update.policies, update.source);
-        std.log.info("Policy registry updated from {s} source with {} policies", .{
-            @tagName(update.source),
-            update.policies.len,
+        self.bus.info(PolicyRegistryUpdated{
+            .source = @tagName(update.source),
+            .policy_count = update.policies.len,
         });
     }
 };
@@ -131,6 +173,16 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Initialize observability
+    var stdio_bus: o11y.StdioEventBus = undefined;
+    stdio_bus.init();
+    const bus = stdio_bus.eventBus();
+    bus.setLevel(.debug);
+
+    // Set global event bus for signal handler
+    global_event_bus = bus;
+    defer global_event_bus = null;
+
     // Parse command line arguments
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -138,8 +190,8 @@ pub fn main() !void {
     _ = args.next(); // Skip program name
     const config_path = args.next() orelse "config.json";
 
-    std.log.info("Tero Edge - Datadog Distribution starting...", .{});
-    std.log.info("Configuration file: {s}", .{config_path});
+    bus.info(ServerStarting{});
+    bus.info(ConfigurationLoaded{ .path = config_path });
 
     // Parse configuration
     const config = try config_parser.parseConfigFile(allocator, config_path);
@@ -167,19 +219,22 @@ pub fn main() !void {
     // Set the instance_id in service metadata
     config.service.instance_id = instance_id_copy;
 
-    std.log.info("Listen address: {}.{}.{}.{}:{}", .{
+    // Format listen address for logging
+    var addr_buf: [64]u8 = undefined;
+    const addr_str = try std.fmt.bufPrint(&addr_buf, "{}.{}.{}.{}", .{
         config.listen_address[0],
         config.listen_address[1],
         config.listen_address[2],
         config.listen_address[3],
-        config.listen_port,
     });
-    std.log.info("Upstream URL: {s}", .{config.upstream_url});
-    std.log.info("Service: {s}/{s} (instance: {s}, version: {s})", .{
-        config.service.namespace,
-        config.service.name,
-        config.service.instance_id,
-        config.service.version,
+
+    bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
+    bus.info(UpstreamConfigured{ .url = config.upstream_url });
+    bus.info(ServiceConfigured{
+        .namespace = config.service.namespace,
+        .name = config.service.name,
+        .instance_id = config.service.instance_id,
+        .version = config.service.version,
     });
 
     // Create centralized policy registry
@@ -187,7 +242,7 @@ pub fn main() !void {
     defer registry.deinit();
 
     // Create callback context for policy updates
-    var callback_context = PolicyCallbackContext{ .registry = &registry };
+    var callback_context = PolicyCallbackContext{ .registry = &registry, .bus = bus };
     const callback = policy_provider_mod.PolicyCallback{
         .context = @ptrCast(&callback_context),
         .onUpdate = PolicyCallbackContext.handleUpdate,
@@ -218,12 +273,12 @@ pub fn main() !void {
         global_http_providers = null;
     }
 
-    std.log.info("Initializing {} policy provider(s)...", .{config.policy_providers.len});
+    bus.info(PolicyProvidersInitializing{ .count = config.policy_providers.len });
     for (config.policy_providers) |provider_config| {
         switch (provider_config.type) {
             .file => {
                 const path = provider_config.path orelse return error.FileProviderRequiresPath;
-                std.log.info("  - File provider: {s}", .{path});
+                bus.info(FileProviderConfigured{ .path = path });
 
                 const file_provider = try FileProvider.init(allocator, path);
                 errdefer file_provider.deinit();
@@ -234,7 +289,7 @@ pub fn main() !void {
             .http => {
                 const url = provider_config.url orelse return error.HttpProviderRequiresUrl;
                 const poll_interval = provider_config.poll_interval orelse 60;
-                std.log.info("  - HTTP provider: {s} (poll interval: {}s)", .{ url, poll_interval });
+                bus.info(HttpProviderConfigured{ .url = url, .poll_interval = poll_interval });
 
                 const http_provider = try HttpProvider.init(
                     allocator,
@@ -251,10 +306,10 @@ pub fn main() !void {
         }
     }
 
-    std.log.info("Policy count: {}", .{registry.getPolicyCount()});
+    bus.info(PolicyCountLoaded{ .count = registry.getPolicyCount() });
 
     // Install signal handlers
-    installShutdownHandlers();
+    installShutdownHandlers(bus);
 
     // Create Datadog module configuration
     var datadog_config = DatadogConfig{
@@ -300,13 +355,13 @@ pub fn main() !void {
     server_instance = &proxy;
     defer server_instance = null;
 
-    std.log.info("Datadog proxy ready. Waiting for connections...", .{});
+    bus.info(ServerReady{});
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
-        std.log.info("To shutdown: kill -s INT {d}", .{std.c.getpid()});
+        bus.info(ShutdownHint{ .pid = std.c.getpid() });
     }
 
     // Start listening (blocks until server.stop() is called)
     try proxy.listen();
 
-    std.log.info("Server stopped gracefully.", .{});
+    bus.info(ServerStopped{});
 }
