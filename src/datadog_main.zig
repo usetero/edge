@@ -288,6 +288,13 @@ pub fn main() !void {
         global_http_providers = null;
     }
 
+    // Storage for PolicyProvider interfaces (needed for registerProvider)
+    var file_provider_interfaces: std.ArrayList(policy_provider_mod.PolicyProvider) = .empty;
+    defer file_provider_interfaces.deinit(allocator);
+
+    var http_provider_interfaces: std.ArrayList(policy_provider_mod.PolicyProvider) = .empty;
+    defer http_provider_interfaces.deinit(allocator);
+
     bus.info(PolicyProvidersInitializing{ .count = config.policy_providers.len });
     for (config.policy_providers) |provider_config| {
         switch (provider_config.type) {
@@ -300,6 +307,10 @@ pub fn main() !void {
 
                 try file_provider.subscribe(callback);
                 try file_providers.append(allocator, file_provider);
+
+                // Register provider with registry for error/stats routing
+                try file_provider_interfaces.append(allocator, policy_provider_mod.PolicyProvider.init(file_provider));
+                registry.registerProvider(.file, &file_provider_interfaces.items[file_provider_interfaces.items.len - 1]);
             },
             .http => {
                 const url = provider_config.url orelse return error.HttpProviderRequiresUrl;
@@ -318,6 +329,10 @@ pub fn main() !void {
 
                 try http_provider.subscribe(callback);
                 try http_providers.append(allocator, http_provider);
+
+                // Register provider with registry for error/stats routing
+                try http_provider_interfaces.append(allocator, policy_provider_mod.PolicyProvider.init(http_provider));
+                registry.registerProvider(.http, &http_provider_interfaces.items[http_provider_interfaces.items.len - 1]);
             },
         }
     }
