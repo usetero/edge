@@ -31,7 +31,6 @@ const ConfigJson = struct {
     upstream_url: []const u8,
     workspace_id: []const u8,
     log_level: []const u8,
-    pretty_print_json: bool,
     max_body_size: u32,
     policy_providers: ?[]ProviderJson = null,
     service: ?ServiceJson = null,
@@ -78,7 +77,6 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
     config.log_level = try LogLevel.parse(json_config.log_level);
 
     // Copy remaining fields
-    config.pretty_print_json = json_config.pretty_print_json;
     config.max_body_size = json_config.max_body_size;
 
     // Parse policy providers if present
@@ -184,7 +182,6 @@ test "parseConfigFile with JSON" {
         \\  "upstream_url": "http://127.0.0.1:80",
         \\  "workspace_id": "test-workspace-123",
         \\  "log_level": "info",
-        \\  "pretty_print_json": true,
         \\  "max_body_size": 1048576
         \\}
     ;
@@ -210,7 +207,6 @@ test "parseConfigFile with JSON" {
     try std.testing.expectEqual(@as(u16, 8080), config.listen_port);
     try std.testing.expectEqualStrings("http://127.0.0.1:80", config.upstream_url);
     try std.testing.expectEqual(LogLevel.info, config.log_level);
-    try std.testing.expectEqual(true, config.pretty_print_json);
     try std.testing.expectEqual(@as(u32, 1048576), config.max_body_size);
     try std.testing.expectEqual(@as(usize, 0), config.policy_providers.len);
 }

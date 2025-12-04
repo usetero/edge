@@ -72,6 +72,5 @@ test {
     _ = @import("modules/passthrough_module.zig");
     _ = @import("modules/datadog_module.zig");
     _ = @import("modules/datadog_logs_v2.zig");
-    _ = @import("json/pretty_print.zig");
     _ = @import("hyperscan/hyperscan.zig");
 }

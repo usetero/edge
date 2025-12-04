@@ -35,7 +35,7 @@ pub const ProxyConfig = struct {
 
     // Inspection config
     log_level: LogLevel,
-    pretty_print_json: bool,
+
     max_body_size: u32,
 
     // Policy providers
@@ -49,7 +49,6 @@ pub const ProxyConfig = struct {
             .workspace_id = "90A6EFC2-27B8-41BC-9343-43BFB1DF0732",
             .service = .{},
             .log_level = .info,
-            .pretty_print_json = true,
             .max_body_size = 1024 * 1024, // 1MB
             .policy_providers = &.{},
         };
