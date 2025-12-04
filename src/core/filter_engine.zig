@@ -437,7 +437,7 @@ test "FilterEngine: single policy drop match" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -471,7 +471,7 @@ test "FilterEngine: single policy keep match" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -508,7 +508,7 @@ test "FilterEngine: multiple matchers AND logic" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -548,7 +548,7 @@ test "FilterEngine: negated matcher" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -592,7 +592,7 @@ test "FilterEngine: mixed negated and non-negated matchers" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -652,7 +652,7 @@ test "FilterEngine: priority ordering - higher priority wins" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{ low_priority, high_priority }, .file);
+    try registry.updatePolicies(&.{ low_priority, high_priority }, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -686,7 +686,7 @@ test "FilterEngine: disabled policies are skipped" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -717,7 +717,7 @@ test "FilterEngine: regex pattern matching" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -759,7 +759,7 @@ test "FilterEngine: missing field with negated matcher succeeds" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
@@ -816,7 +816,7 @@ test "FilterEngine: multiple policies with different matcher keys" {
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{ policy1, policy2 }, .file);
+    try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 

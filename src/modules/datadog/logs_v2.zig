@@ -228,7 +228,7 @@ test "processLogs - DROP policy filters logs from array" {
     });
     defer drop_policy.deinit(allocator);
 
-    try registry.updatePolicies(&.{drop_policy}, .file);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
     const logs =
         \\[{"level": "DEBUG", "message": "debug msg"}, {"level": "ERROR", "message": "error msg"}]
@@ -266,7 +266,7 @@ test "processLogs - DROP policy drops single object" {
     });
     defer drop_policy.deinit(allocator);
 
-    try registry.updatePolicies(&.{drop_policy}, .file);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
     const log =
         \\{"level": "DEBUG", "message": "debug msg"}

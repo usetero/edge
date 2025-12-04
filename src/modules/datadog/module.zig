@@ -249,7 +249,7 @@ test "DatadogModule filters logs with DROP policy" {
     });
     defer drop_policy.deinit(allocator);
 
-    try registry.updatePolicies(&.{drop_policy}, .file);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
@@ -315,7 +315,7 @@ test "DatadogModule returns 202 when all logs dropped" {
     });
     defer drop_all.deinit(allocator);
 
-    try registry.updatePolicies(&.{drop_all}, .file);
+    try registry.updatePolicies(&.{drop_all}, "file-provider", .file);
 
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 

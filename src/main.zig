@@ -30,28 +30,13 @@ const DatadogConfig = datadog_mod.DatadogConfig;
 /// Global server instance for signal handler
 var server_instance: ?*ProxyServer = null;
 
-/// Global provider lists for signal handler
-var global_file_providers: ?*std.ArrayList(*FileProvider) = null;
-var global_http_providers: ?*std.ArrayList(*HttpProvider) = null;
-
 /// Signal handler for graceful shutdown
 fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     _ = sig;
     std.log.info("Shutdown signal received, stopping server...", .{});
 
-    // Shutdown all providers first
-    if (global_file_providers) |providers| {
-        for (providers.items) |provider| {
-            provider.shutdown();
-        }
-    }
-    if (global_http_providers) |providers| {
-        for (providers.items) |provider| {
-            provider.shutdown();
-        }
-    }
-
-    // Then stop the server
+    // Stop the server - this unblocks the main thread
+    // Provider cleanup happens in the defer blocks of main()
     if (server_instance) |server| {
         server_instance = null;
         server.server.stop();
@@ -77,15 +62,19 @@ fn installShutdownHandlers() void {
     std.log.debug("Installed signal handlers for SIGINT and SIGTERM", .{});
 }
 
+const policy_source = @import("./core/policy_source.zig");
+const SourceType = policy_source.SourceType;
+
 /// Context for policy update callback
 const PolicyCallbackContext = struct {
     registry: *policy_registry_mod.PolicyRegistry,
+    source_type: SourceType,
 
     fn handleUpdate(context: *anyopaque, update: policy_provider.PolicyUpdate) !void {
         const self: *PolicyCallbackContext = @ptrCast(@alignCast(context));
-        try self.registry.updatePolicies(update.policies, update.source);
-        std.log.info("Policy registry updated from {s} source with {} policies", .{
-            @tagName(update.source),
+        try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
+        std.log.info("Policy registry updated from provider '{s}' with {} policies", .{
+            update.provider_id,
             update.policies.len,
         });
     }
@@ -165,70 +154,52 @@ pub fn main() !void {
     var registry = policy_registry_mod.PolicyRegistry.init(allocator, bus);
     defer registry.deinit();
 
-    // Create callback context for policy updates
-    var callback_context = PolicyCallbackContext{ .registry = &registry };
-    const callback = policy_provider.PolicyCallback{
-        .context = @ptrCast(&callback_context),
-        .onUpdate = PolicyCallbackContext.handleUpdate,
-    };
-
-    // Initialize providers from config (keep pointers for cleanup)
-    var file_providers: std.ArrayList(*FileProvider) = .empty;
+    // Storage for PolicyProvider interfaces
+    var providers: std.ArrayList(policy_provider.PolicyProvider) = .empty;
     defer {
-        for (file_providers.items) |provider| {
+        for (providers.items) |provider| {
             provider.deinit();
         }
-        file_providers.deinit(allocator);
+        providers.deinit(allocator);
     }
 
-    var http_providers: std.ArrayList(*HttpProvider) = .empty;
-    defer {
-        for (http_providers.items) |provider| {
-            provider.deinit();
-        }
-        http_providers.deinit(allocator);
-    }
-
-    // Set global provider references for signal handler
-    global_file_providers = &file_providers;
-    global_http_providers = &http_providers;
-    defer {
-        global_file_providers = null;
-        global_http_providers = null;
-    }
-
-    // Storage for PolicyProvider interfaces (needed for registerProvider)
-    var file_provider_interfaces: std.ArrayList(policy_provider.PolicyProvider) = .empty;
-    defer file_provider_interfaces.deinit(allocator);
-
-    var http_provider_interfaces: std.ArrayList(policy_provider.PolicyProvider) = .empty;
-    defer http_provider_interfaces.deinit(allocator);
+    // Storage for callback contexts (need to persist for lifetime of providers)
+    var callback_contexts: std.ArrayList(PolicyCallbackContext) = .empty;
+    defer callback_contexts.deinit(allocator);
 
     std.log.info("Initializing {} policy provider(s)...", .{config.policy_providers.len});
     for (config.policy_providers) |provider_config| {
         switch (provider_config.type) {
             .file => {
                 const path = provider_config.path orelse return error.FileProviderRequiresPath;
-                std.log.info("  - File provider: {s}", .{path});
+                std.log.info("  - File provider '{s}': {s}", .{ provider_config.id, path });
 
-                const file_provider = try FileProvider.init(allocator, bus, path);
+                const file_provider = try FileProvider.init(allocator, bus, provider_config.id, path);
                 errdefer file_provider.deinit();
 
-                try file_provider.subscribe(callback);
-                try file_providers.append(allocator, file_provider);
+                // Create callback context with source type
+                try callback_contexts.append(allocator, .{ .registry = &registry, .source_type = .file });
+                const callback = policy_provider.PolicyCallback{
+                    .context = @ptrCast(&callback_contexts.items[callback_contexts.items.len - 1]),
+                    .onUpdate = PolicyCallbackContext.handleUpdate,
+                };
 
-                // Register provider with registry for error/stats routing
-                try file_provider_interfaces.append(allocator, policy_provider.PolicyProvider.init(file_provider));
-                registry.registerProvider(.file, &file_provider_interfaces.items[file_provider_interfaces.items.len - 1]);
+                try file_provider.subscribe(callback);
+
+                // Store provider interface for cleanup and registry routing
+                const provider_interface = policy_provider.PolicyProvider.init(file_provider);
+                try providers.append(allocator, provider_interface);
+                try registry.registerProvider(&providers.items[providers.items.len - 1]);
             },
             .http => {
                 const url = provider_config.url orelse return error.HttpProviderRequiresUrl;
                 const poll_interval = provider_config.poll_interval orelse 60;
-                std.log.info("  - HTTP provider: {s} (poll interval: {}s)", .{ url, poll_interval });
+                std.log.info("  - HTTP provider '{s}': {s} (poll interval: {}s)", .{ provider_config.id, url, poll_interval });
 
                 const http_provider = try HttpProvider.init(
                     allocator,
                     bus,
+                    provider_config.id,
                     url,
                     poll_interval,
                     config.workspace_id,
@@ -236,12 +207,19 @@ pub fn main() !void {
                 );
                 errdefer http_provider.deinit();
 
-                try http_provider.subscribe(callback);
-                try http_providers.append(allocator, http_provider);
+                // Create callback context with source type
+                try callback_contexts.append(allocator, .{ .registry = &registry, .source_type = .http });
+                const callback = policy_provider.PolicyCallback{
+                    .context = @ptrCast(&callback_contexts.items[callback_contexts.items.len - 1]),
+                    .onUpdate = PolicyCallbackContext.handleUpdate,
+                };
 
-                // Register provider with registry for error/stats routing
-                try http_provider_interfaces.append(allocator, policy_provider.PolicyProvider.init(http_provider));
-                registry.registerProvider(.http, &http_provider_interfaces.items[http_provider_interfaces.items.len - 1]);
+                try http_provider.subscribe(callback);
+
+                // Store provider interface for cleanup and registry routing
+                const provider_interface = policy_provider.PolicyProvider.init(http_provider);
+                try providers.append(allocator, provider_interface);
+                try registry.registerProvider(&providers.items[providers.items.len - 1]);
             },
         }
     }

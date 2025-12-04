@@ -1,14 +1,13 @@
 const std = @import("std");
 const proto = @import("proto");
-const policy_source = @import("./policy_source.zig");
 
 const Policy = proto.policy.Policy;
-const SourceType = policy_source.SourceType;
 
 /// Update notification sent by providers to subscribers
 pub const PolicyUpdate = struct {
     policies: []const Policy,
-    source: SourceType,
+    /// ID of the provider that sent this update
+    provider_id: []const u8,
 };
 
 /// Callback signature for policy updates
@@ -29,11 +28,17 @@ pub const PolicyProvider = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        getId: *const fn (ptr: *anyopaque) []const u8,
         subscribe: *const fn (ptr: *anyopaque, callback: PolicyCallback) anyerror!void,
         recordPolicyError: *const fn (ptr: *anyopaque, policy_id: []const u8, error_message: []const u8) void,
         recordPolicyStats: *const fn (ptr: *anyopaque, policy_id: []const u8, hits: i64, misses: i64) void,
         deinit: *const fn (ptr: *anyopaque) void,
     };
+
+    /// Get the unique identifier for this provider
+    pub fn getId(self: PolicyProvider) []const u8 {
+        return self.vtable.getId(self.ptr);
+    }
 
     /// Subscribe to policy updates from this provider
     /// Provider will call callback immediately with current policies,
@@ -65,6 +70,7 @@ pub const PolicyProvider = struct {
 
     /// Create a PolicyProvider from a concrete provider implementation
     /// Provider must implement:
+    /// - getId(*Self) []const u8
     /// - subscribe(*Self, PolicyCallback) !void
     /// - recordPolicyError(*Self, []const u8, []const u8) void
     /// - recordPolicyStats(*Self, []const u8, i64, i64) void
@@ -79,12 +85,18 @@ pub const PolicyProvider = struct {
         const T = ptr_info.pointer.child;
 
         // Verify provider has required methods
+        if (!@hasDecl(T, "getId")) @compileError("provider must have getId method");
         if (!@hasDecl(T, "subscribe")) @compileError("provider must have subscribe method");
         if (!@hasDecl(T, "recordPolicyError")) @compileError("provider must have recordPolicyError method");
         if (!@hasDecl(T, "recordPolicyStats")) @compileError("provider must have recordPolicyStats method");
         if (!@hasDecl(T, "deinit")) @compileError("provider must have deinit method");
 
         const gen = struct {
+            fn getIdImpl(ptr: *anyopaque) []const u8 {
+                const self: Ptr = @ptrCast(@alignCast(ptr));
+                return self.getId();
+            }
+
             fn subscribeImpl(ptr: *anyopaque, callback: PolicyCallback) anyerror!void {
                 const self: Ptr = @ptrCast(@alignCast(ptr));
                 return self.subscribe(callback);
@@ -106,6 +118,7 @@ pub const PolicyProvider = struct {
             }
 
             const vtable = VTable{
+                .getId = getIdImpl,
                 .subscribe = subscribeImpl,
                 .recordPolicyError = recordPolicyErrorImpl,
                 .recordPolicyStats = recordPolicyStatsImpl,

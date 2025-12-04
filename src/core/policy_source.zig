@@ -16,25 +16,29 @@ pub const SourceType = enum(u8) {
 /// Metadata about a policy's source and history
 /// Cold data: only accessed during updates, not during evaluation
 pub const PolicyMetadata = struct {
-    source: SourceType,
+    /// Provider ID that owns this policy
+    provider_id: []const u8,
+    /// Source type for priority ordering
+    source_type: SourceType,
     last_updated: i128, // Unix timestamp in nanoseconds
 
-    pub fn init(source: SourceType) PolicyMetadata {
+    pub fn init(provider_id: []const u8, source_type: SourceType) PolicyMetadata {
         return .{
-            .source = source,
+            .provider_id = provider_id,
+            .source_type = source_type,
             .last_updated = std.time.nanoTimestamp(),
         };
     }
 
     /// Check if this policy should be replaced by a new one from the given source
-    pub fn shouldReplace(self: PolicyMetadata, new_source: SourceType) bool {
-        return new_source.priority() >= self.source.priority();
+    pub fn shouldReplace(self: PolicyMetadata, new_source_type: SourceType) bool {
+        return new_source_type.priority() >= self.source_type.priority();
     }
 };
 
 test "PolicyMetadata.shouldReplace prioritizes HTTP over file" {
-    const file_meta = PolicyMetadata.init(.file);
-    const http_meta = PolicyMetadata.init(.http);
+    const file_meta = PolicyMetadata.init("file-provider", .file);
+    const http_meta = PolicyMetadata.init("http-provider", .http);
 
     // HTTP should replace file
     try std.testing.expect(file_meta.shouldReplace(.http));

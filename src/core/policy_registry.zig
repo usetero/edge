@@ -127,12 +127,9 @@ pub const PolicyRegistry = struct {
     // Current immutable snapshot for lock-free reads
     current_snapshot: std.atomic.Value(?*const PolicySnapshot),
 
-    // Provider references for error routing
+    // Provider references for error routing, keyed by provider ID
     // These are not owned by the registry - caller must ensure they outlive the registry
-    providers: struct {
-        file: ?*policy_provider.PolicyProvider = null,
-        http: ?*policy_provider.PolicyProvider = null,
-    },
+    providers: std.StringHashMapUnmanaged(*policy_provider.PolicyProvider),
 
     // Event bus for observability
     bus: *EventBus,
@@ -152,11 +149,11 @@ pub const PolicyRegistry = struct {
 
     /// Register a provider for error routing.
     /// The provider must outlive the registry.
-    pub fn registerProvider(self: *PolicyRegistry, source: SourceType, provider: *policy_provider.PolicyProvider) void {
-        switch (source) {
-            .file => self.providers.file = provider,
-            .http => self.providers.http = provider,
-        }
+    pub fn registerProvider(self: *PolicyRegistry, provider: *policy_provider.PolicyProvider) !void {
+        const id = provider.getId();
+        const id_copy = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_copy);
+        try self.providers.put(self.allocator, id_copy, provider);
     }
 
     /// Report an error encountered when applying a policy.
@@ -166,12 +163,8 @@ pub const PolicyRegistry = struct {
         defer self.mutex.unlock();
 
         if (self.policy_sources.get(policy_id)) |metadata| {
-            const provider: ?*policy_provider.PolicyProvider = switch (metadata.source) {
-                .file => self.providers.file,
-                .http => self.providers.http,
-            };
-            if (provider) |p| {
-                p.recordPolicyError(policy_id, error_message);
+            if (self.providers.get(metadata.provider_id)) |provider| {
+                provider.recordPolicyError(policy_id, error_message);
             } else {
                 // No provider registered, log as fallback
                 self.bus.err(PolicyErrorNoProvider{ .policy_id = policy_id, .message = error_message });
@@ -189,12 +182,8 @@ pub const PolicyRegistry = struct {
         defer self.mutex.unlock();
 
         if (self.policy_sources.get(policy_id)) |metadata| {
-            const provider: ?*policy_provider.PolicyProvider = switch (metadata.source) {
-                .file => self.providers.file,
-                .http => self.providers.http,
-            };
-            if (provider) |p| {
-                p.recordPolicyStats(policy_id, hits, misses);
+            if (self.providers.get(metadata.provider_id)) |provider| {
+                provider.recordPolicyStats(policy_id, hits, misses);
             }
             // No fallback logging for stats - silent drop if no provider
         }
@@ -215,6 +204,13 @@ pub const PolicyRegistry = struct {
         }
         self.policy_sources.deinit();
 
+        // Free provider keys
+        var prov_it = self.providers.keyIterator();
+        while (prov_it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.providers.deinit(self.allocator);
+
         // Free current snapshot if exists
         if (self.current_snapshot.load(.acquire)) |snapshot| {
             @constCast(snapshot).deinit();
@@ -222,12 +218,13 @@ pub const PolicyRegistry = struct {
         }
     }
 
-    /// Update policies from a specific source
-    /// Deduplicates by id and applies priority rules
+    /// Update policies from a specific provider
+    /// Deduplicates by id and applies priority rules based on source_type
     pub fn updatePolicies(
         self: *PolicyRegistry,
         policies: []const Policy,
-        source: SourceType,
+        provider_id: []const u8,
+        source_type: SourceType,
     ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -235,7 +232,7 @@ pub const PolicyRegistry = struct {
         // Track if any changes were made
         var changed = false;
 
-        // Track which policy ids from this source are in the new set
+        // Track which policy ids from this provider are in the new set
         var new_policy_ids = std.StringHashMap(void).init(self.allocator);
         defer {
             var it = new_policy_ids.keyIterator();
@@ -256,7 +253,7 @@ pub const PolicyRegistry = struct {
             // Check if policy already exists
             if (self.policy_sources.get(policy.id)) |existing_meta| {
                 // Apply priority rules
-                if (existing_meta.shouldReplace(source)) {
+                if (existing_meta.shouldReplace(source_type)) {
                     // Remove old policy and its source tracking
                     self.removePolicyById(policy.id);
                     if (self.policy_sources.fetchRemove(policy.id)) |kv| {
@@ -264,19 +261,19 @@ pub const PolicyRegistry = struct {
                     }
 
                     // Add new policy
-                    try self.addPolicyInternal(policy, source);
+                    try self.addPolicyInternal(policy, provider_id, source_type);
                     changed = true;
                 }
-                // else: HTTP has priority, keep existing
+                // else: higher priority source has priority, keep existing
             } else {
                 // New policy, add it
-                try self.addPolicyInternal(policy, source);
+                try self.addPolicyInternal(policy, provider_id, source_type);
                 changed = true;
             }
         }
 
-        // Remove policies from this source that are no longer present
-        const removed = try self.removeStalePolicies(source, &new_policy_ids);
+        // Remove policies from this provider that are no longer present
+        const removed = try self.removeStalePolicies(provider_id, &new_policy_ids);
         if (removed > 0) {
             changed = true;
         }
@@ -294,7 +291,8 @@ pub const PolicyRegistry = struct {
     fn addPolicyInternal(
         self: *PolicyRegistry,
         policy: Policy,
-        source: SourceType,
+        provider_id: []const u8,
+        source_type: SourceType,
     ) !void {
         // Deep copy the policy so we own the memory
         const policy_copy = try policy.dupe(self.allocator);
@@ -302,7 +300,7 @@ pub const PolicyRegistry = struct {
 
         // Track source metadata by policy id
         const id_key = try self.allocator.dupe(u8, policy.id);
-        try self.policy_sources.put(id_key, PolicyMetadata.init(source));
+        try self.policy_sources.put(id_key, PolicyMetadata.init(provider_id, source_type));
     }
 
     /// Remove a policy by id and free its memory
@@ -316,24 +314,24 @@ pub const PolicyRegistry = struct {
         }
     }
 
-    /// Remove policies from source that are no longer in the new set
+    /// Remove policies from provider that are no longer in the new set
     /// Returns the number of policies removed
     fn removeStalePolicies(
         self: *PolicyRegistry,
-        source: SourceType,
+        provider_id: []const u8,
         new_ids: *const std.StringHashMap(void),
     ) !usize {
         var ids_to_remove = std.ArrayListUnmanaged([]const u8){};
         defer ids_to_remove.deinit(self.allocator);
 
-        // Find policies from this source not in new set
+        // Find policies from this provider not in new set
         var it = self.policy_sources.iterator();
         while (it.next()) |entry| {
             const id = entry.key_ptr.*;
             const metadata = entry.value_ptr.*;
 
-            // Only consider policies from this source
-            if (metadata.source != source) continue;
+            // Only consider policies from this provider
+            if (!std.mem.eql(u8, metadata.provider_id, provider_id)) continue;
 
             // If not in new set, mark for removal
             if (!new_ids.contains(id)) {
@@ -422,17 +420,18 @@ pub const PolicyRegistry = struct {
     }
 
     /// Clear all policies from a specific source
-    pub fn clearSource(self: *PolicyRegistry, source: SourceType) !void {
+    /// Clear all policies from a specific provider
+    pub fn clearProvider(self: *PolicyRegistry, provider_id: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         var ids_to_remove = std.ArrayListUnmanaged([]const u8){};
         defer ids_to_remove.deinit(self.allocator);
 
-        // Find all policies from this source
+        // Find all policies from this provider
         var it = self.policy_sources.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.source == source) {
+            if (std.mem.eql(u8, entry.value_ptr.provider_id, provider_id)) {
                 try ids_to_remove.append(self.allocator, entry.key_ptr.*);
             }
         }
@@ -467,14 +466,16 @@ const PolicyUpdate = policy_provider.PolicyUpdate;
 /// Implements the PolicyProvider interface for integration testing
 pub const TestPolicyProvider = struct {
     allocator: std.mem.Allocator,
-    source: SourceType,
+    id: []const u8,
+    source_type: SourceType,
     policies: std.ArrayListUnmanaged(Policy),
     callbacks: std.ArrayListUnmanaged(PolicyCallback),
 
-    pub fn init(allocator: std.mem.Allocator, source: SourceType) TestPolicyProvider {
+    pub fn init(allocator: std.mem.Allocator, id: []const u8, source_type: SourceType) TestPolicyProvider {
         return .{
             .allocator = allocator,
-            .source = source,
+            .id = id,
+            .source_type = source_type,
             .policies = .empty,
             .callbacks = .empty,
         };
@@ -486,6 +487,11 @@ pub const TestPolicyProvider = struct {
         }
         self.policies.deinit(self.allocator);
         self.callbacks.deinit(self.allocator);
+    }
+
+    /// Get the unique identifier for this provider
+    pub fn getId(self: *TestPolicyProvider) []const u8 {
+        return self.id;
     }
 
     /// Add a policy to the provider's set
@@ -517,7 +523,7 @@ pub const TestPolicyProvider = struct {
     pub fn notifySubscribers(self: *TestPolicyProvider) !void {
         const update = PolicyUpdate{
             .policies = self.policies.items,
-            .source = self.source,
+            .provider_id = self.id,
         };
         for (self.callbacks.items) |callback| {
             try callback.call(update);
@@ -530,9 +536,24 @@ pub const TestPolicyProvider = struct {
         // Immediately notify with current policies
         const update = PolicyUpdate{
             .policies = self.policies.items,
-            .source = self.source,
+            .provider_id = self.id,
         };
         try callback.call(update);
+    }
+
+    /// Record policy errors (no-op for tests)
+    pub fn recordPolicyError(self: *TestPolicyProvider, policy_id: []const u8, error_message: []const u8) void {
+        _ = self;
+        _ = policy_id;
+        _ = error_message;
+    }
+
+    /// Record policy stats (no-op for tests)
+    pub fn recordPolicyStats(self: *TestPolicyProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+        _ = self;
+        _ = policy_id;
+        _ = hits;
+        _ = misses;
     }
 
     /// Get as PolicyProvider interface
@@ -586,7 +607,7 @@ test "PolicyRegistry: add single policy" {
     var policy = try createTestPolicy(allocator, "test-policy");
     defer freeTestPolicy(allocator, &policy);
 
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
@@ -612,7 +633,7 @@ test "PolicyRegistry: add multiple policies" {
     var policy3 = try createTestPolicy(allocator, "policy-3");
     defer freeTestPolicy(allocator, &policy3);
 
-    try registry.updatePolicies(&.{ policy1, policy2, policy3 }, .file);
+    try registry.updatePolicies(&.{ policy1, policy2, policy3 }, "file-provider", .file);
 
     try testing.expectEqual(@as(usize, 3), registry.getPolicyCount());
 
@@ -632,7 +653,7 @@ test "PolicyRegistry: update existing policy from same source" {
     var policy1 = try createTestPolicy(allocator, "test-policy");
     defer freeTestPolicy(allocator, &policy1);
 
-    try registry.updatePolicies(&.{policy1}, .file);
+    try registry.updatePolicies(&.{policy1}, "file-provider", .file);
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
     // Update with same name
@@ -640,7 +661,7 @@ test "PolicyRegistry: update existing policy from same source" {
     policy2.priority = 10; // Different priority
     defer freeTestPolicy(allocator, &policy2);
 
-    try registry.updatePolicies(&.{policy2}, .file);
+    try registry.updatePolicies(&.{policy2}, "file-provider", .file);
 
     // Should still have 1 policy, but updated
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
@@ -666,14 +687,14 @@ test "PolicyRegistry: HTTP source takes priority over file source" {
     http_policy.priority = 1;
     defer freeTestPolicy(allocator, &http_policy);
 
-    try registry.updatePolicies(&.{http_policy}, .http);
+    try registry.updatePolicies(&.{http_policy}, "http-provider", .http);
 
     // Try to update with file source (should be ignored)
     var file_policy = try createTestPolicy(allocator, "shared-policy");
     file_policy.priority = 2;
     defer freeTestPolicy(allocator, &file_policy);
 
-    try registry.updatePolicies(&.{file_policy}, .file);
+    try registry.updatePolicies(&.{file_policy}, "file-provider", .file);
 
     // Should still have the HTTP version
     const snapshot = registry.getSnapshot();
@@ -694,14 +715,14 @@ test "PolicyRegistry: HTTP source can update file source policy" {
     file_policy.priority = 1;
     defer freeTestPolicy(allocator, &file_policy);
 
-    try registry.updatePolicies(&.{file_policy}, .file);
+    try registry.updatePolicies(&.{file_policy}, "file-provider", .file);
 
     // Update with HTTP source (should replace)
     var http_policy = try createTestPolicy(allocator, "shared-policy");
     http_policy.priority = 2;
     defer freeTestPolicy(allocator, &http_policy);
 
-    try registry.updatePolicies(&.{http_policy}, .http);
+    try registry.updatePolicies(&.{http_policy}, "http-provider", .http);
 
     // Should have the HTTP version
     const snapshot = registry.getSnapshot();
@@ -721,13 +742,13 @@ test "PolicyRegistry: multiple sources with different policies" {
     var file_policy = try createTestPolicy(allocator, "file-only-policy");
     defer freeTestPolicy(allocator, &file_policy);
 
-    try registry.updatePolicies(&.{file_policy}, .file);
+    try registry.updatePolicies(&.{file_policy}, "file-provider", .file);
 
     // Add policies from HTTP source
     var http_policy = try createTestPolicy(allocator, "http-only-policy");
     defer freeTestPolicy(allocator, &http_policy);
 
-    try registry.updatePolicies(&.{http_policy}, .http);
+    try registry.updatePolicies(&.{http_policy}, "http-provider", .http);
 
     // Should have both policies
     try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
@@ -751,11 +772,11 @@ test "PolicyRegistry: stale policies are removed when source updates" {
     var policy2 = try createTestPolicy(allocator, "policy-2");
     defer freeTestPolicy(allocator, &policy2);
 
-    try registry.updatePolicies(&.{ policy1, policy2 }, .file);
+    try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
     try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
 
     // Update with only one policy (policy-2 should be removed)
-    try registry.updatePolicies(&.{policy1}, .file);
+    try registry.updatePolicies(&.{policy1}, "file-provider", .file);
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
     const snapshot = registry.getSnapshot();
@@ -774,17 +795,17 @@ test "PolicyRegistry: stale removal only affects same source" {
     var file_policy = try createTestPolicy(allocator, "file-policy");
     defer freeTestPolicy(allocator, &file_policy);
 
-    try registry.updatePolicies(&.{file_policy}, .file);
+    try registry.updatePolicies(&.{file_policy}, "file-provider", .file);
 
     // Add policy from HTTP source
     var http_policy = try createTestPolicy(allocator, "http-policy");
     defer freeTestPolicy(allocator, &http_policy);
 
-    try registry.updatePolicies(&.{http_policy}, .http);
+    try registry.updatePolicies(&.{http_policy}, "http-provider", .http);
     try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
 
     // Update file source with empty set (should only remove file-policy)
-    try registry.updatePolicies(&.{}, .file);
+    try registry.updatePolicies(&.{}, "file-provider", .file);
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
     const snapshot = registry.getSnapshot();
@@ -792,7 +813,7 @@ test "PolicyRegistry: stale removal only affects same source" {
     try testing.expectEqualStrings("http-policy", snapshot.?.policies[0].name);
 }
 
-test "PolicyRegistry: clearSource removes all policies from source" {
+test "PolicyRegistry: clearProvider removes all policies from provider" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
@@ -806,12 +827,12 @@ test "PolicyRegistry: clearSource removes all policies from source" {
     var http_policy = try createTestPolicy(allocator, "http-policy");
     defer freeTestPolicy(allocator, &http_policy);
 
-    try registry.updatePolicies(&.{file_policy}, .file);
-    try registry.updatePolicies(&.{http_policy}, .http);
+    try registry.updatePolicies(&.{file_policy}, "file-provider", .file);
+    try registry.updatePolicies(&.{http_policy}, "http-provider", .http);
     try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
 
-    // Clear file source
-    try registry.clearSource(.file);
+    // Clear file provider
+    try registry.clearProvider("file-provider");
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
     const snapshot = registry.getSnapshot();
@@ -834,25 +855,25 @@ test "PolicyRegistry: snapshot version increments on update" {
     defer freeTestPolicy(allocator, &policy);
 
     // First update
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
     const snapshot1 = registry.getSnapshot();
     try testing.expect(snapshot1 != null);
     try testing.expectEqual(@as(u64, 1), snapshot1.?.version);
 
     // Second update
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
     const snapshot2 = registry.getSnapshot();
     try testing.expect(snapshot2 != null);
     try testing.expectEqual(@as(u64, 2), snapshot2.?.version);
 
     // Third update
-    try registry.updatePolicies(&.{}, .file);
+    try registry.updatePolicies(&.{}, "file-provider", .file);
     const snapshot3 = registry.getSnapshot();
     try testing.expect(snapshot3 != null);
     try testing.expectEqual(@as(u64, 3), snapshot3.?.version);
 }
 
-test "PolicyRegistry: clearSource increments version" {
+test "PolicyRegistry: clearProvider increments version" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
@@ -862,10 +883,10 @@ test "PolicyRegistry: clearSource increments version" {
     var policy = try createTestPolicy(allocator, "test-policy");
     defer freeTestPolicy(allocator, &policy);
 
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
     const version_before = registry.getSnapshot().?.version;
 
-    try registry.clearSource(.file);
+    try registry.clearProvider("file-provider");
     const version_after = registry.getSnapshot().?.version;
 
     try testing.expect(version_after > version_before);
@@ -878,7 +899,7 @@ test "PolicyRegistry: clearSource increments version" {
 test "TestPolicyProvider: basic functionality" {
     const allocator = testing.allocator;
 
-    var prov = TestPolicyProvider.init(allocator, .file);
+    var prov = TestPolicyProvider.init(allocator, "file-provider", .file);
     defer prov.deinit();
 
     // Add a policy
@@ -901,7 +922,7 @@ test "TestPolicyProvider: integrates with PolicyRegistry" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var file_provider = TestPolicyProvider.init(allocator, .file);
+    var file_provider = TestPolicyProvider.init(allocator, "file-provider", .file);
     defer file_provider.deinit();
 
     // Add policy to provider
@@ -913,14 +934,15 @@ test "TestPolicyProvider: integrates with PolicyRegistry" {
     // Create callback that updates registry
     const Ctx = struct {
         registry: *PolicyRegistry,
+        source_type: SourceType,
 
         fn onUpdate(ctx_ptr: *anyopaque, update: PolicyUpdate) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            try self.registry.updatePolicies(update.policies, update.source);
+            try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
         }
     };
 
-    var ctx = Ctx{ .registry = &registry };
+    var ctx = Ctx{ .registry = &registry, .source_type = .file };
     const callback = PolicyCallback{
         .context = &ctx,
         .onUpdate = Ctx.onUpdate,
@@ -943,10 +965,10 @@ test "TestPolicyProvider: multiple providers with different sources" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var file_provider = TestPolicyProvider.init(allocator, .file);
+    var file_provider = TestPolicyProvider.init(allocator, "file-provider", .file);
     defer file_provider.deinit();
 
-    var http_provider = TestPolicyProvider.init(allocator, .http);
+    var http_provider = TestPolicyProvider.init(allocator, "http-provider", .http);
     defer http_provider.deinit();
 
     // Add policies to providers
@@ -959,25 +981,32 @@ test "TestPolicyProvider: multiple providers with different sources" {
     try file_provider.addPolicy(file_policy);
     try http_provider.addPolicy(http_policy);
 
-    // Create callback
+    // Create callbacks with source types
     const Ctx = struct {
         registry: *PolicyRegistry,
+        source_type: SourceType,
 
         fn onUpdate(ctx_ptr: *anyopaque, update: PolicyUpdate) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            try self.registry.updatePolicies(update.policies, update.source);
+            try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
         }
     };
 
-    var ctx = Ctx{ .registry = &registry };
-    const callback = PolicyCallback{
-        .context = &ctx,
+    var file_ctx = Ctx{ .registry = &registry, .source_type = .file };
+    const file_callback = PolicyCallback{
+        .context = &file_ctx,
+        .onUpdate = Ctx.onUpdate,
+    };
+
+    var http_ctx = Ctx{ .registry = &registry, .source_type = .http };
+    const http_callback = PolicyCallback{
+        .context = &http_ctx,
         .onUpdate = Ctx.onUpdate,
     };
 
     // Subscribe to both providers
-    try file_provider.subscribe(callback);
-    try http_provider.subscribe(callback);
+    try file_provider.subscribe(file_callback);
+    try http_provider.subscribe(http_callback);
 
     // Registry should have both policies
     try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
@@ -991,20 +1020,21 @@ test "TestPolicyProvider: notifySubscribers updates registry" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var prov = TestPolicyProvider.init(allocator, .file);
+    var prov = TestPolicyProvider.init(allocator, "file-provider", .file);
     defer prov.deinit();
 
     // Create and subscribe callback
     const Ctx = struct {
         registry: *PolicyRegistry,
+        source_type: SourceType,
 
         fn onUpdate(ctx_ptr: *anyopaque, update: PolicyUpdate) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            try self.registry.updatePolicies(update.policies, update.source);
+            try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
         }
     };
 
-    var ctx = Ctx{ .registry = &registry };
+    var ctx = Ctx{ .registry = &registry, .source_type = .file };
     const callback = PolicyCallback{
         .context = &ctx,
         .onUpdate = Ctx.onUpdate,
@@ -1050,25 +1080,32 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var file_provider = TestPolicyProvider.init(allocator, .file);
+    var file_provider = TestPolicyProvider.init(allocator, "file-provider", .file);
     defer file_provider.deinit();
 
-    var http_provider = TestPolicyProvider.init(allocator, .http);
+    var http_provider = TestPolicyProvider.init(allocator, "http-provider", .http);
     defer http_provider.deinit();
 
-    // Create callback
+    // Create callbacks with source types
     const Ctx = struct {
         registry: *PolicyRegistry,
+        source_type: SourceType,
 
         fn onUpdate(ctx_ptr: *anyopaque, update: PolicyUpdate) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            try self.registry.updatePolicies(update.policies, update.source);
+            try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
         }
     };
 
-    var ctx = Ctx{ .registry = &registry };
-    const callback = PolicyCallback{
-        .context = &ctx,
+    var file_ctx = Ctx{ .registry = &registry, .source_type = .file };
+    const file_callback = PolicyCallback{
+        .context = &file_ctx,
+        .onUpdate = Ctx.onUpdate,
+    };
+
+    var http_ctx = Ctx{ .registry = &registry, .source_type = .http };
+    const http_callback = PolicyCallback{
+        .context = &http_ctx,
         .onUpdate = Ctx.onUpdate,
     };
 
@@ -1078,7 +1115,7 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
     defer freeTestPolicy(allocator, &file_policy);
 
     try file_provider.addPolicy(file_policy);
-    try file_provider.subscribe(callback);
+    try file_provider.subscribe(file_callback);
 
     // Verify file policy is in registry
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
@@ -1093,7 +1130,7 @@ test "TestPolicyProvider: HTTP provider overrides file provider" {
     defer freeTestPolicy(allocator, &http_policy);
 
     try http_provider.addPolicy(http_policy);
-    try http_provider.subscribe(callback);
+    try http_provider.subscribe(http_callback);
 
     // Verify HTTP policy replaced file policy
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
@@ -1181,7 +1218,7 @@ test "PolicySnapshot: log_filter_indices contains only filter policies" {
     var another_no_filter = try createTestPolicy(allocator, "another-no-filter");
     defer freeTestPolicy(allocator, &another_no_filter);
 
-    try registry.updatePolicies(&.{ policy_no_filter, policy_with_filter, another_no_filter }, .file);
+    try registry.updatePolicies(&.{ policy_no_filter, policy_with_filter, another_no_filter }, "file-provider", .file);
 
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
@@ -1212,7 +1249,7 @@ test "PolicySnapshot: multiple filter policies are indexed" {
     var filter3 = try createTestPolicyWithFilter(allocator, "filter-3");
     defer freeTestPolicy(allocator, &filter3);
 
-    try registry.updatePolicies(&.{ filter1, filter2, filter3 }, .file);
+    try registry.updatePolicies(&.{ filter1, filter2, filter3 }, "file-provider", .file);
 
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
@@ -1235,7 +1272,7 @@ test "PolicySnapshot: empty when no filter policies" {
     var policy2 = try createTestPolicy(allocator, "policy-2");
     defer freeTestPolicy(allocator, &policy2);
 
-    try registry.updatePolicies(&.{ policy1, policy2 }, .file);
+    try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
@@ -1261,7 +1298,7 @@ test "PolicySnapshot: iterateLogFilterPolicies returns all filter policies" {
     var filter2 = try createTestPolicyWithFilter(allocator, "filter-2");
     defer freeTestPolicy(allocator, &filter2);
 
-    try registry.updatePolicies(&.{ no_filter, filter1, filter2 }, .file);
+    try registry.updatePolicies(&.{ no_filter, filter1, filter2 }, "file-provider", .file);
 
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
@@ -1298,7 +1335,7 @@ test "PolicySnapshot: iterator returns null when no filter policies" {
     var policy = try createTestPolicy(allocator, "no-filter");
     defer freeTestPolicy(allocator, &policy);
 
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
@@ -1318,7 +1355,7 @@ test "PolicySnapshot: indices update when policies change" {
     var filter1 = try createTestPolicyWithFilter(allocator, "filter-1");
     defer freeTestPolicy(allocator, &filter1);
 
-    try registry.updatePolicies(&.{filter1}, .file);
+    try registry.updatePolicies(&.{filter1}, "file-provider", .file);
 
     var snapshot = registry.getSnapshot();
     try testing.expectEqual(@as(usize, 1), snapshot.?.log_filter_indices.len);
@@ -1327,7 +1364,7 @@ test "PolicySnapshot: indices update when policies change" {
     var filter2 = try createTestPolicyWithFilter(allocator, "filter-2");
     defer freeTestPolicy(allocator, &filter2);
 
-    try registry.updatePolicies(&.{ filter1, filter2 }, .file);
+    try registry.updatePolicies(&.{ filter1, filter2 }, "file-provider", .file);
 
     snapshot = registry.getSnapshot();
     try testing.expectEqual(@as(usize, 2), snapshot.?.log_filter_indices.len);
@@ -1336,7 +1373,7 @@ test "PolicySnapshot: indices update when policies change" {
     var no_filter = try createTestPolicy(allocator, "no-filter");
     defer freeTestPolicy(allocator, &no_filter);
 
-    try registry.updatePolicies(&.{no_filter}, .file);
+    try registry.updatePolicies(&.{no_filter}, "file-provider", .file);
 
     snapshot = registry.getSnapshot();
     try testing.expectEqual(@as(usize, 0), snapshot.?.log_filter_indices.len);
@@ -1350,12 +1387,18 @@ test "PolicySnapshot: indices update when policies change" {
 const MockErrorProvider = struct {
     recorded_errors: std.ArrayListUnmanaged(struct { policy_id: []const u8, message: []const u8 }),
     allocator: std.mem.Allocator,
+    id: []const u8,
 
-    fn init(allocator: std.mem.Allocator) MockErrorProvider {
+    fn init(allocator: std.mem.Allocator, id: []const u8) MockErrorProvider {
         return .{
             .recorded_errors = .{},
             .allocator = allocator,
+            .id = id,
         };
+    }
+
+    pub fn getId(self: *MockErrorProvider) []const u8 {
+        return self.id;
     }
 
     // Must be pub for PolicyProvider.init to find it
@@ -1419,18 +1462,18 @@ test "PolicyRegistry: registerProvider and recordPolicyError routes to correct p
     defer registry.deinit();
 
     // Create mock providers
-    var file_mock = MockErrorProvider.init(allocator);
+    var file_mock = MockErrorProvider.init(allocator, "file-provider");
     defer file_mock.deinit();
 
-    var http_mock = MockErrorProvider.init(allocator);
+    var http_mock = MockErrorProvider.init(allocator, "http-provider");
     defer http_mock.deinit();
 
     // Register providers
     var file_provider = policy_provider.PolicyProvider.init(&file_mock);
     var http_provider = policy_provider.PolicyProvider.init(&http_mock);
 
-    registry.registerProvider(.file, &file_provider);
-    registry.registerProvider(.http, &http_provider);
+    try registry.registerProvider(&file_provider);
+    try registry.registerProvider(&http_provider);
 
     // Add policies from different sources
     var file_policy = try createTestPolicy(allocator, "file-policy-1");
@@ -1439,8 +1482,8 @@ test "PolicyRegistry: registerProvider and recordPolicyError routes to correct p
     var http_policy = try createTestPolicy(allocator, "http-policy-1");
     defer freeTestPolicy(allocator, &http_policy);
 
-    try registry.updatePolicies(&.{file_policy}, .file);
-    try registry.updatePolicies(&.{http_policy}, .http);
+    try registry.updatePolicies(&.{file_policy}, "file-provider", .file);
+    try registry.updatePolicies(&.{http_policy}, "http-provider", .http);
 
     // Record errors
     registry.recordPolicyError("file-policy-1", "Invalid regex in file policy");
@@ -1465,16 +1508,16 @@ test "PolicyRegistry: recordPolicyError for unknown policy does not route to pro
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var mock = MockErrorProvider.init(allocator);
+    var mock = MockErrorProvider.init(allocator, "file-provider");
     defer mock.deinit();
 
     var provider = policy_provider.PolicyProvider.init(&mock);
-    registry.registerProvider(.file, &provider);
+    try registry.registerProvider(&provider);
 
     // Add a real policy so we can test error routing works
     var real_policy = try createTestPolicy(allocator, "real-policy");
     defer freeTestPolicy(allocator, &real_policy);
-    try registry.updatePolicies(&.{real_policy}, .file);
+    try registry.updatePolicies(&.{real_policy}, "file-provider", .file);
 
     // Record error for the real policy - should be routed
     registry.recordPolicyError("real-policy", "Some error");
@@ -1491,15 +1534,15 @@ test "PolicyRegistry: multiple errors for same policy accumulate" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var mock = MockErrorProvider.init(allocator);
+    var mock = MockErrorProvider.init(allocator, "file-provider");
     defer mock.deinit();
 
     var provider = policy_provider.PolicyProvider.init(&mock);
-    registry.registerProvider(.file, &provider);
+    try registry.registerProvider(&provider);
 
     var policy = try createTestPolicy(allocator, "error-prone-policy");
     defer freeTestPolicy(allocator, &policy);
-    try registry.updatePolicies(&.{policy}, .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     // Record multiple errors for the same policy
     registry.recordPolicyError("error-prone-policy", "First error");
@@ -1538,7 +1581,7 @@ test "PolicyRegistry: policies keyed by id not name" {
     defer policy2.deinit(allocator);
 
     // Both should be added (different ids)
-    try registry.updatePolicies(&.{ policy1, policy2 }, .file);
+    try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
     try testing.expectEqual(@as(usize, 2), registry.getPolicyCount());
 
@@ -1563,7 +1606,7 @@ test "PolicyRegistry: policy update by id replaces correctly" {
     };
     defer policy_v1.deinit(allocator);
 
-    try registry.updatePolicies(&.{policy_v1}, .file);
+    try registry.updatePolicies(&.{policy_v1}, "file-provider", .file);
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
 
     var snapshot = registry.getSnapshot();
@@ -1578,7 +1621,7 @@ test "PolicyRegistry: policy update by id replaces correctly" {
     };
     defer policy_v2.deinit(allocator);
 
-    try registry.updatePolicies(&.{policy_v2}, .file);
+    try registry.updatePolicies(&.{policy_v2}, "file-provider", .file);
 
     // Should still have 1 policy, but updated
     try testing.expectEqual(@as(usize, 1), registry.getPolicyCount());
