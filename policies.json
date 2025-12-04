@@ -1,6 +1,7 @@
 {
   "policies": [
     {
+      "id": "drop-echo-logs",
       "name": "drop-echo-logs",
       "matchers": [
         { "match_type": "log_attribute", "key": "ddsource", "regex": "nginx" }
@@ -8,6 +9,7 @@
       "action": "drop"
     },
     {
+      "id": "drop-debug-logs",
       "name": "drop-debug-logs",
       "matchers": [
         { "match_type": "log_body", "regex": "debug" },
@@ -16,18 +18,33 @@
       "action": "drop"
     },
     {
+      "id": "drop-no-such-file-or-directory-logs",
       "name": "drop-no-such-file-or-directory-logs",
       "matchers": [
-        { "match_type": "log_body", "regex": "^.*no such file or directory$" }
+        { "match_type": "log_body", "regex": "no such file or directory" }
       ],
       "action": "drop"
     },
     {
+      "id": "drop-debug-level",
       "name": "drop-debug-level",
       "matchers": [{ "match_type": "log_severity_text", "regex": "DEBUG" }],
       "action": "drop"
     },
     {
+      "id": "drop-edge-logs",
+      "name": "drop-edge-logs",
+      "matchers": [
+        {
+          "match_type": "resource_attribute",
+          "key": "service.name",
+          "regex": "^.*edge$"
+        }
+      ],
+      "action": "drop"
+    },
+    {
+      "id": "keep-error-logs",
       "name": "keep-error-logs",
       "matchers": [
         { "match_type": "log_severity_text", "regex": "error" },

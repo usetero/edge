@@ -10,6 +10,8 @@ const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
 const SourceType = policy_source.SourceType;
 
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
 /// File-based policy provider that watches a config file for changes
 pub const FileProvider = struct {
     allocator: std.mem.Allocator,
@@ -17,6 +19,8 @@ pub const FileProvider = struct {
     callback: ?PolicyCallback,
     watch_thread: ?std.Thread,
     shutdown_flag: std.atomic.Value(bool),
+    /// SHA256 hash of the last loaded file contents
+    content_hash: ?[Sha256.digest_length]u8,
 
     pub fn init(allocator: std.mem.Allocator, config_path: []const u8) !*FileProvider {
         const self = try allocator.create(FileProvider);
@@ -31,6 +35,7 @@ pub const FileProvider = struct {
             .callback = null,
             .watch_thread = null,
             .shutdown_flag = std.atomic.Value(bool).init(false),
+            .content_hash = null,
         };
 
         return self;
@@ -73,7 +78,29 @@ pub const FileProvider = struct {
     fn loadAndNotify(self: *FileProvider) !void {
         std.log.info("Loading policies from file: {s}", .{self.config_path});
 
-        const policies = try parser.parsePoliciesFile(self.allocator, self.config_path);
+        // Read file contents and compute hash
+        const file = try std.fs.cwd().openFile(self.config_path, .{});
+        defer file.close();
+
+        const contents = try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024); // 10MB max
+        defer self.allocator.free(contents);
+
+        var new_hash: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(contents, &new_hash, .{});
+
+        // Check if content has changed
+        if (self.content_hash) |old_hash| {
+            if (std.mem.eql(u8, &old_hash, &new_hash)) {
+                std.log.debug("File content unchanged (hash: {x}), skipping reload", .{new_hash});
+                return;
+            }
+        }
+
+        // Update stored hash
+        self.content_hash = new_hash;
+        std.log.info("File content hash: {x}", .{new_hash});
+
+        const policies = try parser.parsePoliciesBytes(self.allocator, contents);
         defer {
             // Registry duplicates policies, so we must free our parsed copies
             for (policies) |*policy| {
@@ -113,14 +140,14 @@ pub const FileProvider = struct {
 
             const stat = file.stat() catch continue;
 
-            if (stat.mtime != last_mtime and last_mtime != 0) {
-                std.log.info("Config file modified, reloading policies from {s}", .{self.config_path});
+            // Only attempt reload if mtime changed (optimization to avoid reading file every second)
+            if (stat.mtime != last_mtime) {
+                last_mtime = stat.mtime;
+                // loadAndNotify will check content hash and skip if unchanged
                 self.loadAndNotify() catch |err| {
                     std.log.err("Failed to reload policies: {}", .{err});
                 };
             }
-
-            last_mtime = stat.mtime;
         }
     }
 };

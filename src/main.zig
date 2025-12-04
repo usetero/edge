@@ -1,12 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
+pub const std_options: std.Options = .{
+    // Set to .debug to see debug logs, .info for normal operation
+    .log_level = .debug,
+};
+
 const config_types = @import("config/types.zig");
 const config_parser = @import("config/parser.zig");
 const server_mod = @import("proxy/server.zig");
 const proxy_module = @import("core/proxy_module.zig");
 const passthrough_mod = @import("modules/passthrough/module.zig");
 const datadog_mod = @import("modules/datadog/module.zig");
-const filter_mod = @import("./core/filter.zig");
 const policy_registry_mod = @import("./core/policy_registry.zig");
 const policy_provider = @import("./core/policy_provider.zig");
 const FileProvider = @import("config/providers/file_provider.zig").FileProvider;
@@ -211,16 +216,12 @@ pub fn main() !void {
 
     std.log.info("Policy count: {}", .{registry.getPolicyCount()});
 
-    // Create filter evaluator with reference to registry
-    var filter_evaluator = filter_mod.FilterEvaluator.init(&registry);
-    defer filter_evaluator.deinit();
-
     // Install signal handlers
     installShutdownHandlers();
 
     // Create Datadog module configuration
     var datadog_config = DatadogConfig{
-        .filter = &filter_evaluator,
+        .registry = &registry,
     };
 
     // Create modules

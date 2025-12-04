@@ -1,12 +1,12 @@
 const std = @import("std");
 const proto = @import("proto");
 const policy_source = @import("./policy_source.zig");
-const regex_index = @import("./regex_index.zig");
+const matcher_index = @import("./matcher_index.zig");
 
 const Policy = proto.policy.Policy;
 const SourceType = policy_source.SourceType;
 const PolicyMetadata = policy_source.PolicyMetadata;
-const CompiledRegexIndex = regex_index.CompiledRegexIndex;
+const MatcherIndex = matcher_index.MatcherIndex;
 
 /// Policy config types - derived from the Policy.config oneof field
 pub const PolicyConfigType = enum {
@@ -33,15 +33,15 @@ pub const PolicySnapshot = struct {
     /// Allows efficient lookup of policies by their config type
     log_filter_indices: []const u32,
 
-    /// Compiled Hyperscan databases for regex matching
-    /// Grouped by match type for efficient scanning
-    compiled_regex_index: CompiledRegexIndex,
+    /// Compiled Hyperscan-based matcher index for efficient evaluation
+    /// Indexed by (MatchCase, key) for O(k*n) evaluation
+    matcher_index: MatcherIndex,
 
     version: u64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PolicySnapshot) void {
-        self.compiled_regex_index.deinit();
+        self.matcher_index.deinit();
         self.allocator.free(self.policies);
         self.allocator.free(self.log_filter_indices);
     }
@@ -190,6 +190,9 @@ pub const PolicyRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Track if any changes were made
+        var changed = false;
+
         // Track which policy ids from this source are in the new set
         var new_policy_ids = std.StringHashMap(void).init(self.allocator);
         defer {
@@ -220,19 +223,28 @@ pub const PolicyRegistry = struct {
 
                     // Add new policy
                     try self.addPolicyInternal(policy, source);
+                    changed = true;
                 }
                 // else: HTTP has priority, keep existing
             } else {
                 // New policy, add it
                 try self.addPolicyInternal(policy, source);
+                changed = true;
             }
         }
 
         // Remove policies from this source that are no longer present
-        try self.removeStalePolicies(source, &new_policy_ids);
+        const removed = try self.removeStalePolicies(source, &new_policy_ids);
+        if (removed > 0) {
+            changed = true;
+        }
 
-        // Create new immutable snapshot
-        try self.createSnapshot();
+        // Only create new snapshot if something changed
+        if (changed) {
+            try self.createSnapshot();
+        } else {
+            std.log.debug("Policy registry unchanged, skipping snapshot rebuild", .{});
+        }
     }
 
     /// Add a policy and track its source
@@ -263,11 +275,12 @@ pub const PolicyRegistry = struct {
     }
 
     /// Remove policies from source that are no longer in the new set
+    /// Returns the number of policies removed
     fn removeStalePolicies(
         self: *PolicyRegistry,
         source: SourceType,
         new_ids: *const std.StringHashMap(void),
-    ) !void {
+    ) !usize {
         var ids_to_remove = std.ArrayListUnmanaged([]const u8){};
         defer ids_to_remove.deinit(self.allocator);
 
@@ -294,6 +307,8 @@ pub const PolicyRegistry = struct {
             _ = self.policy_sources.remove(id);
             self.allocator.free(id);
         }
+
+        return ids_to_remove.items.len;
     }
 
     /// Create immutable snapshot of current policies
@@ -331,9 +346,9 @@ pub const PolicyRegistry = struct {
             }
         }
 
-        // Build compiled regex index for Hyperscan-based matching
-        var compiled_regex = try CompiledRegexIndex.build(self.allocator, policies_slice);
-        errdefer compiled_regex.deinit();
+        // Build matcher index for Hyperscan-based matching
+        var idx = try MatcherIndex.build(self.allocator, policies_slice);
+        errdefer idx.deinit();
 
         // Increment version
         const new_version = self.version.load(.monotonic) + 1;
@@ -344,7 +359,7 @@ pub const PolicyRegistry = struct {
         snapshot.* = .{
             .policies = policies_slice,
             .log_filter_indices = log_filter_indices,
-            .compiled_regex_index = compiled_regex,
+            .matcher_index = idx,
             .version = new_version,
             .allocator = self.allocator,
         };
