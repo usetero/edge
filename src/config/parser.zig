@@ -3,10 +3,8 @@ const types = @import("types.zig");
 const policy = @import("../policy/root.zig");
 const ProxyConfig = types.ProxyConfig;
 const LogLevel = types.LogLevel;
-
-// Re-export policy parsing for backwards compatibility
-pub const parsePoliciesFile = policy.parser.parsePoliciesFile;
-pub const parsePoliciesBytes = policy.parser.parsePoliciesBytes;
+const ProviderConfig = policy.ProviderConfig;
+const ProviderType = policy.ProviderType;
 
 /// JSON schema for policy provider configuration
 const ProviderJson = struct {
@@ -105,14 +103,14 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
 }
 
 /// Parse provider configurations from JSON array
-fn parseProviders(allocator: std.mem.Allocator, json_providers: []ProviderJson) ![]types.ProviderConfig {
-    var providers = try allocator.alloc(types.ProviderConfig, json_providers.len);
+fn parseProviders(allocator: std.mem.Allocator, json_providers: []ProviderJson) ![]ProviderConfig {
+    var providers = try allocator.alloc(ProviderConfig, json_providers.len);
 
     for (json_providers, 0..) |json_provider, i| {
         // Parse provider type
         const provider_type = try parseProviderType(json_provider.type);
 
-        providers[i] = types.ProviderConfig{
+        providers[i] = ProviderConfig{
             .id = try allocator.dupe(u8, json_provider.id),
             .type = provider_type,
             .path = if (json_provider.path) |p| try allocator.dupe(u8, p) else null,
@@ -139,7 +137,7 @@ fn parseProviders(allocator: std.mem.Allocator, json_providers: []ProviderJson) 
 }
 
 /// Parse ProviderType from string
-fn parseProviderType(s: []const u8) !types.ProviderType {
+fn parseProviderType(s: []const u8) !ProviderType {
     if (std.mem.eql(u8, s, "file")) return .file;
     if (std.mem.eql(u8, s, "http")) return .http;
     return error.InvalidProviderType;

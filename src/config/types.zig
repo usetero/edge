@@ -1,10 +1,8 @@
 const std = @import("std");
 const policy = @import("../policy/root.zig");
 
-// Re-export policy types for backwards compatibility
-pub const ProviderType = policy.ProviderType;
-pub const ProviderConfig = policy.ProviderConfig;
-pub const ServiceMetadata = policy.ServiceMetadata;
+const ProviderConfig = policy.ProviderConfig;
+const ServiceMetadata = policy.ServiceMetadata;
 
 pub const LogLevel = enum(u8) {
     debug,

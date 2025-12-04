@@ -24,9 +24,6 @@ pub const datadog_module = @import("modules/datadog_module.zig");
 pub const hyperscan = @import("hyperscan/hyperscan.zig");
 pub const matcher_index = @import("hyperscan/matcher_index.zig");
 
-// Re-export filter_engine from policy package for backwards compatibility
-pub const filter_engine = @import("policy/filter_engine.zig");
-
 // =============================================================================
 // Distribution entry points
 // =============================================================================
