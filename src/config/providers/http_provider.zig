@@ -5,6 +5,7 @@ const parser = @import("../parser.zig");
 const types = @import("../types.zig");
 const proto = @import("proto");
 const protobuf = @import("protobuf");
+const o11y = @import("../../observability/root.zig");
 
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
@@ -17,6 +18,22 @@ const PolicyType = proto.policy.PolicyType;
 const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
 const ServiceMetadata = types.ServiceMetadata;
+const EventBus = o11y.EventBus;
+
+// =============================================================================
+// Observability Events
+// =============================================================================
+
+const PolicyErrorRecordFailed = struct { policy_id: []const u8 };
+const HttpInitialFetchFailed = struct { err: []const u8 };
+const HttpFetchFailed = struct { url: []const u8, err: []const u8 };
+const HttpPoliciesUnchanged = struct { reason: []const u8 };
+const HttpPolicyHashUpdated = struct { hash: []const u8 };
+const HttpPoliciesLoaded = struct { count: usize, url: []const u8, sync_timestamp: u64 };
+const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
+const HTTPNotModified = struct {};
+const HTTPFetchStarted = struct {};
+const HTTPFetchCompleted = struct {};
 
 /// Tracks status for a specific policy (hits, misses, errors)
 const PolicyStatusRecord = struct {
@@ -56,8 +73,12 @@ pub const HttpProvider = struct {
     // Mutex for thread-safe access to synced state
     sync_state_mutex: std.Thread.Mutex,
 
+    // Event bus for observability
+    bus: *EventBus,
+
     pub fn init(
         allocator: std.mem.Allocator,
+        bus: *EventBus,
         config_url: []const u8,
         poll_interval_seconds: u64,
         workspace_id: []const u8,
@@ -84,6 +105,7 @@ pub const HttpProvider = struct {
             .last_successful_hash = null,
             .policy_statuses = .{},
             .sync_state_mutex = .{},
+            .bus = bus,
         };
 
         return self;
@@ -111,7 +133,7 @@ pub const HttpProvider = struct {
         defer self.sync_state_mutex.unlock();
 
         const msg_copy = self.allocator.dupe(u8, error_message) catch {
-            std.log.err("Failed to record policy error for {s}: out of memory", .{policy_id});
+            self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
             return;
         };
 
@@ -119,14 +141,14 @@ pub const HttpProvider = struct {
             // Append to existing error list
             record.errors.append(self.allocator, msg_copy) catch {
                 self.allocator.free(msg_copy);
-                std.log.err("Failed to append policy error for {s}: out of memory", .{policy_id});
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
         } else {
             // Create new entry
             const id_copy = self.allocator.dupe(u8, policy_id) catch {
                 self.allocator.free(msg_copy);
-                std.log.err("Failed to record policy error for {s}: out of memory", .{policy_id});
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
 
@@ -134,7 +156,7 @@ pub const HttpProvider = struct {
             record.errors.append(self.allocator, msg_copy) catch {
                 self.allocator.free(msg_copy);
                 self.allocator.free(id_copy);
-                std.log.err("Failed to record policy error for {s}: out of memory", .{policy_id});
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
 
@@ -142,7 +164,7 @@ pub const HttpProvider = struct {
                 self.allocator.free(msg_copy);
                 self.allocator.free(id_copy);
                 record.deinit(self.allocator);
-                std.log.err("Failed to record policy error for {s}: out of memory", .{policy_id});
+                self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
                 return;
             };
         }
@@ -167,7 +189,7 @@ pub const HttpProvider = struct {
 
         // Initial fetch and notify (non-fatal if it fails)
         self.fetchAndNotify() catch |err| {
-            std.log.warn("Initial HTTP policy fetch failed: {}. Will retry on next poll.", .{err});
+            self.bus.warn(HttpInitialFetchFailed{ .err = @errorName(err) });
         };
 
         // Start polling
@@ -223,15 +245,15 @@ pub const HttpProvider = struct {
             if (self.shutdown_flag.load(.acquire)) break;
 
             self.fetchAndNotify() catch |err| {
-                std.log.err("HTTP provider fetch failed from {s}: {}", .{ self.config_url, err });
+                self.bus.err(HttpFetchFailed{ .url = self.config_url, .err = @errorName(err) });
             };
         }
     }
 
     fn fetchAndNotify(self: *HttpProvider) !void {
-        std.log.debug("Fetching policies from HTTP: {s}", .{self.config_url});
-
         var new_etag: ?[]u8 = null;
+        var span = self.bus.started(.debug, HTTPFetchStarted{});
+        defer span.completed(HTTPFetchCompleted{});
         var maybe_parsed = try self.fetchPolicies(&new_etag);
 
         if (maybe_parsed) |*parsed| {
@@ -258,14 +280,14 @@ pub const HttpProvider = struct {
             };
 
             if (hash_unchanged) {
-                std.log.debug("Policies unchanged (hash: {s}), skipping reload", .{response.hash});
+                self.bus.debug(HttpPoliciesUnchanged{ .reason = "hash" });
                 return;
             }
 
             // Record the hash for future sync requests
             if (response.hash.len > 0) {
                 try self.recordSyncedHash(response.hash);
-                std.log.info("Policy hash updated: {s}", .{response.hash});
+                self.bus.info(HttpPolicyHashUpdated{ .hash = response.hash });
             }
 
             // Notify callback with policies from response
@@ -276,14 +298,14 @@ pub const HttpProvider = struct {
                 });
             }
 
-            std.log.info("Loaded {} policies from {s} (sync_timestamp: {})", .{
-                response.policies.items.len,
-                self.config_url,
-                response.sync_timestamp_unix_nano,
+            self.bus.info(HttpPoliciesLoaded{
+                .count = response.policies.items.len,
+                .url = self.config_url,
+                .sync_timestamp = response.sync_timestamp_unix_nano,
             });
         } else {
             // 304 Not Modified
-            std.log.debug("Policies unchanged (304 Not Modified)", .{});
+            self.bus.debug(HttpPoliciesUnchanged{ .reason = "304" });
         }
     }
 
@@ -351,8 +373,6 @@ pub const HttpProvider = struct {
         const request_body = try sync_request.jsonEncode(.{}, self.allocator);
         defer self.allocator.free(request_body);
 
-        std.log.debug("Sending SyncRequest: {s}", .{request_body});
-
         // Prepare headers
         var headers_buffer: [2]std.http.Header = undefined;
         var headers_count: usize = 0;
@@ -387,16 +407,15 @@ pub const HttpProvider = struct {
 
         // Check for 304 Not Modified
         if (response.head.status == .not_modified) {
-            std.log.debug("Policies unchanged (304 Not Modified)", .{});
+            self.bus.debug(HTTPNotModified{});
             return null;
         }
 
         // Check status code
         if (response.head.status != .ok) {
-            std.log.err("HTTP sync request to {s} failed with status: {} {s}", .{
-                self.config_url,
-                @intFromEnum(response.head.status),
-                response.head.status.phrase() orelse "Unknown",
+            self.bus.err(HttpSyncRequestFailed{
+                .url = self.config_url,
+                .status = @intFromEnum(response.head.status),
             });
             return error.HttpRequestFailed;
         }

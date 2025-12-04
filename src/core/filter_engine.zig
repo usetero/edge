@@ -18,8 +18,9 @@
 const std = @import("std");
 const proto = @import("proto");
 const matcher_index = @import("matcher_index.zig");
-
-const log = std.log.scoped(.filter_engine);
+const o11y = @import("../observability/root.zig");
+const NoopEventBus = o11y.NoopEventBus;
+const EventBus = o11y.EventBus;
 
 const FilterAction = proto.policy.FilterAction;
 const LogMatcher = proto.policy.LogMatcher;
@@ -52,6 +53,23 @@ pub const FilterResult = enum {
 pub const FieldAccessor = *const fn (ctx: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8;
 
 // =============================================================================
+// Observability Events
+// =============================================================================
+
+const EvaluateEmpty = struct {};
+const EvaluateStart = struct { matcher_key_count: usize };
+const MatcherKeyFieldNotPresent = struct { match_case: MatchCase, key: []const u8 };
+const MatcherKeyFieldValue = struct { match_case: MatchCase, key: []const u8, value: []const u8 };
+const MatcherKeyNoDatabase = struct {};
+const ScanResult = struct { count: usize };
+const PatternNegationFailure = struct { pattern_id: u32, policy_id: []const u8 };
+const PatternMatch = struct { pattern_id: u32, policy_id: []const u8 };
+const MatchCounts = struct { policy_count: usize };
+const PolicyMatchCount = struct { policy_id: []const u8, matches: u32, required: u32, negated: usize };
+const PolicyMatchCountNotFound = struct { policy_id: []const u8, matches: u32 };
+const EvaluateResult = struct { result: FilterResult };
+
+// =============================================================================
 // FilterEngine - Main evaluation engine
 // =============================================================================
 
@@ -60,6 +78,8 @@ pub const FieldAccessor = *const fn (ctx: *const anyopaque, match_case: MatchCas
 pub const FilterEngine = struct {
     /// Allocator for temporary match aggregation buffers
     allocator: std.mem.Allocator,
+    /// Event bus for observability
+    bus: *EventBus,
 
     const Self = @This();
 
@@ -69,9 +89,10 @@ pub const FilterEngine = struct {
     /// Maximum number of policies to track matches for
     const MAX_POLICIES: usize = 1024;
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator, bus: *EventBus) Self {
         return .{
             .allocator = allocator,
+            .bus = bus,
         };
     }
 
@@ -96,14 +117,12 @@ pub const FilterEngine = struct {
         ctx: *const anyopaque,
         field_accessor: FieldAccessor,
     ) FilterResult {
-        _ = self;
-
         if (index.isEmpty()) {
-            log.debug("evaluate: index is empty, returning keep", .{});
+            self.bus.debug(EvaluateEmpty{});
             return .keep;
         }
 
-        log.debug("evaluate: checking {d} matcher keys", .{index.getMatcherKeys().len});
+        self.bus.debug(EvaluateStart{ .matcher_key_count = index.getMatcherKeys().len });
 
         // Stack-allocated match count tracking
         // Maps policy_id hash -> (match_count, policy_id_ptr)
@@ -125,21 +144,25 @@ pub const FilterEngine = struct {
                 // For negated matchers, missing field means pattern cannot be found = success
                 // We don't need to do anything here because negated matchers default to "succeeded"
                 // (only failures are tracked)
-                log.debug("  matcher_key match_case={any} key='{s}': field not present", .{ matcher_key.match_case, matcher_key.key });
+                self.bus.debug(MatcherKeyFieldNotPresent{ .match_case = matcher_key.match_case, .key = matcher_key.key });
                 continue;
             };
 
-            log.debug("  matcher_key match_case={any} key='{s}': value='{s}'", .{ matcher_key.match_case, matcher_key.key, if (value.len > 100) value[0..100] else value });
+            self.bus.debug(MatcherKeyFieldValue{
+                .match_case = matcher_key.match_case,
+                .key = matcher_key.key,
+                .value = if (value.len > 100) value[0..100] else value,
+            });
 
             // Get database for this key
             const db = index.getDatabase(matcher_key) orelse {
-                log.debug("    no database found for this key", .{});
+                self.bus.debug(MatcherKeyNoDatabase{});
                 continue;
             };
 
             // Scan the value
             const scan_result = db.scan(value, &result_buf);
-            log.debug("    scan returned {d} matches", .{scan_result.count});
+            self.bus.debug(ScanResult{ .count = scan_result.count });
 
             // Process matches
             for (scan_result.matches()) |pattern_id| {
@@ -150,7 +173,7 @@ pub const FilterEngine = struct {
                 if (meta.negate) {
                     // Pattern found for a negated matcher = FAILURE
                     // Record this so we know this policy's negated matcher failed
-                    log.debug("    pattern_id={d} policy='{s}' NEGATION FAILURE (pattern found but negate=true)", .{ pattern_id, meta.policy_id });
+                    self.bus.debug(PatternNegationFailure{ .pattern_id = pattern_id, .policy_id = meta.policy_id });
                     if (negation_failure_len < MAX_POLICIES) {
                         negation_failures[negation_failure_len] = .{
                             .policy_id = meta.policy_id,
@@ -161,26 +184,31 @@ pub const FilterEngine = struct {
                 } else {
                     // Pattern found for a non-negated matcher = SUCCESS
                     // Increment match count for this policy
-                    log.debug("    pattern_id={d} policy='{s}' MATCH (incrementing count)", .{ pattern_id, meta.policy_id });
+                    self.bus.debug(PatternMatch{ .pattern_id = pattern_id, .policy_id = meta.policy_id });
                     incrementMatchCount(&match_counts, &match_count_len, meta.policy_id);
                 }
             }
         }
 
         // Log match counts
-        log.debug("Match counts ({d} policies with matches):", .{match_count_len});
+        self.bus.debug(MatchCounts{ .policy_count = match_count_len });
         for (match_counts[0..match_count_len]) |entry| {
             const policy_info = index.getPolicy(entry.policy_id);
             if (policy_info) |info| {
-                log.debug("  policy='{s}' matches={d} required={d} (negated={d})", .{ entry.policy_id, entry.count, info.regex_matcher_count - @as(u32, @intCast(info.negated_matchers.items.len)), info.negated_matchers.items.len });
+                self.bus.debug(PolicyMatchCount{
+                    .policy_id = entry.policy_id,
+                    .matches = entry.count,
+                    .required = info.regex_matcher_count - @as(u32, @intCast(info.negated_matchers.items.len)),
+                    .negated = info.negated_matchers.items.len,
+                });
             } else {
-                log.debug("  policy='{s}' matches={d} (policy info not found!)", .{ entry.policy_id, entry.count });
+                self.bus.debug(PolicyMatchCountNotFound{ .policy_id = entry.policy_id, .matches = entry.count });
             }
         }
 
         // Find the best matching policy
         const result = findBestMatch(index, &match_counts, match_count_len, &negation_failures, negation_failure_len);
-        log.debug("evaluate result: {any}", .{result});
+        self.bus.debug(EvaluateResult{ .result = result });
         return result;
     }
 
@@ -341,10 +369,12 @@ const TestLogContext = struct {
 test "FilterEngine: empty index returns keep" {
     const allocator = testing.allocator;
 
-    var index = try MatcherIndex.build(allocator, &.{});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     const test_log = TestLogContext{ .message = "hello" };
     const result = engine.evaluate(&index, @ptrCast(&test_log), TestLogContext.fieldAccessor);
@@ -369,10 +399,12 @@ test "FilterEngine: single policy drop match" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Matching log should be dropped
     const error_log = TestLogContext{ .message = "an error occurred" };
@@ -400,10 +432,12 @@ test "FilterEngine: single policy keep match" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Matching log should be kept
     const error_log = TestLogContext{ .message = "an error occurred" };
@@ -434,10 +468,12 @@ test "FilterEngine: multiple matchers AND logic" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Both match - dropped
     const payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
@@ -471,10 +507,12 @@ test "FilterEngine: negated matcher" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Non-important log should be dropped (negate: pattern NOT found = success)
     const boring = TestLogContext{ .message = "just a regular log" };
@@ -512,10 +550,12 @@ test "FilterEngine: mixed negated and non-negated matchers" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Error from staging - dropped (error matches, prod not found = both conditions satisfied)
     const staging_error = TestLogContext{ .message = "an error occurred", .env = "staging" };
@@ -569,10 +609,12 @@ test "FilterEngine: priority ordering - higher priority wins" {
     });
     defer high_priority.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{ low_priority, high_priority });
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{ low_priority, high_priority });
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Error from payment - both policies match, high priority wins (KEEP)
     const payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
@@ -600,10 +642,12 @@ test "FilterEngine: disabled policies are skipped" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Would match but policy is disabled - kept
     const error_log = TestLogContext{ .message = "an error occurred" };
@@ -628,10 +672,12 @@ test "FilterEngine: regex pattern matching" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Various error formats should match
     const error1 = TestLogContext{ .message = "an error occurred" };
@@ -667,10 +713,12 @@ test "FilterEngine: missing field with negated matcher succeeds" {
     });
     defer policy.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{policy});
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // No service attribute = pattern cannot be found = negation succeeds = dropped
     const no_service = TestLogContext{ .message = "hello" };
@@ -721,10 +769,12 @@ test "FilterEngine: multiple policies with different matcher keys" {
     });
     defer policy2.deinit(allocator);
 
-    var index = try MatcherIndex.build(allocator, &.{ policy1, policy2 });
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{ policy1, policy2 });
     defer index.deinit();
 
-    const engine = FilterEngine.init(allocator);
+    const engine = FilterEngine.init(allocator, noop_bus.eventBus());
 
     // Matches policy1
     const error_log = TestLogContext{ .message = "an error occurred", .service = "payment" };

@@ -1,9 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const observability = @import("observability/root.zig");
+const StdLogAdapter = observability.StdLogAdapter;
+const Level = observability.Level;
 
+/// Route std.log through our EventBus adapter
 pub const std_options: std.Options = .{
-    // Set to .debug to see debug logs, .info for normal operation
-    .log_level = .debug,
+    .log_level = .debug, // Allow all levels through, EventBus will filter
+    .logFn = StdLogAdapter.logFn,
 };
 
 const config_types = @import("config/types.zig");
@@ -92,6 +96,18 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Initialize observability with log level from environment
+    var stdio_bus: observability.StdioEventBus = undefined;
+    stdio_bus.init();
+    const bus = stdio_bus.eventBus();
+
+    // Parse TERO_LOG_LEVEL env var (defaults to info)
+    bus.setLevel(Level.parseFromEnv("TERO_LOG_LEVEL", .info));
+
+    // Initialize std.log adapter to route through EventBus
+    StdLogAdapter.init(bus);
+    defer StdLogAdapter.deinit();
+
     // Parse command line arguments
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -146,7 +162,7 @@ pub fn main() !void {
     });
 
     // Create centralized policy registry
-    var registry = policy_registry_mod.PolicyRegistry.init(allocator);
+    var registry = policy_registry_mod.PolicyRegistry.init(allocator, bus);
     defer registry.deinit();
 
     // Create callback context for policy updates
@@ -188,7 +204,7 @@ pub fn main() !void {
                 const path = provider_config.path orelse return error.FileProviderRequiresPath;
                 std.log.info("  - File provider: {s}", .{path});
 
-                const file_provider = try FileProvider.init(allocator, path);
+                const file_provider = try FileProvider.init(allocator, bus, path);
                 errdefer file_provider.deinit();
 
                 try file_provider.subscribe(callback);
@@ -201,6 +217,7 @@ pub fn main() !void {
 
                 const http_provider = try HttpProvider.init(
                     allocator,
+                    bus,
                     url,
                     poll_interval,
                     config.workspace_id,
@@ -222,6 +239,7 @@ pub fn main() !void {
     // Create Datadog module configuration
     var datadog_config = DatadogConfig{
         .registry = &registry,
+        .bus = bus,
     };
 
     // Create modules
@@ -253,6 +271,7 @@ pub fn main() !void {
     // Create proxy server with modules
     var proxy = try ProxyServer.init(
         allocator,
+        bus,
         config.listen_address,
         config.listen_port,
         &module_registrations,
