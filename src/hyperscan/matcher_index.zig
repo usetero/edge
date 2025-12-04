@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const proto = @import("proto");
-const hyperscan = @import("../hyperscan/hyperscan.zig");
+const hyperscan = @import("./hyperscan.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;

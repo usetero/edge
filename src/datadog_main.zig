@@ -17,12 +17,9 @@ const edge = @import("root.zig");
 const config_parser = edge.config_parser;
 const server_mod = edge.server;
 const proxy_module = edge.proxy_module;
-const passthrough_mod = edge.passthrough;
-const datadog_mod = edge.datadog;
-const policy_registry_mod = edge.policy_registry;
-const policy_provider_mod = edge.policy_provider;
-const FileProvider = edge.FileProvider;
-const HttpProvider = edge.HttpProvider;
+const passthrough_mod = edge.passthrough_module;
+const datadog_mod = edge.datadog_module;
+const policy = edge.policy;
 
 const o11y = @import("observability/root.zig");
 const EventBus = o11y.EventBus;
@@ -34,7 +31,6 @@ const ModuleRegistration = proxy_module.ModuleRegistration;
 const PassthroughModule = passthrough_mod.PassthroughModule;
 const DatadogModule = datadog_mod.DatadogModule;
 const DatadogConfig = datadog_mod.DatadogConfig;
-const PolicyRegistry = policy_registry_mod.PolicyRegistry;
 
 /// Route std.log through our EventBus adapter
 pub const std_options: std.Options = .{
@@ -146,15 +142,14 @@ fn installShutdownHandlers(bus: *EventBus) void {
 // Policy callback
 // =============================================================================
 
-const policy_source = @import("core/policy_source.zig");
-const SourceType = policy_source.SourceType;
+const SourceType = policy.SourceType;
 
 const PolicyCallbackContext = struct {
-    registry: *PolicyRegistry,
+    registry: *policy.Registry,
     bus: *EventBus,
     source_type: SourceType,
 
-    fn handleUpdate(context: *anyopaque, update: policy_provider_mod.PolicyUpdate) !void {
+    fn handleUpdate(context: *anyopaque, update: policy.PolicyUpdate) !void {
         const self: *PolicyCallbackContext = @ptrCast(@alignCast(context));
         try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
         self.bus.info(PolicyRegistryUpdated{
@@ -244,11 +239,11 @@ pub fn main() !void {
     });
 
     // Create centralized policy registry
-    var registry = PolicyRegistry.init(allocator, bus);
+    var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
     // Storage for PolicyProvider interfaces
-    var providers: std.ArrayList(policy_provider_mod.PolicyProvider) = .empty;
+    var providers: std.ArrayList(policy.Provider) = .empty;
     defer {
         for (providers.items) |provider| {
             provider.deinit();
@@ -267,12 +262,12 @@ pub fn main() !void {
                 const path = provider_config.path orelse return error.FileProviderRequiresPath;
                 bus.info(FileProviderConfigured{ .path = path });
 
-                const file_provider = try FileProvider.init(allocator, bus, provider_config.id, path);
+                const file_provider = try policy.FileProvider.init(allocator, bus, provider_config.id, path);
                 errdefer file_provider.deinit();
 
                 // Create callback context with source type
                 try callback_contexts.append(allocator, .{ .registry = &registry, .bus = bus, .source_type = .file });
-                const callback = policy_provider_mod.PolicyCallback{
+                const callback = policy.PolicyCallback{
                     .context = @ptrCast(&callback_contexts.items[callback_contexts.items.len - 1]),
                     .onUpdate = PolicyCallbackContext.handleUpdate,
                 };
@@ -280,7 +275,7 @@ pub fn main() !void {
                 try file_provider.subscribe(callback);
 
                 // Store provider interface for cleanup and registry routing
-                const provider_interface = policy_provider_mod.PolicyProvider.init(file_provider);
+                const provider_interface = policy.Provider.init(file_provider);
                 try providers.append(allocator, provider_interface);
                 try registry.registerProvider(&providers.items[providers.items.len - 1]);
             },
@@ -289,7 +284,7 @@ pub fn main() !void {
                 const poll_interval = provider_config.poll_interval orelse 60;
                 bus.info(HttpProviderConfigured{ .url = url, .poll_interval = poll_interval });
 
-                const http_provider = try HttpProvider.init(
+                const http_provider = try policy.HttpProvider.init(
                     allocator,
                     bus,
                     provider_config.id,
@@ -302,7 +297,7 @@ pub fn main() !void {
 
                 // Create callback context with source type
                 try callback_contexts.append(allocator, .{ .registry = &registry, .bus = bus, .source_type = .http });
-                const callback = policy_provider_mod.PolicyCallback{
+                const callback = policy.PolicyCallback{
                     .context = @ptrCast(&callback_contexts.items[callback_contexts.items.len - 1]),
                     .onUpdate = PolicyCallbackContext.handleUpdate,
                 };
@@ -310,7 +305,7 @@ pub fn main() !void {
                 try http_provider.subscribe(callback);
 
                 // Store provider interface for cleanup and registry routing
-                const provider_interface = policy_provider_mod.PolicyProvider.init(http_provider);
+                const provider_interface = policy.Provider.init(http_provider);
                 try providers.append(allocator, provider_interface);
                 try registry.registerProvider(&providers.items[providers.items.len - 1]);
             },

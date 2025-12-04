@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const proto = @import("proto");
-const policy_provider = @import("../../core/policy_provider.zig");
-const parser = @import("../parser.zig");
-const o11y = @import("../../observability/root.zig");
+const policy_provider = @import("./provider.zig");
+const parser = @import("./parser.zig");
+const o11y = @import("../observability/root.zig");
 
 const Policy = proto.policy.Policy;
 const PolicyCallback = policy_provider.PolicyCallback;

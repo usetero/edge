@@ -1,8 +1,8 @@
 const std = @import("std");
-const proxy_module = @import("../../core/proxy_module.zig");
-const policy_registry = @import("../../core/policy_registry.zig");
-const logs_v2 = @import("logs_v2.zig");
-const o11y = @import("../../observability/root.zig");
+const proxy_module = @import("./proxy_module.zig");
+const policy = @import("../policy/root.zig");
+const logs_v2 = @import("./datadog_logs_v2.zig");
+const o11y = @import("../observability/root.zig");
 
 const ProxyModule = proxy_module.ProxyModule;
 const ModuleConfig = proxy_module.ModuleConfig;
@@ -10,7 +10,7 @@ const ModuleRequest = proxy_module.ModuleRequest;
 const ModuleResult = proxy_module.ModuleResult;
 const RoutePattern = proxy_module.RoutePattern;
 const MethodBitmask = proxy_module.MethodBitmask;
-const PolicyRegistry = policy_registry.PolicyRegistry;
+const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 

@@ -1,10 +1,9 @@
 const std = @import("std");
-const policy_provider = @import("../../core/policy_provider.zig");
-const parser = @import("../parser.zig");
-const types = @import("../types.zig");
+const policy_provider = @import("./provider.zig");
+const types = @import("./types.zig");
 const proto = @import("proto");
 const protobuf = @import("protobuf");
-const o11y = @import("../../observability/root.zig");
+const o11y = @import("../observability/root.zig");
 
 const PolicyCallback = policy_provider.PolicyCallback;
 const SyncRequest = proto.policy.SyncRequest;

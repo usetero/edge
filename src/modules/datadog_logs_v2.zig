@@ -1,12 +1,12 @@
 const std = @import("std");
-const filter_engine = @import("../../core/filter_engine.zig");
-const policy_registry = @import("../../core/policy_registry.zig");
-const o11y = @import("../../observability/root.zig");
+const filter_engine = @import("../policy/filter_engine.zig");
+const policy = @import("../policy/root.zig");
+const o11y = @import("../observability/root.zig");
 
 const FilterEngine = filter_engine.FilterEngine;
 const FilterResult = filter_engine.FilterResult;
 const MatchCase = filter_engine.MatchCase;
-const PolicyRegistry = policy_registry.PolicyRegistry;
+const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 

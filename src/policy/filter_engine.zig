@@ -17,8 +17,8 @@
 
 const std = @import("std");
 const proto = @import("proto");
-const matcher_index = @import("matcher_index.zig");
-const policy_registry = @import("policy_registry.zig");
+const matcher_index = @import("../hyperscan/matcher_index.zig");
+const policy_mod = @import("./root.zig");
 const o11y = @import("../observability/root.zig");
 const NoopEventBus = o11y.NoopEventBus;
 const EventBus = o11y.EventBus;
@@ -32,8 +32,8 @@ const MatcherDatabase = matcher_index.MatcherDatabase;
 const PolicyInfo = matcher_index.PolicyInfo;
 const PatternMeta = matcher_index.PatternMeta;
 pub const MatchCase = matcher_index.MatchCase;
-pub const PolicyRegistry = policy_registry.PolicyRegistry;
-pub const PolicySnapshot = policy_registry.PolicySnapshot;
+pub const PolicyRegistry = policy_mod.Registry;
+pub const PolicySnapshot = policy_mod.Snapshot;
 
 // =============================================================================
 // FilterResult - Evaluation outcome
@@ -372,8 +372,7 @@ pub const FilterEngine = struct {
 
 const testing = std.testing;
 const Policy = proto.policy.Policy;
-const policy_source = @import("policy_source.zig");
-const SourceType = policy_source.SourceType;
+const SourceType = policy_mod.SourceType;
 
 /// Test context for unit tests - simple struct with known fields
 const TestLogContext = struct {

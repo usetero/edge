@@ -1,7 +1,8 @@
 const std = @import("std");
 const proto = @import("proto");
-const policy_source = @import("./policy_source.zig");
-const matcher_index = @import("./matcher_index.zig");
+const policy_source = @import("./source.zig");
+const policy_provider = @import("./provider.zig");
+const matcher_index = @import("../hyperscan/matcher_index.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -458,7 +459,6 @@ pub const PolicyRegistry = struct {
 // =============================================================================
 
 const testing = std.testing;
-const policy_provider = @import("./policy_provider.zig");
 const PolicyCallback = policy_provider.PolicyCallback;
 const PolicyUpdate = policy_provider.PolicyUpdate;
 
