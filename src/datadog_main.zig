@@ -72,6 +72,7 @@ const PolicyCountLoaded = struct { count: usize };
 const ServerReady = struct {};
 const ShutdownHint = struct { pid: c_int };
 const ServerStopped = struct {};
+const ServerError = struct { message: anyerror };
 
 // =============================================================================
 // Global state for signal handlers
@@ -361,7 +362,9 @@ pub fn main() !void {
     }
 
     // Start listening (blocks until server.stop() is called)
-    try proxy.listen();
+    proxy.listen() catch |err| {
+        bus.err(ServerError{ .message = err });
+    };
 
     bus.info(ServerStopped{});
 }
