@@ -229,6 +229,99 @@ tasks:
       - buf export buf.build/tero/policy -o proto/policy
       - task: build:protos
 
+  # =============================================================================
+  # Build & Release
+  # =============================================================================
+
+  build:container:
+    desc: "🐳 Build container for a distribution (DIST=datadog|otlp|full)"
+    dir: "{{.TASKFILE_DIR}}"
+    vars:
+      DIST: '{{.DIST | default "datadog"}}'
+      GIT_SHA:
+        sh: git rev-parse --short HEAD
+    cmds:
+      - |
+        echo "🐳 Building edge-{{.DIST}} container..."
+        if [ -n "$CI" ]; then
+          # CI: Use buildx with GitHub Actions cache
+          docker buildx build \
+            --build-arg DISTRIBUTION={{.DIST}} \
+            --cache-from type=gha,scope=edge-{{.DIST}} \
+            --cache-to type=gha,mode=max,scope=edge-{{.DIST}} \
+            -t edge-{{.DIST}}:sha-{{.GIT_SHA}} \
+            -t edge-{{.DIST}}:local \
+            --load \
+            .
+        else
+          # Local: Standard build
+          DOCKER_BUILDKIT=1 docker build \
+            --build-arg DISTRIBUTION={{.DIST}} \
+            -t edge-{{.DIST}}:sha-{{.GIT_SHA}} \
+            -t edge-{{.DIST}}:local \
+            .
+        fi
+        echo "✅ Built edge-{{.DIST}}:sha-{{.GIT_SHA}} (also tagged as edge-{{.DIST}}:local)"
+
+  build:containers:
+    desc: "🐳 Build all distribution containers"
+    cmds:
+      - task: build:container
+        vars: { DIST: "datadog" }
+
+  push:container:
+    desc: "🚀 Push container to GCP Artifact Registry (DIST=datadog|otlp|full)"
+    dir: "{{.TASKFILE_DIR}}"
+    vars:
+      DIST: '{{.DIST | default "datadog"}}'
+      GIT_SHA:
+        sh: git rev-parse --short HEAD
+      GCP_PROJECT_ID:
+        sh: echo "${GCP_PROJECT_ID:-usetero-dev}"
+      GCP_REGION:
+        sh: echo "${GCP_REGION:-us-central1}"
+      GCP_REGISTRY:
+        sh: echo "{{.GCP_REGION}}-docker.pkg.dev/{{.GCP_PROJECT_ID}}/edge"
+    preconditions:
+      - sh: docker image inspect edge-{{.DIST}}:sha-{{.GIT_SHA}} >/dev/null 2>&1
+        msg: "Container edge-{{.DIST}}:sha-{{.GIT_SHA}} not found. Run 'task build:container DIST={{.DIST}}' first"
+    cmds:
+      - |
+        echo "🚀 Pushing edge-{{.DIST}} to GCP Artifact Registry..."
+        # Tag for GCP registry
+        docker tag edge-{{.DIST}}:sha-{{.GIT_SHA}} {{.GCP_REGISTRY}}/edge-{{.DIST}}:{{.GIT_SHA}}
+        docker tag edge-{{.DIST}}:sha-{{.GIT_SHA}} {{.GCP_REGISTRY}}/edge-{{.DIST}}:latest
+        # Push both tags
+        docker push {{.GCP_REGISTRY}}/edge-{{.DIST}}:{{.GIT_SHA}}
+        docker push {{.GCP_REGISTRY}}/edge-{{.DIST}}:latest
+        echo "✅ Pushed edge-{{.DIST}}:{{.GIT_SHA}} and edge-{{.DIST}}:latest"
+
+  push:containers:
+    desc: "🚀 Push all distribution containers to GCP"
+    cmds:
+      - task: push:container
+        vars: { DIST: "datadog" }
+
+  release:
+    desc: "🎯 Build and push all containers (for CI)"
+    cmds:
+      - task: build:containers
+      - task: push:containers
+
+  release:container:
+    desc: "🎯 Build and push a specific distribution (DIST=datadog|otlp|full)"
+    vars:
+      DIST: '{{.DIST | default "datadog"}}'
+    cmds:
+      - task: build:container
+        vars: { DIST: "{{.DIST}}" }
+      - task: push:container
+        vars: { DIST: "{{.DIST}}" }
+
+  # =============================================================================
+  # CI Setup
+  # =============================================================================
+
   ci:setup:
     desc: "🔧 Install CI/development dependencies (idempotent, safe to run locally)"
     dir: "{{.TASKFILE_DIR}}"
