@@ -30,10 +30,6 @@ RUN apk add --no-cache \
 
 # Fail early if we can't download protoc (zig-protobuf dependency needs this)
 ARG TARGETARCH
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-    curl -fsSL -o /dev/null https://github.com/protocolbuffers/protobuf/releases/download/v32.1/protoc-32.1-linux-aarch_64.zip \
-    || (echo "Failed to download protoc for arm64 - network issue" && exit 1); \
-    fi
 
 WORKDIR /build
 
@@ -44,6 +40,11 @@ COPY proto/ proto/
 
 # Build argument for distribution selection
 ARG DISTRIBUTION=datadog
+
+RUN for i in 1 2 3 4 5; do \
+    zig build --fetch && break || \
+    (echo "Fetch attempt $i failed, retrying..." && sleep 10); \
+    done
 
 # Build the selected distribution
 RUN zig build ${DISTRIBUTION} -Doptimize=ReleaseSafe
