@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.0](https://github.com/usetero/edge/compare/v1.0.0...v1.1.0) (2025-12-05)
+
+
+### Features
+
+* cross compile and fix linux bug ([#25](https://github.com/usetero/edge/issues/25)) ([6c9bd90](https://github.com/usetero/edge/commit/6c9bd90b6522266b038dbcccd88255376475f03e))
+* fix build by prefetching deps ([#26](https://github.com/usetero/edge/issues/26)) ([03d7367](https://github.com/usetero/edge/commit/03d73676487d3228e4981e595bc47a437973a328))
+* get release done ([#22](https://github.com/usetero/edge/issues/22)) ([1c4e0b2](https://github.com/usetero/edge/commit/1c4e0b209c700ae6112e70d5c3c8f5ecee0c4f04))
+* push to ghcr instead ([#24](https://github.com/usetero/edge/issues/24)) ([de77e66](https://github.com/usetero/edge/commit/de77e666269e4b7d5d0223690a13222802d65847))
+
 ## 1.0.0 (2025-12-05)
 
 
