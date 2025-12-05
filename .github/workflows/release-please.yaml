@@ -1,0 +1,51 @@
+---
+# Release Please Workflow
+#
+# Why this exists:
+# Manually creating releases and writing changelogs is tedious and error-prone.
+# This workflow automates it based on your conventional commit messages.
+#
+# What it does:
+# - Watches master branch for new commits
+# - Creates a "release PR" that updates version numbers and changelog
+# - When you merge that PR, it automatically creates a GitHub release
+# - Uses your PR titles (feat:, fix:, etc.) to generate the changelog
+#
+# How it works:
+# 1. Merge PRs to master as normal
+# 2. Release Please opens a PR with version bump and changelog
+# 3. Review and merge the release PR
+# 4. GitHub release is created automatically
+#
+# DO NOT EDIT: Managed by Terraform at https://github.com/usetero/infrastructure
+name: release-please
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.TERO_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TERO_BOT_PRIVATE_SIGNING_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+          release-type: simple
