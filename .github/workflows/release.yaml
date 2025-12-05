@@ -6,6 +6,8 @@
 #
 # Can also be triggered manually to push :latest from any branch.
 #
+# Builds run separately for each architecture, then merged into a multi-arch manifest.
+#
 # Tags pushed (release):
 # - :v1.2.3 (semantic version from release tag)
 # - :latest
@@ -42,13 +44,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog"]') }}
+        arch: [amd64, arm64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,37 +69,63 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build and Push Container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            DISTRIBUTION=${{ matrix.distribution }}
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}:${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=edge-${{ matrix.distribution }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=edge-${{ matrix.distribution }}-${{ matrix.arch }}
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog"]') }}
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Determine tags
         id: tags
         run: |
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}"
 
           # Always include SHA and latest
-          TAGS="${IMAGE}:${{ github.sha }}"
-          TAGS="${TAGS},${IMAGE}:latest"
+          TAGS="${IMAGE}:${{ github.sha }},${IMAGE}:latest"
 
           # Add version tag for releases
           if [[ "${{ github.event_name }}" == "release" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
             TAGS="${TAGS},${IMAGE}:${VERSION}"
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           fi
 
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          echo "Tags to push: ${TAGS}"
 
-      - name: Build and Push Container
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            DISTRIBUTION=${{ matrix.distribution }}
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=edge-${{ matrix.distribution }}
-          cache-to: type=gha,mode=max,scope=edge-${{ matrix.distribution }}
+      - name: Create multi-arch manifest
+        run: |
+          IMAGE="${{ steps.tags.outputs.image }}"
+
+          # Create and push manifest for each tag
+          for TAG in $(echo "${{ steps.tags.outputs.tags }}" | tr ',' ' '); do
+            echo "Creating manifest for ${TAG}..."
+            docker buildx imagetools create -t "${TAG}" \
+              "${IMAGE}:${{ github.sha }}-amd64" \
+              "${IMAGE}:${{ github.sha }}-arm64"
+          done
 
       - name: Summary
         run: |
@@ -107,6 +136,7 @@ jobs:
           fi
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Distribution:** ${{ matrix.distribution }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Architectures:** amd64, arm64" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Images pushed:**" >> "$GITHUB_STEP_SUMMARY"
           echo "${{ steps.tags.outputs.tags }}" | tr ',' '\n' | while read tag; do

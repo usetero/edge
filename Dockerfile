@@ -25,7 +25,11 @@ RUN apk add --no-cache \
     linux-headers \
     pkgconf \
     vectorscan-dev \
-    vectorscan-static
+    vectorscan-static \
+    curl
+
+# Fail early if we can't download protoc (zig-protobuf dependency needs this)
+ARG TARGETARCH
 
 WORKDIR /build
 
@@ -36,6 +40,11 @@ COPY proto/ proto/
 
 # Build argument for distribution selection
 ARG DISTRIBUTION=datadog
+
+RUN for i in 1 2 3 4 5; do \
+    zig build --fetch && break || \
+    (echo "Fetch attempt $i failed, retrying..." && sleep 10); \
+    done
 
 # Build the selected distribution
 RUN zig build ${DISTRIBUTION} -Doptimize=ReleaseSafe

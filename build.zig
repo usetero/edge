@@ -193,20 +193,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
-    const gen_proto = b.step("gen-proto", "generates zig files from protocol buffer definitions");
-
-    const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
-        // out directory for the generated zig files
-        .destination_directory = b.path("src/proto"),
-        .source_files = &.{
-            "proto/policy/opentelemetry/proto/policy/v1/policy.proto",
-        },
-        .include_directories = &.{
-            "proto/policy",
-        },
-    });
-
-    gen_proto.dependOn(&protoc_step.step);
+    // Proto generation step - only create when explicitly requested via build option.
+    // This avoids fetching protoc binary during normal builds (which fails on ARM64 CI).
+    const gen_proto_opt = b.option(bool, "gen-proto", "Generate protobuf files") orelse false;
+    if (gen_proto_opt) {
+        const gen_proto = b.step("gen-proto", "generates zig files from protocol buffer definitions");
+        const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
+            .destination_directory = b.path("src/proto"),
+            .source_files = &.{
+                "proto/policy/opentelemetry/proto/policy/v1/policy.proto",
+            },
+            .include_directories = &.{
+                "proto/policy",
+            },
+        });
+        gen_proto.dependOn(&protoc_step.step);
+    }
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
