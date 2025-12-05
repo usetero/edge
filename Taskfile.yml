@@ -22,7 +22,7 @@ tasks:
   build:protos:
     desc: "Build the project with protos"
     cmds:
-      - zig build gen-proto
+      - zig build -Dgen-proto=true gen-proto
 
   build:release:
     desc: "Build the project in release mode (ReleaseFast)"
