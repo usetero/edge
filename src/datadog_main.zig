@@ -104,7 +104,14 @@ fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyop
     _ = ctx_ptr;
 
     std.debug.print("\n=== SEGFAULT ===\n", .{});
-    std.debug.print("Faulting address: 0x{x}\n", .{@intFromPtr(info.addr)});
+
+    // Get faulting address - field layout differs between Linux and macOS
+    const fault_addr: usize = switch (builtin.os.tag) {
+        .macos => @intFromPtr(info.addr),
+        .linux => @intFromPtr(info.fields.sigfault.addr),
+        else => 0,
+    };
+    std.debug.print("Faulting address: 0x{x}\n", .{fault_addr});
     std.debug.print("Signal code: {d}\n", .{info.code});
     std.debug.print("Stack trace:\n", .{});
     std.debug.dumpCurrentStackTrace(@returnAddress());
