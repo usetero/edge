@@ -28,9 +28,6 @@ RUN apk add --no-cache \
     vectorscan-static \
     curl
 
-# Fail early if we can't download protoc (zig-protobuf dependency needs this)
-ARG TARGETARCH
-
 WORKDIR /build
 
 # Copy source code
@@ -46,13 +43,14 @@ RUN for i in 1 2 3 4 5; do \
     (echo "Fetch attempt $i failed, retrying..." && sleep 10); \
     done
 
-# Build the selected distribution
-RUN zig build ${DISTRIBUTION} -Doptimize=ReleaseSafe
+# Build the selected distribution with baseline CPU to ensure cross-ARM64 compatibility
+# (GitHub ARM runners use Neoverse-N1, Apple Silicon uses different feature sets)
+RUN zig build ${DISTRIBUTION} -Dcpu=baseline -Doptimize=ReleaseSafe
 
 # =============================================================================
 # Runtime stage - minimal Alpine image
 # =============================================================================
-FROM alpine:edge
+FROM alpine:3.22.2
 
 # Install runtime dependencies
 RUN apk add --no-cache \

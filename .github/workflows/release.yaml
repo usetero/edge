@@ -1,22 +1,8 @@
 ---
 # Release Workflow
 #
-# Builds and pushes container images when a release is created.
-# Triggered by release-please after merging a release PR.
-#
-# Can also be triggered manually to push :latest from any branch.
-#
-# Builds run on native runners (amd64 on ubuntu-latest, arm64 on arm-4-core),
-# then merged into a multi-arch manifest.
-#
-# Tags pushed (release):
-# - :v1.2.3 (semantic version from release tag)
-# - :latest
-# - :<git-sha>
-#
-# Tags pushed (manual):
-# - :latest
-# - :<git-sha>
+# Builds and pushes multi-arch container images.
+# Triggered by release-please or manually.
 name: release
 
 on:
@@ -45,61 +31,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-amd64:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  build:
     strategy:
       fail-fast: false
       matrix:
         distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog"]') }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and Push Container
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          build-args: |
-            DISTRIBUTION=${{ matrix.distribution }}
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}:${{ github.sha }}-amd64
-          cache-from: type=gha,scope=edge-${{ matrix.distribution }}-amd64
-          cache-to: type=gha,mode=max,scope=edge-${{ matrix.distribution }}-amd64
-
-  build-arm64:
-    runs-on: arm-4-core
+        arch:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.arch.runner }}
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog"]') }}
     steps:
-      - name: Install Docker
+      - name: Prepare
+        run: |
+          platform=${{ matrix.arch.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}" >> $GITHUB_ENV
+
+      - name: Install Docker (self-hosted only)
+        if: matrix.arch.runner == 'arm-4-core'
         run: |
           if ! command -v docker &> /dev/null; then
             curl -fsSL https://get.docker.com | sudo sh
           fi
           sudo usermod -aG docker $USER
           sudo systemctl start docker || sudo service docker start || true
-          # Fix socket permissions for current session
           sudo chmod 666 /var/run/docker.sock
           timeout 30 bash -c 'while ! docker version; do sleep 1; done'
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -111,28 +80,58 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push Container
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          platforms: linux/arm64
+          platforms: ${{ matrix.arch.platform }}
           build-args: |
             DISTRIBUTION=${{ matrix.distribution }}
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}:${{ github.sha }}-arm64
-          cache-from: type=gha,scope=edge-${{ matrix.distribution }}-arm64
-          cache-to: type=gha,mode=max,scope=edge-${{ matrix.distribution }}-arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.REGISTRY_IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.distribution }}-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
   merge:
-    needs: [build-amd64, build-arm64]
     runs-on: ubuntu-latest
+    needs: build
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog"]') }}
     steps:
+      - name: Prepare
+        run: |
+          echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}" >> $GITHUB_ENV
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.distribution }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -140,47 +139,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine tags
-        id: tags
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}"
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
 
-          # Always include SHA and latest
-          TAGS="${IMAGE}:${{ github.sha }},${IMAGE}:latest"
-
-          # Add version tag for releases
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-            TAGS="${TAGS},${IMAGE}:${VERSION}"
-          fi
-
-          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-
-      - name: Create multi-arch manifest
+      - name: Inspect image
         run: |
-          IMAGE="${{ steps.tags.outputs.image }}"
-
-          # Create and push manifest for each tag
-          for TAG in $(echo "${{ steps.tags.outputs.tags }}" | tr ',' ' '); do
-            echo "Creating manifest for ${TAG}..."
-            docker buildx imagetools create -t "${TAG}" \
-              "${IMAGE}:${{ github.sha }}-amd64" \
-              "${IMAGE}:${{ github.sha }}-arm64"
-          done
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
 
       - name: Summary
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "## 🚀 Release ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "## 🚀 Manual Build (${{ github.ref_name }})" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🚀 Release" >> "$GITHUB_STEP_SUMMARY"
           echo "**Distribution:** ${{ matrix.distribution }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Architectures:** amd64, arm64" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Images pushed:**" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.tags.outputs.tags }}" | tr ',' '\n' | while read tag; do
-            echo "- \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
-          done
+          echo "**Image:** ${{ env.REGISTRY_IMAGE }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tags:** ${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
