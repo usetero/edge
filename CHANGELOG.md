@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/usetero/edge/compare/v1.1.0...v1.2.0) (2025-12-08)
+
+
+### Features
+
+* use new arm runner for ci/cd ([#27](https://github.com/usetero/edge/issues/27)) ([1944a7b](https://github.com/usetero/edge/commit/1944a7bc6c35ffccca726b162102eeaf9a977dfe))
+
 ## [1.1.0](https://github.com/usetero/edge/compare/v1.0.0...v1.1.0) (2025-12-05)
 
 
