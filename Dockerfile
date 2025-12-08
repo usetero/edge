@@ -60,6 +60,7 @@ RUN apk add --no-cache \
     libstdc++ \
     zlib \
     zstd-libs \
+    vectorscan \
     && adduser -D -H -s /sbin/nologin tero
 
 WORKDIR /app
