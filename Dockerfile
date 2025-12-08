@@ -43,8 +43,10 @@ RUN for i in 1 2 3 4 5; do \
     (echo "Fetch attempt $i failed, retrying..." && sleep 10); \
     done
 
-# Build the selected distribution (native build, no cross-compilation)
-RUN zig build ${DISTRIBUTION} -Doptimize=ReleaseSafe
+# Build the selected distribution with baseline CPU to ensure cross-ARM64 compatibility
+# (GitHub ARM runners use Neoverse-N1, Apple Silicon uses different feature sets)
+# RUN zig build ${DISTRIBUTION} -Doptimize=ReleaseSafe
+RUN zig build ${DISTRIBUTION} -Dcpu=baseline -Doptimize=Debug
 
 # =============================================================================
 # Runtime stage - minimal Alpine image
