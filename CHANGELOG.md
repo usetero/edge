@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/usetero/edge/compare/v1.2.0...v1.2.1) (2025-12-08)
+
+
+### Bug Fixes
+
+* dockerfile needs vectorscan dep ([#29](https://github.com/usetero/edge/issues/29)) ([5d40b18](https://github.com/usetero/edge/commit/5d40b1858fa760582f3346a47d7e56f71a959d8b))
+
 ## [1.2.0](https://github.com/usetero/edge/compare/v1.1.0...v1.2.0) (2025-12-08)
 
 
