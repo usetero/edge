@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.2](https://github.com/usetero/edge/compare/v1.2.1...v1.2.2) (2025-12-08)
+
+
+### Bug Fixes
+
+* arm image not working on mac ([#31](https://github.com/usetero/edge/issues/31)) ([f450f7c](https://github.com/usetero/edge/commit/f450f7c69c85c6a3e1614f6524db7513df8f6a7e))
+
 ## [1.2.1](https://github.com/usetero/edge/compare/v1.2.0...v1.2.1) (2025-12-08)
 
 
