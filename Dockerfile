@@ -28,9 +28,6 @@ RUN apk add --no-cache \
     vectorscan-static \
     curl
 
-# Fail early if we can't download protoc (zig-protobuf dependency needs this)
-ARG TARGETARCH
-
 WORKDIR /build
 
 # Copy source code
@@ -46,13 +43,13 @@ RUN for i in 1 2 3 4 5; do \
     (echo "Fetch attempt $i failed, retrying..." && sleep 10); \
     done
 
-# Build the selected distribution
+# Build the selected distribution (native build, no cross-compilation)
 RUN zig build ${DISTRIBUTION} -Doptimize=ReleaseSafe
 
 # =============================================================================
 # Runtime stage - minimal Alpine image
 # =============================================================================
-FROM alpine:3.21
+FROM alpine:3.22.2
 
 # Install runtime dependencies
 RUN apk add --no-cache \
