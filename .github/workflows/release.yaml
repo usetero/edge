@@ -36,22 +36,22 @@ jobs:
       fail-fast: false
       matrix:
         distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog"]') }}
-        include:
+        arch:
           - platform: linux/amd64
             runner: ubuntu-latest
           - platform: linux/arm64
             runner: arm-4-core
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.arch.runner }}
     timeout-minutes: 30
     steps:
       - name: Prepare
         run: |
-          platform=${{ matrix.platform }}
+          platform=${{ matrix.arch.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
           echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}" >> $GITHUB_ENV
 
       - name: Install Docker (self-hosted only)
-        if: matrix.runner == 'arm-4-core'
+        if: matrix.arch.runner == 'arm-4-core'
         run: |
           if ! command -v docker &> /dev/null; then
             curl -fsSL https://get.docker.com | sudo sh
@@ -86,7 +86,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ matrix.arch.platform }}
           build-args: |
             DISTRIBUTION=${{ matrix.distribution }}
           labels: ${{ steps.meta.outputs.labels }}

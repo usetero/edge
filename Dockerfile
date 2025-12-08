@@ -52,7 +52,7 @@ RUN zig build ${DISTRIBUTION} -Doptimize=ReleaseSafe
 # =============================================================================
 # Runtime stage - minimal Alpine image
 # =============================================================================
-FROM alpine:edge
+FROM alpine:3.21
 
 # Install runtime dependencies
 RUN apk add --no-cache \
