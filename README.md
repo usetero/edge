@@ -1,12 +1,14 @@
 # Tero Edge
 
-Tero Edge is a lightweight, high-performance telemetry proxy that enables efficient telemetry processing via a set of policies. The repository is structured as modular packages that can be composed to enable multiple use cases and scenarios. The proxy demonstrates how to implement the policy spec described in [this OTEP](https://github.com/open-telemetry/opentelemetry-specification/pull/4738). This project is not meant to replace the opentelemetry collector but rather work in tandem with it, providing a lightweight alternative for edge deployments.
+Tero Edge is a lightweight, high-performance telemetry proxy that enables efficient telemetry processing via a set of policies. The repository is structured as modular packages that can be composed to enable multiple use cases and scenarios. The proxy demonstrates how to implement the policy spec described in [this OTEP](https://github.com/open-telemetry/opentelemetry-specification/pull/4738). This project is not meant to replace the opentelemetry collector but rather work in tandem with it, providing a lightweight alternative for solely applying policies.
 
 ## Current Configurations
 
 1. **Edge data proxy** - Receives data in a gateway or sidecar configuration, processes the data through its policy engine, and forwards it to the next destination.
 
-2. **OTLP (OpenTelemetry) proxy** - Receives OpenTelemetry logs via the `/v1/logs` endpoint, applies policy-based filtering (DROP/KEEP), and forwards to OTLP-compatible backends (e.g., Datadog OTLP endpoint).
+2. **OTLP (OpenTelemetry) proxy** - Receives OpenTelemetry logs via the `/v1/logs` endpoint, applies policy-based filtering (DROP/KEEP), and forwards to OTLP-compatible backends.
+
+2. **Datadog proxy** - Receives OpenTelemetry logs via the `/api/v2/logs` endpoint, applies policy-based filtering (DROP/KEEP), and forwards to Datadog.
 
 ## Repository Structure
 
