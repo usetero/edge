@@ -1,0 +1,8 @@
+// This file was bootstrapped by Terraform but is now owned by this repository.
+// Feel free to customize it for your repo's needs (add packageRules, etc.)
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>usetero/renovate-config"
+  ]
+}
