@@ -19,7 +19,7 @@ const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
-const LogsProcessingFailed = struct { err: []const u8 };
+const LogsProcessingFailed = struct { err: []const u8, contentType: []const u8 };
 
 /// Result of processing logs
 pub const ProcessResult = struct {
@@ -41,11 +41,29 @@ pub const ProcessResult = struct {
     }
 };
 
+/// Content format for OTLP logs
+pub const ContentFormat = enum {
+    json,
+    protobuf,
+    unknown,
+
+    /// Detect format from content-type header
+    pub fn fromContentType(content_type: []const u8) ContentFormat {
+        if (std.mem.indexOf(u8, content_type, "application/json") != null) {
+            return .json;
+        }
+        if (std.mem.indexOf(u8, content_type, "application/x-protobuf") != null) {
+            return .protobuf;
+        }
+        return .unknown;
+    }
+};
+
 /// Process OTLP logs with filter evaluation
-/// Takes decompressed JSON data and applies filter policies
+/// Takes decompressed data (JSON or protobuf) and applies filter policies
 /// Returns ProcessResult with data and counts (caller owns the data slice)
 ///
-/// OTLP JSON format (ExportLogsServiceRequest/LogsData):
+/// OTLP format (ExportLogsServiceRequest/LogsData):
 /// {
 ///   "resourceLogs": [
 ///     {
@@ -73,22 +91,23 @@ pub fn processLogs(
     data: []const u8,
     content_type: []const u8,
 ) !ProcessResult {
-    // Only process JSON content types
-    if (std.mem.indexOf(u8, content_type, "application/json") != null) {
-        return processJsonLogs(allocator, registry, bus, data) catch |err| {
-            bus.err(LogsProcessingFailed{ .err = @errorName(err) });
-            const result = try allocator.alloc(u8, data.len);
-            @memcpy(result, data);
-            return .{
-                .data = result,
-                .dropped_count = 0,
-                .original_count = 0,
-            };
-        };
-    }
+    const format = ContentFormat.fromContentType(content_type);
 
-    // For non-JSON content types (protobuf), return unchanged
-    // TODO: Add protobuf support in the future
+    return switch (format) {
+        .json => processJsonLogs(allocator, registry, bus, data) catch |err| {
+            bus.err(LogsProcessingFailed{ .err = @errorName(err), .contentType = content_type });
+            return copyUnchanged(allocator, data);
+        },
+        .protobuf => processProtobufLogs(allocator, registry, bus, data) catch |err| {
+            bus.err(LogsProcessingFailed{ .err = @errorName(err), .contentType = content_type });
+            return copyUnchanged(allocator, data);
+        },
+        .unknown => copyUnchanged(allocator, data),
+    };
+}
+
+/// Copy data unchanged (fail-open behavior)
+fn copyUnchanged(allocator: std.mem.Allocator, data: []const u8) !ProcessResult {
     const result = try allocator.alloc(u8, data.len);
     @memcpy(result, data);
     return .{
@@ -145,20 +164,23 @@ fn otlpFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []const 
     };
 }
 
-fn processJsonLogs(
-    allocator: std.mem.Allocator,
+/// Result of filtering logs in-place
+const FilterCounts = struct {
+    original_count: usize,
+    dropped_count: usize,
+};
+
+/// Filter logs in-place within the LogsData structure
+/// This is the shared filtering logic used by both JSON and protobuf processing
+///
+/// Note: This function does not free dropped log records. The caller is responsible
+/// for memory management (e.g., via json.Parsed.deinit() or LogsData.deinit()).
+fn filterLogsInPlace(
+    logs_data: *LogsData,
     registry: *const PolicyRegistry,
     bus: *EventBus,
-    data: []const u8,
-) !ProcessResult {
-    // Parse JSON into LogsData protobuf struct
-    proto.protobuf.json.pb_options.emit_oneof_field_name = false;
-    var parsed = try LogsData.jsonDecode(data, .{
-        .ignore_unknown_fields = true,
-    }, allocator);
-    defer parsed.deinit();
-
-    // Create filter engine for evaluation
+    allocator: std.mem.Allocator,
+) FilterCounts {
     const engine = FilterEngine.init(allocator, bus, @constCast(registry));
 
     var original_count: usize = 0;
@@ -166,7 +188,7 @@ fn processJsonLogs(
 
     // Iterate through the nested structure and filter logs in place
     // Structure: LogsData -> ResourceLogs[] -> ScopeLogs[] -> LogRecord[]
-    for (parsed.value.resource_logs.items) |*resource_logs| {
+    for (logs_data.resource_logs.items) |*resource_logs| {
         for (resource_logs.scope_logs.items) |*scope_logs| {
             // Count original logs
             original_count += scope_logs.log_records.items.len;
@@ -198,13 +220,73 @@ fn processJsonLogs(
         }
     }
 
+    return .{
+        .original_count = original_count,
+        .dropped_count = dropped_count,
+    };
+}
+
+fn processJsonLogs(
+    allocator: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    data: []const u8,
+) !ProcessResult {
+    // Parse JSON into LogsData protobuf struct
+    proto.protobuf.json.pb_options.emit_oneof_field_name = false;
+    var parsed = try LogsData.jsonDecode(data, .{
+        .ignore_unknown_fields = true,
+    }, allocator);
+    defer parsed.deinit();
+
+    // Filter logs in-place
+    const counts = filterLogsInPlace(&parsed.value, registry, bus, allocator);
+
     // Re-serialize to JSON
     const output = try parsed.value.jsonEncode(.{}, allocator);
 
     return .{
         .data = @constCast(output),
-        .dropped_count = dropped_count,
-        .original_count = original_count,
+        .dropped_count = counts.dropped_count,
+        .original_count = counts.original_count,
+    };
+}
+
+fn processProtobufLogs(
+    allocator: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    data: []const u8,
+) !ProcessResult {
+    // Use an arena for the protobuf decode/filter/encode cycle.
+    // This ensures all allocations (including dropped log records) are freed together.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Create a fixed reader from the protobuf data
+    var reader = std.Io.Reader.fixed(data);
+
+    // Decode protobuf into LogsData struct using arena
+    var logs_data = try LogsData.decode(&reader, arena_alloc);
+
+    // Filter logs in-place
+    const counts = filterLogsInPlace(&logs_data, registry, bus, arena_alloc);
+
+    // Re-serialize to protobuf - use main allocator for output since we return it
+    // TODO: we should be passing the IO Writer to these methods to write the response bytes
+    var output_writer = std.Io.Writer.Allocating.init(allocator);
+    errdefer output_writer.deinit();
+
+    try logs_data.encode(&output_writer.writer, arena_alloc);
+
+    // Transfer ownership of the written data to caller
+    const output = try output_writer.toOwnedSlice();
+
+    return .{
+        .data = output,
+        .dropped_count = counts.dropped_count,
+        .original_count = counts.original_count,
     };
 }
 
@@ -249,7 +331,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
 }
 
-test "processLogs - non-JSON content type returns unchanged" {
+test "processLogs - unknown content type returns unchanged" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -257,12 +339,29 @@ test "processLogs - non-JSON content type returns unchanged" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    const data = "some protobuf data";
+    const data = "some unknown data";
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), data, "application/x-protobuf");
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), data, "text/plain");
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(data, result.data);
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+}
+
+test "processLogs - malformed protobuf returns unchanged (fail-open)" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    const malformed = "not valid protobuf";
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), malformed, "application/x-protobuf");
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqualStrings(malformed, result.data);
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
 }
 
@@ -439,4 +538,155 @@ test "processLogs - all logs dropped returns empty structure" {
     try std.testing.expectEqual(@as(usize, 2), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
     try std.testing.expect(result.allDropped());
+}
+
+// =============================================================================
+// Protobuf Tests
+// =============================================================================
+
+/// Helper to create protobuf-encoded LogsData for testing
+fn createTestProtobufLogs(allocator: std.mem.Allocator, messages: []const []const u8) ![]u8 {
+    // Use an arena for the temporary protobuf structures
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var scope_logs = ScopeLogs{};
+    for (messages) |msg| {
+        const log_record = LogRecord{
+            .severity_text = "INFO",
+            .body = .{ .value = .{ .string_value = msg } },
+        };
+        try scope_logs.log_records.append(arena_alloc, log_record);
+    }
+
+    var resource_logs = ResourceLogs{};
+    try resource_logs.scope_logs.append(arena_alloc, scope_logs);
+
+    var logs_data = LogsData{};
+    try logs_data.resource_logs.append(arena_alloc, resource_logs);
+
+    // Encode to protobuf - use main allocator for output since we return it
+    var output_writer = std.Io.Writer.Allocating.init(allocator);
+    errdefer output_writer.deinit();
+
+    try logs_data.encode(&output_writer.writer, arena_alloc);
+
+    return try output_writer.toOwnedSlice();
+}
+
+test "processLogs - protobuf parses and re-serializes" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create valid protobuf data
+    const proto_data = try createTestProtobufLogs(allocator, &.{ "hello world", "test message" });
+    defer allocator.free(proto_data);
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), proto_data, "application/x-protobuf");
+    defer allocator.free(result.data);
+
+    // With no policies, all logs should be kept
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    try std.testing.expect(!result.wasModified());
+}
+
+test "processLogs - protobuf DROP policy filters logs" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy for logs containing "secret"
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-secret"),
+        .name = try allocator.dupe(u8, "drop-secret"),
+        .enabled = true,
+        .log_filter = .{
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
+        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "secret") } },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // Create protobuf data with one log containing "secret"
+    const proto_data = try createTestProtobufLogs(allocator, &.{ "normal message", "contains secret data" });
+    defer allocator.free(proto_data);
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), proto_data, "application/x-protobuf");
+    defer allocator.free(result.data);
+
+    // One log should be dropped
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    try std.testing.expect(result.wasModified());
+
+    // Verify the result can be decoded and contains only the normal message
+    var reader = std.Io.Reader.fixed(result.data);
+    var decoded = try LogsData.decode(&reader, allocator);
+    defer decoded.deinit(allocator);
+
+    // Should have 1 log record remaining
+    var total_logs: usize = 0;
+    for (decoded.resource_logs.items) |*rl| {
+        for (rl.scope_logs.items) |*sl| {
+            total_logs += sl.log_records.items.len;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), total_logs);
+}
+
+test "processLogs - protobuf all logs dropped" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy that matches all logs
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-all"),
+        .name = try allocator.dupe(u8, "drop-all"),
+        .enabled = true,
+        .log_filter = .{
+            .action = .FILTER_ACTION_DROP,
+        },
+    };
+    try drop_policy.log_filter.?.matchers.append(allocator, .{
+        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "msg") } },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // Create protobuf data with logs that all match the pattern
+    const proto_data = try createTestProtobufLogs(allocator, &.{ "msg1", "msg2", "msg3" });
+    defer allocator.free(proto_data);
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), proto_data, "application/x-protobuf");
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 3), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 3), result.original_count);
+    try std.testing.expect(result.allDropped());
+}
+
+test "ContentFormat.fromContentType" {
+    try std.testing.expectEqual(ContentFormat.json, ContentFormat.fromContentType("application/json"));
+    try std.testing.expectEqual(ContentFormat.json, ContentFormat.fromContentType("application/json; charset=utf-8"));
+    try std.testing.expectEqual(ContentFormat.protobuf, ContentFormat.fromContentType("application/x-protobuf"));
+    try std.testing.expectEqual(ContentFormat.unknown, ContentFormat.fromContentType("text/plain"));
+    try std.testing.expectEqual(ContentFormat.unknown, ContentFormat.fromContentType(""));
 }

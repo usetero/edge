@@ -36,6 +36,7 @@ const RequestError = struct {
     method: []const u8,
     path: []const u8,
     err: []const u8,
+    stack_trace: ?[]const u8 = null,
 };
 
 const DecompressError = struct {
@@ -62,6 +63,12 @@ const UpstreamResponse = struct {
 
 const UpstreamStreamError = struct {
     err: []const u8,
+    bytes_streamed: usize = 0,
+};
+
+const ResponseFlushError = struct {
+    err: []const u8,
+    bytes_written: usize,
 };
 
 const ResponseTruncated = struct {
@@ -179,10 +186,25 @@ const ServerContext = struct {
         res: *httpz.Response,
         err: anyerror,
     ) void {
+        // Format stack trace addresses if available
+        var stack_buf: [2048]u8 = undefined;
+        var stack_trace_str: ?[]const u8 = null;
+
+        if (@errorReturnTrace()) |trace| {
+            var fbs = std.io.fixedBufferStream(&stack_buf);
+            const writer = fbs.writer().any();
+            const frames = trace.instruction_addresses[0..@min(trace.index, trace.instruction_addresses.len)];
+            for (frames) |addr| {
+                writer.print("0x{x} ", .{addr}) catch break;
+            }
+            stack_trace_str = fbs.getWritten();
+        }
+
         self.bus.err(RequestError{
             .method = @tagName(req.method),
             .path = req.url.path,
             .err = @errorName(err),
+            .stack_trace = stack_trace_str,
         });
         res.status = 500;
         res.body = "Internal Server Error";
@@ -570,7 +592,10 @@ fn proxyToUpstream(
         ) catch |err| switch (err) {
             error.EndOfStream => break,
             else => {
-                ctx.bus.err(UpstreamStreamError{ .err = @errorName(err) });
+                ctx.bus.err(UpstreamStreamError{
+                    .err = @errorName(err),
+                    .bytes_streamed = total_bytes,
+                });
                 return err;
             },
         };
@@ -583,7 +608,13 @@ fn proxyToUpstream(
     }
 
     // Flush the response writer to ensure all data is sent to client
-    try response_writer.flush();
+    response_writer.flush() catch |err| {
+        ctx.bus.err(ResponseFlushError{
+            .err = @errorName(err),
+            .bytes_written = total_bytes,
+        });
+        return err;
+    };
 
     return total_bytes;
 }
