@@ -226,7 +226,8 @@ tasks:
   update:protos:
     desc: "Update proto files"
     cmds:
-      - buf export buf.build/tero/policy -o proto/policy
+      - buf export buf.build/tero/policy -o proto
+      - buf export buf.build/opentelemetry/opentelemetry -o proto
       - task: build:protos
 
   # =============================================================================
@@ -268,6 +269,8 @@ tasks:
     cmds:
       - task: build:container
         vars: { DIST: "datadog" }
+      - task: build:container
+        vars: { DIST: "otlp" }
 
   push:container:
     desc: "🚀 Push container to GCP Artifact Registry (DIST=datadog|otlp|full)"
@@ -301,6 +304,8 @@ tasks:
     cmds:
       - task: push:container
         vars: { DIST: "datadog" }
+      - task: push:container
+        vars: { DIST: "otlp" }
 
   release:
     desc: "🎯 Build and push all containers (for CI)"

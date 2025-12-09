@@ -17,6 +17,7 @@ on:
         type: choice
         options:
           - datadog
+          - otlp
 
 env:
   REGISTRY: ghcr.io
@@ -35,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog", "otlp"]') }}
         arch:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -116,7 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog", "otlp"]') }}
     steps:
       - name: Prepare
         run: |
