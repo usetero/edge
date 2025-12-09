@@ -119,36 +119,48 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // ==========================================================================
-    // Datadog Distribution
+    // Distribution Builds
     // ==========================================================================
-    // A focused distribution for Datadog log ingestion with filtering.
-    // Build with: zig build datadog
-    // Run with: zig build run-datadog
-    const datadog_exe = b.addExecutable(.{
-        .name = "edge-datadog",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/datadog_main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    datadog_exe.root_module.addImport("httpz", httpz.module("httpz"));
-    datadog_exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
-    datadog_exe.root_module.addImport("proto", proto_mod);
-    datadog_exe.root_module.link_libc = true;
-    datadog_exe.root_module.linkSystemLibrary("z", .{});
-    datadog_exe.root_module.linkSystemLibrary("zstd", .{});
-    datadog_exe.root_module.linkSystemLibrary("hs", .{});
+    // Each distribution is a focused edge proxy for a specific backend.
+    // Build with: zig build <distribution>
+    // Run with: zig build run-<distribution>
 
-    const datadog_step = b.step("datadog", "Build the Datadog distribution");
-    datadog_step.dependOn(&b.addInstallArtifact(datadog_exe, .{}).step);
+    const distributions = .{
+        .{ "datadog", "src/datadog_main.zig", "Datadog log ingestion" },
+        .{ "otlp", "src/otlp_main.zig", "OpenTelemetry (OTLP) log ingestion" },
+    };
 
-    const run_datadog_step = b.step("run-datadog", "Run the Datadog distribution");
-    const run_datadog_cmd = b.addRunArtifact(datadog_exe);
-    run_datadog_step.dependOn(&run_datadog_cmd.step);
-    run_datadog_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_datadog_cmd.addArgs(args);
+    inline for (distributions) |dist| {
+        const name = dist[0];
+        const source = dist[1];
+        const desc = dist[2];
+
+        const dist_exe = b.addExecutable(.{
+            .name = "edge-" ++ name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(source),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        dist_exe.root_module.addImport("httpz", httpz.module("httpz"));
+        dist_exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
+        dist_exe.root_module.addImport("proto", proto_mod);
+        dist_exe.root_module.link_libc = true;
+        dist_exe.root_module.linkSystemLibrary("z", .{});
+        dist_exe.root_module.linkSystemLibrary("zstd", .{});
+        dist_exe.root_module.linkSystemLibrary("hs", .{});
+
+        const dist_step = b.step(name, "Build the " ++ name ++ " distribution (" ++ desc ++ ")");
+        dist_step.dependOn(&b.addInstallArtifact(dist_exe, .{}).step);
+
+        const run_dist_step = b.step("run-" ++ name, "Run the " ++ name ++ " distribution");
+        const run_dist_cmd = b.addRunArtifact(dist_exe);
+        run_dist_step.dependOn(&run_dist_cmd.step);
+        run_dist_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            run_dist_cmd.addArgs(args);
+        }
     }
 
     // This creates a top level step. Top level steps have a name and can be
@@ -201,10 +213,11 @@ pub fn build(b: *std.Build) void {
         const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
             .destination_directory = b.path("src/proto"),
             .source_files = &.{
-                "proto/policy/opentelemetry/proto/policy/v1/policy.proto",
+                "proto/opentelemetry/proto/policy/v1/policy.proto",
+                "proto/opentelemetry/proto/logs/v1/logs.proto",
             },
             .include_directories = &.{
-                "proto/policy",
+                "proto",
             },
         });
         gen_proto.dependOn(&protoc_step.step);

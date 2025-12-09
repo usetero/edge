@@ -1,10 +1,14 @@
 # Tero Edge
 
-Tero Edge is a lightweight, high-performance telemetry proxy that enables efficient telemetry processing via a set of policies. The repository is structured as modular packages that can be composed to enable multiple use cases and scenarios.
+Tero Edge is a lightweight, high-performance telemetry proxy that enables efficient telemetry processing via a set of policies. The repository is structured as modular packages that can be composed to enable multiple use cases and scenarios. The proxy demonstrates how to implement the policy spec described in [this OTEP](https://github.com/open-telemetry/opentelemetry-specification/pull/4738). This project is not meant to replace the opentelemetry collector but rather work in tandem with it, providing a lightweight alternative for solely applying policies. It's expected that a follow up to this project will be a collector processor Policy implementation.
 
 ## Current Configurations
 
 1. **Edge data proxy** - Receives data in a gateway or sidecar configuration, processes the data through its policy engine, and forwards it to the next destination.
+
+2. **OTLP (OpenTelemetry) proxy** - Receives OpenTelemetry logs via the `/v1/logs` endpoint, applies policy-based filtering (DROP/KEEP), and forwards to OTLP-compatible backends.
+
+2. **Datadog proxy** - Receives OpenTelemetry logs via the `/api/v2/logs` endpoint, applies policy-based filtering (DROP/KEEP), and forwards to Datadog.
 
 ## Repository Structure
 
@@ -12,6 +16,7 @@ Tero Edge is a lightweight, high-performance telemetry proxy that enables effici
 src/
 ├── main.zig              # Default distribution entry point
 ├── datadog_main.zig      # Datadog-focused distribution entry point
+├── otlp_main.zig         # OTLP-focused distribution entry point
 ├── root.zig              # Library root (public API exports)
 │
 ├── policy/               # Policy management package
@@ -105,6 +110,7 @@ Protocol-specific request processing modules that plug into the proxy infrastruc
 - `ProxyModule` - Vtable interface for request processing
 - `ModuleRegistration` - Module configuration (routes, upstream, etc.)
 - `DatadogModule` - Datadog log ingestion with policy-based filtering
+- `OtlpModule` - OpenTelemetry log ingestion with policy-based filtering
 - `PassthroughModule` - No-op passthrough for unhandled routes
 
 **Integration:**
@@ -135,7 +141,24 @@ const registrations = [_]modules.ModuleRegistration{
 };
 ```
 
-**Dependencies:** `policy/` (for DatadogModule), `observability/`
+**Dependencies:** `policy/` (for DatadogModule, OtlpModule), `observability/`
+
+#### OtlpModule
+
+The OTLP module handles OpenTelemetry log ingestion with policy-based filtering. It processes the standard OTLP JSON format (`ExportLogsServiceRequest`).
+
+**Supported filter match cases:**
+- `log_body` - Match against log message body
+- `log_severity_text` - Match against severity text (INFO, DEBUG, ERROR, etc.)
+- `log_severity_number` - Match against severity number (1-24)
+- `log_attribute` - Match against log record attributes
+- `resource_attribute` - Match against resource attributes (e.g., `service.name`)
+- `scope_name` - Match against instrumentation scope name
+- `scope_version` - Match against instrumentation scope version
+- `scope_attribute` - Match against scope attributes
+
+**Routes:**
+- `POST /v1/logs` - OTLP log ingestion endpoint
 
 ---
 
@@ -255,6 +278,19 @@ Focused distribution for Datadog log ingestion with:
 
 Build: `zig build` (default) or `zig build datadog`
 
+### OTLP (`otlp_main.zig`)
+Focused distribution for OpenTelemetry Protocol (OTLP) log ingestion with:
+- Handles `/v1/logs` endpoint (OTLP JSON format)
+- Policy-based log filtering (DROP/KEEP) on log body, severity, attributes
+- Support for resource attributes, scope attributes, and log attributes
+- Fail-open behavior (errors pass logs through unchanged)
+- Lock-free policy updates via atomic snapshots
+- Graceful shutdown with signal handling
+- Compatible with any OTLP-receiving backend (Datadog, Jaeger, etc.)
+
+Build: `zig build otlp`
+Run: `zig build run-otlp` or `./zig-out/bin/edge-otlp [config-file]`
+
 ## Building
 
 ```bash
@@ -266,15 +302,52 @@ zig build test
 
 # Build specific distribution
 zig build datadog
+zig build otlp
+
+# Run specific distribution
+zig build run-datadog
+zig build run-otlp
 ```
 
 ## Configuration
 
-See `config.json` for example configuration. Key settings:
+See `config.json` for the Datadog distribution or `config-otlp.json` for the OTLP distribution.
+
+### Key settings:
 - `listen_address` / `listen_port` - Server bind address
 - `upstream_url` - Default upstream destination
+- `workspace_id` - Workspace identifier for policy sync
+- `log_level` - Logging level (trace, debug, info, warn, err)
 - `policy_providers` - List of policy sources (file/http)
 - `max_body_size` - Request/response body limits
+
+### Example OTLP Configuration (`config-otlp.json`):
+
+```json
+{
+  "listen_address": "127.0.0.1",
+  "listen_port": 8080,
+  "upstream_url": "https://otlp.us5.datadoghq.com",
+  "workspace_id": "your-workspace-id",
+  "log_level": "info",
+  "max_body_size": 1048576,
+  "policy_providers": [
+    {
+      "id": "file",
+      "type": "file",
+      "path": "policies.json"
+    },
+    {
+      "id": "http",
+      "type": "http",
+      "url": "http://localhost:9090/v1/policy/sync"
+    }
+  ]
+}
+```
+
+### Environment Variables:
+- `TERO_LOG_LEVEL` - Override log level (trace, debug, info, warn, err)
 
 ## Design Principles
 

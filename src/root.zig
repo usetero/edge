@@ -19,6 +19,7 @@ pub const server = @import("proxy/server.zig");
 pub const proxy_module = @import("modules/proxy_module.zig");
 pub const passthrough_module = @import("modules/passthrough_module.zig");
 pub const datadog_module = @import("modules/datadog_module.zig");
+pub const otlp_module = @import("modules/otlp_module.zig");
 
 // Hyperscan/Vectorscan bindings
 pub const hyperscan = @import("hyperscan/hyperscan.zig");
@@ -30,6 +31,9 @@ pub const matcher_index = @import("hyperscan/matcher_index.zig");
 
 /// Datadog distribution - focused edge proxy for Datadog log ingestion
 pub const datadog_distribution = @import("datadog_main.zig");
+
+/// OTLP distribution - focused edge proxy for OpenTelemetry log ingestion
+pub const otlp_distribution = @import("otlp_main.zig");
 
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
@@ -69,5 +73,7 @@ test {
     _ = @import("modules/passthrough_module.zig");
     _ = @import("modules/datadog_module.zig");
     _ = @import("modules/datadog_logs_v2.zig");
+    _ = @import("modules/otlp_module.zig");
+    _ = @import("modules/otlp_logs.zig");
     _ = @import("hyperscan/hyperscan.zig");
 }
