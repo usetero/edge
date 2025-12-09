@@ -1,6 +1,6 @@
 # Tero Edge
 
-Tero Edge is a lightweight, high-performance telemetry proxy that enables efficient telemetry processing via a set of policies. The repository is structured as modular packages that can be composed to enable multiple use cases and scenarios. The proxy demonstrates how to implement the policy spec described in [this OTEP](https://github.com/open-telemetry/opentelemetry-specification/pull/4738). This project is not meant to replace the opentelemetry collector but rather work in tandem with it, providing a lightweight alternative for solely applying policies.
+Tero Edge is a lightweight, high-performance telemetry proxy that enables efficient telemetry processing via a set of policies. The repository is structured as modular packages that can be composed to enable multiple use cases and scenarios. The proxy demonstrates how to implement the policy spec described in [this OTEP](https://github.com/open-telemetry/opentelemetry-specification/pull/4738). This project is not meant to replace the opentelemetry collector but rather work in tandem with it, providing a lightweight alternative for solely applying policies. It's expected that a follow up to this project will be a collector processor Policy implementation.
 
 ## Current Configurations
 
