@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.0](https://github.com/usetero/edge/compare/v1.2.2...v1.3.0) (2025-12-09)
+
+
+### Features
+
+* add in protobuf support ([#38](https://github.com/usetero/edge/issues/38)) ([c86b1c5](https://github.com/usetero/edge/commit/c86b1c501e4b61eed935780f9937b579c448cbb1))
+* support otlp logs in the proxy ([#33](https://github.com/usetero/edge/issues/33)) ([b432018](https://github.com/usetero/edge/commit/b432018fe417642eefe5d3bd79f1617866bfe17a))
+
+
+### Bug Fixes
+
+* pin versions ([#39](https://github.com/usetero/edge/issues/39)) ([a770707](https://github.com/usetero/edge/commit/a7707074a4a1657d9656d0a33b43c5738e85150d))
+
 ## [1.2.2](https://github.com/usetero/edge/compare/v1.2.1...v1.2.2) (2025-12-08)
 
 
