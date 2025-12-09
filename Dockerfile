@@ -5,7 +5,7 @@
 # =============================================================================
 # Build stage
 # =============================================================================
-FROM alpine:edge AS builder
+FROM alpine:edge@sha256:115729ec5cb049ba6359c3ab005ac742012d92bbaa5b8bc1a878f1e8f62c0cb8 AS builder
 
 # Install Zig and build dependencies from build.zig:
 # - zig: compiler
@@ -50,7 +50,7 @@ RUN zig build ${DISTRIBUTION} -Dcpu=baseline -Doptimize=ReleaseSafe
 # =============================================================================
 # Runtime stage - minimal Alpine image
 # =============================================================================
-FROM alpine:3.22.2
+FROM alpine:3.22.2@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412
 
 # Install runtime dependencies
 RUN apk add --no-cache \
