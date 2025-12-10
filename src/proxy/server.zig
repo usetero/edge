@@ -66,6 +66,12 @@ const UpstreamStreamError = struct {
     bytes_streamed: usize = 0,
 };
 
+const UpstreamConnectionError = struct {
+    err: []const u8,
+    phase: []const u8,
+    underlying_err: ?[]const u8 = null,
+};
+
 const ResponseFlushError = struct {
     err: []const u8,
     bytes_written: usize,
@@ -512,6 +518,14 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
     }
 }
 
+/// Extract underlying write error from HTTP client request
+/// The WriteFailed error is a wrapper - actual error is stored in the connection's stream_writer
+fn getUnderlyingWriteError(upstream_req: *std.http.Client.Request) ?[]const u8 {
+    const connection = upstream_req.connection orelse return null;
+    const write_err = connection.stream_writer.err orelse return null;
+    return @errorName(write_err);
+}
+
 /// Forward request to upstream and stream response back
 /// Returns the number of bytes in the response body
 fn proxyToUpstream(
@@ -550,20 +564,56 @@ fn proxyToUpstream(
     };
 
     // Create upstream request
-    var upstream_req = try client.request(method, uri, .{
+    var upstream_req = client.request(method, uri, .{
         .extra_headers = headers,
-    });
+        // We have to disable keep-alives for now because of a persistent connection bug.
+        // https://codeberg.org/ziglang/zig/issues/30165
+        // .keep_alive = false,
+    }) catch |err| {
+        ctx.bus.err(UpstreamConnectionError{
+            .err = @errorName(err),
+            .phase = "connect",
+        });
+        return err;
+    };
     defer upstream_req.deinit();
 
-    // Send body if present
+    // Send body
     if (has_body) {
-        try upstream_req.sendBodyComplete(@constCast(body_to_send));
+        upstream_req.sendBodyComplete(@constCast(body_to_send)) catch |err| {
+            ctx.bus.err(UpstreamConnectionError{
+                .err = @errorName(err),
+                .phase = "send_body",
+                .underlying_err = getUnderlyingWriteError(&upstream_req),
+            });
+            if (upstream_req.connection) |conn| conn.closing = true;
+            return err;
+        };
     } else {
-        try upstream_req.sendBodiless();
+        upstream_req.sendBodiless() catch |err| {
+            ctx.bus.err(UpstreamConnectionError{
+                .err = @errorName(err),
+                .phase = "send_bodiless",
+                .underlying_err = getUnderlyingWriteError(&upstream_req),
+            });
+            if (upstream_req.connection) |conn| conn.closing = true;
+            return err;
+        };
     }
 
     // Receive response head
-    var upstream_res = try upstream_req.receiveHead(&.{});
+    var upstream_res = upstream_req.receiveHead(&.{}) catch |err| {
+        ctx.bus.err(UpstreamConnectionError{
+            .err = @errorName(err),
+            .phase = "receive_head",
+        });
+        if (upstream_req.connection) |conn| {
+            std.debug.print("Closing and destroying connection:\n", .{});
+            conn.closing = true;
+            try conn.end();
+        }
+        return err;
+    };
 
     // Set response status
     res.status = @intFromEnum(upstream_res.head.status);
