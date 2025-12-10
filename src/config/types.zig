@@ -36,6 +36,9 @@ pub const ProxyConfig = struct {
 
     max_body_size: u32,
 
+    // Retry config
+    max_upstream_retries: u8,
+
     // Policy providers
     policy_providers: []ProviderConfig,
 
@@ -48,6 +51,7 @@ pub const ProxyConfig = struct {
             .service = .{},
             .log_level = .info,
             .max_body_size = 1024 * 1024, // 1MB
+            .max_upstream_retries = 10,
             .policy_providers = &.{},
         };
     }

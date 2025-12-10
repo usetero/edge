@@ -165,6 +165,9 @@ const ServerContext = struct {
     /// Listen port
     listen_port: u16,
 
+    /// Maximum retries for failed upstream requests
+    max_upstream_retries: u8,
+
     /// Event bus for observability
     bus: *EventBus,
 
@@ -239,6 +242,7 @@ pub const ProxyServer = struct {
         bus: *EventBus,
         listen_address: [4]u8,
         listen_port: u16,
+        max_upstream_retries: u8,
         module_registrations: []const ModuleRegistration,
     ) !ProxyServer {
         var ctx = try allocator.create(ServerContext);
@@ -246,6 +250,7 @@ pub const ProxyServer = struct {
 
         ctx.allocator = allocator;
         ctx.bus = bus;
+        ctx.max_upstream_retries = max_upstream_retries;
         ctx.upstreams = UpstreamClientManager.init(allocator);
         ctx.modules = .{ .modules = .{} };
 
@@ -541,7 +546,7 @@ fn proxyToUpstream(
     module_id: ModuleId,
     body_to_send: []const u8,
 ) !usize {
-    const max_retries: u8 = 10;
+    const max_retries = ctx.max_upstream_retries;
     var attempt: u8 = 0;
 
     // https://codeberg.org/ziglang/zig/issues/30165
