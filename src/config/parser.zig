@@ -30,6 +30,7 @@ const ConfigJson = struct {
     workspace_id: []const u8,
     log_level: []const u8,
     max_body_size: u32,
+    max_upstream_retries: ?u8 = null,
     policy_providers: ?[]ProviderJson = null,
     service: ?ServiceJson = null,
 };
@@ -76,6 +77,7 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
 
     // Copy remaining fields
     config.max_body_size = json_config.max_body_size;
+    config.max_upstream_retries = json_config.max_upstream_retries orelse 10;
 
     // Parse policy providers if present
     if (json_config.policy_providers) |json_providers| {

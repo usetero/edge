@@ -362,6 +362,7 @@ pub fn main() !void {
         bus,
         config.listen_address,
         config.listen_port,
+        config.max_upstream_retries,
         &module_registrations,
     );
     defer proxy.deinit();

@@ -122,6 +122,8 @@ pub const EventBus = struct {
     err_writer: *std.Io.Writer,
     min_level: Level,
     current_span: ?*const Span,
+    /// Mutex for thread-safe writes (writers are not thread-safe)
+    mutex: std.Thread.Mutex,
 
     /// Initialize with a single std.Io.Writer for all levels
     pub fn init(writer: *std.Io.Writer) EventBus {
@@ -130,6 +132,7 @@ pub const EventBus = struct {
             .err_writer = writer,
             .min_level = .info,
             .current_span = null,
+            .mutex = .{},
         };
     }
 
@@ -140,6 +143,7 @@ pub const EventBus = struct {
             .err_writer = stderr_writer,
             .min_level = .info,
             .current_span = null,
+            .mutex = .{},
         };
     }
 
@@ -234,6 +238,10 @@ pub const EventBus = struct {
         if (@intFromEnum(level) < @intFromEnum(self.min_level)) {
             return;
         }
+
+        // Acquire mutex for thread-safe writes
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         // Select writer based on level (errors go to err_writer)
         const writer = self.writerForLevel(level);

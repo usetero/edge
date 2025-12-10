@@ -90,13 +90,7 @@ fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     if (global_event_bus) |bus| {
         bus.info(ShutdownSignalReceived{});
     }
-
-    // Stop the server - this unblocks the main thread
-    // Provider cleanup happens in the defer blocks of main()
-    if (server_instance) |server| {
-        server_instance = null;
-        server.server.stop();
-    }
+    std.process.exit(0);
 }
 
 fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
@@ -362,6 +356,7 @@ pub fn main() !void {
         bus,
         config.listen_address,
         config.listen_port,
+        config.max_upstream_retries,
         &module_registrations,
     );
     defer proxy.deinit();

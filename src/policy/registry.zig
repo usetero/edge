@@ -213,6 +213,9 @@ pub const PolicyRegistry = struct {
         self.providers.deinit(self.allocator);
 
         // Free current snapshot if exists
+        // Note: snapshot.policies is a shallow copy of self.policies, so its Policy
+        // structs share pointers with the originals we just freed. snapshot.deinit()
+        // only frees the array itself and matcher_index, not the policy contents.
         if (self.current_snapshot.load(.acquire)) |snapshot| {
             @constCast(snapshot).deinit();
             self.allocator.destroy(snapshot);

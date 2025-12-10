@@ -84,6 +84,12 @@ pub const ContentFormat = enum {
 ///     }
 ///   ]
 /// }
+const LogsProcessingStarted = struct {
+    content_type: []const u8,
+    data_len: usize,
+    format: []const u8,
+};
+
 pub fn processLogs(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
@@ -92,6 +98,12 @@ pub fn processLogs(
     content_type: []const u8,
 ) !ProcessResult {
     const format = ContentFormat.fromContentType(content_type);
+
+    bus.debug(LogsProcessingStarted{
+        .content_type = content_type,
+        .data_len = data.len,
+        .format = @tagName(format),
+    });
 
     return switch (format) {
         .json => processJsonLogs(allocator, registry, bus, data) catch |err| {
@@ -258,6 +270,17 @@ fn processProtobufLogs(
     bus: *EventBus,
     data: []const u8,
 ) !ProcessResult {
+    // Basic validation: empty data or data that looks like JSON should not be decoded as protobuf.
+    // The protobuf library panics on certain invalid inputs, so we validate first.
+    if (data.len == 0) {
+        return error.EmptyProtobufData;
+    }
+
+    // Check if data looks like JSON (starts with '{' or '[') - this would cause protobuf decoder to panic
+    if (data[0] == '{' or data[0] == '[') {
+        return error.DataLooksLikeJson;
+    }
+
     // Use an arena for the protobuf decode/filter/encode cycle.
     // This ensures all allocations (including dropped log records) are freed together.
     var arena = std.heap.ArenaAllocator.init(allocator);
