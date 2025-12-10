@@ -81,6 +81,12 @@ const ResponseTruncated = struct {
     max_size: usize,
 };
 
+const UpstreamRetry = struct {
+    attempt: u8,
+    max_retries: u8,
+    err: []const u8,
+};
+
 const ServerListening = struct {
     address: []const u8,
     port: u16,
@@ -535,6 +541,48 @@ fn proxyToUpstream(
     module_id: ModuleId,
     body_to_send: []const u8,
 ) !usize {
+    const max_retries: u8 = 10;
+    var attempt: u8 = 0;
+
+    // https://codeberg.org/ziglang/zig/issues/30165
+    // TODO: Once the above is fixed, we should re-evaluate this logic.
+    while (attempt < max_retries) : (attempt += 1) {
+        const result = proxyToUpstreamOnce(ctx, req, res, module_id, body_to_send);
+        if (result) |bytes| {
+            return bytes;
+        } else |err| {
+            // Only retry on connection-related errors (stale connections from pool)
+            const err_name = @errorName(err);
+            const is_retryable = std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
+                std.mem.eql(u8, err_name, "BrokenPipe") or
+                std.mem.eql(u8, err_name, "ConnectionTimedOut") or
+                std.mem.eql(u8, err_name, "UnexpectedReadFailure") or
+                std.mem.eql(u8, err_name, "HttpConnectionClosing") or
+                std.mem.eql(u8, err_name, "UnexpectedWriteFailure");
+
+            if (!is_retryable or attempt + 1 >= max_retries) {
+                return err;
+            }
+
+            ctx.bus.warn(UpstreamRetry{
+                .attempt = attempt + 1,
+                .max_retries = max_retries,
+                .err = err_name,
+            });
+        }
+    }
+
+    return error.NotEnoughData;
+}
+
+/// Single attempt to forward request to upstream
+fn proxyToUpstreamOnce(
+    ctx: *ServerContext,
+    req: *httpz.Request,
+    res: *httpz.Response,
+    module_id: ModuleId,
+    body_to_send: []const u8,
+) !usize {
     // Build upstream URI using pre-allocated buffer
     const upstream_uri_str = try ctx.upstreams.buildUpstreamUri(
         module_id,
@@ -566,9 +614,6 @@ fn proxyToUpstream(
     // Create upstream request
     var upstream_req = client.request(method, uri, .{
         .extra_headers = headers,
-        // We have to disable keep-alives for now because of a persistent connection bug.
-        // https://codeberg.org/ziglang/zig/issues/30165
-        // .keep_alive = false,
     }) catch |err| {
         ctx.bus.err(UpstreamConnectionError{
             .err = @errorName(err),
@@ -586,6 +631,8 @@ fn proxyToUpstream(
                 .phase = "send_body",
                 .underlying_err = getUnderlyingWriteError(&upstream_req),
             });
+            // https://codeberg.org/ziglang/zig/issues/30165
+            // TODO: Remove this once the bug is fixed.
             if (upstream_req.connection) |conn| conn.closing = true;
             return err;
         };
@@ -596,6 +643,8 @@ fn proxyToUpstream(
                 .phase = "send_bodiless",
                 .underlying_err = getUnderlyingWriteError(&upstream_req),
             });
+            // https://codeberg.org/ziglang/zig/issues/30165
+            // TODO: Remove this once the bug is fixed.
             if (upstream_req.connection) |conn| conn.closing = true;
             return err;
         };
@@ -607,10 +656,11 @@ fn proxyToUpstream(
             .err = @errorName(err),
             .phase = "receive_head",
         });
+        // https://codeberg.org/ziglang/zig/issues/30165
+        // TODO: Remove this once the bug is fixed.
         if (upstream_req.connection) |conn| {
-            std.debug.print("Closing and destroying connection:\n", .{});
             conn.closing = true;
-            try conn.end();
+            conn.end() catch {};
         }
         return err;
     };
