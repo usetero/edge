@@ -90,9 +90,6 @@ fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     if (global_event_bus) |bus| {
         bus.info(ShutdownSignalReceived{});
     }
-
-    // Exit immediately - don't try to gracefully shutdown as httpz has race conditions
-    // between worker threads and resource cleanup. The OS will clean up all resources.
     std.process.exit(0);
 }
 
