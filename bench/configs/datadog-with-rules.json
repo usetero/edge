@@ -1,0 +1,16 @@
+{
+  "listen_address": "127.0.0.1",
+  "listen_port": 8080,
+  "upstream_url": "http://127.0.0.1:9999",
+  "workspace_id": "benchmark",
+  "log_level": "err",
+  "max_body_size": 4194304,
+  "max_upstream_retries": 3,
+  "policy_providers": [
+    {
+      "id": "bench-policies",
+      "type": "file",
+      "path": "bench/configs/policies.json"
+    }
+  ]
+}

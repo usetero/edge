@@ -205,6 +205,32 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    // ==========================================================================
+    // Benchmark Tools
+    // ==========================================================================
+
+    // Echo server for benchmarking - a minimal HTTP server that returns 202
+    const echo_server = b.addExecutable(.{
+        .name = "echo-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/echo_server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    echo_server.root_module.addImport("httpz", httpz.module("httpz"));
+
+    const echo_step = b.step("echo-server", "Build the echo server for benchmarking");
+    echo_step.dependOn(&b.addInstallArtifact(echo_server, .{}).step);
+
+    const run_echo_step = b.step("run-echo-server", "Run the echo server");
+    const run_echo_cmd = b.addRunArtifact(echo_server);
+    run_echo_step.dependOn(&run_echo_cmd.step);
+    run_echo_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_echo_cmd.addArgs(args);
+    }
+
     // Proto generation step - only create when explicitly requested via build option.
     // This avoids fetching protoc binary during normal builds (which fails on ARM64 CI).
     const gen_proto_opt = b.option(bool, "gen-proto", "Generate protobuf files") orelse false;

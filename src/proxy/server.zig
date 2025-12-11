@@ -243,6 +243,7 @@ pub const ProxyServer = struct {
         listen_address: [4]u8,
         listen_port: u16,
         max_upstream_retries: u8,
+        max_body_size: u32,
         module_registrations: []const ModuleRegistration,
     ) !ProxyServer {
         var ctx = try allocator.create(ServerContext);
@@ -305,6 +306,9 @@ pub const ProxyServer = struct {
         server.* = try httpz.Server(*ServerContext).init(allocator, .{
             .address = ctx.listen_address,
             .port = listen_port,
+            .request = .{
+                .max_body_size = max_body_size,
+            },
         }, ctx);
 
         return .{

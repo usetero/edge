@@ -363,6 +363,7 @@ pub fn main() !void {
         config.listen_address,
         config.listen_port,
         config.max_upstream_retries,
+        config.max_body_size,
         &module_registrations,
     );
     defer proxy.deinit();

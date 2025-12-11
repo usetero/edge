@@ -1,0 +1,1 @@
+{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"auth-service"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1705315800000000000","body":{"stringValue":"User login successful"},"severityText":"INFO"}]}]}]}
