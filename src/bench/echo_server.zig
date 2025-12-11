@@ -9,6 +9,7 @@ const ServerContext = struct {
     pub fn handle(self: *ServerContext, _: *httpz.Request, res: *httpz.Response) void {
         _ = self.requests_received.fetchAdd(1, .monotonic);
         res.status = 202;
+        res.body = "{}";
     }
 };
 
@@ -27,10 +28,9 @@ pub fn main() !void {
 
     var ctx = ServerContext{};
 
-    var server = try httpz.Server(*ServerContext).init(allocator, .{
-        .port = port,
-        .address = "127.0.0.1",
-    }, &ctx);
+    var server = try httpz.Server(*ServerContext).init(allocator, .{ .port = port, .address = "127.0.0.1", .request = .{
+        .max_body_size = 5194304,
+    } }, &ctx);
     defer server.deinit();
 
     std.debug.print("Echo server listening on http://127.0.0.1:{d}\n", .{port});
