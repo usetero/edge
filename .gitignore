@@ -16,6 +16,8 @@ zig-out/
 /build/
 /build-*/
 /docgen_tmp/
+bench/debug
+bench/results
 
 # Although this was renamed to .zig-cache, let's leave it here for a few
 # releases to make it less annoying to work with multiple branches.
