@@ -221,6 +221,67 @@ start_otelcol() {
     wait_for_server "$OTLP_PORT" "otel-collector (OTLP)"
 }
 
+# Resource monitoring variables
+MONITOR_PID=""
+RESOURCE_FILE=""
+
+# Start monitoring CPU/memory for a process
+start_resource_monitor() {
+    local pid=$1
+    RESOURCE_FILE=$(mktemp)
+
+    # Sample CPU and memory every 100ms in background
+    (
+        trap '' TERM  # Ignore SIGTERM in subprocess
+        while kill -0 "$pid" 2>/dev/null; do
+            # Get CPU% and RSS memory in KB
+            ps -o %cpu=,rss= -p "$pid" 2>/dev/null >> "$RESOURCE_FILE"
+            sleep 0.1
+        done
+    ) 2>/dev/null &
+    MONITOR_PID=$!
+    disown "$MONITOR_PID" 2>/dev/null || true
+}
+
+# Stop monitoring and return avg_cpu,max_cpu,avg_mem_mb,max_mem_mb
+stop_resource_monitor() {
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+        MONITOR_PID=""
+    fi
+
+    if [[ -f "$RESOURCE_FILE" ]] && [[ -s "$RESOURCE_FILE" ]]; then
+        # Calculate avg/max CPU and memory from samples
+        awk '
+        BEGIN { cpu_sum=0; cpu_max=0; mem_sum=0; mem_max=0; count=0 }
+        {
+            cpu = $1 + 0
+            mem = $2 + 0
+            cpu_sum += cpu
+            mem_sum += mem
+            if (cpu > cpu_max) cpu_max = cpu
+            if (mem > mem_max) mem_max = mem
+            count++
+        }
+        END {
+            if (count > 0) {
+                avg_cpu = cpu_sum / count
+                avg_mem = mem_sum / count / 1024  # Convert to MB
+                max_mem = mem_max / 1024  # Convert to MB
+                printf "%.1f,%.1f,%.1f,%.1f", avg_cpu, cpu_max, avg_mem, max_mem
+            } else {
+                print "0,0,0,0"
+            }
+        }' "$RESOURCE_FILE"
+        rm -f "$RESOURCE_FILE"
+    else
+        echo "0,0,0,0"
+        rm -f "$RESOURCE_FILE" 2>/dev/null
+    fi
+    RESOURCE_FILE=""
+}
+
 # Run a single benchmark and return JSON result
 run_benchmark() {
     local url=$1
@@ -306,7 +367,7 @@ run_all_scenarios() {
     local current_otelcol_config=""
 
     # CSV header
-    echo "Scenario,Type,Mode,Payload Size,Requests/sec,p50 (ms),p99 (ms),Success %" > "$results_file"
+    echo "Scenario,Type,Mode,Payload Size,Requests/sec,p50 (ms),p99 (ms),Success %,Avg CPU %,Max CPU %,Avg Mem MB,Max Mem MB" > "$results_file"
 
     for scenario in "${SCENARIOS[@]}"; do
         IFS='|' read -r name type mode config endpoint payload <<< "$scenario"
@@ -315,6 +376,7 @@ run_all_scenarios() {
         payload_size=$(wc -c < "$payload" | tr -d ' ')
 
         local port
+        local monitor_pid=""
 
         # Handle otelcol scenarios
         if [[ "$type" == "otelcol-datadog" || "$type" == "otelcol-otlp" ]]; then
@@ -323,6 +385,7 @@ run_all_scenarios() {
                 start_otelcol "$config" "$name-$mode"
                 current_otelcol_config="$config"
             fi
+            monitor_pid="$OTELCOL_PID"
             if [[ "$type" == "otelcol-datadog" ]]; then
                 port=$DATADOG_PORT
             else
@@ -339,6 +402,7 @@ run_all_scenarios() {
                 start_datadog_proxy "$config" "$mode" "$name-$mode"
                 current_datadog_config="$config"
             fi
+            monitor_pid="$DATADOG_PID"
             port=$DATADOG_PORT
         elif [[ "$type" == "otlp" ]]; then
             # Stop otelcol if it was running (switching back to edge)
@@ -350,6 +414,7 @@ run_all_scenarios() {
                 start_otlp_proxy "$config" "$mode" "$name-$mode"
                 current_otlp_config="$config"
             fi
+            monitor_pid="$OTLP_PID"
             port=$OTLP_PORT
         fi
 
@@ -362,16 +427,24 @@ run_all_scenarios() {
             oha_log="$DEBUG_DIR/oha-$(echo "$type-$name-$mode" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').log"
         fi
 
+        # Start resource monitoring
+        start_resource_monitor "$monitor_pid"
+
         log_info "Running: $name ($type, $mode)..."
         run_benchmark "$url" "$payload" "$output_json" "$oha_log"
+
+        # Stop monitoring and get resource metrics
+        local resource_metrics
+        resource_metrics=$(stop_resource_monitor)
 
         local metrics
         metrics=$(extract_metrics "$output_json")
 
         IFS=',' read -r rps p50 p99 success <<< "$metrics"
-        log_success "$name ($type, $mode): ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms"
+        IFS=',' read -r avg_cpu max_cpu avg_mem max_mem <<< "$resource_metrics"
+        log_success "$name ($type, $mode): ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, CPU: ${avg_cpu}%/${max_cpu}%, Mem: ${avg_mem}MB/${max_mem}MB"
 
-        echo "$name,$type,$mode,$payload_size,$rps,$p50,$p99,$success" >> "$results_file"
+        echo "$name,$type,$mode,$payload_size,$rps,$p50,$p99,$success,$avg_cpu,$max_cpu,$avg_mem,$max_mem" >> "$results_file"
     done
 }
 
@@ -392,14 +465,14 @@ generate_report() {
 
 ## Results
 
-| Scenario | Type | Mode | Payload | Req/s | p50 (ms) | p99 (ms) | Success |
-|----------|------|------|---------|-------|----------|----------|---------|
+| Scenario | Type | Mode | Payload | Req/s | p50 (ms) | p99 (ms) | Success | Avg CPU % | Max CPU % | Avg Mem MB | Max Mem MB |
+|----------|------|------|---------|-------|----------|----------|---------|-----------|-----------|------------|------------|
 EOF
 
     # Skip header line and format each row
-    tail -n +2 "$results_file" | while IFS=',' read -r name type mode size rps p50 p99 success; do
-        printf "| %s | %s | %s | %s bytes | %s | %s | %s | %s%% |\n" \
-            "$name" "$type" "$mode" "$size" "$rps" "$p50" "$p99" "$success" >> "$report_file"
+    tail -n +2 "$results_file" | while IFS=',' read -r name type mode size rps p50 p99 success avg_cpu max_cpu avg_mem max_mem; do
+        printf "| %s | %s | %s | %s bytes | %s | %s | %s | %s%% | %s | %s | %s | %s |\n" \
+            "$name" "$type" "$mode" "$size" "$rps" "$p50" "$p99" "$success" "$avg_cpu" "$max_cpu" "$avg_mem" "$max_mem" >> "$report_file"
     done
 
     cat >> "$report_file" << 'EOF'

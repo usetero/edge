@@ -176,7 +176,7 @@ const ServerContext = struct {
     /// Handle all requests directly - we do our own routing
     pub fn handle(self: *ServerContext, req: *httpz.Request, res: *httpz.Response) void {
         // Start request span
-        var span = self.bus.started(.info, RequestStarted{
+        var span = self.bus.started(.debug, RequestStarted{
             .method = @tagName(req.method),
             .path = req.url.path,
             .body_len = req.body_len,

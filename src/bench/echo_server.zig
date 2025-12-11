@@ -13,6 +13,14 @@ const ServerContext = struct {
     }
 };
 
+var server_instance: ?*httpz.Server(*ServerContext) = null;
+
+fn handleSigint(_: c_int) callconv(.c) void {
+    if (server_instance) |s| {
+        s.stop();
+    }
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -27,14 +35,29 @@ pub fn main() !void {
         9999;
 
     var ctx = ServerContext{};
-
-    var server = try httpz.Server(*ServerContext).init(allocator, .{ .port = port, .address = "127.0.0.1", .request = .{
-        .max_body_size = 5194304,
-    } }, &ctx);
+    var server = try httpz.Server(*ServerContext).init(allocator, .{
+        .port = port,
+        .address = "127.0.0.1",
+        .request = .{
+            .max_body_size = 5194304,
+        },
+    }, &ctx);
     defer server.deinit();
+
+    server_instance = &server;
+    defer server_instance = null;
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handleSigint },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
     std.debug.print("Echo server listening on http://127.0.0.1:{d}\n", .{port});
     std.debug.print("Press Ctrl+C to stop\n", .{});
 
     try server.listen();
+
+    std.debug.print("\nShutting down. Received {d} requests.\n", .{ctx.requests_received.load(.monotonic)});
 }
