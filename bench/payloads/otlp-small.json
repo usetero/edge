@@ -1,1 +1,24 @@
-{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"auth-service"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1705315800000000000","body":{"stringValue":"User login successful"},"severityText":"INFO"}]}]}]}
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "auth-service" } }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "timeUnixNano": "1705315800000000000",
+              "body": { "stringValue": "User login successful" },
+              "severityText": "INFO",
+              "traceId": "00000000000000000000000000000001",
+              "spanId": "0000000000000001"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

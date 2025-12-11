@@ -36,6 +36,7 @@ OTLP_PORT=8081
 ECHO_PID=""
 DATADOG_PID=""
 OTLP_PID=""
+OTELCOL_PID=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -54,6 +55,7 @@ cleanup() {
     [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null || true
     [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null || true
     [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null || true
+    [[ -n "$OTELCOL_PID" ]] && kill "$OTELCOL_PID" 2>/dev/null || true
     wait 2>/dev/null || true
 }
 
@@ -64,6 +66,19 @@ usage() {
     exit 0
 }
 
+# Find otelcol-contrib binary (check bench/bin first, then PATH)
+find_otelcol() {
+    if [[ -x "bench/bin/otelcol-contrib" ]]; then
+        echo "bench/bin/otelcol-contrib"
+    elif command -v otelcol-contrib >/dev/null 2>&1; then
+        echo "otelcol-contrib"
+    else
+        echo ""
+    fi
+}
+
+OTELCOL_BIN=""
+
 check_dependencies() {
     local missing=()
 
@@ -71,15 +86,30 @@ check_dependencies() {
     command -v curl >/dev/null 2>&1 || missing+=("curl")
     command -v jq >/dev/null 2>&1 || missing+=("jq")
 
+    OTELCOL_BIN=$(find_otelcol)
+    [[ -z "$OTELCOL_BIN" ]] && missing+=("otelcol-contrib")
+
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Missing dependencies: ${missing[*]}"
         echo ""
         echo "Install with:"
         echo "  brew install oha jq"
+        echo ""
+        echo "For otelcol-contrib (includes Datadog support), download from GitHub releases to bench/bin/:"
+        echo "  mkdir -p bench/bin"
+        echo "  # For Apple Silicon (arm64):"
+        echo "  curl --proto '=https' --tlsv1.2 -fOL https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.141.0/otelcol-contrib_0.141.0_darwin_arm64.tar.gz"
+        echo "  tar -xvf otelcol-contrib_0.141.0_darwin_arm64.tar.gz"
+        echo "  mv otelcol-contrib bench/bin/"
+        echo ""
+        echo "  # For Intel (amd64):"
+        echo "  curl --proto '=https' --tlsv1.2 -fOL https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.141.0/otelcol-contrib_0.141.0_darwin_amd64.tar.gz"
+        echo "  tar -xvf otelcol-contrib_0.141.0_darwin_amd64.tar.gz"
+        echo "  mv otelcol-contrib bench/bin/"
         exit 1
     fi
 
-    log_success "All dependencies found"
+    log_success "All dependencies found (otelcol-contrib: $OTELCOL_BIN)"
 }
 
 wait_for_server() {
@@ -150,21 +180,75 @@ start_otlp_proxy() {
     wait_for_server "$OTLP_PORT" "OTLP proxy"
 }
 
+stop_otelcol() {
+    if [[ -n "$OTELCOL_PID" ]]; then
+        # Give otelcol time to flush any pending data
+        sleep 0.3
+        # Send SIGTERM for graceful shutdown
+        kill -TERM "$OTELCOL_PID" 2>/dev/null || true
+        # Wait briefly, then force kill if still running
+        sleep 0.5
+        kill -9 "$OTELCOL_PID" 2>/dev/null || true
+        wait "$OTELCOL_PID" 2>/dev/null || true
+        OTELCOL_PID=""
+    fi
+}
+
+start_otelcol() {
+    local config_file=$1
+    local scenario_name=$2
+
+    # Kill existing if running
+    stop_otelcol
+
+    # Also stop edge proxies since otelcol uses same ports
+    [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null || true
+    [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null || true
+    DATADOG_PID=""
+    OTLP_PID=""
+    sleep 0.2
+
+    log_info "Starting otel-collector ($config_file)..."
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        local log_file="$DEBUG_DIR/otelcol-$(echo "$scenario_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').log"
+        "$OTELCOL_BIN" --config "$config_file" > "$log_file" 2>&1 &
+    else
+        "$OTELCOL_BIN" --config "$config_file" >/dev/null 2>&1 &
+    fi
+    OTELCOL_PID=$!
+    sleep 1  # otelcol takes a moment to start
+    wait_for_server "$DATADOG_PORT" "otel-collector (Datadog)"
+    wait_for_server "$OTLP_PORT" "otel-collector (OTLP)"
+}
+
 # Run a single benchmark and return JSON result
 run_benchmark() {
     local url=$1
     local payload_file=$2
     local output_file=$3
+    local log_file=$4
 
-    oha -n "$REQUESTS" \
-        -c "$CONNECTIONS" \
-        --no-tui \
-        -m POST \
-        -H "Content-Type: application/json" \
-        -D "$payload_file" \
-        --output-format json \
-        -o "$output_file" \
-        "$url" 2>/dev/null
+    if [[ -n "$log_file" ]]; then
+        oha -n "$REQUESTS" \
+            -c "$CONNECTIONS" \
+            --no-tui \
+            -m POST \
+            -H "Content-Type: application/json" \
+            -D "$payload_file" \
+            --output-format json \
+            -o "$output_file" \
+            "$url" 2>"$log_file"
+    else
+        oha -n "$REQUESTS" \
+            -c "$CONNECTIONS" \
+            --no-tui \
+            -m POST \
+            -H "Content-Type: application/json" \
+            -D "$payload_file" \
+            --output-format json \
+            -o "$output_file" \
+            "$url" 2>/dev/null
+    fi
 }
 
 # Extract metrics from oha JSON output
@@ -187,6 +271,7 @@ extract_metrics() {
 # Define all test scenarios
 declare -a SCENARIOS=(
     # Format: "name|type|mode|config|endpoint|payload"
+    # Edge proxy scenarios
     "Datadog Small|datadog|passthrough|bench/configs/datadog-passthrough.json|/api/v2/logs|bench/payloads/datadog-small.json"
     "Datadog Small|datadog|with-rules|bench/configs/datadog-with-rules.json|/api/v2/logs|bench/payloads/datadog-small.json"
     "Datadog Large|datadog|passthrough|bench/configs/datadog-passthrough.json|/api/v2/logs|bench/payloads/datadog-large.json"
@@ -199,12 +284,26 @@ declare -a SCENARIOS=(
     "OTLP Large|otlp|with-rules|bench/configs/otlp-with-rules.json|/v1/logs|bench/payloads/otlp-large.json"
     "OTLP 1MB|otlp|passthrough|bench/configs/otlp-passthrough.json|/v1/logs|bench/payloads/otlp-1mb.json"
     "OTLP 1MB|otlp|with-rules|bench/configs/otlp-with-rules.json|/v1/logs|bench/payloads/otlp-1mb.json"
+    # OpenTelemetry Collector scenarios
+    "Datadog Small|otelcol-datadog|passthrough|bench/configs/otel-collector.yaml|/api/v2/logs|bench/payloads/datadog-small.json"
+    "Datadog Small|otelcol-datadog|with-rules|bench/configs/otel-collector-rules.yaml|/api/v2/logs|bench/payloads/datadog-small.json"
+    "Datadog Large|otelcol-datadog|passthrough|bench/configs/otel-collector.yaml|/api/v2/logs|bench/payloads/datadog-large.json"
+    "Datadog Large|otelcol-datadog|with-rules|bench/configs/otel-collector-rules.yaml|/api/v2/logs|bench/payloads/datadog-large.json"
+    "Datadog 1MB|otelcol-datadog|passthrough|bench/configs/otel-collector.yaml|/api/v2/logs|bench/payloads/datadog-1mb.json"
+    "Datadog 1MB|otelcol-datadog|with-rules|bench/configs/otel-collector-rules.yaml|/api/v2/logs|bench/payloads/datadog-1mb.json"
+    "OTLP Small|otelcol-otlp|passthrough|bench/configs/otel-collector.yaml|/v1/logs|bench/payloads/otlp-small.json"
+    "OTLP Small|otelcol-otlp|with-rules|bench/configs/otel-collector-rules.yaml|/v1/logs|bench/payloads/otlp-small.json"
+    "OTLP Large|otelcol-otlp|passthrough|bench/configs/otel-collector.yaml|/v1/logs|bench/payloads/otlp-large.json"
+    "OTLP Large|otelcol-otlp|with-rules|bench/configs/otel-collector-rules.yaml|/v1/logs|bench/payloads/otlp-large.json"
+    "OTLP 1MB|otelcol-otlp|passthrough|bench/configs/otel-collector.yaml|/v1/logs|bench/payloads/otlp-1mb.json"
+    "OTLP 1MB|otelcol-otlp|with-rules|bench/configs/otel-collector-rules.yaml|/v1/logs|bench/payloads/otlp-1mb.json"
 )
 
 run_all_scenarios() {
     local results_file="$OUTPUT_DIR/results.csv"
     local current_datadog_config=""
     local current_otlp_config=""
+    local current_otelcol_config=""
 
     # CSV header
     echo "Scenario,Type,Mode,Payload Size,Requests/sec,p50 (ms),p99 (ms),Success %" > "$results_file"
@@ -215,33 +314,62 @@ run_all_scenarios() {
         local payload_size
         payload_size=$(wc -c < "$payload" | tr -d ' ')
 
-        # Start/restart proxy for each scenario
-        # In debug mode, always restart to get separate logs per scenario
-        if [[ "$type" == "datadog" ]]; then
+        local port
+
+        # Handle otelcol scenarios
+        if [[ "$type" == "otelcol-datadog" || "$type" == "otelcol-otlp" ]]; then
+            # Restart otelcol if config changed or in debug mode
+            if [[ "$config" != "$current_otelcol_config" ]] || [[ "$DEBUG_MODE" == "true" ]]; then
+                start_otelcol "$config" "$name-$mode"
+                current_otelcol_config="$config"
+            fi
+            if [[ "$type" == "otelcol-datadog" ]]; then
+                port=$DATADOG_PORT
+            else
+                port=$OTLP_PORT
+            fi
+        # Handle edge proxy scenarios
+        elif [[ "$type" == "datadog" ]]; then
+            # Stop otelcol if it was running (switching back to edge)
+            if [[ -n "$current_otelcol_config" ]]; then
+                stop_otelcol
+                current_otelcol_config=""
+            fi
             if [[ "$DEBUG_MODE" == "true" || "$config" != "$current_datadog_config" ]]; then
                 start_datadog_proxy "$config" "$mode" "$name-$mode"
                 current_datadog_config="$config"
             fi
-            local port=$DATADOG_PORT
-        else
+            port=$DATADOG_PORT
+        elif [[ "$type" == "otlp" ]]; then
+            # Stop otelcol if it was running (switching back to edge)
+            if [[ -n "$current_otelcol_config" ]]; then
+                stop_otelcol
+                current_otelcol_config=""
+            fi
             if [[ "$DEBUG_MODE" == "true" || "$config" != "$current_otlp_config" ]]; then
                 start_otlp_proxy "$config" "$mode" "$name-$mode"
                 current_otlp_config="$config"
             fi
-            local port=$OTLP_PORT
+            port=$OTLP_PORT
         fi
 
         local url="http://127.0.0.1:$port$endpoint"
-        local output_json="$OUTPUT_DIR/$(echo "$name-$mode" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').json"
+        local output_json="$OUTPUT_DIR/$(echo "$type-$name-$mode" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').json"
+        local oha_log=""
 
-        log_info "Running: $name ($mode)..."
-        run_benchmark "$url" "$payload" "$output_json"
+        # In debug mode, save oha logs to debug directory
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            oha_log="$DEBUG_DIR/oha-$(echo "$type-$name-$mode" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').log"
+        fi
+
+        log_info "Running: $name ($type, $mode)..."
+        run_benchmark "$url" "$payload" "$output_json" "$oha_log"
 
         local metrics
         metrics=$(extract_metrics "$output_json")
 
         IFS=',' read -r rps p50 p99 success <<< "$metrics"
-        log_success "$name ($mode): ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms"
+        log_success "$name ($type, $mode): ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms"
 
         echo "$name,$type,$mode,$payload_size,$rps,$p50,$p99,$success" >> "$results_file"
     done
