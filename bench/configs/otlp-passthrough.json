@@ -5,6 +5,6 @@
   "workspace_id": "benchmark",
   "log_level": "err",
   "max_body_size": 4194304,
-  "max_upstream_retries": 3,
+  "max_upstream_retries": 10,
   "policy_providers": []
 }

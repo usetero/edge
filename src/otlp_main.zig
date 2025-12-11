@@ -352,7 +352,7 @@ pub fn main() !void {
 
     // Create proxy server with modules
     var proxy = try ProxyServer.init(
-        allocator,
+        std.heap.page_allocator,
         bus,
         config.listen_address,
         config.listen_port,

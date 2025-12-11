@@ -52,10 +52,15 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 cleanup() {
     log_info "Cleaning up..."
+    # Stop resource monitor if running
+    [[ -n "$MONITOR_PID" ]] && kill "$MONITOR_PID" 2>/dev/null || true
+    # Stop servers
     [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null || true
     [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null || true
     [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null || true
     [[ -n "$OTELCOL_PID" ]] && kill "$OTELCOL_PID" 2>/dev/null || true
+    # Clean up any leftover temp files
+    rm -f /tmp/bench_mem_* 2>/dev/null || true
     wait 2>/dev/null || true
 }
 
@@ -129,6 +134,147 @@ wait_for_server() {
     log_success "$name ready on port $port"
 }
 
+# =============================================================================
+# Resource Monitoring
+# =============================================================================
+# We track ACTUAL CPU TIME CONSUMED (user + sys) and calculate percentage.
+# This is more reliable than sampling instantaneous CPU which varies wildly.
+#
+# Approach:
+# 1. Record CPU time at start of benchmark
+# 2. Sample memory periodically during benchmark (for peak tracking)
+# 3. Record CPU time at end of benchmark
+# 4. CPU% = (cpu_time_end - cpu_time_start) / wall_time * 100
+#
+# This gives accurate CPU utilization for the benchmark period.
+# =============================================================================
+
+# Per-scenario tracking
+MONITOR_PID=""
+RESOURCE_FILE=""
+CPU_START_TIME=""
+BENCH_START_WALL=""
+MONITORED_PID=""
+
+# Get cumulative CPU time (user + sys) in seconds for a process
+get_cpu_seconds() {
+    local pid=$1
+    # ps -o time= gives cumulative CPU time in format "MM:SS.ss" or "HH:MM:SS.ss"
+    local time_str
+    time_str=$(ps -o time= -p "$pid" 2>/dev/null | tr -d ' ')
+
+    if [[ -z "$time_str" ]]; then
+        echo "0"
+        return
+    fi
+
+    # Convert to seconds using awk
+    # Format is typically: MM:SS.ss or H:MM:SS.ss or HH:MM:SS.ss
+    echo "$time_str" | awk -F: '{
+        n = NF
+        # Last field may have decimal (seconds.fraction)
+        secs = $n + 0  # This handles "SS" or "SS.ss"
+
+        if (n == 2) {
+            # MM:SS.ss
+            mins = $1 + 0
+            printf "%.2f", mins * 60 + secs
+        } else if (n == 3) {
+            # HH:MM:SS.ss
+            hrs = $1 + 0
+            mins = $2 + 0
+            printf "%.2f", hrs * 3600 + mins * 60 + secs
+        } else {
+            printf "%.2f", secs
+        }
+    }'
+}
+
+# Start monitoring - record start CPU time and begin memory sampling
+start_resource_monitor() {
+    local target_pid=$1
+    MONITORED_PID="$target_pid"
+    RESOURCE_FILE=$(mktemp /tmp/bench_mem_XXXXXX)
+
+    # Record starting CPU time and wall clock
+    CPU_START_TIME=$(get_cpu_seconds "$target_pid")
+    BENCH_START_WALL=$(date +%s.%N)
+
+    # Sample memory in background (RSS in KB)
+    (
+        trap '' TERM INT
+        local peak_rss=0
+        while kill -0 "$target_pid" 2>/dev/null; do
+            local rss_kb
+            rss_kb=$(ps -o rss= -p "$target_pid" 2>/dev/null | tr -d ' ')
+            if [[ -n "$rss_kb" ]] && [[ "$rss_kb" =~ ^[0-9]+$ ]]; then
+                echo "$rss_kb" >> "$RESOURCE_FILE"
+            fi
+            sleep 0.1
+        done
+    ) 2>/dev/null &
+    MONITOR_PID=$!
+    disown "$MONITOR_PID" 2>/dev/null || true
+}
+
+# Stop monitoring and return cpu_percent,peak_mem_mb
+stop_resource_monitor() {
+    local target_pid="$MONITORED_PID"
+
+    # Record ending CPU time and wall clock BEFORE killing monitor
+    local cpu_end_time
+    local wall_end
+    cpu_end_time=$(get_cpu_seconds "$target_pid")
+    wall_end=$(date +%s.%N)
+
+    # Stop the memory sampling process
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+        MONITOR_PID=""
+    fi
+
+    # Calculate CPU percentage
+    local cpu_used=0
+    local wall_time=1
+    local cpu_percent=0
+
+    if [[ -n "$CPU_START_TIME" ]] && [[ -n "$cpu_end_time" ]]; then
+        cpu_used=$(echo "$cpu_end_time - $CPU_START_TIME" | bc 2>/dev/null || echo "0")
+    fi
+
+    if [[ -n "$BENCH_START_WALL" ]] && [[ -n "$wall_end" ]]; then
+        wall_time=$(echo "$wall_end - $BENCH_START_WALL" | bc 2>/dev/null || echo "1")
+    fi
+
+    if (( $(echo "$wall_time > 0" | bc -l 2>/dev/null || echo "0") )); then
+        cpu_percent=$(echo "scale=1; $cpu_used / $wall_time * 100" | bc 2>/dev/null || echo "0")
+    fi
+
+    # Calculate peak memory from samples
+    local peak_mem_mb=0
+    if [[ -f "$RESOURCE_FILE" ]] && [[ -s "$RESOURCE_FILE" ]]; then
+        local peak_kb
+        peak_kb=$(sort -n "$RESOURCE_FILE" | tail -1)
+        if [[ -n "$peak_kb" ]] && [[ "$peak_kb" =~ ^[0-9]+$ ]]; then
+            peak_mem_mb=$(echo "scale=1; $peak_kb / 1024" | bc 2>/dev/null || echo "0")
+        fi
+    fi
+
+    # Cleanup
+    rm -f "$RESOURCE_FILE" 2>/dev/null
+    RESOURCE_FILE=""
+    CPU_START_TIME=""
+    BENCH_START_WALL=""
+    MONITORED_PID=""
+
+    echo "${cpu_percent},${peak_mem_mb}"
+}
+
+# =============================================================================
+# Server Management
+# =============================================================================
+
 start_echo_server() {
     log_info "Starting echo server..."
     if [[ "$DEBUG_MODE" == "true" ]]; then
@@ -146,10 +292,11 @@ start_datadog_proxy() {
     local scenario_name=$3
 
     # Kill existing if running
-    [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null || true
-    sleep 0.2
+    [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null && sleep 0.3 || true
+    DATADOG_PID=""
 
     log_info "Starting Datadog proxy ($mode)..."
+
     if [[ "$DEBUG_MODE" == "true" ]]; then
         local log_file="$DEBUG_DIR/datadog-$(echo "$scenario_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').log"
         ./zig-out/bin/edge-datadog "$config" > "$log_file" 2>&1 &
@@ -166,10 +313,11 @@ start_otlp_proxy() {
     local scenario_name=$3
 
     # Kill existing if running
-    [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null || true
-    sleep 0.2
+    [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null && sleep 0.3 || true
+    OTLP_PID=""
 
     log_info "Starting OTLP proxy ($mode)..."
+
     if [[ "$DEBUG_MODE" == "true" ]]; then
         local log_file="$DEBUG_DIR/otlp-$(echo "$scenario_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').log"
         ./zig-out/bin/edge-otlp "$config" > "$log_file" 2>&1 &
@@ -182,11 +330,8 @@ start_otlp_proxy() {
 
 stop_otelcol() {
     if [[ -n "$OTELCOL_PID" ]]; then
-        # Give otelcol time to flush any pending data
         sleep 0.3
-        # Send SIGTERM for graceful shutdown
         kill -TERM "$OTELCOL_PID" 2>/dev/null || true
-        # Wait briefly, then force kill if still running
         sleep 0.5
         kill -9 "$OTELCOL_PID" 2>/dev/null || true
         wait "$OTELCOL_PID" 2>/dev/null || true
@@ -198,7 +343,6 @@ start_otelcol() {
     local config_file=$1
     local scenario_name=$2
 
-    # Kill existing if running
     stop_otelcol
 
     # Also stop edge proxies since otelcol uses same ports
@@ -206,9 +350,10 @@ start_otelcol() {
     [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null || true
     DATADOG_PID=""
     OTLP_PID=""
-    sleep 0.2
+    sleep 0.3
 
     log_info "Starting otel-collector ($config_file)..."
+
     if [[ "$DEBUG_MODE" == "true" ]]; then
         local log_file="$DEBUG_DIR/otelcol-$(echo "$scenario_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').log"
         "$OTELCOL_BIN" --config "$config_file" > "$log_file" 2>&1 &
@@ -216,83 +361,25 @@ start_otelcol() {
         "$OTELCOL_BIN" --config "$config_file" >/dev/null 2>&1 &
     fi
     OTELCOL_PID=$!
-    sleep 1  # otelcol takes a moment to start
+    sleep 1
     wait_for_server "$DATADOG_PORT" "otel-collector (Datadog)"
     wait_for_server "$OTLP_PORT" "otel-collector (OTLP)"
 }
 
-# Resource monitoring variables
-MONITOR_PID=""
-RESOURCE_FILE=""
+# =============================================================================
+# Benchmark Execution
+# =============================================================================
 
-# Start monitoring CPU/memory for a process
-start_resource_monitor() {
-    local pid=$1
-    RESOURCE_FILE=$(mktemp)
-
-    # Sample CPU and memory every 100ms in background
-    (
-        trap '' TERM  # Ignore SIGTERM in subprocess
-        while kill -0 "$pid" 2>/dev/null; do
-            # Get CPU% and RSS memory in KB
-            ps -o %cpu=,rss= -p "$pid" 2>/dev/null >> "$RESOURCE_FILE"
-            sleep 0.1
-        done
-    ) 2>/dev/null &
-    MONITOR_PID=$!
-    disown "$MONITOR_PID" 2>/dev/null || true
-}
-
-# Stop monitoring and return avg_cpu,max_cpu,avg_mem_mb,max_mem_mb
-stop_resource_monitor() {
-    if [[ -n "$MONITOR_PID" ]]; then
-        kill "$MONITOR_PID" 2>/dev/null || true
-        wait "$MONITOR_PID" 2>/dev/null || true
-        MONITOR_PID=""
-    fi
-
-    if [[ -f "$RESOURCE_FILE" ]] && [[ -s "$RESOURCE_FILE" ]]; then
-        # Calculate avg/max CPU and memory from samples
-        awk '
-        BEGIN { cpu_sum=0; cpu_max=0; mem_sum=0; mem_max=0; count=0 }
-        {
-            cpu = $1 + 0
-            mem = $2 + 0
-            cpu_sum += cpu
-            mem_sum += mem
-            if (cpu > cpu_max) cpu_max = cpu
-            if (mem > mem_max) mem_max = mem
-            count++
-        }
-        END {
-            if (count > 0) {
-                avg_cpu = cpu_sum / count
-                avg_mem = mem_sum / count / 1024  # Convert to MB
-                max_mem = mem_max / 1024  # Convert to MB
-                printf "%.1f,%.1f,%.1f,%.1f", avg_cpu, cpu_max, avg_mem, max_mem
-            } else {
-                print "0,0,0,0"
-            }
-        }' "$RESOURCE_FILE"
-        rm -f "$RESOURCE_FILE"
-    else
-        echo "0,0,0,0"
-        rm -f "$RESOURCE_FILE" 2>/dev/null
-    fi
-    RESOURCE_FILE=""
-}
-
-# Run a single benchmark and return JSON result
 run_benchmark() {
     local url=$1
     local payload_file=$2
     local output_file=$3
     local log_file=$4
 
+    # Show TUI progress (goes to terminal), JSON output goes to file
     if [[ -n "$log_file" ]]; then
         oha -n "$REQUESTS" \
             -c "$CONNECTIONS" \
-            --no-tui \
             -m POST \
             -H "Content-Type: application/json" \
             -D "$payload_file" \
@@ -302,17 +389,19 @@ run_benchmark() {
     else
         oha -n "$REQUESTS" \
             -c "$CONNECTIONS" \
-            --no-tui \
             -m POST \
             -H "Content-Type: application/json" \
             -D "$payload_file" \
             --output-format json \
             -o "$output_file" \
-            "$url" 2>/dev/null
+            "$url"
     fi
 }
 
 # Extract metrics from oha JSON output
+# FIXED: Calculate success rate from HTTP status codes, not oha's successRate
+# oha's successRate only measures "got a response" vs "connection failed"
+# We need to check statusCodeDistribution for actual HTTP success (2xx)
 extract_metrics() {
     local json_file=$1
 
@@ -321,12 +410,39 @@ extract_metrics() {
         return
     fi
 
-    jq -r '[
-        (.summary.requestsPerSec | floor),
-        (.latencyPercentiles.p50 * 1000 | . * 100 | floor | . / 100),
-        (.latencyPercentiles.p99 * 1000 | . * 100 | floor | . / 100),
-        (.summary.successRate * 100 | floor)
-    ] | @csv' "$json_file" | tr -d '"'
+    # Calculate success rate from status code distribution
+    # Success = 2xx responses / total responses * 100
+    jq -r '
+        # Get status code distribution
+        .statusCodeDistribution as $dist |
+
+        # Calculate total requests and successful (2xx) requests
+        ($dist | to_entries | map(.value) | add // 0) as $total |
+        ($dist | to_entries | map(select(.key | test("^2"))) | map(.value) | add // 0) as $success |
+
+        # Calculate success percentage
+        (if $total > 0 then ($success / $total * 100 | floor) else 0 end) as $success_pct |
+
+        # Get other metrics
+        [
+            (.summary.requestsPerSec | floor),
+            (.latencyPercentiles.p50 * 1000 | . * 100 | floor | . / 100),
+            (.latencyPercentiles.p99 * 1000 | . * 100 | floor | . / 100),
+            $success_pct
+        ] | @csv
+    ' "$json_file" | tr -d '"'
+}
+
+# Also extract detailed status code breakdown for debugging
+extract_status_codes() {
+    local json_file=$1
+
+    if [[ ! -f "$json_file" ]]; then
+        echo "N/A"
+        return
+    fi
+
+    jq -r '.statusCodeDistribution | to_entries | map("\(.key):\(.value)") | join(" ")' "$json_file"
 }
 
 # Define all test scenarios
@@ -367,7 +483,7 @@ run_all_scenarios() {
     local current_otelcol_config=""
 
     # CSV header
-    echo "Scenario,Type,Mode,Payload Size,Requests/sec,p50 (ms),p99 (ms),Success %,Avg CPU %,Max CPU %,Avg Mem MB,Max Mem MB" > "$results_file"
+    echo "Scenario,Type,Mode,Payload Size,Requests/sec,p50 (ms),p99 (ms),Success %,CPU %,Peak Mem MB,Status Codes" > "$results_file"
 
     for scenario in "${SCENARIOS[@]}"; do
         IFS='|' read -r name type mode config endpoint payload <<< "$scenario"
@@ -376,45 +492,43 @@ run_all_scenarios() {
         payload_size=$(wc -c < "$payload" | tr -d ' ')
 
         local port
-        local monitor_pid=""
+        local server_pid=""
 
-        # Handle otelcol scenarios
+        # Start appropriate server for this scenario (reuse if config unchanged)
         if [[ "$type" == "otelcol-datadog" || "$type" == "otelcol-otlp" ]]; then
-            # Restart otelcol if config changed or in debug mode
-            if [[ "$config" != "$current_otelcol_config" ]] || [[ "$DEBUG_MODE" == "true" ]]; then
+            if [[ "$config" != "$current_otelcol_config" ]]; then
                 start_otelcol "$config" "$name-$mode"
                 current_otelcol_config="$config"
             fi
-            monitor_pid="$OTELCOL_PID"
+            server_pid="$OTELCOL_PID"
             if [[ "$type" == "otelcol-datadog" ]]; then
                 port=$DATADOG_PORT
             else
                 port=$OTLP_PORT
             fi
-        # Handle edge proxy scenarios
         elif [[ "$type" == "datadog" ]]; then
-            # Stop otelcol if it was running (switching back to edge)
+            # Stop otelcol if running
             if [[ -n "$current_otelcol_config" ]]; then
                 stop_otelcol
                 current_otelcol_config=""
             fi
-            if [[ "$DEBUG_MODE" == "true" || "$config" != "$current_datadog_config" ]]; then
+            if [[ "$config" != "$current_datadog_config" ]]; then
                 start_datadog_proxy "$config" "$mode" "$name-$mode"
                 current_datadog_config="$config"
             fi
-            monitor_pid="$DATADOG_PID"
+            server_pid="$DATADOG_PID"
             port=$DATADOG_PORT
         elif [[ "$type" == "otlp" ]]; then
-            # Stop otelcol if it was running (switching back to edge)
+            # Stop otelcol if running
             if [[ -n "$current_otelcol_config" ]]; then
                 stop_otelcol
                 current_otelcol_config=""
             fi
-            if [[ "$DEBUG_MODE" == "true" || "$config" != "$current_otlp_config" ]]; then
+            if [[ "$config" != "$current_otlp_config" ]]; then
                 start_otlp_proxy "$config" "$mode" "$name-$mode"
                 current_otlp_config="$config"
             fi
-            monitor_pid="$OTLP_PID"
+            server_pid="$OTLP_PID"
             port=$OTLP_PORT
         fi
 
@@ -422,29 +536,42 @@ run_all_scenarios() {
         local output_json="$OUTPUT_DIR/$(echo "$type-$name-$mode" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').json"
         local oha_log=""
 
-        # In debug mode, save oha logs to debug directory
         if [[ "$DEBUG_MODE" == "true" ]]; then
             oha_log="$DEBUG_DIR/oha-$(echo "$type-$name-$mode" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').log"
         fi
 
         # Start resource monitoring
-        start_resource_monitor "$monitor_pid"
+        start_resource_monitor "$server_pid"
 
         log_info "Running: $name ($type, $mode)..."
         run_benchmark "$url" "$payload" "$output_json" "$oha_log"
 
-        # Stop monitoring and get resource metrics
+        # Stop monitoring and get metrics
         local resource_metrics
         resource_metrics=$(stop_resource_monitor)
 
         local metrics
         metrics=$(extract_metrics "$output_json")
 
-        IFS=',' read -r rps p50 p99 success <<< "$metrics"
-        IFS=',' read -r avg_cpu max_cpu avg_mem max_mem <<< "$resource_metrics"
-        log_success "$name ($type, $mode): ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, CPU: ${avg_cpu}%/${max_cpu}%, Mem: ${avg_mem}MB/${max_mem}MB"
+        local status_codes
+        status_codes=$(extract_status_codes "$output_json")
 
-        echo "$name,$type,$mode,$payload_size,$rps,$p50,$p99,$success,$avg_cpu,$max_cpu,$avg_mem,$max_mem" >> "$results_file"
+        IFS=',' read -r rps p50 p99 success <<< "$metrics"
+        IFS=',' read -r cpu_percent peak_mem <<< "$resource_metrics"
+
+        # Color code success rate
+        local success_color="${GREEN}"
+        if [[ "$success" != "100" ]] && [[ "$success" != "N/A" ]]; then
+            success_color="${RED}"
+        fi
+
+        log_success "$name ($type, $mode): ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, CPU: ${cpu_percent}%, Mem: ${peak_mem}MB"
+
+        if [[ "$success" != "100" ]] && [[ "$success" != "N/A" ]]; then
+            log_warn "  Status codes: $status_codes"
+        fi
+
+        echo "$name,$type,$mode,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,\"$status_codes\"" >> "$results_file"
     done
 }
 
@@ -465,14 +592,23 @@ generate_report() {
 
 ## Results
 
-| Scenario | Type | Mode | Payload | Req/s | p50 (ms) | p99 (ms) | Success | Avg CPU % | Max CPU % | Avg Mem MB | Max Mem MB |
-|----------|------|------|---------|-------|----------|----------|---------|-----------|-----------|------------|------------|
+| Scenario | Type | Mode | Payload | Req/s | p50 (ms) | p99 (ms) | Success | CPU % | Peak Mem MB |
+|----------|------|------|---------|-------|----------|----------|---------|-------|-------------|
 EOF
 
     # Skip header line and format each row
-    tail -n +2 "$results_file" | while IFS=',' read -r name type mode size rps p50 p99 success avg_cpu max_cpu avg_mem max_mem; do
-        printf "| %s | %s | %s | %s bytes | %s | %s | %s | %s%% | %s | %s | %s | %s |\n" \
-            "$name" "$type" "$mode" "$size" "$rps" "$p50" "$p99" "$success" "$avg_cpu" "$max_cpu" "$avg_mem" "$max_mem" >> "$report_file"
+    tail -n +2 "$results_file" | while IFS=',' read -r name type mode size rps p50 p99 success cpu_pct peak_mem status_codes; do
+        # Remove quotes from status_codes if present
+        status_codes=$(echo "$status_codes" | tr -d '"')
+
+        # Add warning emoji if success < 100%
+        local success_indicator=""
+        if [[ "$success" != "100" ]] && [[ "$success" != "N/A" ]]; then
+            success_indicator=" ⚠️"
+        fi
+
+        printf "| %s | %s | %s | %s bytes | %s | %s | %s | %s%%%s | %s | %s |\n" \
+            "$name" "$type" "$mode" "$size" "$rps" "$p50" "$p99" "$success" "$success_indicator" "$cpu_pct" "$peak_mem" >> "$report_file"
     done
 
     cat >> "$report_file" << 'EOF'
@@ -483,7 +619,7 @@ EOF
 EOF
 
     # Calculate overhead for each scenario pair
-    tail -n +2 "$results_file" | while IFS=',' read -r name type mode size rps p50 p99 success; do
+    tail -n +2 "$results_file" | while IFS=',' read -r name type mode size rps p50 p99 success cpu_pct peak_mem status_codes; do
         if [[ "$mode" == "passthrough" ]]; then
             local passthrough_rps=$rps
             local passthrough_p50=$p50
@@ -491,7 +627,7 @@ EOF
             local rules_line
             rules_line=$(grep "^$name,$type,with-rules," "$results_file" || true)
             if [[ -n "$rules_line" ]]; then
-                IFS=',' read -r _ _ _ _ rules_rps rules_p50 _ _ <<< "$rules_line"
+                IFS=',' read -r _ _ _ _ rules_rps rules_p50 _ _ _ _ _ <<< "$rules_line"
                 if [[ "$passthrough_rps" != "N/A" && "$rules_rps" != "N/A" && "$passthrough_rps" -gt 0 ]]; then
                     local overhead
                     overhead=$(echo "scale=1; (1 - $rules_rps / $passthrough_rps) * 100" | bc 2>/dev/null || echo "N/A")
@@ -502,6 +638,31 @@ EOF
             fi
         fi
     done
+
+    # Add error summary if there were any non-100% success rates
+    local has_errors=false
+    while IFS=',' read -r name type mode size rps p50 p99 success cpu_pct peak_mem status_codes; do
+        if [[ "$success" != "100" ]] && [[ "$success" != "N/A" ]] && [[ "$success" != "Success %" ]]; then
+            has_errors=true
+            break
+        fi
+    done < "$results_file"
+
+    if [[ "$has_errors" == "true" ]]; then
+        cat >> "$report_file" << 'EOF'
+
+### Error Summary
+
+⚠️ Some scenarios had non-2xx responses:
+
+EOF
+        tail -n +2 "$results_file" | while IFS=',' read -r name type mode size rps p50 p99 success cpu_pct peak_mem status_codes; do
+            if [[ "$success" != "100" ]] && [[ "$success" != "N/A" ]]; then
+                status_codes=$(echo "$status_codes" | tr -d '"')
+                echo "- **$name ($type, $mode):** ${success}% success - Status codes: $status_codes" >> "$report_file"
+            fi
+        done
+    fi
 
     log_success "Report saved to $report_file"
     echo ""
