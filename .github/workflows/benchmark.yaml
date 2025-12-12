@@ -1,0 +1,107 @@
+name: Benchmark
+
+on:
+  schedule:
+    # Run daily at 2am UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      requests:
+        description: "Number of requests per test"
+        required: false
+        default: "10000"
+      connections:
+        description: "Number of concurrent connections"
+        required: false
+        default: "50"
+
+permissions:
+  contents: write
+
+env:
+  HERMIT_ENV: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Hermit
+        uses: cashapp/activate-hermit@v1
+
+      - name: Install oha
+        run: |
+          # oha is not available in Hermit, install from GitHub releases
+          curl -sSfL https://github.com/hatoo/oha/releases/download/v1.4.7/oha-linux-amd64 -o "$HOME/.local/bin/oha"
+          mkdir -p "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/oha"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install otelcol-contrib
+        run: |
+          # otelcol-contrib is not available in Hermit, install from GitHub releases
+          mkdir -p bench/bin
+          curl -sSfL https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.141.0/otelcol-contrib_0.141.0_linux_amd64.tar.gz -o otelcol.tar.gz
+          tar -xzf otelcol.tar.gz
+          mv otelcol-contrib bench/bin/
+          rm otelcol.tar.gz
+
+      - name: Verify dependencies
+        run: |
+          oha --version
+          bench/bin/otelcol-contrib --version
+          vector --version
+          jq --version
+          zig version
+
+      - name: Run benchmarks
+        run: |
+          task benchmark:history \
+            REQUESTS="${{ github.event.inputs.requests || '10000' }}" \
+            CONNECTIONS="${{ github.event.inputs.connections || '50' }}"
+
+      - name: Commit results
+        run: |
+          DATE=$(date -u +"%Y-%m-%d")
+          OUTPUT_DIR="bench/history/$DATE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add all results
+          git add "$OUTPUT_DIR"
+
+          # Only commit if there are changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore(bench): add benchmark results for $DATE"
+            git push
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: bench/history/
+          retention-days: 90
+
+      - name: Generate summary
+        run: |
+          DATE=$(date -u +"%Y-%m-%d")
+          OUTPUT_DIR="bench/history/$DATE"
+
+          echo "## Benchmark Results - $DATE" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f "$OUTPUT_DIR/report.md" ]; then
+            # Skip the title line since we added our own
+            tail -n +3 "$OUTPUT_DIR/report.md" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No report generated" >> $GITHUB_STEP_SUMMARY
+          fi
