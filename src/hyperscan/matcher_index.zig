@@ -142,10 +142,8 @@ pub const PolicyInfo = struct {
 pub const MatcherDatabase = struct {
     /// The compiled Hyperscan database
     db: hyperscan.Database,
-    /// Scratch space for scanning - protected by mutex
-    scratch: hyperscan.Scratch,
-    /// Mutex for thread-safe scratch access
-    mutex: std.Thread.Mutex,
+    /// Pool of scratch spaces for concurrent scanning
+    scratch_pool: ScratchPool,
     /// Maps Hyperscan pattern ID -> PatternMeta
     patterns: []const PatternMeta,
     /// Allocator used for patterns array
@@ -155,17 +153,99 @@ pub const MatcherDatabase = struct {
 
     const Self = @This();
 
-    /// Scan a value and return all matching pattern IDs.
-    /// Caller must hold no locks - this function acquires the mutex internally.
-    pub fn scan(self: *Self, value: []const u8, result_buf: []u32) ScanResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    /// Number of scratch spaces in the pool (allows this many concurrent scans)
+    const SCRATCH_POOL_SIZE = 8;
 
+    /// Pool of scratch spaces with lightweight locking
+    const ScratchPool = struct {
+        scratches: [SCRATCH_POOL_SIZE]hyperscan.Scratch,
+        /// Bitset tracking which scratches are available (1 = available)
+        available: std.atomic.Value(u8),
+        /// Fallback mutex for when pool is exhausted
+        fallback_scratch: hyperscan.Scratch,
+        fallback_mutex: std.Thread.Mutex,
+
+        fn init(db: *hyperscan.Database) !ScratchPool {
+            var pool: ScratchPool = .{
+                .scratches = undefined,
+                .available = std.atomic.Value(u8).init(0xFF), // All 8 bits set = all available
+                .fallback_scratch = undefined,
+                .fallback_mutex = .{},
+            };
+
+            // Initialize pool scratches
+            for (&pool.scratches, 0..) |*scratch, i| {
+                scratch.* = hyperscan.Scratch.init(db) catch |err| {
+                    // Clean up already allocated scratches
+                    for (pool.scratches[0..i]) |*s| s.deinit();
+                    return err;
+                };
+            }
+
+            // Initialize fallback scratch
+            pool.fallback_scratch = try hyperscan.Scratch.init(db);
+
+            return pool;
+        }
+
+        fn deinit(self: *ScratchPool) void {
+            for (&self.scratches) |*scratch| {
+                scratch.deinit();
+            }
+            self.fallback_scratch.deinit();
+        }
+
+        /// Acquire a scratch space. Returns index and pointer, or null to use fallback.
+        fn acquire(self: *ScratchPool) ?struct { index: u3, scratch: *hyperscan.Scratch } {
+            while (true) {
+                const current = self.available.load(.acquire);
+                if (current == 0) return null; // Pool exhausted, use fallback
+
+                // Find first available slot
+                const index: u3 = @intCast(@ctz(current));
+                const mask = @as(u8, 1) << index;
+                const new = current & ~mask;
+
+                // Try to claim it
+                if (self.available.cmpxchgWeak(current, new, .acq_rel, .acquire)) |_| {
+                    // CAS failed, retry
+                    continue;
+                }
+
+                return .{ .index = index, .scratch = &self.scratches[index] };
+            }
+        }
+
+        /// Release a scratch space back to the pool
+        fn release(self: *ScratchPool, index: u3) void {
+            const mask = @as(u8, 1) << index;
+            _ = self.available.fetchOr(mask, .release);
+        }
+    };
+
+    /// Scan a value and return all matching pattern IDs.
+    /// Thread-safe: uses a pool of scratch spaces for concurrent access.
+    pub fn scan(self: *Self, value: []const u8, result_buf: []u32) ScanResult {
         var result = ScanResult{ .count = 0, .buf = result_buf };
 
-        _ = self.db.scanWithCallback(&self.scratch, value, &result, scanCallback) catch |err| {
+        // Try to get a scratch from the pool
+        if (self.scratch_pool.acquire()) |acquired| {
+            defer self.scratch_pool.release(acquired.index);
+            self.doScan(acquired.scratch, value, &result);
+        } else {
+            // Pool exhausted, fall back to mutex-protected scratch
+            self.scratch_pool.fallback_mutex.lock();
+            defer self.scratch_pool.fallback_mutex.unlock();
+            self.doScan(&self.scratch_pool.fallback_scratch, value, &result);
+        }
+
+        return result;
+    }
+
+    fn doScan(self: *Self, scratch: *hyperscan.Scratch, value: []const u8, result: *ScanResult) void {
+        _ = self.db.scanWithCallback(scratch, value, result, scanCallback) catch |err| {
             self.bus.warn(ScanError{ .err = @errorName(err) });
-            return result;
+            return;
         };
 
         if (result.count > 0) {
@@ -181,8 +261,6 @@ pub const MatcherDatabase = struct {
                 }
             }
         }
-
-        return result;
     }
 
     fn scanCallback(ctx: *ScanResult, match: hyperscan.Match) bool {
@@ -195,7 +273,7 @@ pub const MatcherDatabase = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.scratch.deinit();
+        self.scratch_pool.deinit();
         self.db.deinit();
         // Free pattern metadata (including policy_id strings we duped)
         for (self.patterns) |meta| {
@@ -536,16 +614,15 @@ fn compileDatabase(
     var db = try hyperscan.Database.compileMulti(allocator, hs_patterns, .{});
     errdefer db.deinit();
 
-    // Allocate scratch
-    var scratch = try hyperscan.Scratch.init(&db);
-    errdefer scratch.deinit();
+    // Initialize scratch pool
+    var scratch_pool = try MatcherDatabase.ScratchPool.init(&db);
+    errdefer scratch_pool.deinit();
 
     // Create the database struct
     const matcher_db = try allocator.create(MatcherDatabase);
     matcher_db.* = .{
         .db = db,
-        .scratch = scratch,
-        .mutex = .{},
+        .scratch_pool = scratch_pool,
         .patterns = pattern_metas,
         .allocator = allocator,
         .bus = bus,
