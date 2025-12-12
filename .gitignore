@@ -25,3 +25,4 @@ bench/bin
 zig-cache/
 
 .DS_Store
+profile.json.gz

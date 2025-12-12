@@ -142,8 +142,6 @@ pub const PolicyInfo = struct {
 pub const MatcherDatabase = struct {
     /// The compiled Hyperscan database
     db: hyperscan.Database,
-    /// Pool of scratch spaces for concurrent scanning
-    scratch_pool: ScratchPool,
     /// Maps Hyperscan pattern ID -> PatternMeta
     patterns: []const PatternMeta,
     /// Allocator used for patterns array
@@ -153,99 +151,14 @@ pub const MatcherDatabase = struct {
 
     const Self = @This();
 
-    /// Number of scratch spaces in the pool (allows this many concurrent scans)
-    const SCRATCH_POOL_SIZE = 8;
-
-    /// Pool of scratch spaces with lightweight locking
-    const ScratchPool = struct {
-        scratches: [SCRATCH_POOL_SIZE]hyperscan.Scratch,
-        /// Bitset tracking which scratches are available (1 = available)
-        available: std.atomic.Value(u8),
-        /// Fallback mutex for when pool is exhausted
-        fallback_scratch: hyperscan.Scratch,
-        fallback_mutex: std.Thread.Mutex,
-
-        fn init(db: *hyperscan.Database) !ScratchPool {
-            var pool: ScratchPool = .{
-                .scratches = undefined,
-                .available = std.atomic.Value(u8).init(0xFF), // All 8 bits set = all available
-                .fallback_scratch = undefined,
-                .fallback_mutex = .{},
-            };
-
-            // Initialize pool scratches
-            for (&pool.scratches, 0..) |*scratch, i| {
-                scratch.* = hyperscan.Scratch.init(db) catch |err| {
-                    // Clean up already allocated scratches
-                    for (pool.scratches[0..i]) |*s| s.deinit();
-                    return err;
-                };
-            }
-
-            // Initialize fallback scratch
-            pool.fallback_scratch = try hyperscan.Scratch.init(db);
-
-            return pool;
-        }
-
-        fn deinit(self: *ScratchPool) void {
-            for (&self.scratches) |*scratch| {
-                scratch.deinit();
-            }
-            self.fallback_scratch.deinit();
-        }
-
-        /// Acquire a scratch space. Returns index and pointer, or null to use fallback.
-        fn acquire(self: *ScratchPool) ?struct { index: u3, scratch: *hyperscan.Scratch } {
-            while (true) {
-                const current = self.available.load(.acquire);
-                if (current == 0) return null; // Pool exhausted, use fallback
-
-                // Find first available slot
-                const index: u3 = @intCast(@ctz(current));
-                const mask = @as(u8, 1) << index;
-                const new = current & ~mask;
-
-                // Try to claim it
-                if (self.available.cmpxchgWeak(current, new, .acq_rel, .acquire)) |_| {
-                    // CAS failed, retry
-                    continue;
-                }
-
-                return .{ .index = index, .scratch = &self.scratches[index] };
-            }
-        }
-
-        /// Release a scratch space back to the pool
-        fn release(self: *ScratchPool, index: u3) void {
-            const mask = @as(u8, 1) << index;
-            _ = self.available.fetchOr(mask, .release);
-        }
-    };
-
-    /// Scan a value and return all matching pattern IDs.
-    /// Thread-safe: uses a pool of scratch spaces for concurrent access.
-    pub fn scan(self: *Self, value: []const u8, result_buf: []u32) ScanResult {
+    /// Scan a value using an externally-provided scratch space.
+    /// The scratch must be compatible with this database (created via initMulti).
+    pub fn scanWithScratch(self: *Self, scratch: *hyperscan.Scratch, value: []const u8, result_buf: []u32) ScanResult {
         var result = ScanResult{ .count = 0, .buf = result_buf };
 
-        // Try to get a scratch from the pool
-        if (self.scratch_pool.acquire()) |acquired| {
-            defer self.scratch_pool.release(acquired.index);
-            self.doScan(acquired.scratch, value, &result);
-        } else {
-            // Pool exhausted, fall back to mutex-protected scratch
-            self.scratch_pool.fallback_mutex.lock();
-            defer self.scratch_pool.fallback_mutex.unlock();
-            self.doScan(&self.scratch_pool.fallback_scratch, value, &result);
-        }
-
-        return result;
-    }
-
-    fn doScan(self: *Self, scratch: *hyperscan.Scratch, value: []const u8, result: *ScanResult) void {
-        _ = self.db.scanWithCallback(scratch, value, result, scanCallback) catch |err| {
+        _ = self.db.scanWithCallback(scratch, value, &result, scanCallback) catch |err| {
             self.bus.warn(ScanError{ .err = @errorName(err) });
-            return;
+            return result;
         };
 
         if (result.count > 0) {
@@ -261,6 +174,8 @@ pub const MatcherDatabase = struct {
                 }
             }
         }
+
+        return result;
     }
 
     fn scanCallback(ctx: *ScanResult, match: hyperscan.Match) bool {
@@ -273,7 +188,6 @@ pub const MatcherDatabase = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.scratch_pool.deinit();
         self.db.deinit();
         // Free pattern metadata (including policy_id strings we duped)
         for (self.patterns) |meta| {
@@ -320,7 +234,143 @@ pub const MatcherIndex = struct {
     /// Event bus for observability
     bus: *EventBus,
 
+    /// Pool of scratch spaces for concurrent scanning (shared across all databases)
+    scratch_pool: ScratchPool,
+
     const Self = @This();
+
+    /// Number of scratch spaces in the pool (allows this many concurrent evaluations)
+    const SCRATCH_POOL_SIZE = 8;
+
+    /// Pool of scratch spaces with lightweight locking.
+    /// Each scratch is compatible with ALL databases in the index (via initMulti).
+    pub const ScratchPool = struct {
+        scratches: [SCRATCH_POOL_SIZE]hyperscan.Scratch,
+        /// Bitset tracking which scratches are available (1 = available)
+        available: std.atomic.Value(u8),
+        /// Fallback mutex for when pool is exhausted
+        fallback_scratch: hyperscan.Scratch,
+        fallback_mutex: std.Thread.Mutex,
+        /// Whether the pool has been initialized (false if no databases)
+        initialized: bool,
+
+        const PoolSelf = @This();
+
+        fn initEmpty() ScratchPool {
+            return .{
+                .scratches = undefined,
+                .available = std.atomic.Value(u8).init(0),
+                .fallback_scratch = undefined,
+                .fallback_mutex = .{},
+                .initialized = false,
+            };
+        }
+
+        fn initMulti(db_ptrs: []const *const hyperscan.Database) !ScratchPool {
+            if (db_ptrs.len == 0) return initEmpty();
+
+            var pool: ScratchPool = .{
+                .scratches = undefined,
+                .available = std.atomic.Value(u8).init(0xFF), // All 8 bits set = all available
+                .fallback_scratch = undefined,
+                .fallback_mutex = .{},
+                .initialized = true,
+            };
+
+            // Initialize pool scratches - each compatible with all databases
+            for (&pool.scratches, 0..) |*scratch, i| {
+                scratch.* = hyperscan.Scratch.initMulti(db_ptrs) catch |err| {
+                    // Clean up already allocated scratches
+                    for (pool.scratches[0..i]) |*s| s.deinit();
+                    return err;
+                };
+            }
+
+            // Initialize fallback scratch
+            pool.fallback_scratch = try hyperscan.Scratch.initMulti(db_ptrs);
+
+            return pool;
+        }
+
+        fn deinit(self: *ScratchPool) void {
+            if (!self.initialized) return;
+            for (&self.scratches) |*scratch| {
+                scratch.deinit();
+            }
+            self.fallback_scratch.deinit();
+        }
+
+        /// Acquire a scratch space. Returns index and pointer, or null to use fallback.
+        fn acquire(self: *const ScratchPool) ?struct { index: u3, scratch: *hyperscan.Scratch } {
+            if (!self.initialized) return null;
+
+            // Cast away const for atomic operations - this is safe because atomics handle synchronization
+            const mutable_self = @constCast(self);
+
+            while (true) {
+                const current = mutable_self.available.load(.acquire);
+                if (current == 0) return null; // Pool exhausted, use fallback
+
+                // Find first available slot
+                const index: u3 = @intCast(@ctz(current));
+                const mask = @as(u8, 1) << index;
+                const new = current & ~mask;
+
+                // Try to claim it
+                if (mutable_self.available.cmpxchgWeak(current, new, .acq_rel, .acquire)) |_| {
+                    // CAS failed, retry
+                    continue;
+                }
+
+                return .{ .index = index, .scratch = &mutable_self.scratches[index] };
+            }
+        }
+
+        /// Release a scratch space back to the pool
+        fn release(self: *const ScratchPool, index: u3) void {
+            const mask = @as(u8, 1) << index;
+            _ = @constCast(self).available.fetchOr(mask, .release);
+        }
+    };
+
+    /// Handle to an acquired scratch space - must be released after use
+    pub const AcquiredScratch = struct {
+        pool: *const ScratchPool,
+        scratch: *hyperscan.Scratch,
+        index: ?u3, // null if using fallback
+        holds_fallback_lock: bool,
+
+        pub fn release(self: *AcquiredScratch) void {
+            if (self.index) |idx| {
+                self.pool.release(idx);
+            } else if (self.holds_fallback_lock) {
+                @constCast(self.pool).fallback_mutex.unlock();
+            }
+            self.* = undefined;
+        }
+    };
+
+    /// Acquire a scratch space for scanning. Caller must call release() when done.
+    /// The returned scratch can be used with any database in this index.
+    pub fn acquireScratch(self: *const Self) AcquiredScratch {
+        if (self.scratch_pool.acquire()) |acquired| {
+            return .{
+                .pool = &self.scratch_pool,
+                .scratch = acquired.scratch,
+                .index = acquired.index,
+                .holds_fallback_lock = false,
+            };
+        } else {
+            // Pool exhausted, fall back to mutex-protected scratch
+            @constCast(&self.scratch_pool).fallback_mutex.lock();
+            return .{
+                .pool = &self.scratch_pool,
+                .scratch = @constCast(&self.scratch_pool.fallback_scratch),
+                .index = null,
+                .holds_fallback_lock = true,
+            };
+        }
+    }
 
     /// Build a MatcherIndex from a slice of policies.
     pub fn build(allocator: std.mem.Allocator, bus: *EventBus, policies_slice: []const Policy) !Self {
@@ -334,6 +384,7 @@ pub const MatcherIndex = struct {
             .key_storage = .{},
             .policy_id_storage = .{},
             .bus = bus,
+            .scratch_pool = ScratchPool.initEmpty(),
         };
         errdefer self.deinit();
 
@@ -470,6 +521,22 @@ pub const MatcherIndex = struct {
         // Store matcher keys for iteration
         self.matcher_keys = try allocator.dupe(MatcherKey, keys_list.items);
 
+        // Initialize scratch pool with all databases
+        if (self.databases.count() > 0) {
+            // Collect database pointers for initMulti
+            const db_ptrs = try allocator.alloc(*const hyperscan.Database, self.databases.count());
+            defer allocator.free(db_ptrs);
+
+            var db_iter = self.databases.valueIterator();
+            var i: usize = 0;
+            while (db_iter.next()) |db| {
+                db_ptrs[i] = &db.*.db;
+                i += 1;
+            }
+
+            self.scratch_pool = try ScratchPool.initMulti(db_ptrs);
+        }
+
         span.completed(MatcherIndexBuildCompleted{
             .database_count = self.databases.count(),
             .matcher_key_count = self.matcher_keys.len,
@@ -509,6 +576,9 @@ pub const MatcherIndex = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Free scratch pool first (before databases)
+        self.scratch_pool.deinit();
+
         // Free databases
         var db_it = self.databases.valueIterator();
         while (db_it.next()) |db| {
@@ -614,15 +684,10 @@ fn compileDatabase(
     var db = try hyperscan.Database.compileMulti(allocator, hs_patterns, .{});
     errdefer db.deinit();
 
-    // Initialize scratch pool
-    var scratch_pool = try MatcherDatabase.ScratchPool.init(&db);
-    errdefer scratch_pool.deinit();
-
-    // Create the database struct
+    // Create the database struct (scratch pool is managed by MatcherIndex)
     const matcher_db = try allocator.create(MatcherDatabase);
     matcher_db.* = .{
         .db = db,
-        .scratch_pool = scratch_pool,
         .patterns = pattern_metas,
         .allocator = allocator,
         .bus = bus,
@@ -854,19 +919,23 @@ test "MatcherIndex: scan database" {
     var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    var db = index.getDatabase(.{ .match_case = .log_body, .key = "" }).?;
+    const db = index.getDatabase(.{ .match_case = .log_body, .key = "" }).?;
+
+    // Acquire scratch from the index
+    var acquired = index.acquireScratch();
+    defer acquired.release();
 
     // Scan matching value
     var result_buf: [16]u32 = undefined;
-    var result = db.scan("an error occurred", &result_buf);
+    var result = db.scanWithScratch(acquired.scratch, "an error occurred", &result_buf);
     try testing.expectEqual(@as(usize, 1), result.count);
 
     // Scan non-matching value
-    result = db.scan("all good", &result_buf);
+    result = db.scanWithScratch(acquired.scratch, "all good", &result_buf);
     try testing.expectEqual(@as(usize, 0), result.count);
 
     // Scan value matching both patterns
-    result = db.scan("error and warning", &result_buf);
+    result = db.scanWithScratch(acquired.scratch, "error and warning", &result_buf);
     try testing.expectEqual(@as(usize, 2), result.count);
 }
 

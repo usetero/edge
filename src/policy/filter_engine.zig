@@ -129,14 +129,19 @@ pub const FilterEngine = struct {
             return .keep;
         };
 
-        const index = &snapshot.matcher_index;
+        var index = &snapshot.matcher_index;
 
         if (index.isEmpty()) {
             self.bus.debug(EvaluateEmpty{});
             return .keep;
         }
 
-        self.bus.debug(EvaluateStart{ .matcher_key_count = index.getMatcherKeys().len });
+        const matcher_keys = index.getMatcherKeys();
+        self.bus.debug(EvaluateStart{ .matcher_key_count = matcher_keys.len });
+
+        // Acquire a single scratch that works with all databases
+        var acquired = index.acquireScratch();
+        defer acquired.release();
 
         // Stack-allocated match count tracking
         // Maps policy_id hash -> (match_count, policy_id_ptr)
@@ -151,7 +156,7 @@ pub const FilterEngine = struct {
         var result_buf: [MAX_MATCHES_PER_SCAN]u32 = undefined;
 
         // Iterate through all matcher keys
-        for (index.getMatcherKeys()) |matcher_key| {
+        for (matcher_keys) |matcher_key| {
             // Get field value for this key
             const value = field_accessor(ctx, matcher_key.match_case, matcher_key.key) orelse {
                 // Field not present - handle negated matchers specially
@@ -174,8 +179,8 @@ pub const FilterEngine = struct {
                 continue;
             };
 
-            // Scan the value
-            const scan_result = db.scan(value, &result_buf);
+            // Scan the value using the shared scratch
+            const scan_result = db.scanWithScratch(acquired.scratch, value, &result_buf);
             self.bus.debug(ScanResult{ .count = scan_result.count });
 
             // Process matches

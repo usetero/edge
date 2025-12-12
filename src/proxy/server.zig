@@ -309,6 +309,13 @@ pub const ProxyServer = struct {
             .request = .{
                 .max_body_size = max_body_size,
             },
+            .workers = .{
+                .count = 1,
+            },
+            .thread_pool = .{
+                .count = 64, // Enough threads to keep upstream connections saturated
+                .buffer_size = 32768, // Larger buffer for 4-16KB bodies
+            },
         }, ctx);
 
         return .{
