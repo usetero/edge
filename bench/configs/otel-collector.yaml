@@ -25,7 +25,7 @@ exporters:
     host_metadata:
       enabled: false
     api:
-      key: "b34202b3f064900075e8e0326561af8d"
+      key: "xxxxxxxxxxxxx"
       site: "us5.datadoghq.com"
     logs:
       endpoint: "http://127.0.0.1:9999"

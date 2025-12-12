@@ -32,7 +32,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Hermit
-        uses: cashapp/activate-hermit@v1
+        uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
 
       - name: Install oha
         run: |
