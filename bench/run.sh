@@ -37,6 +37,7 @@ ECHO_PID=""
 DATADOG_PID=""
 OTLP_PID=""
 OTELCOL_PID=""
+VECTOR_PID=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -59,6 +60,7 @@ cleanup() {
     [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null || true
     [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null || true
     [[ -n "$OTELCOL_PID" ]] && kill "$OTELCOL_PID" 2>/dev/null || true
+    [[ -n "$VECTOR_PID" ]] && kill "$VECTOR_PID" 2>/dev/null || true
     # Clean up any leftover temp files
     rm -f /tmp/bench_mem_* 2>/dev/null || true
     wait 2>/dev/null || true
@@ -82,7 +84,19 @@ find_otelcol() {
     fi
 }
 
+# Find vector binary (check ~/.vector/bin first, then PATH)
+find_vector() {
+    if [[ -x "$HOME/.vector/bin/vector" ]]; then
+        echo "$HOME/.vector/bin/vector"
+    elif command -v vector >/dev/null 2>&1; then
+        echo "vector"
+    else
+        echo ""
+    fi
+}
+
 OTELCOL_BIN=""
+VECTOR_BIN=""
 
 check_dependencies() {
     local missing=()
@@ -93,6 +107,9 @@ check_dependencies() {
 
     OTELCOL_BIN=$(find_otelcol)
     [[ -z "$OTELCOL_BIN" ]] && missing+=("otelcol-contrib")
+
+    VECTOR_BIN=$(find_vector)
+    [[ -z "$VECTOR_BIN" ]] && missing+=("vector")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Missing dependencies: ${missing[*]}"
@@ -111,10 +128,13 @@ check_dependencies() {
         echo "  curl --proto '=https' --tlsv1.2 -fOL https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.141.0/otelcol-contrib_0.141.0_darwin_amd64.tar.gz"
         echo "  tar -xvf otelcol-contrib_0.141.0_darwin_amd64.tar.gz"
         echo "  mv otelcol-contrib bench/bin/"
+        echo ""
+        echo "For Vector:"
+        echo "  curl --proto '=https' --tlsv1.2 -sSfL https://sh.vector.dev | bash -s -- -y"
         exit 1
     fi
 
-    log_success "All dependencies found (otelcol-contrib: $OTELCOL_BIN)"
+    log_success "All dependencies found (otelcol: $OTELCOL_BIN, vector: $VECTOR_BIN)"
 }
 
 wait_for_server() {
@@ -344,6 +364,7 @@ start_otelcol() {
     local scenario_name=$2
 
     stop_otelcol
+    stop_vector
 
     # Also stop edge proxies since otelcol uses same ports
     [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null || true
@@ -364,6 +385,48 @@ start_otelcol() {
     sleep 1
     wait_for_server "$DATADOG_PORT" "otel-collector (Datadog)"
     wait_for_server "$OTLP_PORT" "otel-collector (OTLP)"
+}
+
+stop_vector() {
+    if [[ -n "$VECTOR_PID" ]]; then
+        sleep 0.3
+        kill -TERM "$VECTOR_PID" 2>/dev/null || true
+        sleep 0.5
+        kill -9 "$VECTOR_PID" 2>/dev/null || true
+        wait "$VECTOR_PID" 2>/dev/null || true
+        VECTOR_PID=""
+    fi
+}
+
+start_vector() {
+    local config_file=$1
+    local port=$2
+    local scenario_name=$3
+
+    stop_vector
+    stop_otelcol
+
+    # Also stop edge proxies since vector uses same ports
+    [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null || true
+    [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null || true
+    DATADOG_PID=""
+    OTLP_PID=""
+    sleep 0.3
+
+    # Create data directories for Vector
+    mkdir -p /tmp/vector /tmp/vector-rules
+
+    log_info "Starting Vector ($config_file)..."
+
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        local log_file="$DEBUG_DIR/vector-$(echo "$scenario_name" | tr ' ' '-' | tr '[:upper:]' '[:lower:]').log"
+        "$VECTOR_BIN" --config "$config_file" > "$log_file" 2>&1 &
+    else
+        "$VECTOR_BIN" --config "$config_file" >/dev/null 2>&1 &
+    fi
+    VECTOR_PID=$!
+    sleep 1
+    wait_for_server "$port" "Vector"
 }
 
 # =============================================================================
@@ -474,6 +537,19 @@ declare -a SCENARIOS=(
     "OTLP Large|otelcol-otlp|with-rules|bench/configs/otel-collector-rules.yaml|/v1/logs|bench/payloads/otlp-large.json"
     "OTLP 1MB|otelcol-otlp|passthrough|bench/configs/otel-collector.yaml|/v1/logs|bench/payloads/otlp-1mb.json"
     "OTLP 1MB|otelcol-otlp|with-rules|bench/configs/otel-collector-rules.yaml|/v1/logs|bench/payloads/otlp-1mb.json"
+    # Vector scenarios
+    "Datadog Small|vector-datadog|passthrough|bench/configs/vector.yaml|/api/v2/logs|bench/payloads/datadog-small.json"
+    "Datadog Small|vector-datadog|with-rules|bench/configs/vector-rules.yaml|/api/v2/logs|bench/payloads/datadog-small.json"
+    "Datadog Large|vector-datadog|passthrough|bench/configs/vector.yaml|/api/v2/logs|bench/payloads/datadog-large.json"
+    "Datadog Large|vector-datadog|with-rules|bench/configs/vector-rules.yaml|/api/v2/logs|bench/payloads/datadog-large.json"
+    "Datadog 1MB|vector-datadog|passthrough|bench/configs/vector.yaml|/api/v2/logs|bench/payloads/datadog-1mb.json"
+    "Datadog 1MB|vector-datadog|with-rules|bench/configs/vector-rules.yaml|/api/v2/logs|bench/payloads/datadog-1mb.json"
+    "OTLP Small|vector-otlp|passthrough|bench/configs/vector.yaml|/v1/logs|bench/payloads/otlp-small.json"
+    "OTLP Small|vector-otlp|with-rules|bench/configs/vector-rules.yaml|/v1/logs|bench/payloads/otlp-small.json"
+    "OTLP Large|vector-otlp|passthrough|bench/configs/vector.yaml|/v1/logs|bench/payloads/otlp-large.json"
+    "OTLP Large|vector-otlp|with-rules|bench/configs/vector-rules.yaml|/v1/logs|bench/payloads/otlp-large.json"
+    "OTLP 1MB|vector-otlp|passthrough|bench/configs/vector.yaml|/v1/logs|bench/payloads/otlp-1mb.json"
+    "OTLP 1MB|vector-otlp|with-rules|bench/configs/vector-rules.yaml|/v1/logs|bench/payloads/otlp-1mb.json"
 )
 
 run_all_scenarios() {
@@ -481,6 +557,7 @@ run_all_scenarios() {
     local current_datadog_config=""
     local current_otlp_config=""
     local current_otelcol_config=""
+    local current_vector_config=""
 
     # CSV header
     echo "Scenario,Type,Mode,Payload Size,Requests/sec,p50 (ms),p99 (ms),Success %,CPU %,Peak Mem MB,Status Codes" > "$results_file"
@@ -499,6 +576,7 @@ run_all_scenarios() {
             if [[ "$config" != "$current_otelcol_config" ]]; then
                 start_otelcol "$config" "$name-$mode"
                 current_otelcol_config="$config"
+                current_vector_config=""
             fi
             server_pid="$OTELCOL_PID"
             if [[ "$type" == "otelcol-datadog" ]]; then
@@ -506,11 +584,31 @@ run_all_scenarios() {
             else
                 port=$OTLP_PORT
             fi
+        elif [[ "$type" == "vector-datadog" ]]; then
+            if [[ "$config" != "$current_vector_config" ]]; then
+                start_vector "$config" "$DATADOG_PORT" "$name-$mode"
+                current_vector_config="$config"
+                current_otelcol_config=""
+            fi
+            server_pid="$VECTOR_PID"
+            port=$DATADOG_PORT
+        elif [[ "$type" == "vector-otlp" ]]; then
+            if [[ "$config" != "$current_vector_config" ]]; then
+                start_vector "$config" "$OTLP_PORT" "$name-$mode"
+                current_vector_config="$config"
+                current_otelcol_config=""
+            fi
+            server_pid="$VECTOR_PID"
+            port=$OTLP_PORT
         elif [[ "$type" == "datadog" ]]; then
-            # Stop otelcol if running
+            # Stop otelcol/vector if running
             if [[ -n "$current_otelcol_config" ]]; then
                 stop_otelcol
                 current_otelcol_config=""
+            fi
+            if [[ -n "$current_vector_config" ]]; then
+                stop_vector
+                current_vector_config=""
             fi
             if [[ "$config" != "$current_datadog_config" ]]; then
                 start_datadog_proxy "$config" "$mode" "$name-$mode"
@@ -519,10 +617,14 @@ run_all_scenarios() {
             server_pid="$DATADOG_PID"
             port=$DATADOG_PORT
         elif [[ "$type" == "otlp" ]]; then
-            # Stop otelcol if running
+            # Stop otelcol/vector if running
             if [[ -n "$current_otelcol_config" ]]; then
                 stop_otelcol
                 current_otelcol_config=""
+            fi
+            if [[ -n "$current_vector_config" ]]; then
+                stop_vector
+                current_vector_config=""
             fi
             if [[ "$config" != "$current_otlp_config" ]]; then
                 start_otlp_proxy "$config" "$mode" "$name-$mode"

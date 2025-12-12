@@ -1,1 +1,11 @@
-[{"message":"User login successful","service":"auth-service","hostname":"web-01","ddsource":"nodejs","ddtags":"env:prod,version:1.2.3","status":"info"}]
+[
+  {
+    "message": "User login successful",
+    "service": "auth-service",
+    "hostname": "web-01",
+    "ddsource": "nodejs",
+    "ddtags": "env:prod,version:1.2.3",
+    "status": "info",
+    "timestamp": 1733946000000
+  }
+]
