@@ -141,7 +141,6 @@ pub const FilterEngine = struct {
 
         // Acquire a single scratch that works with all databases
         var acquired = index.acquireScratch();
-        defer acquired.release();
 
         // Stack-allocated match count tracking
         // Maps policy_id hash -> (match_count, policy_id_ptr)
@@ -182,6 +181,7 @@ pub const FilterEngine = struct {
             // Scan the value using the shared scratch
             const scan_result = db.scanWithScratch(acquired.scratch, value, &result_buf);
             self.bus.debug(ScanResult{ .count = scan_result.count });
+            acquired.release();
 
             // Process matches
             for (scan_result.matches()) |pattern_id| {
