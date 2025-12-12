@@ -446,7 +446,7 @@ run_benchmark() {
             -m POST \
             -H "Content-Type: application/json" \
             -D "$payload_file" \
-            --json \
+            --output-format json \
             -o "$output_file" \
             "$url" 2>"$log_file"
     else
@@ -455,7 +455,7 @@ run_benchmark() {
             -m POST \
             -H "Content-Type: application/json" \
             -D "$payload_file" \
-            --json \
+            --output-format json \
             -o "$output_file" \
             "$url"
     fi

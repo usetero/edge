@@ -38,7 +38,7 @@ jobs:
         run: |
           # oha is not available in Hermit, install from GitHub releases
           mkdir -p "$HOME/.local/bin"
-          curl -sSfL https://github.com/hatoo/oha/releases/download/v1.4.7/oha-linux-amd64 -o "$HOME/.local/bin/oha"
+          curl -sSfL https://github.com/hatoo/oha/releases/download/v1.12.0/oha-linux-amd64 -o "$HOME/.local/bin/oha"
           chmod +x "$HOME/.local/bin/oha"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
