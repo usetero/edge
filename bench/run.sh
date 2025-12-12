@@ -66,7 +66,14 @@ cleanup() {
     wait 2>/dev/null || true
 }
 
+# Handle signals gracefully - cleanup and exit 0 for intentional interrupts
+handle_signal() {
+    cleanup
+    exit 0
+}
+
 trap cleanup EXIT
+trap handle_signal TERM INT
 
 usage() {
     sed -n '3,15p' "$0" | sed 's/^# //' | sed 's/^#//'
