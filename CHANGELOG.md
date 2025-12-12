@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.0](https://github.com/usetero/edge/compare/v1.3.0...v1.4.0) (2025-12-12)
+
+
+### Features
+
+* continuous benchmarks ([#45](https://github.com/usetero/edge/issues/45)) ([289cbd1](https://github.com/usetero/edge/commit/289cbd1e83ce0936832968ad25e6bc8173d11f52))
+
+
+### Bug Fixes
+
+* retry on connection issues ([#40](https://github.com/usetero/edge/issues/40)) ([8efea22](https://github.com/usetero/edge/commit/8efea22711b5434ab138bfc76e4443645ce21cce))
+
 ## [1.3.0](https://github.com/usetero/edge/compare/v1.2.2...v1.3.0) (2025-12-09)
 
 
