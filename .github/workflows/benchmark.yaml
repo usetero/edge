@@ -59,6 +59,9 @@ jobs:
           jq --version
           zig version
 
+      - name: Setup CI environment
+        run: task ci:setup
+
       - name: Run benchmarks
         run: |
           task benchmark:history \
