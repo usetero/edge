@@ -98,7 +98,7 @@ pub const DatadogModule = struct {
             return ModuleResult.unchanged();
         };
 
-        self.bus.info(LogsProcessed{
+        self.bus.debug(LogsProcessed{
             .dropped = result.dropped_count,
             .kept = result.original_count - result.dropped_count,
         });

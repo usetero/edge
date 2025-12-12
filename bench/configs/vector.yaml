@@ -1,0 +1,34 @@
+# Vector configuration for passthrough benchmarks
+# Receives Datadog and OTLP logs and forwards to echo server
+
+data_dir: "/tmp/vector"
+
+sources:
+  datadog_logs:
+    type: datadog_agent
+    address: "127.0.0.1:8080"
+
+  otlp_logs:
+    type: http_server
+    address: "127.0.0.1:8081"
+    path: "/v1/logs"
+    decoding:
+      codec: bytes
+    response_code: 202
+
+sinks:
+  datadog_sink:
+    type: datadog_logs
+    inputs: ["datadog_logs"]
+    default_api_key: "dummy-key"
+    endpoint: "http://127.0.0.1:9999"
+    compression: none
+
+  otlp_sink:
+    type: http
+    inputs: ["otlp_logs"]
+    uri: "http://127.0.0.1:9999"
+    encoding:
+      codec: json
+    compression: none
+    method: post

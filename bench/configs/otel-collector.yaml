@@ -1,0 +1,50 @@
+receivers:
+  # Datadog receiver - receives Datadog format logs
+  datadog:
+    endpoint: 127.0.0.1:8080
+    read_timeout: 60s
+
+  # OTLP receiver - receives OTLP format logs
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:8081
+
+processors:
+  # Minimal batching for benchmarks - send data quickly
+  batch:
+    send_batch_size: 10000
+
+exporters:
+  # Debug exporter for logging
+  debug:
+    verbosity: basic
+
+  # Datadog exporter - sends to echo server
+  datadog:
+    host_metadata:
+      enabled: false
+    api:
+      key: "xxxxxxxxxxxxx"
+      site: "us5.datadoghq.com"
+    logs:
+      endpoint: "http://127.0.0.1:9999"
+
+  # OTLP HTTP exporter - sends to echo server
+  otlphttp:
+    endpoint: http://127.0.0.1:9999
+    compression: none
+
+service:
+  telemetry:
+    logs:
+      level: debug
+  pipelines:
+    logs/datadog:
+      receivers: [datadog]
+      processors: [batch]
+      exporters: [datadog, debug]
+    logs/otlp:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp, debug]

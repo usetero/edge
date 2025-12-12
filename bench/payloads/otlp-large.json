@@ -1,0 +1,86 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "auth-service" } },
+          { "key": "service.version", "value": { "stringValue": "1.2.3" } },
+          {
+            "key": "host.name",
+            "value": { "stringValue": "web-01.us-east-1.prod.example.com" }
+          },
+          {
+            "key": "deployment.environment",
+            "value": { "stringValue": "production" }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "auth-logger", "version": "1.0.0" },
+          "logRecords": [
+            {
+              "timeUnixNano": "1705315800000000000",
+              "observedTimeUnixNano": "1705315800000000000",
+              "body": {
+                "stringValue": "User authentication completed successfully with MFA verification"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [
+                { "key": "user_id", "value": { "stringValue": "user-12345" } },
+                {
+                  "key": "request_id",
+                  "value": { "stringValue": "req-67890" }
+                },
+                { "key": "duration_ms", "value": { "intValue": "150" } },
+                { "key": "mfa_method", "value": { "stringValue": "totp" } }
+              ],
+              "traceId": "00000000000000000000000000000001",
+              "spanId": "0000000000000001"
+            },
+            {
+              "timeUnixNano": "1705315801000000000",
+              "observedTimeUnixNano": "1705315801000000000",
+              "body": {
+                "stringValue": "Database query executed: SELECT * FROM users WHERE id = ?"
+              },
+              "severityText": "DEBUG",
+              "severityNumber": 5,
+              "attributes": [
+                { "key": "query_type", "value": { "stringValue": "select" } },
+                { "key": "table", "value": { "stringValue": "users" } },
+                { "key": "duration_ms", "value": { "intValue": "25" } }
+              ],
+              "traceId": "00000000000000000000000000000002",
+              "spanId": "0000000000000002"
+            },
+            {
+              "timeUnixNano": "1705315802000000000",
+              "observedTimeUnixNano": "1705315802000000000",
+              "body": {
+                "stringValue": "HTTP request completed with status 200"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [
+                { "key": "http.method", "value": { "stringValue": "GET" } },
+                {
+                  "key": "http.path",
+                  "value": { "stringValue": "/api/v1/users/profile" }
+                },
+                { "key": "http.status_code", "value": { "intValue": "200" } },
+                {
+                  "key": "http.response_time_ms",
+                  "value": { "intValue": "85" }
+                }
+              ],
+              "traceId": "00000000000000000000000000000003",
+              "spanId": "0000000000000003"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

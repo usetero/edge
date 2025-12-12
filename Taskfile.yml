@@ -129,11 +129,62 @@ tasks:
       - zig env
 
   benchmark:
-    desc: "Run benchmarks"
+    desc: "Run full benchmark suite with oha and hyperfine"
     aliases: [bench, bm]
     cmds:
-      - echo "Running benchmarks..."
-      - zig build test -Doptimize=ReleaseFast
+      - ./bench/run.sh
+
+  benchmark:quick:
+    desc: "Run quick benchmark (1000 requests)"
+    aliases: [bench-quick, bmq]
+    cmds:
+      - ./bench/run.sh -n 1000 -c 10
+
+  benchmark:heavy:
+    desc: "Run heavy benchmark (100000 requests, 100 connections)"
+    aliases: [bench-heavy, bmh]
+    cmds:
+      - ./bench/run.sh -n 100000 -c 100
+
+  benchmark:ci:
+    desc: "Run benchmark in CI mode (skip build, use existing binaries)"
+    cmds:
+      - ./bench/run.sh --skip-build
+
+  benchmark:history:
+    desc: "Run benchmarks and save to dated history folder"
+    aliases: [bench-history, bmh]
+    vars:
+      DATE:
+        sh: date -u +"%Y-%m-%d"
+      REQUESTS: '{{.REQUESTS | default "10000"}}'
+      CONNECTIONS: '{{.CONNECTIONS | default "50"}}'
+    cmds:
+      - mkdir -p bench/history/{{.DATE}}
+      - ./bench/run.sh --requests {{.REQUESTS}} --connections {{.CONNECTIONS}} --output bench/history/{{.DATE}}
+
+  echo-server:
+    desc: "Build and run the echo server for manual testing"
+    cmds:
+      - zig build echo-server -Doptimize=ReleaseFast
+      - ./zig-out/bin/echo-server {{.PORT | default "9999"}}
+
+  benchmark:setup:
+    desc: "Install benchmark dependencies (oha, jq)"
+    cmds:
+      - |
+        echo "Installing benchmark dependencies..."
+        if [ "$(uname)" = "Darwin" ]; then
+          brew install oha jq
+        elif command -v cargo >/dev/null 2>&1; then
+          cargo install oha
+          echo "Please also install jq via your package manager"
+        else
+          echo "Please install oha and jq manually:"
+          echo "  https://github.com/hatoo/oha"
+          exit 1
+        fi
+        echo "Benchmark dependencies installed"
 
   watch:
     desc: "Watch for changes and rebuild"

@@ -1,0 +1,101 @@
+# Vector configuration with filtering rules
+# Receives Datadog and OTLP logs, applies VRL filtering, forwards to echo server
+
+data_dir: "/tmp/vector-rules"
+
+sources:
+  datadog_logs:
+    type: datadog_agent
+    address: "127.0.0.1:8080"
+
+  otlp_logs:
+    type: http_server
+    address: "127.0.0.1:8081"
+    path: "/v1/logs"
+    decoding:
+      codec: bytes
+    response_code: 202
+
+transforms:
+  # Filter Datadog logs using VRL
+  # Equivalent to policies.json rules
+  filter_datadog:
+    type: filter
+    inputs: ["datadog_logs"]
+    condition:
+      type: vrl
+      source: |
+        # Keep errors (high priority - check first)
+        status = string(.status) ?? ""
+        if match(status, r'(?i)^(ERROR|FATAL)$') {
+          true
+        } else {
+          # Drop debug logs
+          if match(status, r'(?i)^DEBUG$') {
+            false
+          } else {
+            # Drop health check logs
+            msg = string(.message) ?? ""
+            if match(msg, r'/health|/ready|/live') {
+              false
+            } else if match(msg, r'Database query executed') {
+              # Drop database query logs
+              false
+            } else if match(msg, r'Log entry 0:') {
+              # Drop first log entry pattern
+              false
+            } else {
+              # Keep everything else
+              true
+            }
+          }
+        }
+
+  # Filter OTLP logs using VRL
+  filter_otlp:
+    type: filter
+    inputs: ["otlp_logs"]
+    condition:
+      type: vrl
+      source: |
+        # For OTLP via http_server, the message is in .message as bytes
+        msg = string(.message) ?? ""
+
+        # Keep errors (high priority)
+        if match(msg, r'(?i)"severity_text"\s*:\s*"(ERROR|FATAL)"') {
+          true
+        } else {
+          # Drop debug logs
+          if match(msg, r'(?i)"severity_text"\s*:\s*"DEBUG"') {
+            false
+          } else if match(msg, r'/health|/ready|/live') {
+            # Drop health check logs
+            false
+          } else if match(msg, r'Database query executed') {
+            # Drop database query logs
+            false
+          } else if match(msg, r'Log entry 0:') {
+            # Drop first log entry pattern
+            false
+          } else {
+            # Keep everything else
+            true
+          }
+        }
+
+sinks:
+  datadog_sink:
+    type: datadog_logs
+    inputs: ["filter_datadog"]
+    default_api_key: "dummy-key"
+    endpoint: "http://127.0.0.1:9999"
+    compression: none
+
+  otlp_sink:
+    type: http
+    inputs: ["filter_otlp"]
+    uri: "http://127.0.0.1:9999"
+    encoding:
+      codec: json
+    compression: none
+    method: post

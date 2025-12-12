@@ -1,0 +1,47 @@
+{
+  "policies": [
+    {
+      "id": "drop-debug-logs",
+      "name": "Drop debug level logs",
+      "matchers": [
+        { "match_type": "log_severity_text", "regex": "DEBUG" },
+        { "match_type": "log_severity_text", "regex": "debug" }
+      ],
+      "action": "drop"
+    },
+    {
+      "id": "drop-health-checks",
+      "name": "Drop health check logs",
+      "matchers": [
+        { "match_type": "log_body", "regex": "/health" },
+        { "match_type": "log_body", "regex": "/ready" },
+        { "match_type": "log_body", "regex": "/live" }
+      ],
+      "action": "drop"
+    },
+    {
+      "id": "keep-errors",
+      "name": "Keep error logs",
+      "matchers": [
+        { "match_type": "log_severity_text", "regex": "ERROR" },
+        { "match_type": "log_severity_text", "regex": "error" },
+        { "match_type": "log_severity_text", "regex": "FATAL" }
+      ],
+      "action": "keep"
+    },
+    {
+      "id": "drop-database-queries",
+      "name": "Drop database query logs (matches 1 log in large payloads)",
+      "matchers": [
+        { "match_type": "log_body", "regex": "Database query executed" }
+      ],
+      "action": "drop"
+    },
+    {
+      "id": "drop-first-entry",
+      "name": "Drop first log entry (matches 1 log in 1MB payloads)",
+      "matchers": [{ "match_type": "log_body", "regex": "Log entry 0:" }],
+      "action": "drop"
+    }
+  ]
+}
