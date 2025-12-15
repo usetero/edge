@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.5.0](https://github.com/usetero/edge/compare/v1.4.0...v1.5.0) (2025-12-15)
+
+
+### Features
+
+* accept headers in config ([#49](https://github.com/usetero/edge/issues/49)) ([bf14083](https://github.com/usetero/edge/commit/bf14083cea7d0563d31ec6d8719ae389d87efff1))
+
+
+### Bug Fixes
+
+* remove wait ([#47](https://github.com/usetero/edge/issues/47)) ([24c2ad8](https://github.com/usetero/edge/commit/24c2ad8219f6d553a530b52b0ad032ebe8f45437))
+
 ## [1.4.0](https://github.com/usetero/edge/compare/v1.3.0...v1.4.0) (2025-12-15)
 
 
