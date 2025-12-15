@@ -54,26 +54,40 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 cleanup() {
     log_info "Cleaning up..."
     # Stop resource monitor if running
-    [[ -n "$MONITOR_PID" ]] && kill "$MONITOR_PID" 2>/dev/null || true
+    if [[ -n "$MONITOR_PID" ]]; then
+        log_info "  Stopping monitor (PID $MONITOR_PID)..."
+        kill "$MONITOR_PID" 2>/dev/null || true
+    fi
     # Stop servers
-    [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null || true
-    [[ -n "$DATADOG_PID" ]] && kill "$DATADOG_PID" 2>/dev/null || true
-    [[ -n "$OTLP_PID" ]] && kill "$OTLP_PID" 2>/dev/null || true
-    [[ -n "$OTELCOL_PID" ]] && kill "$OTELCOL_PID" 2>/dev/null || true
-    [[ -n "$VECTOR_PID" ]] && kill "$VECTOR_PID" 2>/dev/null || true
+    if [[ -n "$ECHO_PID" ]]; then
+        log_info "  Stopping echo server (PID $ECHO_PID)..."
+        kill "$ECHO_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$DATADOG_PID" ]]; then
+        log_info "  Stopping datadog proxy (PID $DATADOG_PID)..."
+        kill "$DATADOG_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$OTLP_PID" ]]; then
+        log_info "  Stopping otlp proxy (PID $OTLP_PID)..."
+        kill "$OTLP_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$OTELCOL_PID" ]]; then
+        log_info "  Stopping otelcol (PID $OTELCOL_PID)..."
+        kill "$OTELCOL_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$VECTOR_PID" ]]; then
+        log_info "  Stopping vector (PID $VECTOR_PID)..."
+        kill "$VECTOR_PID" 2>/dev/null || true
+    fi
     # Clean up any leftover temp files
+    log_info "  Removing temp files..."
     rm -f /tmp/bench_mem_* 2>/dev/null || true
+    log_info "  Waiting for processes to exit..."
     wait 2>/dev/null || true
+    log_info "Cleanup complete."
 }
 
-# Handle signals gracefully - cleanup and exit 0 for intentional interrupts
-handle_signal() {
-    cleanup
-    exit 0
-}
-
-trap cleanup EXIT
-trap handle_signal TERM INT
+trap cleanup TERM INT EXIT
 
 usage() {
     sed -n '3,15p' "$0" | sed 's/^# //' | sed 's/^#//'

@@ -63,10 +63,10 @@ jobs:
         run: task ci:setup
 
       - name: Run benchmarks
-        run: |
-          task benchmark:history \
-            REQUESTS="${{ github.event.inputs.requests || '10000' }}" \
-            CONNECTIONS="${{ github.event.inputs.connections || '50' }}"
+        env:
+          REQUESTS: ${{ github.event.inputs.requests || '10000' }}
+          CONNECTIONS: ${{ github.event.inputs.connections || '50' }}
+        run: task benchmark:history
 
       - name: Commit results
         run: |
