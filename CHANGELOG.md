@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.1](https://github.com/usetero/edge/compare/v1.5.0...v1.5.1) (2025-12-15)
+
+
+### Bug Fixes
+
+* read the full body with fetch ([#51](https://github.com/usetero/edge/issues/51)) ([61ff928](https://github.com/usetero/edge/commit/61ff928174a5bfcc08e476bd64513473cfa68683))
+
 ## [1.5.0](https://github.com/usetero/edge/compare/v1.4.0...v1.5.0) (2025-12-15)
 
 
