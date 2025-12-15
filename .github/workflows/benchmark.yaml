@@ -1,15 +1,17 @@
 name: Benchmark
 
 on:
-  schedule:
-    # Run daily at 2am UTC
-    - cron: "0 2 * * *"
+  # Disable the schedule for now.
+  # We need a larger runner and IMO we should run this on our own hardware.
+  # schedule:
+  #   # Run daily at 2am UTC
+  #   - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       requests:
         description: "Number of requests per test"
         required: false
-        default: "10000"
+        default: "1000"
       connections:
         description: "Number of concurrent connections"
         required: false
