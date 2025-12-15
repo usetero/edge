@@ -87,7 +87,13 @@ cleanup() {
     # log_info "Cleanup complete."
 }
 
-trap cleanup TERM INT EXIT
+handle_signal() {
+    log_info "Received signal, exiting fast"
+    exit 0
+}
+
+trap cleanup TERM
+trap handle_signal INT EXIT
 
 usage() {
     sed -n '3,15p' "$0" | sed 's/^# //' | sed 's/^#//'
