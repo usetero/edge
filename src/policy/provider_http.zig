@@ -33,7 +33,6 @@ const HttpPoliciesUnchanged = struct { reason: []const u8 };
 const HttpPolicyHashUpdated = struct { hash: []const u8 };
 const HttpPoliciesLoaded = struct { count: usize, url: []const u8, sync_timestamp: u64 };
 const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
-const HTTPNotModified = struct {};
 const HTTPFetchStarted = struct {};
 const HTTPFetchCompleted = struct {};
 
@@ -62,7 +61,6 @@ pub const HttpProvider = struct {
     callback: ?PolicyCallback,
     poll_thread: ?std.Thread,
     shutdown_flag: std.atomic.Value(bool),
-    last_etag: ?[]u8,
 
     // Service metadata for sync requests (not owned, references config)
     service: ServiceMetadata,
@@ -131,7 +129,6 @@ pub const HttpProvider = struct {
             .callback = null,
             .poll_thread = null,
             .shutdown_flag = std.atomic.Value(bool).init(false),
-            .last_etag = null,
             .service = service,
             .workspace_id = workspace_id,
             .last_sync_timestamp = 0,
@@ -277,10 +274,6 @@ pub const HttpProvider = struct {
         // Ensure shutdown is called first
         self.shutdown();
 
-        if (self.last_etag) |etag| {
-            self.allocator.free(etag);
-        }
-
         if (self.last_successful_hash) |hash| {
             self.allocator.free(hash);
         }
@@ -326,68 +319,59 @@ pub const HttpProvider = struct {
         }
     }
 
+    const FetchResult = struct {
+        parsed: std.json.Parsed(SyncResponse),
+        response_body: []u8,
+    };
+
     fn fetchAndNotify(self: *HttpProvider) !void {
-        var new_etag: ?[]u8 = null;
         var span = self.bus.started(.debug, HTTPFetchStarted{});
         defer span.completed(HTTPFetchCompleted{});
-        var maybe_parsed = try self.fetchPolicies(&new_etag);
+        var result = try self.fetchPolicies();
+        defer result.parsed.deinit();
+        defer self.allocator.free(result.response_body);
 
-        if (maybe_parsed) |*parsed| {
-            defer parsed.deinit();
+        const response = result.parsed.value;
 
-            const response = parsed.value;
+        // Update last sync timestamp
+        self.last_sync_timestamp = response.sync_timestamp_unix_nano;
 
-            // Update ETag
-            if (self.last_etag) |old_etag| {
-                self.allocator.free(old_etag);
+        // Check if content has changed by comparing hashes
+        const hash_unchanged = blk: {
+            if (response.hash.len == 0) break :blk false;
+            if (self.last_successful_hash) |old_hash| {
+                break :blk std.mem.eql(u8, old_hash, response.hash);
             }
-            self.last_etag = new_etag;
+            break :blk false;
+        };
 
-            // Update last sync timestamp
-            self.last_sync_timestamp = response.sync_timestamp_unix_nano;
-
-            // Check if content has changed by comparing hashes
-            const hash_unchanged = blk: {
-                if (response.hash.len == 0) break :blk false;
-                if (self.last_successful_hash) |old_hash| {
-                    break :blk std.mem.eql(u8, old_hash, response.hash);
-                }
-                break :blk false;
-            };
-
-            if (hash_unchanged) {
-                self.bus.debug(HttpPoliciesUnchanged{ .reason = "hash" });
-                return;
-            }
-
-            // Record the hash for future sync requests
-            if (response.hash.len > 0) {
-                try self.recordSyncedHash(response.hash);
-                self.bus.info(HttpPolicyHashUpdated{ .hash = response.hash });
-            }
-
-            // Notify callback with policies from response
-            if (self.callback) |cb| {
-                try cb.call(.{
-                    .policies = response.policies.items,
-                    .provider_id = self.id,
-                });
-            }
-
-            self.bus.info(HttpPoliciesLoaded{
-                .count = response.policies.items.len,
-                .url = self.config_url,
-                .sync_timestamp = response.sync_timestamp_unix_nano,
-            });
-        } else {
-            // 304 Not Modified
-            self.bus.debug(HttpPoliciesUnchanged{ .reason = "304" });
+        if (hash_unchanged) {
+            self.bus.debug(HttpPoliciesUnchanged{ .reason = "hash" });
+            return;
         }
+
+        // Record the hash for future sync requests
+        if (response.hash.len > 0) {
+            try self.recordSyncedHash(response.hash);
+            self.bus.info(HttpPolicyHashUpdated{ .hash = response.hash });
+        }
+
+        // Notify callback with policies from response
+        if (self.callback) |cb| {
+            try cb.call(.{
+                .policies = response.policies.items,
+                .provider_id = self.id,
+            });
+        }
+
+        self.bus.info(HttpPoliciesLoaded{
+            .count = response.policies.items.len,
+            .url = self.config_url,
+            .sync_timestamp = response.sync_timestamp_unix_nano,
+        });
     }
 
-    fn fetchPolicies(self: *HttpProvider, out_etag: *?[]u8) !?std.json.Parsed(SyncResponse) {
-        const uri = try std.Uri.parse(self.config_url);
-
+    fn fetchPolicies(self: *HttpProvider) !FetchResult {
         // Build resource_attributes with required fields:
         // - service.name
         // - service.instance.id
@@ -413,23 +397,25 @@ pub const HttpProvider = struct {
         var policy_statuses_list = std.ArrayListUnmanaged(PolicySyncStatus){};
         defer policy_statuses_list.deinit(self.allocator);
 
-        // Lock to read sync state
-        self.sync_state_mutex.lock();
-        defer self.sync_state_mutex.unlock();
+        // Get last successful hash (if any) - read under lock
+        var last_hash: []const u8 = &.{};
+        {
+            self.sync_state_mutex.lock();
+            defer self.sync_state_mutex.unlock();
 
-        // Build PolicySyncStatus entries from tracked policy statuses
-        var ps_it = self.policy_statuses.iterator();
-        while (ps_it.next()) |entry| {
-            try policy_statuses_list.append(self.allocator, .{
-                .id = entry.key_ptr.*,
-                .hits = entry.value_ptr.hits,
-                .misses = entry.value_ptr.misses,
-                .errors = entry.value_ptr.errors,
-            });
+            // Build PolicySyncStatus entries from tracked policy statuses
+            var ps_it = self.policy_statuses.iterator();
+            while (ps_it.next()) |entry| {
+                try policy_statuses_list.append(self.allocator, .{
+                    .id = entry.key_ptr.*,
+                    .hits = entry.value_ptr.hits,
+                    .misses = entry.value_ptr.misses,
+                    .errors = entry.value_ptr.errors,
+                });
+            }
+
+            last_hash = self.last_successful_hash orelse &.{};
         }
-
-        // Get last successful hash (if any)
-        const last_hash: []const u8 = self.last_successful_hash orelse &.{};
 
         // Create SyncRequest with the new structure
         const sync_request = SyncRequest{
@@ -449,8 +435,8 @@ pub const HttpProvider = struct {
         const request_body = try sync_request.jsonEncode(.{}, self.allocator);
         defer self.allocator.free(request_body);
 
-        // Prepare headers: content-type + optional etag + custom headers
-        const max_builtin_headers: usize = 2;
+        // Prepare headers: content-type + custom headers
+        const max_builtin_headers: usize = 1;
         const total_headers = max_builtin_headers + self.custom_headers.len;
         const headers_buffer = try self.allocator.alloc(std.http.Header, total_headers);
         defer self.allocator.free(headers_buffer);
@@ -463,14 +449,6 @@ pub const HttpProvider = struct {
         };
         headers_count += 1;
 
-        if (self.last_etag) |etag| {
-            headers_buffer[headers_count] = .{
-                .name = "if-none-match",
-                .value = etag,
-            };
-            headers_count += 1;
-        }
-
         // Add custom headers
         for (self.custom_headers) |h| {
             headers_buffer[headers_count] = .{
@@ -482,57 +460,37 @@ pub const HttpProvider = struct {
 
         const extra_headers = headers_buffer[0..headers_count];
 
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+
         // Create request
-        var req = try self.http_client.request(.POST, uri, .{
+        const result = try self.http_client.fetch(.{
+            .location = .{ .url = self.config_url },
             .extra_headers = extra_headers,
+            .method = .POST,
+            .payload = request_body,
+            .response_writer = &body.writer,
         });
-        defer req.deinit();
-
-        // Send request with body
-        try req.sendBodyComplete(@constCast(request_body));
-
-        // Receive response headers
-        var response = try req.receiveHead(&.{});
-
-        // Check for 304 Not Modified
-        if (response.head.status == .not_modified) {
-            self.bus.debug(HTTPNotModified{});
-            return null;
-        }
 
         // Check status code
-        if (response.head.status != .ok) {
+        if (result.status != .ok) {
             self.bus.err(HttpSyncRequestFailed{
                 .url = self.config_url,
-                .status = @intFromEnum(response.head.status),
+                .status = @intFromEnum(result.status),
             });
             return error.HttpRequestFailed;
         }
 
-        // Extract ETag from response headers
-        var it = response.head.iterateHeaders();
-        while (it.next()) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "etag")) {
-                out_etag.* = try self.allocator.dupe(u8, header.value);
-            }
-        }
-
-        // Read response body using allocating writer
-        var body_writer = std.Io.Writer.Allocating.init(self.allocator);
-        defer body_writer.deinit();
-
-        // Buffer for streaming response
-        var read_buffer: [4096]u8 = undefined;
-        const body_reader = response.reader(&read_buffer);
-
-        // Stream response to allocating writer
-        _ = try body_reader.stream(&body_writer.writer, std.io.Limit.limited(std.math.maxInt(usize)));
-
-        const response_body = body_writer.written();
+        // Read response body - take ownership to keep memory alive for parsed result
+        const response_body = try body.toOwnedSlice();
+        errdefer self.allocator.free(response_body);
 
         // Decode SyncResponse from JSON
         const parsed = try SyncResponse.jsonDecode(response_body, .{}, self.allocator);
 
-        return parsed;
+        return .{
+            .parsed = parsed,
+            .response_body = response_body,
+        };
     }
 };

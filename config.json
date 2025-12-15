@@ -14,8 +14,13 @@
     {
       "id": "http",
       "type": "http",
-      "url": "http://localhost:9090/v1/policy/sync",
-      "headers": [{ "name": "Authorization", "value": "Bearer my-token" }]
+      "url": "http://control-plane-sync.orb.local:8090/v1/policy/sync",
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer tero_sk_bk2M1oiJsXJuIm6gSNHeJRNrvq2RER_hsLlnIHnqKL8="
+        }
+      ]
     }
   ]
 }

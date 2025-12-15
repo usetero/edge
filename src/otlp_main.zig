@@ -204,6 +204,13 @@ pub fn main() !void {
             allocator.free(provider_config.id);
             if (provider_config.path) |path| allocator.free(path);
             if (provider_config.url) |url| allocator.free(url);
+            for (provider_config.headers) |header| {
+                allocator.free(header.name);
+                allocator.free(header.value);
+            }
+            if (provider_config.headers.len > 0) {
+                allocator.free(provider_config.headers);
+            }
         }
         allocator.free(config.policy_providers);
         allocator.destroy(config);
