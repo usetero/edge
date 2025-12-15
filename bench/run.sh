@@ -83,8 +83,8 @@ cleanup() {
     log_info "  Removing temp files..."
     rm -f /tmp/bench_mem_* 2>/dev/null || true
     log_info "  Waiting for processes to exit..."
-    wait 2>/dev/null || true
-    log_info "Cleanup complete."
+    # wait 2>/dev/null || true
+    # log_info "Cleanup complete."
 }
 
 trap cleanup TERM INT EXIT
