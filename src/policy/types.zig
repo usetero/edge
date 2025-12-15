@@ -1,4 +1,7 @@
 const std = @import("std");
+const provider_http = @import("./provider_http.zig");
+
+pub const Header = provider_http.Header;
 
 /// Service metadata for identifying this edge instance
 pub const ServiceMetadata = struct {
@@ -29,4 +32,5 @@ pub const ProviderConfig = struct {
     // For http provider
     url: ?[]const u8 = null,
     poll_interval: ?u64 = null, // seconds
+    headers: []const Header = &.{}, // custom headers for http provider
 };

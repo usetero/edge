@@ -16,6 +16,12 @@ const AnyValue = proto.common.AnyValue;
 const ServiceMetadata = types.ServiceMetadata;
 const EventBus = o11y.EventBus;
 
+/// A header to be sent with HTTP requests
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 // =============================================================================
 // Observability Events
 // =============================================================================
@@ -68,6 +74,9 @@ pub const HttpProvider = struct {
     // Used to report hits/misses/errors encountered when applying policies
     policy_statuses: std.StringHashMapUnmanaged(PolicyStatusRecord),
 
+    // Custom headers to send with HTTP requests (owned, copied from config)
+    custom_headers: []Header,
+
     // Mutex for thread-safe access to synced state
     sync_state_mutex: std.Thread.Mutex,
 
@@ -82,6 +91,7 @@ pub const HttpProvider = struct {
         poll_interval_seconds: u64,
         workspace_id: []const u8,
         service: ServiceMetadata,
+        headers: []const Header,
     ) !*HttpProvider {
         const self = try allocator.create(HttpProvider);
         errdefer allocator.destroy(self);
@@ -91,6 +101,26 @@ pub const HttpProvider = struct {
 
         const url_copy = try allocator.dupe(u8, config_url);
         errdefer allocator.free(url_copy);
+
+        // Copy headers (both the slice and the string contents)
+        const headers_copy = try allocator.alloc(Header, headers.len);
+        errdefer allocator.free(headers_copy);
+
+        var headers_initialized: usize = 0;
+        errdefer {
+            for (headers_copy[0..headers_initialized]) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+        }
+
+        for (headers, 0..) |h, i| {
+            const name_copy = try allocator.dupe(u8, h.name);
+            errdefer allocator.free(name_copy);
+            const value_copy = try allocator.dupe(u8, h.value);
+            headers_copy[i] = .{ .name = name_copy, .value = value_copy };
+            headers_initialized = i + 1;
+        }
 
         self.* = .{
             .allocator = allocator,
@@ -107,6 +137,7 @@ pub const HttpProvider = struct {
             .last_sync_timestamp = 0,
             .last_successful_hash = null,
             .policy_statuses = .{},
+            .custom_headers = headers_copy,
             .sync_state_mutex = .{},
             .bus = bus,
         };
@@ -262,6 +293,13 @@ pub const HttpProvider = struct {
         }
         self.policy_statuses.deinit(self.allocator);
 
+        // Free custom headers
+        for (self.custom_headers) |h| {
+            self.allocator.free(h.name);
+            self.allocator.free(h.value);
+        }
+        self.allocator.free(self.custom_headers);
+
         self.http_client.deinit();
         self.allocator.free(self.id);
         self.allocator.free(self.config_url);
@@ -411,8 +449,12 @@ pub const HttpProvider = struct {
         const request_body = try sync_request.jsonEncode(.{}, self.allocator);
         defer self.allocator.free(request_body);
 
-        // Prepare headers
-        var headers_buffer: [2]std.http.Header = undefined;
+        // Prepare headers: content-type + optional etag + custom headers
+        const max_builtin_headers: usize = 2;
+        const total_headers = max_builtin_headers + self.custom_headers.len;
+        const headers_buffer = try self.allocator.alloc(std.http.Header, total_headers);
+        defer self.allocator.free(headers_buffer);
+
         var headers_count: usize = 0;
 
         headers_buffer[headers_count] = .{
@@ -425,6 +467,15 @@ pub const HttpProvider = struct {
             headers_buffer[headers_count] = .{
                 .name = "if-none-match",
                 .value = etag,
+            };
+            headers_count += 1;
+        }
+
+        // Add custom headers
+        for (self.custom_headers) |h| {
+            headers_buffer[headers_count] = .{
+                .name = h.name,
+                .value = h.value,
             };
             headers_count += 1;
         }

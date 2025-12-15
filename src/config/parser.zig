@@ -5,6 +5,13 @@ const ProxyConfig = types.ProxyConfig;
 const LogLevel = types.LogLevel;
 const ProviderConfig = policy.ProviderConfig;
 const ProviderType = policy.ProviderType;
+const Header = policy.Header;
+
+/// JSON schema for custom headers
+const HeaderJson = struct {
+    name: []const u8,
+    value: []const u8,
+};
 
 /// JSON schema for policy provider configuration
 const ProviderJson = struct {
@@ -13,6 +20,7 @@ const ProviderJson = struct {
     path: ?[]const u8 = null,
     url: ?[]const u8 = null,
     poll_interval: ?u64 = null,
+    headers: ?[]HeaderJson = null,
 };
 
 /// JSON schema for service metadata
@@ -112,12 +120,19 @@ fn parseProviders(allocator: std.mem.Allocator, json_providers: []ProviderJson) 
         // Parse provider type
         const provider_type = try parseProviderType(json_provider.type);
 
+        // Parse headers if present
+        const headers = if (json_provider.headers) |json_headers|
+            try parseHeaders(allocator, json_headers)
+        else
+            &[_]Header{};
+
         providers[i] = ProviderConfig{
             .id = try allocator.dupe(u8, json_provider.id),
             .type = provider_type,
             .path = if (json_provider.path) |p| try allocator.dupe(u8, p) else null,
             .url = if (json_provider.url) |u| try allocator.dupe(u8, u) else null,
             .poll_interval = json_provider.poll_interval,
+            .headers = headers,
         };
 
         // Validate provider-specific required fields
@@ -136,6 +151,20 @@ fn parseProviders(allocator: std.mem.Allocator, json_providers: []ProviderJson) 
     }
 
     return providers;
+}
+
+/// Parse headers from JSON array
+fn parseHeaders(allocator: std.mem.Allocator, json_headers: []HeaderJson) ![]Header {
+    const headers = try allocator.alloc(Header, json_headers.len);
+
+    for (json_headers, 0..) |json_header, i| {
+        headers[i] = Header{
+            .name = try allocator.dupe(u8, json_header.name),
+            .value = try allocator.dupe(u8, json_header.value),
+        };
+    }
+
+    return headers;
 }
 
 /// Parse ProviderType from string

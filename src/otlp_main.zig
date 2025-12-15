@@ -293,6 +293,7 @@ pub fn main() !void {
                     poll_interval,
                     config.workspace_id,
                     config.service,
+                    provider_config.headers,
                 );
                 errdefer http_provider.deinit();
 

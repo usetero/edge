@@ -63,6 +63,7 @@ pub const types = @import("./types.zig");
 pub const ServiceMetadata = types.ServiceMetadata;
 pub const ProviderType = types.ProviderType;
 pub const ProviderConfig = types.ProviderConfig;
+pub const Header = types.Header;
 
 // =============================================================================
 // Parsing
