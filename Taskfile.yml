@@ -157,8 +157,8 @@ tasks:
     vars:
       DATE:
         sh: date -u +"%Y-%m-%d"
-      REQUESTS: '{{.REQUESTS | default "10000"}}'
-      CONNECTIONS: '{{.CONNECTIONS | default "50"}}'
+      REQUESTS: '{{.REQUESTS | default (env "REQUESTS") | default "10000"}}'
+      CONNECTIONS: '{{.CONNECTIONS | default (env "CONNECTIONS") | default "50"}}'
     cmds:
       - mkdir -p bench/history/{{.DATE}}
       - ./bench/run.sh --requests {{.REQUESTS}} --connections {{.CONNECTIONS}} --output bench/history/{{.DATE}}
