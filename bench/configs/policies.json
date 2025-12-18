@@ -4,44 +4,44 @@
       "id": "drop-debug-logs",
       "name": "Drop debug level logs",
       "matchers": [
-        { "match_type": "log_severity_text", "regex": "DEBUG" },
-        { "match_type": "log_severity_text", "regex": "debug" }
+        { "field": "log_severity_text", "pattern": "DEBUG" },
+        { "field": "log_severity_text", "pattern": "debug" }
       ],
-      "action": "drop"
+      "keep": "none"
     },
     {
       "id": "drop-health-checks",
       "name": "Drop health check logs",
       "matchers": [
-        { "match_type": "log_body", "regex": "/health" },
-        { "match_type": "log_body", "regex": "/ready" },
-        { "match_type": "log_body", "regex": "/live" }
+        { "field": "log_body", "pattern": "/health" },
+        { "field": "log_body", "pattern": "/ready" },
+        { "field": "log_body", "pattern": "/live" }
       ],
-      "action": "drop"
+      "keep": "none"
     },
     {
       "id": "keep-errors",
       "name": "Keep error logs",
       "matchers": [
-        { "match_type": "log_severity_text", "regex": "ERROR" },
-        { "match_type": "log_severity_text", "regex": "error" },
-        { "match_type": "log_severity_text", "regex": "FATAL" }
+        { "field": "log_severity_text", "pattern": "ERROR" },
+        { "field": "log_severity_text", "pattern": "error" },
+        { "field": "log_severity_text", "pattern": "FATAL" }
       ],
-      "action": "keep"
+      "keep": "all"
     },
     {
       "id": "drop-database-queries",
       "name": "Drop database query logs (matches 1 log in large payloads)",
       "matchers": [
-        { "match_type": "log_body", "regex": "Database query executed" }
+        { "field": "log_body", "pattern": "Database query executed" }
       ],
-      "action": "drop"
+      "keep": "none"
     },
     {
       "id": "drop-first-entry",
       "name": "Drop first log entry (matches 1 log in 1MB payloads)",
-      "matchers": [{ "match_type": "log_body", "regex": "Log entry 0:" }],
-      "action": "drop"
+      "matchers": [{ "field": "log_body", "pattern": "Log entry 0:" }],
+      "keep": "none"
     }
   ]
 }
