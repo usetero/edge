@@ -239,7 +239,8 @@ pub fn build(b: *std.Build) void {
         const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
             .destination_directory = b.path("src/proto"),
             .source_files = &.{
-                "proto/opentelemetry/proto/policy/v1/policy.proto",
+                "proto/tero/policy/v1/policy.proto",
+                "proto/tero/policy/v1/log.proto",
                 "proto/opentelemetry/proto/logs/v1/logs.proto",
             },
             .include_directories = &.{

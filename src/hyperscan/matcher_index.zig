@@ -33,9 +33,9 @@ const ScanError = struct { err: []const u8 };
 // Debug-level events for MatcherIndex.build
 const ProcessingPolicy = struct { id: []const u8, name: []const u8, enabled: bool };
 const SkippingPolicyNoFilter = struct { id: []const u8 };
-const PolicyMatcherCount = struct { id: []const u8, matcher_count: usize, action: proto.policy.FilterAction };
+const PolicyMatcherCount = struct { id: []const u8, matcher_count: usize, keep: []const u8 };
+const MatcherNullField = struct { matcher_idx: usize };
 const MatcherNullMatch = struct { matcher_idx: usize };
-const MatcherSeverityNumber = struct { matcher_idx: usize };
 const MatcherNoRegex = struct { matcher_idx: usize };
 const MatcherEmptyRegex = struct { matcher_idx: usize };
 const MatcherDetail = struct { matcher_idx: usize, match_case: MatchCase, key: []const u8, regex: []const u8, negate: bool };
@@ -45,9 +45,45 @@ const CompilingDatabasePattern = struct { idx: usize, policy_id: []const u8, reg
 
 const Policy = proto.policy.Policy;
 const LogMatcher = proto.policy.LogMatcher;
-const FilterAction = proto.policy.FilterAction;
+const LogTarget = proto.policy.LogTarget;
+const LogField = proto.policy.LogField;
 
-pub const MatchCase = LogMatcher._match_case;
+/// MatchCase represents the type of field being matched.
+/// This is derived from the new LogMatcher.field oneof.
+pub const MatchCase = enum {
+    // Simple log fields (from LogField enum)
+    log_body,
+    log_severity_text,
+    log_trace_id,
+    log_span_id,
+    log_event_name,
+    resource_schema_url,
+    scope_schema_url,
+
+    // Keyed attribute fields
+    log_attribute,
+    resource_attribute,
+    scope_attribute,
+
+    /// Convert from proto LogMatcher.field_union to MatchCase
+    pub fn fromFieldUnion(field: LogMatcher.field_union) MatchCase {
+        return switch (field) {
+            .log_field => |lf| switch (lf) {
+                .LOG_FIELD_BODY => .log_body,
+                .LOG_FIELD_SEVERITY_TEXT => .log_severity_text,
+                .LOG_FIELD_TRACE_ID => .log_trace_id,
+                .LOG_FIELD_SPAN_ID => .log_span_id,
+                .LOG_FIELD_EVENT_NAME => .log_event_name,
+                .LOG_FIELD_RESOURCE_SCHEMA_URL => .resource_schema_url,
+                .LOG_FIELD_SCOPE_SCHEMA_URL => .scope_schema_url,
+                else => .log_body, // Default for unspecified
+            },
+            .log_attribute => .log_attribute,
+            .resource_attribute => .resource_attribute,
+            .scope_attribute => .scope_attribute,
+        };
+    }
+};
 
 // =============================================================================
 // MatcherKey - Index key for databases
@@ -111,16 +147,87 @@ pub const PatternMeta = struct {
 // PolicyInfo - Policy metadata for match aggregation
 // =============================================================================
 
+/// Parsed keep value from policy
+/// Priority order (most restrictive first): none > percentage > all > rate_limit
+pub const KeepValue = union(enum) {
+    /// Keep all logs (default)
+    all,
+    /// Drop all logs
+    none,
+    /// Keep a percentage of logs (0-100)
+    percentage: u8,
+    /// Rate limit: keep N logs per second
+    per_second: u32,
+    /// Rate limit: keep N logs per minute
+    per_minute: u32,
+
+    /// Parse a keep string into a KeepValue
+    /// Valid formats: "all", "none", "N%", "N/s", "N/m"
+    pub fn parse(s: []const u8) KeepValue {
+        if (s.len == 0 or std.mem.eql(u8, s, "all")) {
+            return .all;
+        }
+        if (std.mem.eql(u8, s, "none")) {
+            return .none;
+        }
+        // Check for percentage: "N%"
+        if (s.len >= 2 and s[s.len - 1] == '%') {
+            const num_str = s[0 .. s.len - 1];
+            const pct = std.fmt.parseInt(u8, num_str, 10) catch return .all;
+            if (pct > 100) return .all;
+            return .{ .percentage = pct };
+        }
+        // Check for rate limit: "N/s" or "N/m"
+        if (s.len >= 3 and s[s.len - 2] == '/') {
+            const num_str = s[0 .. s.len - 2];
+            const rate = std.fmt.parseInt(u32, num_str, 10) catch return .all;
+            return switch (s[s.len - 1]) {
+                's' => .{ .per_second = rate },
+                'm' => .{ .per_minute = rate },
+                else => .all,
+            };
+        }
+        return .all;
+    }
+
+    /// Compare two KeepValues for restrictiveness.
+    /// Returns true if self is more restrictive than other.
+    /// Order: none > percentage (lower %) > all > rate limits
+    pub fn isMoreRestrictiveThan(self: KeepValue, other: KeepValue) bool {
+        const self_rank = self.restrictiveness();
+        const other_rank = other.restrictiveness();
+        if (self_rank != other_rank) {
+            return self_rank < other_rank; // Lower rank = more restrictive
+        }
+        // Same category - compare values
+        return switch (self) {
+            .percentage => |p| switch (other) {
+                .percentage => |op| p < op, // Lower percentage is more restrictive
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Get restrictiveness rank (lower = more restrictive)
+    fn restrictiveness(self: KeepValue) u8 {
+        return switch (self) {
+            .none => 0,
+            .percentage => 1,
+            .all => 2,
+            .per_second, .per_minute => 3, // Rate limits are least restrictive in priority
+        };
+    }
+};
+
 /// Policy information needed for match aggregation and action determination.
 pub const PolicyInfo = struct {
     /// Policy ID
     id: []const u8,
-    /// Total number of regex matchers in this policy (excludes severity_number)
+    /// Total number of regex matchers in this policy
     regex_matcher_count: u32,
-    /// Filter action to take when policy matches
-    action: FilterAction,
-    /// Policy priority (higher = more important)
-    priority: i32,
+    /// Keep value parsed from policy (determines what to do when matched)
+    keep: KeepValue,
     /// Whether policy is enabled
     enabled: bool,
     /// Negated matchers info: maps MatcherKey -> list of matcher indices
@@ -278,34 +385,42 @@ pub const MatcherIndex = struct {
         for (policies_slice) |*policy| {
             bus.debug(ProcessingPolicy{ .id = policy.id, .name = policy.name, .enabled = policy.enabled });
 
-            const filter_config = policy.log_filter orelse {
+            const log_target = policy.log orelse {
                 bus.debug(SkippingPolicyNoFilter{ .id = policy.id });
                 continue;
             };
 
-            // Count regex matchers (exclude severity_number which uses range)
+            // Count regex matchers
             var regex_matcher_count: u32 = 0;
             var negated_matchers = std.ArrayListUnmanaged(PolicyInfo.NegatedMatcherInfo){};
 
-            bus.debug(PolicyMatcherCount{ .id = policy.id, .matcher_count = filter_config.matchers.items.len, .action = filter_config.action });
+            bus.debug(PolicyMatcherCount{ .id = policy.id, .matcher_count = log_target.match.items.len, .keep = log_target.keep });
 
-            for (filter_config.matchers.items, 0..) |matcher, matcher_idx| {
-                const match = matcher.match orelse {
+            for (log_target.match.items, 0..) |matcher, matcher_idx| {
+                // Get field type from matcher
+                const field = matcher.field orelse {
+                    bus.debug(MatcherNullField{ .matcher_idx = matcher_idx });
+                    continue;
+                };
+
+                const match_case = MatchCase.fromFieldUnion(field);
+
+                // Get match type - we only support regex for hyperscan
+                const match_union = matcher.match orelse {
                     bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
                     continue;
                 };
-                const match_case: MatchCase = match;
 
-                // Skip severity_number - it uses min/max range, not regex
-                if (match_case == .log_severity_number) {
-                    bus.debug(MatcherSeverityNumber{ .matcher_idx = matcher_idx });
-                    continue;
-                }
-
-                const regex = getRegexFromMatch(match) orelse {
-                    bus.debug(MatcherNoRegex{ .matcher_idx = matcher_idx });
-                    continue;
+                // Extract regex from match union (only regex type is supported for hyperscan)
+                const regex: []const u8 = switch (match_union) {
+                    .regex => |r| r,
+                    .exact => |e| e, // Treat exact as literal regex (will be escaped by hyperscan)
+                    .exists => {
+                        // exists doesn't use regex matching - skip for hyperscan index
+                        continue;
+                    },
                 };
+
                 if (regex.len == 0) {
                     bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
                     continue;
@@ -313,8 +428,8 @@ pub const MatcherIndex = struct {
 
                 regex_matcher_count += 1;
 
-                // Get or create key
-                const raw_key = getKeyFromMatch(match) orelse "";
+                // Get key for attribute-based matchers
+                const raw_key = getKeyFromField(field) orelse "";
                 const matcher_key = MatcherKey{ .match_case = match_case, .key = raw_key };
 
                 bus.debug(MatcherDetail{ .matcher_idx = matcher_idx, .match_case = match_case, .key = raw_key, .regex = regex, .negate = matcher.negate });
@@ -359,8 +474,7 @@ pub const MatcherIndex = struct {
             try self.policies.put(allocator, policy_id_copy, .{
                 .id = policy_id_copy,
                 .regex_matcher_count = regex_matcher_count,
-                .action = filter_config.action,
-                .priority = policy.priority,
+                .keep = KeepValue.parse(log_target.keep),
                 .enabled = policy.enabled,
                 .negated_matchers = negated_matchers,
             });
@@ -475,29 +589,13 @@ const PatternCollector = struct {
     regex: []const u8,
 };
 
-/// Extract the regex string from a match union
-fn getRegexFromMatch(match: LogMatcher.match_union) ?[]const u8 {
-    return switch (match) {
-        .resource_schema_url => |m| m.regex,
-        .resource_attribute => |m| m.regex,
-        .scope_schema_url => |m| m.regex,
-        .scope_name => |m| m.regex,
-        .scope_version => |m| m.regex,
-        .scope_attribute => |m| m.regex,
-        .log_body => |m| m.regex,
-        .log_severity_text => |m| m.regex,
-        .log_severity_number => null, // Uses min/max, not regex
-        .log_attribute => |m| m.regex,
-    };
-}
-
-/// Extract the key from a keyed match union
-fn getKeyFromMatch(match: LogMatcher.match_union) ?[]const u8 {
-    return switch (match) {
-        .resource_attribute => |m| m.key,
-        .scope_attribute => |m| m.key,
-        .log_attribute => |m| m.key,
-        else => null,
+/// Extract the key from a field union (for keyed attribute types)
+fn getKeyFromField(field: LogMatcher.field_union) ?[]const u8 {
+    return switch (field) {
+        .log_attribute => |key| key,
+        .resource_attribute => |key| key,
+        .scope_attribute => |key| key,
+        .log_field => null, // Simple fields don't have keys
     };
 }
 
@@ -584,10 +682,53 @@ test "MatcherKey: hash and equality" {
 test "MatcherKey: isKeyed" {
     try testing.expect(!MatcherKey.isKeyed(.log_body));
     try testing.expect(!MatcherKey.isKeyed(.log_severity_text));
-    try testing.expect(!MatcherKey.isKeyed(.scope_name));
+    try testing.expect(!MatcherKey.isKeyed(.resource_schema_url));
     try testing.expect(MatcherKey.isKeyed(.log_attribute));
     try testing.expect(MatcherKey.isKeyed(.resource_attribute));
     try testing.expect(MatcherKey.isKeyed(.scope_attribute));
+}
+
+test "KeepValue: parse" {
+    // Test basic values
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("all"));
+    try testing.expectEqual(KeepValue.all, KeepValue.parse(""));
+    try testing.expectEqual(KeepValue.none, KeepValue.parse("none"));
+
+    // Test percentages
+    try testing.expectEqual(KeepValue{ .percentage = 50 }, KeepValue.parse("50%"));
+    try testing.expectEqual(KeepValue{ .percentage = 0 }, KeepValue.parse("0%"));
+    try testing.expectEqual(KeepValue{ .percentage = 100 }, KeepValue.parse("100%"));
+
+    // Test rate limits
+    try testing.expectEqual(KeepValue{ .per_second = 100 }, KeepValue.parse("100/s"));
+    try testing.expectEqual(KeepValue{ .per_minute = 1000 }, KeepValue.parse("1000/m"));
+
+    // Invalid values default to all
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("invalid"));
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("101%")); // > 100
+}
+
+test "KeepValue: restrictiveness comparison" {
+    const none: KeepValue = .none;
+    const all: KeepValue = .all;
+    const pct50: KeepValue = .{ .percentage = 50 };
+    const pct10: KeepValue = .{ .percentage = 10 };
+    const rate100: KeepValue = .{ .per_second = 100 };
+
+    // none is most restrictive
+    try testing.expect(none.isMoreRestrictiveThan(all));
+    try testing.expect(none.isMoreRestrictiveThan(pct50));
+
+    // percentage is more restrictive than all
+    try testing.expect(pct50.isMoreRestrictiveThan(all));
+    try testing.expect(pct10.isMoreRestrictiveThan(pct50));
+
+    // all is more restrictive than rate limits
+    try testing.expect(all.isMoreRestrictiveThan(rate100));
+
+    // Same restrictiveness
+    try testing.expect(!all.isMoreRestrictiveThan(all));
+    try testing.expect(!none.isMoreRestrictiveThan(none));
 }
 
 test "MatcherIndex: build empty" {
@@ -610,13 +751,13 @@ test "MatcherIndex: build with single policy" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     defer policy.deinit(allocator);
 
@@ -633,7 +774,7 @@ test "MatcherIndex: build with single policy" {
     const policy_info = index.getPolicy("policy-1");
     try testing.expect(policy_info != null);
     try testing.expectEqual(@as(u32, 1), policy_info.?.regex_matcher_count);
-    try testing.expectEqual(@as(i32, 10), policy_info.?.priority);
+    try testing.expectEqual(KeepValue.none, policy_info.?.keep);
     try testing.expect(policy_info.?.enabled);
 
     // Check database exists for log_body
@@ -648,21 +789,17 @@ test "MatcherIndex: build with keyed matchers" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_attribute = .{
-            .key = try allocator.dupe(u8, "service"),
-            .regex = try allocator.dupe(u8, "payment"),
-        } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .match = .{ .regex = try allocator.dupe(u8, "payment") },
     });
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_attribute = .{
-            .key = try allocator.dupe(u8, "env"),
-            .regex = try allocator.dupe(u8, "prod"),
-        } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+        .match = .{ .regex = try allocator.dupe(u8, "prod") },
     });
     defer policy.deinit(allocator);
 
@@ -687,13 +824,13 @@ test "MatcherIndex: multiple policies same matcher key" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "policy-1"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy1.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     defer policy1.deinit(allocator);
 
@@ -701,13 +838,13 @@ test "MatcherIndex: multiple policies same matcher key" {
         .id = try allocator.dupe(u8, "policy-2"),
         .name = try allocator.dupe(u8, "policy-2"),
         .enabled = true,
-        .priority = 20,
-        .log_filter = .{
-            .action = .FILTER_ACTION_KEEP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
         },
     };
-    try policy2.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "warning") } },
+    try policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "warning") },
     });
     defer policy2.deinit(allocator);
 
@@ -732,12 +869,13 @@ test "MatcherIndex: negated matcher tracking" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
         .negate = true,
     });
     defer policy.deinit(allocator);
@@ -760,15 +898,17 @@ test "MatcherIndex: scan database" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "warning") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "warning") },
     });
     defer policy.deinit(allocator);
 
@@ -793,24 +933,26 @@ test "MatcherIndex: scan database" {
     try testing.expectEqual(@as(usize, 2), result.count);
 }
 
-test "MatcherIndex: severity_number excluded from regex matchers" {
+test "MatcherIndex: exists matcher excluded from regex matchers" {
     const allocator = testing.allocator;
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
     // Add a regex matcher
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
-    // Add a severity_number matcher (should be excluded from count)
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_severity_number = .{ .min = 17, .max = 21 } },
+    // Add an exists matcher (should be excluded from hyperscan index)
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .match = .{ .exists = true },
     });
     defer policy.deinit(allocator);
 
@@ -819,10 +961,10 @@ test "MatcherIndex: severity_number excluded from regex matchers" {
     var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    // Only 1 database (for log_body, not severity_number)
+    // Only 1 database (for log_body, exists matcher is not indexed)
     try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
 
-    // regex_matcher_count should be 1 (excludes severity_number)
+    // regex_matcher_count should be 1 (excludes exists)
     const policy_info = index.getPolicy("policy-1");
     try testing.expect(policy_info != null);
     try testing.expectEqual(@as(u32, 1), policy_info.?.regex_matcher_count);

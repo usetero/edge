@@ -164,15 +164,14 @@ fn otlpFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []const 
     return switch (match_case) {
         .log_body => getAnyValueString(log_ctx.log_record.body),
         .log_severity_text => if (log_ctx.log_record.severity_text.len > 0) log_ctx.log_record.severity_text else null,
+        .log_trace_id => if (log_ctx.log_record.trace_id.len > 0) log_ctx.log_record.trace_id else null,
+        .log_span_id => if (log_ctx.log_record.span_id.len > 0) log_ctx.log_record.span_id else null,
+        .log_event_name => null, // OTLP LogRecord doesn't have a dedicated event_name field
         .log_attribute => findAttribute(log_ctx.log_record.attributes.items, key),
         .resource_schema_url => if (log_ctx.resource_logs.schema_url.len > 0) log_ctx.resource_logs.schema_url else null,
         .resource_attribute => if (log_ctx.resource_logs.resource) |res| findAttribute(res.attributes.items, key) else null,
         .scope_schema_url => if (log_ctx.scope_logs.schema_url.len > 0) log_ctx.scope_logs.schema_url else null,
-        .scope_name => if (log_ctx.scope_logs.scope) |scope| (if (scope.name.len > 0) scope.name else null) else null,
-        .scope_version => if (log_ctx.scope_logs.scope) |scope| (if (scope.version.len > 0) scope.version else null) else null,
         .scope_attribute => if (log_ctx.scope_logs.scope) |scope| findAttribute(scope.attributes.items, key) else null,
-        // log_severity_number uses min/max range matching, not regex - handled separately
-        .log_severity_number => null,
     };
 }
 
@@ -423,12 +422,13 @@ test "processLogs - DROP policy filters logs by severity" {
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try drop_policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .regex = try allocator.dupe(u8, "DEBUG") },
     });
     defer drop_policy.deinit(allocator);
 
@@ -462,12 +462,13 @@ test "processLogs - DROP policy filters logs by body content" {
         .id = try allocator.dupe(u8, "drop-secret"),
         .name = try allocator.dupe(u8, "drop-secret"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try drop_policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "secret") } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "secret") },
     });
     defer drop_policy.deinit(allocator);
 
@@ -499,15 +500,13 @@ test "processLogs - DROP policy filters logs by resource attribute" {
         .id = try allocator.dupe(u8, "drop-test-service"),
         .name = try allocator.dupe(u8, "drop-test-service"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try drop_policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .resource_attribute = .{
-            .key = try allocator.dupe(u8, "service.name"),
-            .regex = try allocator.dupe(u8, "test-service"),
-        } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .resource_attribute = try allocator.dupe(u8, "service.name") },
+        .match = .{ .regex = try allocator.dupe(u8, "test-service") },
     });
     defer drop_policy.deinit(allocator);
 
@@ -540,12 +539,13 @@ test "processLogs - all logs dropped returns empty structure" {
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try drop_policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "msg") } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "msg") },
     });
     defer drop_policy.deinit(allocator);
 
@@ -632,12 +632,13 @@ test "processLogs - protobuf DROP policy filters logs" {
         .id = try allocator.dupe(u8, "drop-secret"),
         .name = try allocator.dupe(u8, "drop-secret"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try drop_policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "secret") } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "secret") },
     });
     defer drop_policy.deinit(allocator);
 
@@ -683,12 +684,13 @@ test "processLogs - protobuf all logs dropped" {
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try drop_policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "msg") } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "msg") },
     });
     defer drop_policy.deinit(allocator);
 

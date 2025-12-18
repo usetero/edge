@@ -23,8 +23,8 @@ const o11y = @import("../observability/root.zig");
 const NoopEventBus = o11y.NoopEventBus;
 const EventBus = o11y.EventBus;
 
-const FilterAction = proto.policy.FilterAction;
 const LogMatcher = proto.policy.LogMatcher;
+const KeepValue = matcher_index.KeepValue;
 
 const MatcherIndex = matcher_index.MatcherIndex;
 const MatcherKey = matcher_index.MatcherKey;
@@ -277,7 +277,8 @@ pub const FilterEngine = struct {
         }
     }
 
-    /// Find the best matching policy given match counts and negation failures
+    /// Find the best (most restrictive) matching policy given match counts and negation failures
+    /// Priority order: none > percentage (lower %) > all > rate limits
     fn findBestMatch(
         index: *const MatcherIndex,
         match_counts: *const [MAX_POLICIES]MatchCountEntry,
@@ -285,7 +286,7 @@ pub const FilterEngine = struct {
         negation_failures: *const [MAX_POLICIES]NegationFailure,
         negation_failure_len: usize,
     ) MatchResult {
-        var best_priority: ?i32 = null;
+        var best_keep: ?KeepValue = null;
         var best_action: FilterResult = .keep;
         var best_policy_id: ?[]const u8 = null;
 
@@ -314,10 +315,10 @@ pub const FilterEngine = struct {
             }
             if (negation_failed) continue;
 
-            // Policy fully matches! Check if it's the best priority
-            if (best_priority == null or policy_info.priority > best_priority.?) {
-                best_priority = policy_info.priority;
-                best_action = actionToResult(policy_info.action);
+            // Policy fully matches! Check if it's more restrictive
+            if (best_keep == null or policy_info.keep.isMoreRestrictiveThan(best_keep.?)) {
+                best_keep = policy_info.keep;
+                best_action = keepToResult(policy_info.keep);
                 best_policy_id = policy_info.id;
             }
         }
@@ -345,10 +346,10 @@ pub const FilterEngine = struct {
             }
             if (negation_failed) continue;
 
-            // This all-negated policy matches! Check priority
-            if (best_priority == null or policy_info.priority > best_priority.?) {
-                best_priority = policy_info.priority;
-                best_action = actionToResult(policy_info.action);
+            // This all-negated policy matches! Check if more restrictive
+            if (best_keep == null or policy_info.keep.isMoreRestrictiveThan(best_keep.?)) {
+                best_keep = policy_info.keep;
+                best_action = keepToResult(policy_info.keep);
                 best_policy_id = policy_info.id;
             }
         }
@@ -356,12 +357,15 @@ pub const FilterEngine = struct {
         return .{ .action = best_action, .policy_id = best_policy_id };
     }
 
-    /// Convert proto FilterAction to FilterResult
-    fn actionToResult(action: FilterAction) FilterResult {
-        return switch (action) {
-            .FILTER_ACTION_DROP => .drop,
-            .FILTER_ACTION_KEEP => .keep,
-            else => .keep,
+    /// Convert KeepValue to FilterResult
+    /// For now, we only support "none" (drop) vs everything else (keep)
+    /// Rate limiting and percentage sampling are not implemented yet
+    fn keepToResult(keep: KeepValue) FilterResult {
+        return switch (keep) {
+            .none => .drop,
+            .all => .keep,
+            // For percentage and rate limits, we keep for now (sampling not implemented)
+            .percentage, .per_second, .per_minute => .keep,
         };
     }
 };
@@ -422,13 +426,13 @@ test "FilterEngine: single policy drop match" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "drop-errors"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     defer policy.deinit(allocator);
 
@@ -456,13 +460,13 @@ test "FilterEngine: single policy keep match" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "keep-errors"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_KEEP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     defer policy.deinit(allocator);
 
@@ -486,20 +490,18 @@ test "FilterEngine: multiple matchers AND logic" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "drop-payment-errors"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
     // Two matchers - both must match
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_attribute = .{
-            .key = try allocator.dupe(u8, "service"),
-            .regex = try allocator.dupe(u8, "payment"),
-        } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .match = .{ .regex = try allocator.dupe(u8, "payment") },
     });
     defer policy.deinit(allocator);
 
@@ -532,13 +534,13 @@ test "FilterEngine: negated matcher" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "drop-non-important"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "important") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "important") },
         .negate = true,
     });
     defer policy.deinit(allocator);
@@ -568,21 +570,19 @@ test "FilterEngine: mixed negated and non-negated matchers" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "drop-non-prod-errors"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
     // Must contain "error"
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     // Must NOT be from production
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_attribute = .{
-            .key = try allocator.dupe(u8, "env"),
-            .regex = try allocator.dupe(u8, "prod"),
-        } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+        .match = .{ .regex = try allocator.dupe(u8, "prod") },
         .negate = true,
     });
     defer policy.deinit(allocator);
@@ -608,60 +608,58 @@ test "FilterEngine: mixed negated and non-negated matchers" {
     try testing.expectEqual(FilterResult.keep, engine.evaluate(@ptrCast(&staging_info), TestLogContext.fieldAccessor));
 }
 
-test "FilterEngine: priority ordering - higher priority wins" {
+test "FilterEngine: most restrictive wins - drop beats keep" {
     const allocator = testing.allocator;
 
-    // Low priority: drop errors
-    var low_priority = Policy{
-        .id = try allocator.dupe(u8, "low-priority"),
-        .name = try allocator.dupe(u8, "low-priority"),
+    // Policy that keeps errors
+    var keep_policy = Policy{
+        .id = try allocator.dupe(u8, "keep-errors"),
+        .name = try allocator.dupe(u8, "keep-errors"),
         .enabled = true,
-        .priority = 1,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
         },
     };
-    try low_priority.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try keep_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
-    defer low_priority.deinit(allocator);
+    defer keep_policy.deinit(allocator);
 
-    // High priority: keep errors from payment service
-    var high_priority = Policy{
-        .id = try allocator.dupe(u8, "high-priority"),
-        .name = try allocator.dupe(u8, "high-priority"),
+    // Policy that drops errors from payment service (more specific AND more restrictive)
+    var drop_policy = Policy{
+        .id = try allocator.dupe(u8, "drop-payment-errors"),
+        .name = try allocator.dupe(u8, "drop-payment-errors"),
         .enabled = true,
-        .priority = 100,
-        .log_filter = .{
-            .action = .FILTER_ACTION_KEEP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try high_priority.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
-    try high_priority.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_attribute = .{
-            .key = try allocator.dupe(u8, "service"),
-            .regex = try allocator.dupe(u8, "payment"),
-        } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .match = .{ .regex = try allocator.dupe(u8, "payment") },
     });
-    defer high_priority.deinit(allocator);
+    defer drop_policy.deinit(allocator);
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.updatePolicies(&.{ low_priority, high_priority }, "file-provider", .file);
+    try registry.updatePolicies(&.{ keep_policy, drop_policy }, "file-provider", .file);
 
     const engine = FilterEngine.init(allocator, noop_bus.eventBus(), &registry);
 
-    // Error from payment - both policies match, high priority wins (KEEP)
+    // Error from payment - both policies match, most restrictive (DROP) wins
     const payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
-    try testing.expectEqual(FilterResult.keep, engine.evaluate(@ptrCast(&payment_error), TestLogContext.fieldAccessor));
+    try testing.expectEqual(FilterResult.drop, engine.evaluate(@ptrCast(&payment_error), TestLogContext.fieldAccessor));
 
-    // Error from auth - only low priority matches (DROP)
+    // Error from auth - only keep_policy matches (KEEP)
     const auth_error = TestLogContext{ .message = "an error occurred", .service = "auth-api" };
-    try testing.expectEqual(FilterResult.drop, engine.evaluate(@ptrCast(&auth_error), TestLogContext.fieldAccessor));
+    try testing.expectEqual(FilterResult.keep, engine.evaluate(@ptrCast(&auth_error), TestLogContext.fieldAccessor));
 }
 
 test "FilterEngine: disabled policies are skipped" {
@@ -671,13 +669,13 @@ test "FilterEngine: disabled policies are skipped" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "disabled-drop"),
         .enabled = false, // Disabled!
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     defer policy.deinit(allocator);
 
@@ -701,14 +699,14 @@ test "FilterEngine: regex pattern matching" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "drop-error-pattern"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
     // Regex pattern: matches "error" or "Error" case-insensitive with (?i)
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "^.*rror") } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "^.*rror") },
     });
     defer policy.deinit(allocator);
 
@@ -740,16 +738,13 @@ test "FilterEngine: missing field with negated matcher succeeds" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "drop-non-critical"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_attribute = .{
-            .key = try allocator.dupe(u8, "service"),
-            .regex = try allocator.dupe(u8, "^critical-s.*$"),
-        } },
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .match = .{ .regex = try allocator.dupe(u8, "^critical-s.*$") },
         .negate = true,
     });
     defer policy.deinit(allocator);
@@ -783,13 +778,13 @@ test "FilterEngine: multiple policies with different matcher keys" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "drop-errors"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy1.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_body = .{ .regex = try allocator.dupe(u8, "error") } },
+    try policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     defer policy1.deinit(allocator);
 
@@ -798,16 +793,13 @@ test "FilterEngine: multiple policies with different matcher keys" {
         .id = try allocator.dupe(u8, "policy-2"),
         .name = try allocator.dupe(u8, "drop-debug-service"),
         .enabled = true,
-        .priority = 10,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try policy2.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_attribute = .{
-            .key = try allocator.dupe(u8, "service"),
-            .regex = try allocator.dupe(u8, "debug"),
-        } },
+    try policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .match = .{ .regex = try allocator.dupe(u8, "debug") },
     });
     defer policy2.deinit(allocator);
 

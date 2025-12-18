@@ -10,7 +10,7 @@ const SyncRequest = proto.policy.SyncRequest;
 const SyncResponse = proto.policy.SyncResponse;
 const ClientMetadata = proto.policy.ClientMetadata;
 const PolicySyncStatus = proto.policy.PolicySyncStatus;
-const PolicyType = proto.policy.PolicyType;
+const PolicyStage = proto.policy.PolicyStage;
 const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
 const ServiceMetadata = types.ServiceMetadata;
@@ -390,8 +390,8 @@ pub const HttpProvider = struct {
             .{ .key = "workspace.id", .value = .{ .value = .{ .string_value = self.workspace_id } } },
         };
 
-        // Build supported_policy_types
-        const supported_policy_types = [_]PolicyType{.POLICY_TYPE_LOG_FILTER};
+        // Build supported_policy_stages
+        const supported_policy_stages = [_]PolicyStage{.POLICY_STAGE_LOG_FILTER};
 
         // Build policy_statuses from our tracked state
         var policy_statuses_list = std.ArrayListUnmanaged(PolicySyncStatus){};
@@ -420,7 +420,7 @@ pub const HttpProvider = struct {
         // Create SyncRequest with the new structure
         const sync_request = SyncRequest{
             .client_metadata = ClientMetadata{
-                .supported_policy_types = .{ .items = @constCast(&supported_policy_types), .capacity = supported_policy_types.len },
+                .supported_policy_stages = .{ .items = @constCast(&supported_policy_stages), .capacity = supported_policy_stages.len },
                 .resource_attributes = .{ .items = @constCast(&resource_attributes), .capacity = resource_attributes.len },
                 .labels = .{ .items = @constCast(&labels), .capacity = labels.len },
             },

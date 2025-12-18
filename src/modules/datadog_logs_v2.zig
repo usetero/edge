@@ -74,16 +74,16 @@ fn datadogFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []con
     const field_name: []const u8 = switch (match_case) {
         .log_body => "message",
         .log_severity_text => "level",
-        .log_severity_number => "severity_number",
         .log_attribute => key, // For attributes, use the key directly (e.g., "ddtags", "service")
-        // TODO: These are unsupported today.
-        // resource_schema_url
-        // resource_attribute
-        // scope_schema_url
-        // scope_name
-        // scope_version
-        // scope_attribute
-        else => return null,
+        // Datadog JSON format doesn't have direct equivalents for these OTLP fields
+        .log_trace_id,
+        .log_span_id,
+        .log_event_name,
+        .resource_schema_url,
+        .scope_schema_url,
+        .resource_attribute,
+        .scope_attribute,
+        => return null,
     };
 
     // Get the field value
@@ -219,12 +219,13 @@ test "processLogs - DROP policy filters logs from array" {
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try drop_policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .regex = try allocator.dupe(u8, "DEBUG") },
     });
     defer drop_policy.deinit(allocator);
 
@@ -257,12 +258,13 @@ test "processLogs - DROP policy drops single object" {
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .log_filter = .{
-            .action = .FILTER_ACTION_DROP,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
         },
     };
-    try drop_policy.log_filter.?.matchers.append(allocator, .{
-        .match = .{ .log_severity_text = .{ .regex = try allocator.dupe(u8, "DEBUG") } },
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .regex = try allocator.dupe(u8, "DEBUG") },
     });
     defer drop_policy.deinit(allocator);
 

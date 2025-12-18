@@ -1,0 +1,207 @@
+syntax = "proto3";
+
+package tero.policy.v1;
+
+option go_package = "github.com/usetero/policy/gen/go/tero/policy/v1";
+
+// =============================================================================
+// Log Target
+// =============================================================================
+
+// LogTarget defines matching and actions for logs.
+message LogTarget {
+  // Matchers to identify which logs this policy applies to (AND logic)
+  repeated LogMatcher match = 1;
+
+  // The keep field controls whether matching telemetry survives. It unifies
+  // dropping, sampling, and rate limiting into a single concept: what percentage
+  // or amount of matching telemetry continues to the next stage?
+  //
+  // Valid values:
+  //   "all"  - Keep everything (default, can be omitted)
+  //   "none" - Drop everything
+  //   "N%"   - Keep N percent (0-100), e.g. "50%"
+  //   "N/s"  - Keep at most N per second, e.g. "100/s"
+  //   "N/m"  - Keep at most N per minute, e.g. "1000/m"
+  string keep = 2;
+
+  // Transform operations to apply
+  LogTransform transform = 3;
+}
+
+// =============================================================================
+// Log Field Selection
+// =============================================================================
+
+// LogField identifies simple log fields (non-keyed).
+enum LogField {
+  LOG_FIELD_UNSPECIFIED = 0;
+
+  // Log record fields
+  LOG_FIELD_BODY = 1;
+  LOG_FIELD_SEVERITY_TEXT = 2;
+  LOG_FIELD_TRACE_ID = 3;
+  LOG_FIELD_SPAN_ID = 4;
+  LOG_FIELD_EVENT_NAME = 5;
+
+  // Schema URLs
+  LOG_FIELD_RESOURCE_SCHEMA_URL = 10;
+  LOG_FIELD_SCOPE_SCHEMA_URL = 11;
+}
+
+// =============================================================================
+// Log Matching
+// =============================================================================
+
+// LogMatcher provides a way to match against log telemetry data using known fields.
+//
+// IMPORTANT CONSTRAINTS:
+// - Multiple matchers are ANDed together: all matchers must match for the
+//   overall match to succeed.
+// - The list of matchers should uniquely identify a specific pattern of telemetry
+//   for that policy. Matchers should NOT be used as a catch-all; they should be
+//   specific enough to target the intended telemetry precisely.
+//
+// All regex fields use RE2 syntax for consistency across implementations.
+message LogMatcher {
+  // FIELD SELECTION (keep in sync with LogRedact, LogRename, LogAdd, LogRemove)
+  // The field to match against. Exactly one must be set.
+  oneof field {
+    // Simple fields (body, severity_text, trace_id, span_id, etc.)
+    LogField log_field = 1;
+
+    // Log record attribute by key
+    string log_attribute = 2;
+
+    // Resource attribute by key
+    string resource_attribute = 3;
+
+    // Scope attribute by key
+    string scope_attribute = 4;
+  }
+
+  // Match type. Exactly one must be set.
+  oneof match {
+    // Exact string match
+    string exact = 10;
+
+    // Regular expression match
+    string regex = 11;
+
+    // Field existence check
+    bool exists = 12;
+  }
+
+  // If true, inverts the match result
+  bool negate = 20;
+}
+
+// =============================================================================
+// Log Transform
+// =============================================================================
+
+// LogTransform defines modifications to logs.
+message LogTransform {
+  // Fields to remove
+  repeated LogRemove remove = 1;
+
+  // Fields to redact
+  repeated LogRedact redact = 2;
+
+  // Fields to rename
+  repeated LogRename rename = 3;
+
+  // Fields to add
+  repeated LogAdd add = 4;
+}
+
+// LogRemove removes a field.
+message LogRemove {
+  // FIELD SELECTION (keep in sync with LogMatcher, LogRedact, LogRename, LogAdd)
+  // The field to remove. Exactly one must be set.
+  oneof field {
+    // Simple fields (body, severity_text, trace_id, span_id, etc.)
+    LogField log_field = 1;
+
+    // Log record attribute by key
+    string log_attribute = 2;
+
+    // Resource attribute by key
+    string resource_attribute = 3;
+
+    // Scope attribute by key
+    string scope_attribute = 4;
+  }
+}
+
+// LogRedact masks a field value.
+message LogRedact {
+  // FIELD SELECTION (keep in sync with LogMatcher, LogRemove, LogRename, LogAdd)
+  // The field to redact. Exactly one must be set.
+  oneof field {
+    // Simple fields (body, severity_text, trace_id, span_id, etc.)
+    LogField log_field = 1;
+
+    // Log record attribute by key
+    string log_attribute = 2;
+
+    // Resource attribute by key
+    string resource_attribute = 3;
+
+    // Scope attribute by key
+    string scope_attribute = 4;
+  }
+
+  // Replacement value (e.g., "[REDACTED]")
+  string replacement = 10;
+}
+
+// LogRename changes a field name.
+message LogRename {
+  // FIELD SELECTION (keep in sync with LogMatcher, LogRemove, LogRedact, LogAdd)
+  // The field to rename. Exactly one must be set.
+  oneof from {
+    // Simple fields (body, severity_text, trace_id, span_id, etc.)
+    LogField from_log_field = 1;
+
+    // Log record attribute by key
+    string from_log_attribute = 2;
+
+    // Resource attribute by key
+    string from_resource_attribute = 3;
+
+    // Scope attribute by key
+    string from_scope_attribute = 4;
+  }
+
+  // The new field name
+  string to = 10;
+
+  // If true, overwrites the target field if it already exists
+  bool upsert = 11;
+}
+
+// LogAdd inserts a field.
+message LogAdd {
+  // FIELD SELECTION (keep in sync with LogMatcher, LogRemove, LogRedact, LogRename)
+  // The field to add. Exactly one must be set.
+  oneof field {
+    // Simple fields (body, severity_text, trace_id, span_id, etc.)
+    LogField log_field = 1;
+
+    // Log record attribute by key
+    string log_attribute = 2;
+
+    // Resource attribute by key
+    string resource_attribute = 3;
+
+    // Scope attribute by key
+    string scope_attribute = 4;
+  }
+
+  // The value to set
+  string value = 10;
+
+  // If true, overwrites the field if it already exists
+  bool upsert = 11;
+}
