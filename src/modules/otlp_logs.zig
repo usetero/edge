@@ -1,6 +1,6 @@
 const std = @import("std");
 const proto = @import("proto");
-const filter_engine = @import("../policy/filter_engine.zig");
+const policy_engine = @import("../policy/policy_engine.zig");
 const policy = @import("../policy/root.zig");
 const o11y = @import("../observability/root.zig");
 
@@ -12,9 +12,9 @@ const AnyValue = proto.common.AnyValue;
 const KeyValue = proto.common.KeyValue;
 const InstrumentationScope = proto.common.InstrumentationScope;
 
-const FilterEngine = filter_engine.FilterEngine;
-const FilterResult = filter_engine.FilterResult;
-const MatchCase = filter_engine.MatchCase;
+const PolicyEngine = policy_engine.PolicyEngine;
+const FilterDecision = policy_engine.FilterDecision;
+const MatchCase = policy_engine.MatchCase;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -192,7 +192,7 @@ fn filterLogsInPlace(
     bus: *EventBus,
     allocator: std.mem.Allocator,
 ) FilterCounts {
-    const engine = FilterEngine.init(allocator, bus, @constCast(registry));
+    const engine = PolicyEngine.init(allocator, bus, @constCast(registry));
 
     var original_count: usize = 0;
     var dropped_count: usize = 0;
@@ -213,9 +213,9 @@ fn filterLogsInPlace(
                     .scope_logs = scope_logs,
                 };
 
-                const filter_result = engine.evaluate(@ptrCast(&ctx), otlpFieldAccessor);
+                const filter_result = engine.evaluateFilter(@ptrCast(&ctx), otlpFieldAccessor);
 
-                if (filter_result == .keep) {
+                if (filter_result.shouldContinue()) {
                     // Keep this log - move to write position if needed
                     if (write_idx != scope_logs.log_records.items.len - 1) {
                         scope_logs.log_records.items[write_idx] = log_record.*;

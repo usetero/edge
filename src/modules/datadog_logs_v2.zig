@@ -1,19 +1,36 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
-const filter_engine = @import("../policy/filter_engine.zig");
+const policy_engine = @import("../policy/policy_engine.zig");
 const policy = @import("../policy/root.zig");
 const o11y = @import("../observability/root.zig");
 
-const FilterEngine = filter_engine.FilterEngine;
-const FilterResult = filter_engine.FilterResult;
-const MatchCase = filter_engine.MatchCase;
+const PolicyEngine = policy_engine.PolicyEngine;
+const FilterDecision = policy_engine.FilterDecision;
+const MatchCase = policy_engine.MatchCase;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
 const StreamParser = zimdjson.ondemand.StreamParser(.default);
 const Object = StreamParser.Object;
+const Document = StreamParser.Document;
 const ArrayList = std.ArrayListUnmanaged;
+
+/// Datadog log schema for parsing and serialization
+/// Uses zimdjson schema inference for deserialization
+const DatadogLog = struct {
+    message: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    level: ?[]const u8 = null,
+    service: ?[]const u8 = null,
+    hostname: ?[]const u8 = null,
+    ddsource: ?[]const u8 = null,
+    ddtags: ?[]const u8 = null,
+    timestamp: ?i64 = null,
+    environment: ?[]const u8 = null,
+    custom_field: ?[]const u8 = null,
+    // TODO: may need to handle additional fields dynamically
+};
 
 /// Result of processing logs
 pub const ProcessResult = struct {
@@ -64,27 +81,31 @@ pub fn processLogs(
     };
 }
 
-/// Context for field accessor - holds the zimdjson Object for field lookups
+/// Context for field accessor - holds the DatadogLog struct
 const FieldAccessorContext = struct {
-    object: Object,
+    log: *const DatadogLog,
 };
 
-/// Field accessor for Datadog JSON log format using zimdjson
+/// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
-/// Supports arbitrary field lookups via the zimdjson Object
 fn datadogFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8 {
     const field_ctx: *const FieldAccessorContext = @ptrCast(@alignCast(ctx));
+    const log = field_ctx.log;
 
-    // Map match_case to appropriate field name(s)
-    const field_name: []const u8 = switch (match_case) {
-        .log_body => "message",
-        .log_severity_text => blk: {
-            // Datadog uses "status" for severity, but also check "level" as fallback
-            const status_value = field_ctx.object.at("status");
-            if (status_value.asString()) |s| return s else |_| {}
-            break :blk "level"; // Try level as fallback
+    return switch (match_case) {
+        .log_body => log.message,
+        .log_severity_text => log.status orelse log.level,
+        .log_attribute => {
+            // For attributes, look up by key name
+            if (std.mem.eql(u8, key, "service")) return log.service;
+            if (std.mem.eql(u8, key, "hostname")) return log.hostname;
+            if (std.mem.eql(u8, key, "ddsource")) return log.ddsource;
+            if (std.mem.eql(u8, key, "ddtags")) return log.ddtags;
+            if (std.mem.eql(u8, key, "environment")) return log.environment;
+            if (std.mem.eql(u8, key, "custom_field")) return log.custom_field;
+            // TODO: handle additional dynamic fields
+            return null;
         },
-        .log_attribute => key, // For attributes, use the key directly (supports any field)
         // Datadog JSON format doesn't have direct equivalents for these OTLP fields
         .log_trace_id,
         .log_span_id,
@@ -93,12 +114,8 @@ fn datadogFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []con
         .scope_schema_url,
         .resource_attribute,
         .scope_attribute,
-        => return null,
+        => null,
     };
-
-    // Look up the field in the zimdjson object
-    const field_value = field_ctx.object.at(field_name);
-    return field_value.asString() catch null;
 }
 
 /// Process JSON logs with filter evaluation using zimdjson streaming parser
@@ -112,7 +129,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
     var reader = std.Io.Reader.fixed(data);
 
     // Parse the JSON document using streaming parser
-    const document = parser.parseFromReader(allocator, &reader) catch {
+    const document: Document = parser.parseFromReader(allocator, &reader) catch {
         // If JSON parsing fails, return data unchanged (fail-open)
         const result = try allocator.alloc(u8, data.len);
         @memcpy(result, data);
@@ -123,9 +140,8 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
         };
     };
 
-    // Create filter engine for evaluation (gets snapshot from registry internally)
-    const engine = FilterEngine.init(allocator, bus, @constCast(registry));
-
+    // Create policy engine for evaluation (gets snapshot from registry internally)
+    const engine = PolicyEngine.init(allocator, bus, @constCast(registry));
     // Get the value type to determine if it's an array or object
     const value_type = document.getType() catch {
         // If we can't determine the type, return unchanged
@@ -141,7 +157,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
     switch (value_type) {
         .array => {
             // Process array of logs using schema-based parsing
-            const array = document.asArray() catch {
+            var array: std.json.Parsed([]DatadogLog) = document.as([]DatadogLog, allocator, .{}) catch {
                 const result = try allocator.alloc(u8, data.len);
                 @memcpy(result, data);
                 return .{
@@ -150,32 +166,25 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
                     .original_count = 0,
                 };
             };
+            defer array.deinit();
 
-            // Collect indices of kept logs
-            var kept_indices: ArrayList(usize) = .empty;
-            defer kept_indices.deinit(allocator);
+            // Collect objects of kept logs
+            var kept_objects: ArrayList(DatadogLog) = .empty;
+            defer kept_objects.deinit(allocator);
 
             var dropped_count: usize = 0;
             var original_count: usize = 0;
 
-            var it = array.iterator();
-            while (it.next() catch null) |log_value| {
+            for (array.value) |*log_obj| {
                 original_count += 1;
 
-                // Get the log object for field lookups
-                const log_obj = log_value.asObject() catch {
-                    // If not an object, keep the log (fail-open)
-                    try kept_indices.append(allocator, original_count - 1);
-                    continue;
-                };
-
                 const field_ctx = FieldAccessorContext{
-                    .object = log_obj,
+                    .log = log_obj,
                 };
 
-                const filter_result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor);
-                if (filter_result == .keep) {
-                    try kept_indices.append(allocator, original_count - 1);
+                const filter_result = engine.evaluateFilter(@ptrCast(&field_ctx), datadogFieldAccessor);
+                if (filter_result.shouldContinue()) {
+                    try kept_objects.append(allocator, log_obj.*);
                 } else {
                     dropped_count += 1;
                 }
@@ -193,7 +202,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             }
 
             // If everything was dropped, return empty array
-            if (kept_indices.items.len == 0) {
+            if (kept_objects.items.len == 0) {
                 const result = try allocator.alloc(u8, 2);
                 result[0] = '[';
                 result[1] = ']';
@@ -206,7 +215,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
 
             // Serialize kept logs
             var out: std.Io.Writer.Allocating = .init(allocator);
-            try std.json.Stringify.value(kept_indices.items, .{}, &out.writer);
+            try std.json.Stringify.value(kept_objects.items, .{}, &out.writer);
 
             return .{
                 .data = try out.toOwnedSlice(),
@@ -216,7 +225,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
         },
         .object => {
             // Process single log object
-            const log_obj = document.asObject() catch {
+            var log_obj: std.json.Parsed(DatadogLog) = document.as(DatadogLog, allocator, .{}) catch {
                 // If not an object, return unchanged (fail-open)
                 const result = try allocator.alloc(u8, data.len);
                 @memcpy(result, data);
@@ -226,13 +235,14 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
                     .original_count = 1,
                 };
             };
+            defer log_obj.deinit();
 
             const field_ctx = FieldAccessorContext{
-                .object = log_obj,
+                .log = &log_obj.value,
             };
 
-            const filter_result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor);
-            if (filter_result == .drop) {
+            const filter_result = engine.evaluateFilter(@ptrCast(&field_ctx), datadogFieldAccessor);
+            if (!filter_result.shouldContinue()) {
                 // Return empty array for dropped single log
                 const result = try allocator.alloc(u8, 2);
                 result[0] = '[';

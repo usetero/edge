@@ -7,8 +7,14 @@
 //! ## Architecture
 //!
 //! 1. **MatcherKey**: Identifies a unique (MatchCase, attribute_key) tuple
-//! 2. **MatcherDatabase**: Compiled Hyperscan DB for one MatcherKey, patterns map to policy IDs
+//! 2. **MatcherDatabase**: Compiled Hyperscan DBs for one MatcherKey (positive + negated)
 //! 3. **MatcherIndex**: Collection of all databases + policy metadata for match aggregation
+//!
+//! ## Performance Optimizations
+//!
+//! - **Numeric policy indices**: O(1) array lookups instead of string hash lookups
+//! - **Separate positive/negated databases**: Clean separation, no per-pattern negate flag
+//! - **Dense policy array**: Cache-friendly iteration over matched policies
 
 const std = @import("std");
 const proto = @import("proto");
@@ -23,33 +29,46 @@ const NoopEventBus = o11y.NoopEventBus;
 
 // Info-level events
 const MatcherIndexBuildStarted = struct { policy_count: usize };
-const MatcherIndexBuildCompleted = struct { database_count: usize, matcher_key_count: usize };
+const MatcherIndexBuildCompleted = struct { database_count: usize, matcher_key_count: usize, policy_count: usize };
 
 // Debug-level events for MatcherDatabase.scan
-const ScanMatched = struct { pattern_count: usize, value_len: usize, value_preview: []const u8 };
-const ScanMatchDetail = struct { pattern_id: u32, policy_id: []const u8, negate: bool };
+const ScanMatched = struct { pattern_count: usize, value_len: usize, value_preview: []const u8, is_negated: bool };
+const ScanMatchDetail = struct { pattern_id: u32, policy_index: PolicyIndex };
 const ScanError = struct { err: []const u8 };
 
 // Debug-level events for MatcherIndex.build
-const ProcessingPolicy = struct { id: []const u8, name: []const u8, enabled: bool };
+const ProcessingPolicy = struct { id: []const u8, name: []const u8, enabled: bool, index: PolicyIndex };
 const SkippingPolicyNoFilter = struct { id: []const u8 };
 const PolicyMatcherCount = struct { id: []const u8, matcher_count: usize, keep: []const u8 };
 const MatcherNullField = struct { matcher_idx: usize };
 const MatcherNullMatch = struct { matcher_idx: usize };
-const MatcherNoRegex = struct { matcher_idx: usize };
 const MatcherEmptyRegex = struct { matcher_idx: usize };
 const MatcherDetail = struct { matcher_idx: usize, match_case: MatchCase, key: []const u8, regex: []const u8, negate: bool };
-const PolicyStored = struct { id: []const u8, regex_matcher_count: u32, negated_matcher_count: usize };
-const CompilingDatabase = struct { match_case: MatchCase, key: []const u8, pattern_count: usize };
-const CompilingDatabasePattern = struct { idx: usize, policy_id: []const u8, regex: []const u8, negate: bool };
+const PolicyStored = struct { id: []const u8, index: PolicyIndex, required_matches: u16, negated_count: u16 };
+const CompilingDatabase = struct { match_case: MatchCase, key: []const u8, positive_count: usize, negated_count: usize };
 
 const Policy = proto.policy.Policy;
 const LogMatcher = proto.policy.LogMatcher;
 const LogTarget = proto.policy.LogTarget;
 const LogField = proto.policy.LogField;
 
+// =============================================================================
+// Policy Index - Numeric identifier for O(1) lookups
+// =============================================================================
+
+/// Numeric policy index for efficient array-based lookups at runtime.
+/// Supports up to 65,535 policies which is more than sufficient.
+pub const PolicyIndex = u16;
+
+/// Maximum number of policies supported
+pub const MAX_POLICIES: usize = 4096; // Practical limit for stack-allocated bitsets
+
+// =============================================================================
+// MatchCase - Field type being matched
+// =============================================================================
+
 /// MatchCase represents the type of field being matched.
-/// This is derived from the new LogMatcher.field oneof.
+/// This is derived from the LogMatcher.field oneof.
 pub const MatchCase = enum {
     // Simple log fields (from LogField enum)
     log_body,
@@ -135,16 +154,12 @@ pub const MatcherKeyContext = struct {
 /// Metadata for a pattern in the Hyperscan database.
 /// Maps Hyperscan pattern ID back to policy information.
 pub const PatternMeta = struct {
-    /// Policy ID this pattern belongs to
-    policy_id: []const u8,
-    /// Index of this matcher within the policy's matchers list
-    matcher_index: u32,
-    /// Whether this is a negated matcher (pattern must NOT match)
-    negate: bool,
+    /// Numeric index of the policy (for O(1) array lookups)
+    policy_index: PolicyIndex,
 };
 
 // =============================================================================
-// PolicyInfo - Policy metadata for match aggregation
+// KeepValue - Parsed keep configuration
 // =============================================================================
 
 /// Parsed keep value from policy
@@ -220,57 +235,74 @@ pub const KeepValue = union(enum) {
     }
 };
 
+// =============================================================================
+// PolicyInfo - Policy metadata for match aggregation
+// =============================================================================
+
 /// Policy information needed for match aggregation and action determination.
 pub const PolicyInfo = struct {
-    /// Policy ID
+    /// Policy ID (for reporting/debugging)
     id: []const u8,
-    /// Total number of regex matchers in this policy
-    regex_matcher_count: u32,
+    /// Numeric index for O(1) array lookups
+    index: PolicyIndex,
+    /// Number of positive (non-negated) matchers that must match
+    required_match_count: u16,
     /// Keep value parsed from policy (determines what to do when matched)
     keep: KeepValue,
     /// Whether policy is enabled
     enabled: bool,
-    /// Negated matchers info: maps MatcherKey -> list of matcher indices
-    /// Used to track which negated patterns need to NOT match
-    negated_matchers: std.ArrayListUnmanaged(NegatedMatcherInfo),
-
-    pub const NegatedMatcherInfo = struct {
-        matcher_key: MatcherKey,
-        matcher_index: u32,
-    };
+    /// Whether this policy has only negated matchers (no positive matches required)
+    all_negated: bool,
 };
 
 // =============================================================================
-// MatcherDatabase - Compiled Hyperscan DB for one MatcherKey
+// MatcherDatabase - Compiled Hyperscan DBs for one MatcherKey
 // =============================================================================
 
-/// A compiled Hyperscan database for a specific MatcherKey.
-/// Contains all patterns from all policies that match on this (MatchCase, Key).
+/// A compiled Hyperscan database pair for a specific MatcherKey.
+/// Contains separate databases for positive and negated patterns.
 pub const MatcherDatabase = struct {
-    /// The compiled Hyperscan database
-    db: hyperscan.Database,
+    /// The compiled Hyperscan database for positive patterns (must match)
+    positive_db: ?hyperscan.Database,
+    /// The compiled Hyperscan database for negated patterns (must NOT match)
+    negated_db: ?hyperscan.Database,
     /// Scratch space for scanning - protected by mutex
-    scratch: hyperscan.Scratch,
+    scratch: ?hyperscan.Scratch,
     /// Mutex for thread-safe scratch access
     mutex: std.Thread.Mutex,
-    /// Maps Hyperscan pattern ID -> PatternMeta
-    patterns: []const PatternMeta,
-    /// Allocator used for patterns array
+    /// Maps Hyperscan pattern ID -> PolicyIndex for positive patterns
+    positive_patterns: []const PatternMeta,
+    /// Maps Hyperscan pattern ID -> PolicyIndex for negated patterns
+    negated_patterns: []const PatternMeta,
+    /// Allocator used for patterns arrays
     allocator: std.mem.Allocator,
     /// Event bus for observability
     bus: *EventBus,
 
     const Self = @This();
 
-    /// Scan a value and return all matching pattern IDs.
-    /// Caller must hold no locks - this function acquires the mutex internally.
-    pub fn scan(self: *Self, value: []const u8, result_buf: []u32) ScanResult {
+    /// Scan a value against positive patterns.
+    /// Returns matching pattern IDs in result_buf.
+    pub fn scanPositive(self: *Self, value: []const u8, result_buf: []u32) ScanResult {
+        return self.scanDb(self.positive_db, self.positive_patterns, value, result_buf, false);
+    }
+
+    /// Scan a value against negated patterns.
+    /// Returns matching pattern IDs in result_buf (these are failures - pattern should NOT have matched).
+    pub fn scanNegated(self: *Self, value: []const u8, result_buf: []u32) ScanResult {
+        return self.scanDb(self.negated_db, self.negated_patterns, value, result_buf, true);
+    }
+
+    fn scanDb(self: *Self, db: ?hyperscan.Database, patterns: []const PatternMeta, value: []const u8, result_buf: []u32, is_negated: bool) ScanResult {
+        const database = db orelse return ScanResult{ .count = 0, .buf = result_buf };
+        const scratch = &(self.scratch orelse return ScanResult{ .count = 0, .buf = result_buf });
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
         var result = ScanResult{ .count = 0, .buf = result_buf };
 
-        _ = self.db.scanWithCallback(&self.scratch, value, &result, scanCallback) catch |err| {
+        _ = database.scanWithCallback(scratch, value, &result, scanCallback) catch |err| {
             self.bus.warn(ScanError{ .err = @errorName(err) });
             return result;
         };
@@ -280,11 +312,12 @@ pub const MatcherDatabase = struct {
                 .pattern_count = result.count,
                 .value_len = value.len,
                 .value_preview = if (value.len > 100) value[0..100] else value,
+                .is_negated = is_negated,
             });
             for (result.matches()) |pattern_id| {
-                if (pattern_id < self.patterns.len) {
-                    const meta = self.patterns[pattern_id];
-                    self.bus.debug(ScanMatchDetail{ .pattern_id = pattern_id, .policy_id = meta.policy_id, .negate = meta.negate });
+                if (pattern_id < patterns.len) {
+                    const meta = patterns[pattern_id];
+                    self.bus.debug(ScanMatchDetail{ .pattern_id = pattern_id, .policy_index = meta.policy_index });
                 }
             }
         }
@@ -302,13 +335,11 @@ pub const MatcherDatabase = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.scratch.deinit();
-        self.db.deinit();
-        // Free pattern metadata (including policy_id strings we duped)
-        for (self.patterns) |meta| {
-            self.allocator.free(meta.policy_id);
-        }
-        self.allocator.free(self.patterns);
+        if (self.scratch) |*s| s.deinit();
+        if (self.positive_db) |*db| db.deinit();
+        if (self.negated_db) |*db| db.deinit();
+        self.allocator.free(self.positive_patterns);
+        self.allocator.free(self.negated_patterns);
     }
 };
 
@@ -334,8 +365,9 @@ pub const MatcherIndex = struct {
     /// Maps MatcherKey -> MatcherDatabase
     databases: std.HashMap(MatcherKey, *MatcherDatabase, MatcherKeyContext, std.hash_map.default_max_load_percentage),
 
-    /// Maps policy_id -> PolicyInfo
-    policies: std.StringHashMapUnmanaged(PolicyInfo),
+    /// Dense array of policy info indexed by PolicyIndex
+    /// Enables O(1) lookups during evaluation
+    policies: []PolicyInfo,
 
     /// All unique matcher keys (for iteration during evaluation)
     matcher_keys: []MatcherKey,
@@ -355,10 +387,14 @@ pub const MatcherIndex = struct {
     pub fn build(allocator: std.mem.Allocator, bus: *EventBus, policies_slice: []const Policy) !Self {
         var span = bus.started(.info, MatcherIndexBuildStarted{ .policy_count = policies_slice.len });
 
+        if (policies_slice.len > MAX_POLICIES) {
+            return error.TooManyPolicies;
+        }
+
         var self = Self{
             .allocator = allocator,
             .databases = std.HashMap(MatcherKey, *MatcherDatabase, MatcherKeyContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .policies = .{},
+            .policies = &.{},
             .matcher_keys = &.{},
             .key_storage = .{},
             .policy_id_storage = .{},
@@ -367,32 +403,43 @@ pub const MatcherIndex = struct {
         errdefer self.deinit();
 
         // Temporary storage for collecting patterns per MatcherKey
+        const PatternsPerKey = struct {
+            positive: std.ArrayListUnmanaged(PatternCollector),
+            negated: std.ArrayListUnmanaged(PatternCollector),
+        };
+
         var patterns_by_key = std.HashMap(
             MatcherKey,
-            std.ArrayListUnmanaged(PatternCollector),
+            PatternsPerKey,
             MatcherKeyContext,
             std.hash_map.default_max_load_percentage,
         ).init(allocator);
         defer {
             var it = patterns_by_key.valueIterator();
-            while (it.next()) |list| {
-                list.deinit(allocator);
+            while (it.next()) |patterns| {
+                patterns.positive.deinit(allocator);
+                patterns.negated.deinit(allocator);
             }
             patterns_by_key.deinit();
         }
 
-        // First pass: collect patterns and build policy info
-        for (policies_slice) |*policy| {
-            bus.debug(ProcessingPolicy{ .id = policy.id, .name = policy.name, .enabled = policy.enabled });
+        // Temporary list for building policy info
+        var policy_info_list = std.ArrayListUnmanaged(PolicyInfo){};
+        defer policy_info_list.deinit(allocator);
 
+        // First pass: collect patterns and build policy info
+        var policy_index: PolicyIndex = 0;
+        for (policies_slice) |*policy| {
             const log_target = policy.log orelse {
                 bus.debug(SkippingPolicyNoFilter{ .id = policy.id });
                 continue;
             };
 
-            // Count regex matchers
-            var regex_matcher_count: u32 = 0;
-            var negated_matchers = std.ArrayListUnmanaged(PolicyInfo.NegatedMatcherInfo){};
+            bus.debug(ProcessingPolicy{ .id = policy.id, .name = policy.name, .enabled = policy.enabled, .index = policy_index });
+
+            // Count matchers
+            var positive_count: u16 = 0;
+            var negated_count: u16 = 0;
 
             bus.debug(PolicyMatcherCount{ .id = policy.id, .matcher_count = log_target.match.items.len, .keep = log_target.keep });
 
@@ -414,11 +461,8 @@ pub const MatcherIndex = struct {
                 // Extract regex from match union (only regex type is supported for hyperscan)
                 const regex: []const u8 = switch (match_union) {
                     .regex => |r| r,
-                    .exact => |e| e, // Treat exact as literal regex (will be escaped by hyperscan)
-                    .exists => {
-                        // exists doesn't use regex matching - skip for hyperscan index
-                        continue;
-                    },
+                    .exact => |e| e, // Treat exact as literal regex
+                    .exists => continue, // exists doesn't use regex matching
                 };
 
                 if (regex.len == 0) {
@@ -426,61 +470,66 @@ pub const MatcherIndex = struct {
                     continue;
                 }
 
-                regex_matcher_count += 1;
-
                 // Get key for attribute-based matchers
                 const raw_key = getKeyFromField(field) orelse "";
                 const matcher_key = MatcherKey{ .match_case = match_case, .key = raw_key };
 
                 bus.debug(MatcherDetail{ .matcher_idx = matcher_idx, .match_case = match_case, .key = raw_key, .regex = regex, .negate = matcher.negate });
 
-                // Track negated matchers
+                // Track counts
                 if (matcher.negate) {
-                    // Dupe the key if needed
-                    const key_copy = if (raw_key.len > 0) try allocator.dupe(u8, raw_key) else "";
-                    if (key_copy.len > 0) {
-                        try self.key_storage.append(allocator, key_copy);
-                    }
-                    try negated_matchers.append(allocator, .{
-                        .matcher_key = .{ .match_case = match_case, .key = key_copy },
-                        .matcher_index = @intCast(matcher_idx),
-                    });
+                    negated_count += 1;
+                } else {
+                    positive_count += 1;
                 }
 
                 // Add to patterns collection
                 const gop = try patterns_by_key.getOrPut(matcher_key);
                 if (!gop.found_existing) {
-                    // First time seeing this key - dupe it
+                    // First time seeing this key - dupe it if needed
                     if (raw_key.len > 0) {
                         const key_copy = try allocator.dupe(u8, raw_key);
                         try self.key_storage.append(allocator, key_copy);
                         gop.key_ptr.key = key_copy;
                     }
-                    gop.value_ptr.* = .{};
+                    gop.value_ptr.* = .{
+                        .positive = .{},
+                        .negated = .{},
+                    };
                 }
 
-                try gop.value_ptr.append(allocator, .{
-                    .policy_id = policy.id,
-                    .matcher_index = @intCast(matcher_idx),
-                    .negate = matcher.negate,
+                const collector = PatternCollector{
+                    .policy_index = policy_index,
                     .regex = regex,
-                });
+                };
+
+                if (matcher.negate) {
+                    try gop.value_ptr.negated.append(allocator, collector);
+                } else {
+                    try gop.value_ptr.positive.append(allocator, collector);
+                }
             }
 
             // Store policy info
             const policy_id_copy = try allocator.dupe(u8, policy.id);
             try self.policy_id_storage.append(allocator, policy_id_copy);
 
-            try self.policies.put(allocator, policy_id_copy, .{
+            try policy_info_list.append(allocator, .{
                 .id = policy_id_copy,
-                .regex_matcher_count = regex_matcher_count,
+                .index = policy_index,
+                .required_match_count = positive_count,
                 .keep = KeepValue.parse(log_target.keep),
                 .enabled = policy.enabled,
-                .negated_matchers = negated_matchers,
+                .all_negated = positive_count == 0 and negated_count > 0,
             });
 
-            bus.debug(PolicyStored{ .id = policy.id, .regex_matcher_count = regex_matcher_count, .negated_matcher_count = negated_matchers.items.len });
+            bus.debug(PolicyStored{ .id = policy.id, .index = policy_index, .required_matches = positive_count, .negated_count = negated_count });
+
+            policy_index += 1;
         }
+
+        // Copy policy info to owned slice
+        self.policies = try allocator.dupe(PolicyInfo, policy_info_list.items);
 
         // Second pass: compile databases for each MatcherKey
         var keys_list = std.ArrayListUnmanaged(MatcherKey){};
@@ -489,16 +538,18 @@ pub const MatcherIndex = struct {
         var key_it = patterns_by_key.iterator();
         while (key_it.next()) |entry| {
             const matcher_key = entry.key_ptr.*;
-            const collectors = entry.value_ptr.items;
+            const patterns = entry.value_ptr.*;
 
-            if (collectors.len == 0) continue;
+            if (patterns.positive.items.len == 0 and patterns.negated.items.len == 0) continue;
 
-            bus.debug(CompilingDatabase{ .match_case = matcher_key.match_case, .key = matcher_key.key, .pattern_count = collectors.len });
-            for (collectors, 0..) |collector, idx| {
-                bus.debug(CompilingDatabasePattern{ .idx = idx, .policy_id = collector.policy_id, .regex = collector.regex, .negate = collector.negate });
-            }
+            bus.debug(CompilingDatabase{
+                .match_case = matcher_key.match_case,
+                .key = matcher_key.key,
+                .positive_count = patterns.positive.items.len,
+                .negated_count = patterns.negated.items.len,
+            });
 
-            const db = try compileDatabase(allocator, bus, collectors);
+            const db = try compileDatabase(allocator, bus, patterns.positive.items, patterns.negated.items);
             try self.databases.put(matcher_key, db);
             try keys_list.append(allocator, matcher_key);
         }
@@ -509,6 +560,7 @@ pub const MatcherIndex = struct {
         span.completed(MatcherIndexBuildCompleted{
             .database_count = self.databases.count(),
             .matcher_key_count = self.matcher_keys.len,
+            .policy_count = self.policies.len,
         });
 
         return self;
@@ -519,14 +571,28 @@ pub const MatcherIndex = struct {
         return self.databases.get(key);
     }
 
-    /// Get policy info by ID, or null if not found.
+    /// Get policy info by index (O(1) array lookup).
+    pub fn getPolicyByIndex(self: *const Self, index: PolicyIndex) ?PolicyInfo {
+        if (index >= self.policies.len) return null;
+        return self.policies[index];
+    }
+
+    /// Get policy info by ID (O(n) search - use for debugging only).
     pub fn getPolicy(self: *const Self, id: []const u8) ?PolicyInfo {
-        return self.policies.get(id);
+        for (self.policies) |info| {
+            if (std.mem.eql(u8, info.id, id)) return info;
+        }
+        return null;
     }
 
     /// Get all matcher keys for iteration during evaluation.
     pub fn getMatcherKeys(self: *const Self) []const MatcherKey {
         return self.matcher_keys;
+    }
+
+    /// Get all policies for iteration.
+    pub fn getPolicies(self: *const Self) []const PolicyInfo {
+        return self.policies;
     }
 
     /// Check if the index is empty (no databases compiled).
@@ -541,7 +607,7 @@ pub const MatcherIndex = struct {
 
     /// Get count of policies.
     pub fn getPolicyCount(self: *const Self) usize {
-        return self.policies.count();
+        return self.policies.len;
     }
 
     pub fn deinit(self: *Self) void {
@@ -553,12 +619,8 @@ pub const MatcherIndex = struct {
         }
         self.databases.deinit();
 
-        // Free policy info (including negated_matchers lists)
-        var policy_it = self.policies.valueIterator();
-        while (policy_it.next()) |info| {
-            info.negated_matchers.deinit(self.allocator);
-        }
-        self.policies.deinit(self.allocator);
+        // Free policies array
+        self.allocator.free(self.policies);
 
         // Free matcher keys array
         self.allocator.free(self.matcher_keys);
@@ -578,16 +640,8 @@ pub const MatcherIndex = struct {
 };
 
 // =============================================================================
-// Helper types and functions
+// Helper functions
 // =============================================================================
-
-/// Temporary struct for collecting patterns before compilation
-const PatternCollector = struct {
-    policy_id: []const u8,
-    matcher_index: u32,
-    negate: bool,
-    regex: []const u8,
-};
 
 /// Extract the key from a field union (for keyed attribute types)
 fn getKeyFromField(field: LogMatcher.field_union) ?[]const u8 {
@@ -599,52 +653,91 @@ fn getKeyFromField(field: LogMatcher.field_union) ?[]const u8 {
     };
 }
 
-/// Compile a list of patterns into a MatcherDatabase
+/// Pattern collector for building databases
+const PatternCollector = struct {
+    policy_index: PolicyIndex,
+    regex: []const u8,
+};
+
+/// Compile positive and negated patterns into a MatcherDatabase
 fn compileDatabase(
     allocator: std.mem.Allocator,
     bus: *EventBus,
-    collectors: []const PatternCollector,
+    positive_collectors: []const PatternCollector,
+    negated_collectors: []const PatternCollector,
 ) !*MatcherDatabase {
-    // Build Hyperscan pattern array
-    const hs_patterns = try allocator.alloc(hyperscan.Pattern, collectors.len);
-    defer allocator.free(hs_patterns);
+    var positive_db: ?hyperscan.Database = null;
+    var negated_db: ?hyperscan.Database = null;
+    var scratch: ?hyperscan.Scratch = null;
 
-    const pattern_metas = try allocator.alloc(PatternMeta, collectors.len);
-    errdefer allocator.free(pattern_metas);
-
-    for (collectors, 0..) |collector, i| {
-        hs_patterns[i] = .{
-            .expression = collector.regex,
-            .id = @intCast(i),
-            .flags = .{},
-        };
-
-        // Dupe the policy_id for the pattern meta
-        const policy_id_copy = try allocator.dupe(u8, collector.policy_id);
-        errdefer allocator.free(policy_id_copy);
-
-        pattern_metas[i] = .{
-            .policy_id = policy_id_copy,
-            .matcher_index = collector.matcher_index,
-            .negate = collector.negate,
-        };
+    errdefer {
+        if (scratch) |*s| s.deinit();
+        if (positive_db) |*db| db.deinit();
+        if (negated_db) |*db| db.deinit();
     }
 
-    // Compile with Hyperscan
-    var db = try hyperscan.Database.compileMulti(allocator, hs_patterns, .{});
-    errdefer db.deinit();
+    // Compile positive patterns
+    var positive_patterns: []PatternMeta = &.{};
+    if (positive_collectors.len > 0) {
+        const hs_patterns = try allocator.alloc(hyperscan.Pattern, positive_collectors.len);
+        defer allocator.free(hs_patterns);
 
-    // Allocate scratch
-    var scratch = try hyperscan.Scratch.init(&db);
-    errdefer scratch.deinit();
+        positive_patterns = try allocator.alloc(PatternMeta, positive_collectors.len);
+        errdefer allocator.free(positive_patterns);
+
+        for (positive_collectors, 0..) |collector, i| {
+            hs_patterns[i] = .{
+                .expression = collector.regex,
+                .id = @intCast(i),
+                .flags = .{},
+            };
+            positive_patterns[i] = .{ .policy_index = collector.policy_index };
+        }
+
+        positive_db = try hyperscan.Database.compileMulti(allocator, hs_patterns, .{});
+    }
+
+    // Compile negated patterns
+    var negated_patterns: []PatternMeta = &.{};
+    if (negated_collectors.len > 0) {
+        const hs_patterns = try allocator.alloc(hyperscan.Pattern, negated_collectors.len);
+        defer allocator.free(hs_patterns);
+
+        negated_patterns = try allocator.alloc(PatternMeta, negated_collectors.len);
+        errdefer allocator.free(negated_patterns);
+
+        for (negated_collectors, 0..) |collector, i| {
+            hs_patterns[i] = .{
+                .expression = collector.regex,
+                .id = @intCast(i),
+                .flags = .{},
+            };
+            negated_patterns[i] = .{ .policy_index = collector.policy_index };
+        }
+
+        negated_db = try hyperscan.Database.compileMulti(allocator, hs_patterns, .{});
+    }
+
+    // Allocate scratch for whichever database exists
+    if (positive_db) |*db| {
+        scratch = try hyperscan.Scratch.init(db);
+        if (negated_db) |*ndb| {
+            // Extend scratch for negated db
+            _ = try hyperscan.Scratch.init(ndb);
+        }
+    } else if (negated_db) |*db| {
+        scratch = try hyperscan.Scratch.init(db);
+    }
 
     // Create the database struct
     const matcher_db = try allocator.create(MatcherDatabase);
     matcher_db.* = .{
-        .db = db,
+        .positive_db = positive_db,
+        .negated_db = negated_db,
         .scratch = scratch,
         .mutex = .{},
-        .patterns = pattern_metas,
+        .positive_patterns = positive_patterns,
+        .negated_patterns = negated_patterns,
         .allocator = allocator,
         .bus = bus,
     };
@@ -770,16 +863,24 @@ test "MatcherIndex: build with single policy" {
     try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
 
-    // Check policy info
-    const policy_info = index.getPolicy("policy-1");
+    // Check policy info by index
+    const policy_info = index.getPolicyByIndex(0);
     try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u32, 1), policy_info.?.regex_matcher_count);
+    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
     try testing.expectEqual(KeepValue.none, policy_info.?.keep);
     try testing.expect(policy_info.?.enabled);
+    try testing.expect(!policy_info.?.all_negated);
+
+    // Check policy info by ID
+    const policy_info_by_id = index.getPolicy("policy-1");
+    try testing.expect(policy_info_by_id != null);
+    try testing.expectEqualStrings("policy-1", policy_info_by_id.?.id);
 
     // Check database exists for log_body
     const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
     try testing.expect(db != null);
+    try testing.expect(db.?.positive_db != null);
+    try testing.expect(db.?.negated_db == null);
 }
 
 test "MatcherIndex: build with keyed matchers" {
@@ -859,10 +960,10 @@ test "MatcherIndex: multiple policies same matcher key" {
 
     const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
     try testing.expect(db != null);
-    try testing.expectEqual(@as(usize, 2), db.?.patterns.len);
+    try testing.expectEqual(@as(usize, 2), db.?.positive_patterns.len);
 }
 
-test "MatcherIndex: negated matcher tracking" {
+test "MatcherIndex: negated matcher creates negated database" {
     const allocator = testing.allocator;
 
     var policy = Policy{
@@ -885,10 +986,60 @@ test "MatcherIndex: negated matcher tracking" {
     var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const policy_info = index.getPolicy("policy-1");
+    const policy_info = index.getPolicyByIndex(0);
     try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(usize, 1), policy_info.?.negated_matchers.items.len);
-    try testing.expectEqual(MatchCase.log_body, policy_info.?.negated_matchers.items[0].matcher_key.match_case);
+    try testing.expectEqual(@as(u16, 0), policy_info.?.required_match_count);
+    try testing.expect(policy_info.?.all_negated);
+
+    // Check database has negated patterns
+    const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
+    try testing.expect(db != null);
+    try testing.expect(db.?.positive_db == null);
+    try testing.expect(db.?.negated_db != null);
+    try testing.expectEqual(@as(usize, 1), db.?.negated_patterns.len);
+}
+
+test "MatcherIndex: mixed positive and negated matchers" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "test-policy"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        },
+    };
+    // Positive matcher
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    // Negated matcher on same field
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "ignore") },
+        .negate = true,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    const policy_info = index.getPolicyByIndex(0);
+    try testing.expect(policy_info != null);
+    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
+    try testing.expect(!policy_info.?.all_negated);
+
+    // Check database has both positive and negated
+    const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
+    try testing.expect(db != null);
+    try testing.expect(db.?.positive_db != null);
+    try testing.expect(db.?.negated_db != null);
+    try testing.expectEqual(@as(usize, 1), db.?.positive_patterns.len);
+    try testing.expectEqual(@as(usize, 1), db.?.negated_patterns.len);
 }
 
 test "MatcherIndex: scan database" {
@@ -921,15 +1072,15 @@ test "MatcherIndex: scan database" {
 
     // Scan matching value
     var result_buf: [16]u32 = undefined;
-    var result = db.scan("an error occurred", &result_buf);
+    var result = db.scanPositive("an error occurred", &result_buf);
     try testing.expectEqual(@as(usize, 1), result.count);
 
     // Scan non-matching value
-    result = db.scan("all good", &result_buf);
+    result = db.scanPositive("all good", &result_buf);
     try testing.expectEqual(@as(usize, 0), result.count);
 
     // Scan value matching both patterns
-    result = db.scan("error and warning", &result_buf);
+    result = db.scanPositive("error and warning", &result_buf);
     try testing.expectEqual(@as(usize, 2), result.count);
 }
 
@@ -964,8 +1115,8 @@ test "MatcherIndex: exists matcher excluded from regex matchers" {
     // Only 1 database (for log_body, exists matcher is not indexed)
     try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
 
-    // regex_matcher_count should be 1 (excludes exists)
-    const policy_info = index.getPolicy("policy-1");
+    // required_match_count should be 1 (excludes exists)
+    const policy_info = index.getPolicyByIndex(0);
     try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u32, 1), policy_info.?.regex_matcher_count);
+    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
 }
