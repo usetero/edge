@@ -40,6 +40,10 @@
             .url = "git+https://github.com/jaronoff97/zig-protobuf?ref=fix-json-oneof-shadowing#8c725412202bad5aa6a5c3f1f3be2b5a82566cc7",
             .hash = "protobuf-3.0.0-0e82amfxKAB0IUqYIztvAVCHz3NAmOc3NxYzZdYHx-Jb",
         },
+        .zimdjson = .{
+            .url = "git+https://github.com/jaronoff97/zimdjson?ref=zig-0.15.1-support#ade65bff7909170378d27fafaae7363db39fa223",
+            .hash = "zimdjson-0.1.1-89pgxY9QBgBnAmvODmFXuvoOsnqIj8GKS57yIqmtMHAf",
+        },
     },
     .paths = .{
         "build.zig",
