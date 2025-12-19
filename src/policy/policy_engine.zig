@@ -191,10 +191,25 @@ pub const PolicyEngine = struct {
         self.bus.debug(EvaluateStart{ .matcher_key_count = index.getMatcherKeys().len, .policy_count = policy_count });
 
         // Stack-allocated arrays for O(1) per-policy operations
-        // match_counts[i] = number of positive patterns matched for policy i
+        // Initialize match_counts[i] = negated_count[i] (assume all negated patterns pass)
+        // Positive matches increment, negated matches decrement
+        // Policy matches when match_counts[i] == required_match_count[i]
         var match_counts: [MAX_POLICIES]u16 = std.mem.zeroes([MAX_POLICIES]u16);
-        // negation_failed[i] = true if any negated pattern matched for policy i
-        var negation_failed: [MAX_POLICIES]bool = std.mem.zeroes([MAX_POLICIES]bool);
+
+        // Track which policies had any match activity
+        var active_policies: [MAX_POLICIES]PolicyIndex = undefined;
+        var active_count: usize = 0;
+        var is_active: [MAX_POLICIES]bool = std.mem.zeroes([MAX_POLICIES]bool);
+
+        // Initialize match counts and mark policies with negated patterns as active
+        // Uses precomputed list from index build time - no iteration over all policies
+        for (index.getPoliciesWithNegation()) |policy_index| {
+            const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
+            match_counts[policy_index] = policy_info.negated_count;
+            is_active[policy_index] = true;
+            active_policies[active_count] = policy_index;
+            active_count += 1;
+        }
 
         // Buffer for scan results
         var result_buf: [MAX_MATCHES_PER_SCAN]u32 = undefined;
@@ -203,7 +218,7 @@ pub const PolicyEngine = struct {
         for (index.getMatcherKeys()) |matcher_key| {
             // Get field value for this key
             const value = field_accessor(ctx, matcher_key.match_case, matcher_key.key) orelse {
-                // Field not present - negated matchers succeed (pattern can't be found)
+                // Field not present - negated matchers succeed (already counted)
                 // Positive matchers fail (no match possible)
                 self.bus.debug(MatcherKeyFieldNotPresent{ .match_case = matcher_key.match_case, .key = matcher_key.key });
                 continue;
@@ -227,15 +242,25 @@ pub const PolicyEngine = struct {
                 if (pattern_id < db.positive_patterns.len) {
                     const meta = db.positive_patterns[pattern_id];
                     match_counts[meta.policy_index] += 1;
+                    if (!is_active[meta.policy_index]) {
+                        is_active[meta.policy_index] = true;
+                        active_policies[active_count] = meta.policy_index;
+                        active_count += 1;
+                    }
                 }
             }
 
-            // Scan negated patterns - mark as failed if any match
+            // Scan negated patterns - decrement match counts (negated pattern matched = failed)
             const negated_result = db.scanNegated(value, &result_buf);
             for (negated_result.matches()) |pattern_id| {
                 if (pattern_id < db.negated_patterns.len) {
                     const meta = db.negated_patterns[pattern_id];
-                    negation_failed[meta.policy_index] = true;
+                    match_counts[meta.policy_index] -= 1;
+                    if (!is_active[meta.policy_index]) {
+                        is_active[meta.policy_index] = true;
+                        active_policies[active_count] = meta.policy_index;
+                        active_count += 1;
+                    }
                     self.bus.debug(PolicyNegationFailed{ .policy_index = meta.policy_index });
                 }
             }
@@ -243,25 +268,19 @@ pub const PolicyEngine = struct {
             self.bus.debug(ScanResult{ .positive_count = positive_result.count, .negated_count = negated_result.count });
         }
 
-        // Find all matching policies and determine the filter decision
+        // Find all matching policies from active set
         var matched_count: usize = 0;
         var best_keep: ?KeepValue = null;
         var best_decision: FilterDecision = .unset;
 
-        for (index.getPolicies()) |policy_info| {
+        for (active_policies[0..active_count]) |policy_index| {
+            const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
+
             // Skip disabled policies
             if (!policy_info.enabled) continue;
 
-            // Check if policy fully matches
-            const is_match = if (policy_info.all_negated)
-                // All-negated policy: matches if no negation failed
-                !negation_failed[policy_info.index]
-            else
-                // Normal policy: matches if all positive patterns matched AND no negation failed
-                match_counts[policy_info.index] == policy_info.required_match_count and
-                    !negation_failed[policy_info.index];
-
-            if (is_match) {
+            // Policy matches when count equals required
+            if (match_counts[policy_index] == policy_info.required_match_count) {
                 self.bus.debug(PolicyFullMatch{ .policy_index = policy_info.index, .policy_id = policy_info.id });
 
                 // Add to matched list if not dropping
@@ -836,4 +855,279 @@ test "FilterDecision: shouldContinue" {
     try testing.expect(FilterDecision.keep.shouldContinue());
     try testing.expect(FilterDecision.unset.shouldContinue());
     try testing.expect(!FilterDecision.drop.shouldContinue());
+}
+
+// =============================================================================
+// Edge case tests for active policy tracking optimization
+// =============================================================================
+
+test "PolicyEngine: all policies positive only - none start active" {
+    // Edge case: No policies have negated patterns, so policies_with_negation is empty.
+    // Policies should only become active when positive patterns match.
+    const allocator = testing.allocator;
+
+    var policy1 = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy1.deinit(allocator);
+
+    var policy2 = Policy{
+        .id = try allocator.dupe(u8, "policy-2"),
+        .name = try allocator.dupe(u8, "drop-warning"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "warning") },
+    });
+    defer policy2.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // No match - no policies become active
+    const normal = TestLogContext{ .message = "all good" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&normal), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Match policy1 only
+    const error_log = TestLogContext{ .message = "error occurred" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Match policy2 only
+    const warning_log = TestLogContext{ .message = "warning issued" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&warning_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+}
+
+test "PolicyEngine: all policies negated only - all start active" {
+    // Edge case: All policies have only negated patterns.
+    // All policies start active and match if their negated patterns don't match.
+    const allocator = testing.allocator;
+
+    var policy1 = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "drop-non-important"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "important") },
+        .negate = true,
+    });
+    defer policy1.deinit(allocator);
+
+    var policy2 = Policy{
+        .id = try allocator.dupe(u8, "policy-2"),
+        .name = try allocator.dupe(u8, "drop-non-critical"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "critical") },
+        .negate = true,
+    });
+    defer policy2.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Neither "important" nor "critical" - both policies match
+    const boring = TestLogContext{ .message = "just a normal log" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&boring), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains "important" - policy1 fails, policy2 still matches
+    const important = TestLogContext{ .message = "important data here" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&important), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains "critical" - policy1 still matches, policy2 fails
+    const critical = TestLogContext{ .message = "critical issue" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&critical), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains both - both policies fail
+    const both = TestLogContext{ .message = "important and critical" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&both), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+}
+
+test "PolicyEngine: mix of positive-only and negated policies" {
+    // Edge case: Some policies have negated patterns (start active), others don't.
+    // Verifies both paths work correctly together.
+    const allocator = testing.allocator;
+
+    // Policy with only positive pattern
+    var positive_policy = Policy{
+        .id = try allocator.dupe(u8, "positive-policy"),
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try positive_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer positive_policy.deinit(allocator);
+
+    // Policy with only negated pattern
+    var negated_policy = Policy{
+        .id = try allocator.dupe(u8, "negated-policy"),
+        .name = try allocator.dupe(u8, "drop-non-debug"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try negated_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "debug") },
+        .negate = true,
+    });
+    defer negated_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ positive_policy, negated_policy }, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // No "error", no "debug" - negated policy matches (drops)
+    const normal = TestLogContext{ .message = "normal log" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&normal), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains "error", no "debug" - both policies match
+    const error_log = TestLogContext{ .message = "error occurred" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains "debug" - negated policy fails, positive policy doesn't match
+    const debug_log = TestLogContext{ .message = "debug info" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&debug_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains both "error" and "debug" - positive matches, negated fails
+    const error_debug = TestLogContext{ .message = "error in debug mode" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&error_debug), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+}
+
+test "PolicyEngine: multiple negated patterns same policy" {
+    // Edge case: Policy with multiple negated patterns - all must "pass" (not match)
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "drop-non-special"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    // Must NOT contain "skip" AND must NOT contain "ignore"
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "skip") },
+        .negate = true,
+    });
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "ignore") },
+        .negate = true,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Neither word - both negations pass - policy matches
+    const normal = TestLogContext{ .message = "normal message" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&normal), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains "skip" - first negation fails - policy doesn't match
+    const skip = TestLogContext{ .message = "skip this one" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&skip), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains "ignore" - second negation fails - policy doesn't match
+    const ignore = TestLogContext{ .message = "ignore this" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&ignore), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Contains both - both negations fail - policy doesn't match
+    const both = TestLogContext{ .message = "skip and ignore" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&both), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+}
+
+test "PolicyEngine: policy becomes active via positive then fails via negated" {
+    // Edge case: Policy has both positive and negated patterns.
+    // Positive matches first (becomes active), then negated also matches (fails).
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "drop-errors-not-debug"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    // Must contain "error" AND must NOT contain "debug"
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "debug") },
+        .negate = true,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Has "error", no "debug" - positive matches, negation passes - policy matches
+    const error_only = TestLogContext{ .message = "error occurred" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(@ptrCast(&error_only), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Has both "error" and "debug" - positive matches but negation fails
+    // required_match_count = 2 (1 positive + 1 negated)
+    // match_counts starts at 1 (negated_count)
+    // positive match: +1 -> 2
+    // negated match: -1 -> 1
+    // Final: 1 != 2 - policy doesn't match
+    const error_debug = TestLogContext{ .message = "debug error message" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&error_debug), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Has "debug" but no "error" - positive doesn't match, negation fails
+    // match_counts starts at 1, negated match: -1 -> 0, final: 0 != 2
+    const debug_only = TestLogContext{ .message = "debug info" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&debug_only), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+
+    // Has neither - positive doesn't match, negation passes
+    // match_counts stays at 1 (negated_count), final: 1 != 2
+    const neither = TestLogContext{ .message = "normal log" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(@ptrCast(&neither), TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
