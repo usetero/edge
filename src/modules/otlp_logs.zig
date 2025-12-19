@@ -13,8 +13,10 @@ const KeyValue = proto.common.KeyValue;
 const InstrumentationScope = proto.common.InstrumentationScope;
 
 const PolicyEngine = policy_engine.PolicyEngine;
+const PolicyResult = policy_engine.PolicyResult;
 const FilterDecision = policy_engine.FilterDecision;
 const MatchCase = policy_engine.MatchCase;
+const MAX_POLICIES = @import("../hyperscan/matcher_index.zig").MAX_POLICIES;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -197,6 +199,9 @@ fn filterLogsInPlace(
     var original_count: usize = 0;
     var dropped_count: usize = 0;
 
+    // Buffer for matched policy IDs (stack allocated)
+    var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
+
     // Iterate through the nested structure and filter logs in place
     // Structure: LogsData -> ResourceLogs[] -> ScopeLogs[] -> LogRecord[]
     for (logs_data.resource_logs.items) |*resource_logs| {
@@ -213,10 +218,11 @@ fn filterLogsInPlace(
                     .scope_logs = scope_logs,
                 };
 
-                const filter_result = engine.evaluateFilter(@ptrCast(&ctx), otlpFieldAccessor);
+                const result = engine.evaluate(@ptrCast(&ctx), otlpFieldAccessor, &policy_id_buf);
 
-                if (filter_result.shouldContinue()) {
+                if (result.decision.shouldContinue()) {
                     // Keep this log - move to write position if needed
+                    // TODO: Apply transforms using result.matched_policy_ids
                     if (write_idx != scope_logs.log_records.items.len - 1) {
                         scope_logs.log_records.items[write_idx] = log_record.*;
                     }

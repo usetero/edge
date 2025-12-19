@@ -72,6 +72,22 @@ pub const Header = types.Header;
 pub const parser = @import("./parser.zig");
 
 // =============================================================================
+// Transforms
+// =============================================================================
+
+pub const log_transform = @import("./log_transform.zig");
+pub const FieldRef = log_transform.FieldRef;
+pub const FieldAccessor = log_transform.FieldAccessor;
+pub const FieldMutator = log_transform.FieldMutator;
+pub const MutateOp = log_transform.MutateOp;
+pub const TransformResult = log_transform.TransformResult;
+pub const applyTransforms = log_transform.applyTransforms;
+pub const applyRemove = log_transform.applyRemove;
+pub const applyRedact = log_transform.applyRedact;
+pub const applyRename = log_transform.applyRename;
+pub const applyAdd = log_transform.applyAdd;
+
+// =============================================================================
 // Tests
 // =============================================================================
 

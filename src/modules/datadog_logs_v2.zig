@@ -5,8 +5,10 @@ const policy = @import("../policy/root.zig");
 const o11y = @import("../observability/root.zig");
 
 const PolicyEngine = policy_engine.PolicyEngine;
+const PolicyResult = policy_engine.PolicyResult;
 const FilterDecision = policy_engine.FilterDecision;
 const MatchCase = policy_engine.MatchCase;
+const MAX_POLICIES = @import("../hyperscan/matcher_index.zig").MAX_POLICIES;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -175,6 +177,9 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             var dropped_count: usize = 0;
             var original_count: usize = 0;
 
+            // Buffer for matched policy IDs (stack allocated)
+            var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
+
             for (array.value) |*log_obj| {
                 original_count += 1;
 
@@ -182,8 +187,9 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
                     .log = log_obj,
                 };
 
-                const filter_result = engine.evaluateFilter(@ptrCast(&field_ctx), datadogFieldAccessor);
-                if (filter_result.shouldContinue()) {
+                const result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, &policy_id_buf);
+                if (result.decision.shouldContinue()) {
+                    // TODO: Apply transforms using result.matched_policy_ids
                     try kept_objects.append(allocator, log_obj.*);
                 } else {
                     dropped_count += 1;
@@ -241,23 +247,26 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
                 .log = &log_obj.value,
             };
 
-            const filter_result = engine.evaluateFilter(@ptrCast(&field_ctx), datadogFieldAccessor);
-            if (!filter_result.shouldContinue()) {
+            // Buffer for matched policy IDs (stack allocated)
+            var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
+            const eval_result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, &policy_id_buf);
+            if (!eval_result.decision.shouldContinue()) {
                 // Return empty array for dropped single log
-                const result = try allocator.alloc(u8, 2);
-                result[0] = '[';
-                result[1] = ']';
+                const output = try allocator.alloc(u8, 2);
+                output[0] = '[';
+                output[1] = ']';
                 return .{
-                    .data = result,
+                    .data = output,
                     .dropped_count = 1,
                     .original_count = 1,
                 };
             }
             // Keep the log - return as-is
-            const result = try allocator.alloc(u8, data.len);
-            @memcpy(result, data);
+            // TODO: Apply transforms using eval_result.matched_policy_ids
+            const output = try allocator.alloc(u8, data.len);
+            @memcpy(output, data);
             return .{
-                .data = result,
+                .data = output,
                 .dropped_count = 0,
                 .original_count = 1,
             };
