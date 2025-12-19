@@ -372,6 +372,12 @@ pub const HttpProvider = struct {
     }
 
     fn fetchPolicies(self: *HttpProvider) !FetchResult {
+        // Use arena allocator for all temporary structures during fetch.
+        // This reduces fragmentation by freeing all temporary memory at once.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const temp_allocator = arena.allocator();
+
         // Build resource_attributes with required fields:
         // - service.name
         // - service.instance.id
@@ -395,7 +401,7 @@ pub const HttpProvider = struct {
 
         // Build policy_statuses from our tracked state
         var policy_statuses_list = std.ArrayListUnmanaged(PolicySyncStatus){};
-        defer policy_statuses_list.deinit(self.allocator);
+        // No defer needed - arena handles cleanup
 
         // Get last successful hash (if any) - read under lock
         var last_hash: []const u8 = &.{};
@@ -406,7 +412,7 @@ pub const HttpProvider = struct {
             // Build PolicySyncStatus entries from tracked policy statuses
             var ps_it = self.policy_statuses.iterator();
             while (ps_it.next()) |entry| {
-                try policy_statuses_list.append(self.allocator, .{
+                try policy_statuses_list.append(temp_allocator, .{
                     .id = entry.key_ptr.*,
                     .hits = entry.value_ptr.hits,
                     .misses = entry.value_ptr.misses,
@@ -432,14 +438,14 @@ pub const HttpProvider = struct {
 
         // Encode SyncRequest to JSON
         protobuf.json.pb_options.emit_oneof_field_name = false;
-        const request_body = try sync_request.jsonEncode(.{}, self.allocator);
-        defer self.allocator.free(request_body);
+        const request_body = try sync_request.jsonEncode(.{}, temp_allocator);
+        // No defer needed - arena handles cleanup
 
         // Prepare headers: content-type + custom headers
         const max_builtin_headers: usize = 1;
         const total_headers = max_builtin_headers + self.custom_headers.len;
-        const headers_buffer = try self.allocator.alloc(std.http.Header, total_headers);
-        defer self.allocator.free(headers_buffer);
+        const headers_buffer = try temp_allocator.alloc(std.http.Header, total_headers);
+        // No defer needed - arena handles cleanup
 
         var headers_count: usize = 0;
 

@@ -390,6 +390,12 @@ pub const MatcherIndex = struct {
         };
         errdefer self.deinit();
 
+        // Use arena allocator for all temporary structures during build.
+        // This reduces fragmentation by freeing all temporary memory at once.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const temp_allocator = arena.allocator();
+
         // Temporary storage for collecting patterns per MatcherKey
         const PatternsPerKey = struct {
             positive: std.ArrayListUnmanaged(PatternCollector),
@@ -401,19 +407,12 @@ pub const MatcherIndex = struct {
             PatternsPerKey,
             MatcherKeyContext,
             std.hash_map.default_max_load_percentage,
-        ).init(allocator);
-        defer {
-            var it = patterns_by_key.valueIterator();
-            while (it.next()) |patterns| {
-                patterns.positive.deinit(allocator);
-                patterns.negated.deinit(allocator);
-            }
-            patterns_by_key.deinit();
-        }
+        ).init(temp_allocator);
+        // No defer needed - arena handles cleanup
 
         // Temporary list for building policy info
         var policy_info_list = std.ArrayListUnmanaged(PolicyInfo){};
-        defer policy_info_list.deinit(allocator);
+        // No defer needed - arena handles cleanup
 
         // First pass: collect patterns and build policy info
         var policy_index: PolicyIndex = 0;
@@ -495,9 +494,9 @@ pub const MatcherIndex = struct {
                 };
 
                 if (matcher.negate) {
-                    try gop.value_ptr.negated.append(allocator, collector);
+                    try gop.value_ptr.negated.append(temp_allocator, collector);
                 } else {
-                    try gop.value_ptr.positive.append(allocator, collector);
+                    try gop.value_ptr.positive.append(temp_allocator, collector);
                 }
             }
 
@@ -505,7 +504,7 @@ pub const MatcherIndex = struct {
             const policy_id_copy = try allocator.dupe(u8, policy.id);
             try self.policy_id_storage.append(allocator, policy_id_copy);
 
-            try policy_info_list.append(allocator, .{
+            try policy_info_list.append(temp_allocator, .{
                 .id = policy_id_copy,
                 .index = policy_index,
                 .required_match_count = positive_count + negated_count,
@@ -524,17 +523,17 @@ pub const MatcherIndex = struct {
 
         // Build list of policy indices with negated patterns (for fast evaluation init)
         var negation_indices = std.ArrayListUnmanaged(PolicyIndex){};
-        defer negation_indices.deinit(allocator);
+        // No defer needed - arena handles cleanup
         for (self.policies) |p| {
             if (p.negated_count > 0) {
-                try negation_indices.append(allocator, p.index);
+                try negation_indices.append(temp_allocator, p.index);
             }
         }
         self.policies_with_negation = try allocator.dupe(PolicyIndex, negation_indices.items);
 
         // Second pass: compile databases for each MatcherKey
         var keys_list = std.ArrayListUnmanaged(MatcherKey){};
-        defer keys_list.deinit(allocator);
+        // No defer needed - arena handles cleanup
 
         var key_it = patterns_by_key.iterator();
         while (key_it.next()) |entry| {
@@ -551,7 +550,7 @@ pub const MatcherIndex = struct {
 
             const db = try compileDatabase(allocator, bus, patterns.positive.items, patterns.negated.items);
             try self.databases.put(matcher_key, db);
-            try keys_list.append(allocator, matcher_key);
+            try keys_list.append(temp_allocator, matcher_key);
         }
 
         // Store matcher keys for iteration

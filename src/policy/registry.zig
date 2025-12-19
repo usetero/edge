@@ -111,6 +111,20 @@ pub const PolicySnapshot = struct {
     };
 };
 
+/// Grace period in nanoseconds before freeing old snapshots.
+/// This allows in-flight readers to complete before memory is reclaimed.
+const SNAPSHOT_GRACE_PERIOD_NS: u64 = 100 * std.time.ns_per_ms; // 100ms
+
+/// Maximum number of pending snapshots waiting for cleanup.
+/// If this limit is reached, we force cleanup of the oldest snapshots.
+const MAX_PENDING_SNAPSHOTS: usize = 8;
+
+/// A snapshot pending cleanup after its grace period expires
+const PendingSnapshot = struct {
+    snapshot: *const PolicySnapshot,
+    retire_time: i128, // Timestamp when snapshot was retired
+};
+
 /// Centralized policy registry with multi-source support
 pub const PolicyRegistry = struct {
     // All policies stored together
@@ -128,6 +142,9 @@ pub const PolicyRegistry = struct {
     // Current immutable snapshot for lock-free reads
     current_snapshot: std.atomic.Value(?*const PolicySnapshot),
 
+    // Snapshots pending cleanup after grace period
+    pending_snapshots: std.ArrayListUnmanaged(PendingSnapshot),
+
     // Provider references for error routing, keyed by provider ID
     // These are not owned by the registry - caller must ensure they outlive the registry
     providers: std.StringHashMapUnmanaged(*policy_provider.PolicyProvider),
@@ -143,6 +160,7 @@ pub const PolicyRegistry = struct {
             .allocator = allocator,
             .version = std.atomic.Value(u64).init(0),
             .current_snapshot = std.atomic.Value(?*const PolicySnapshot).init(null),
+            .pending_snapshots = .{},
             .providers = .{},
             .bus = bus,
         };
@@ -211,6 +229,13 @@ pub const PolicyRegistry = struct {
             self.allocator.free(key.*);
         }
         self.providers.deinit(self.allocator);
+
+        // Free all pending snapshots (force cleanup, no grace period on shutdown)
+        for (self.pending_snapshots.items) |pending| {
+            @constCast(pending.snapshot).deinit();
+            self.allocator.destroy(pending.snapshot);
+        }
+        self.pending_snapshots.deinit(self.allocator);
 
         // Free current snapshot if exists
         // Note: snapshot.policies is a shallow copy of self.policies, so its Policy
@@ -411,10 +436,41 @@ pub const PolicyRegistry = struct {
         // Swap snapshot atomically
         const old_snapshot = self.current_snapshot.swap(snapshot, .acq_rel);
 
-        // Clean up old snapshot (TODO: RCU for grace period)
+        // Defer cleanup of old snapshot to allow in-flight readers to complete.
+        // This implements a simple grace period mechanism to prevent use-after-free.
         if (old_snapshot) |old| {
-            @constCast(old).deinit();
-            self.allocator.destroy(old);
+            const now = std.time.nanoTimestamp();
+            try self.pending_snapshots.append(self.allocator, .{
+                .snapshot = old,
+                .retire_time = now,
+            });
+        }
+
+        // Clean up snapshots whose grace period has expired
+        self.cleanupExpiredSnapshots();
+    }
+
+    /// Clean up snapshots whose grace period has expired.
+    /// Also forces cleanup if we have too many pending snapshots.
+    fn cleanupExpiredSnapshots(self: *PolicyRegistry) void {
+        const now = std.time.nanoTimestamp();
+        var i: usize = 0;
+
+        while (i < self.pending_snapshots.items.len) {
+            const pending = self.pending_snapshots.items[i];
+            const elapsed = now - pending.retire_time;
+            const grace_expired = elapsed >= SNAPSHOT_GRACE_PERIOD_NS;
+            const force_cleanup = self.pending_snapshots.items.len > MAX_PENDING_SNAPSHOTS;
+
+            if (grace_expired or force_cleanup) {
+                // Grace period expired or too many pending - free this snapshot
+                @constCast(pending.snapshot).deinit();
+                self.allocator.destroy(pending.snapshot);
+                _ = self.pending_snapshots.swapRemove(i);
+                // Don't increment i - swapRemove moved an element into this position
+            } else {
+                i += 1;
+            }
         }
     }
 
