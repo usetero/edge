@@ -245,14 +245,14 @@ pub const PolicyInfo = struct {
     id: []const u8,
     /// Numeric index for O(1) array lookups
     index: PolicyIndex,
-    /// Number of positive (non-negated) matchers that must match
+    /// Total number of matchers (positive + negated) that must match
     required_match_count: u16,
+    /// Number of negated matchers (used to initialize match count)
+    negated_count: u16,
     /// Keep value parsed from policy (determines what to do when matched)
     keep: KeepValue,
     /// Whether policy is enabled
     enabled: bool,
-    /// Whether this policy has only negated matchers (no positive matches required)
-    all_negated: bool,
 };
 
 // =============================================================================
@@ -369,6 +369,10 @@ pub const MatcherIndex = struct {
     /// Enables O(1) lookups during evaluation
     policies: []PolicyInfo,
 
+    /// Policy indices that have negated patterns (precomputed for fast initialization)
+    /// These need to be marked as active at evaluation start
+    policies_with_negation: []PolicyIndex,
+
     /// All unique matcher keys (for iteration during evaluation)
     matcher_keys: []MatcherKey,
 
@@ -395,6 +399,7 @@ pub const MatcherIndex = struct {
             .allocator = allocator,
             .databases = std.HashMap(MatcherKey, *MatcherDatabase, MatcherKeyContext, std.hash_map.default_max_load_percentage).init(allocator),
             .policies = &.{},
+            .policies_with_negation = &.{},
             .matcher_keys = &.{},
             .key_storage = .{},
             .policy_id_storage = .{},
@@ -517,10 +522,10 @@ pub const MatcherIndex = struct {
             try policy_info_list.append(allocator, .{
                 .id = policy_id_copy,
                 .index = policy_index,
-                .required_match_count = positive_count,
+                .required_match_count = positive_count + negated_count,
+                .negated_count = negated_count,
                 .keep = KeepValue.parse(log_target.keep),
                 .enabled = policy.enabled,
-                .all_negated = positive_count == 0 and negated_count > 0,
             });
 
             bus.debug(PolicyStored{ .id = policy.id, .index = policy_index, .required_matches = positive_count, .negated_count = negated_count });
@@ -530,6 +535,16 @@ pub const MatcherIndex = struct {
 
         // Copy policy info to owned slice
         self.policies = try allocator.dupe(PolicyInfo, policy_info_list.items);
+
+        // Build list of policy indices with negated patterns (for fast evaluation init)
+        var negation_indices = std.ArrayListUnmanaged(PolicyIndex){};
+        defer negation_indices.deinit(allocator);
+        for (self.policies) |p| {
+            if (p.negated_count > 0) {
+                try negation_indices.append(allocator, p.index);
+            }
+        }
+        self.policies_with_negation = try allocator.dupe(PolicyIndex, negation_indices.items);
 
         // Second pass: compile databases for each MatcherKey
         var keys_list = std.ArrayListUnmanaged(MatcherKey){};
@@ -595,6 +610,12 @@ pub const MatcherIndex = struct {
         return self.policies;
     }
 
+    /// Get policy indices that have negated patterns.
+    /// These need to be marked as active at evaluation start.
+    pub fn getPoliciesWithNegation(self: *const Self) []const PolicyIndex {
+        return self.policies_with_negation;
+    }
+
     /// Check if the index is empty (no databases compiled).
     pub fn isEmpty(self: *const Self) bool {
         return self.databases.count() == 0;
@@ -621,6 +642,9 @@ pub const MatcherIndex = struct {
 
         // Free policies array
         self.allocator.free(self.policies);
+
+        // Free policies with negation array
+        self.allocator.free(self.policies_with_negation);
 
         // Free matcher keys array
         self.allocator.free(self.matcher_keys);
@@ -867,9 +891,9 @@ test "MatcherIndex: build with single policy" {
     const policy_info = index.getPolicyByIndex(0);
     try testing.expect(policy_info != null);
     try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
+    try testing.expectEqual(@as(u16, 0), policy_info.?.negated_count);
     try testing.expectEqual(KeepValue.none, policy_info.?.keep);
     try testing.expect(policy_info.?.enabled);
-    try testing.expect(!policy_info.?.all_negated);
 
     // Check policy info by ID
     const policy_info_by_id = index.getPolicy("policy-1");
@@ -988,8 +1012,10 @@ test "MatcherIndex: negated matcher creates negated database" {
 
     const policy_info = index.getPolicyByIndex(0);
     try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 0), policy_info.?.required_match_count);
-    try testing.expect(policy_info.?.all_negated);
+    // With new model: required_match_count = positive + negated = 0 + 1 = 1
+    // negated_count = 1 (we start with this, and decrement if negated pattern matches)
+    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
+    try testing.expectEqual(@as(u16, 1), policy_info.?.negated_count);
 
     // Check database has negated patterns
     const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
@@ -1030,8 +1056,10 @@ test "MatcherIndex: mixed positive and negated matchers" {
 
     const policy_info = index.getPolicyByIndex(0);
     try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
-    try testing.expect(!policy_info.?.all_negated);
+    // With new model: required_match_count = positive + negated = 1 + 1 = 2
+    // negated_count = 1
+    try testing.expectEqual(@as(u16, 2), policy_info.?.required_match_count);
+    try testing.expectEqual(@as(u16, 1), policy_info.?.negated_count);
 
     // Check database has both positive and negated
     const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
