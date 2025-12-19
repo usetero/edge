@@ -7,7 +7,8 @@ const o11y = @import("../observability/root.zig");
 const PolicyEngine = policy_engine.PolicyEngine;
 const PolicyResult = policy_engine.PolicyResult;
 const FilterDecision = policy_engine.FilterDecision;
-const MatchCase = policy_engine.MatchCase;
+const FieldRef = policy_engine.FieldRef;
+const LogField = @import("proto").policy.LogField;
 const MAX_POLICIES = @import("../hyperscan/matcher_index.zig").MAX_POLICIES;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
@@ -90,14 +91,18 @@ const FieldAccessorContext = struct {
 
 /// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
-fn datadogFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8 {
+fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     const field_ctx: *const FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const log = field_ctx.log;
 
-    return switch (match_case) {
-        .log_body => log.message,
-        .log_severity_text => log.status orelse log.level,
-        .log_attribute => {
+    return switch (field) {
+        .log_field => |lf| switch (lf) {
+            .LOG_FIELD_BODY => log.message,
+            .LOG_FIELD_SEVERITY_TEXT => log.status orelse log.level,
+            // Datadog JSON format doesn't have direct equivalents for these OTLP fields
+            else => null,
+        },
+        .log_attribute => |key| {
             // For attributes, look up by key name
             if (std.mem.eql(u8, key, "service")) return log.service;
             if (std.mem.eql(u8, key, "hostname")) return log.hostname;
@@ -108,15 +113,8 @@ fn datadogFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []con
             // TODO: handle additional dynamic fields
             return null;
         },
-        // Datadog JSON format doesn't have direct equivalents for these OTLP fields
-        .log_trace_id,
-        .log_span_id,
-        .log_event_name,
-        .resource_schema_url,
-        .scope_schema_url,
-        .resource_attribute,
-        .scope_attribute,
-        => null,
+        // Datadog JSON format doesn't have resource/scope attributes
+        .resource_attribute, .scope_attribute => null,
     };
 }
 
@@ -187,9 +185,8 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
                     .log = log_obj,
                 };
 
-                const result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, &policy_id_buf);
+                const result = engine.evaluate(@ptrCast(@constCast(&field_ctx)), datadogFieldAccessor, null, &policy_id_buf);
                 if (result.decision.shouldContinue()) {
-                    // TODO: Apply transforms using result.matched_policy_ids
                     try kept_objects.append(allocator, log_obj.*);
                 } else {
                     dropped_count += 1;
@@ -249,7 +246,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
 
             // Buffer for matched policy IDs (stack allocated)
             var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
-            const eval_result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, &policy_id_buf);
+            const eval_result = engine.evaluate(@ptrCast(@constCast(&field_ctx)), datadogFieldAccessor, null, &policy_id_buf);
             if (!eval_result.decision.shouldContinue()) {
                 // Return empty array for dropped single log
                 const output = try allocator.alloc(u8, 2);

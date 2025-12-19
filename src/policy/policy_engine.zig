@@ -30,6 +30,8 @@ const std = @import("std");
 const proto = @import("proto");
 const matcher_index = @import("../hyperscan/matcher_index.zig");
 const policy_mod = @import("./root.zig");
+const policy_types = @import("./types.zig");
+const log_transform = @import("./log_transform.zig");
 
 const o11y = @import("../observability/root.zig");
 const NoopEventBus = o11y.NoopEventBus;
@@ -46,9 +48,13 @@ const MatcherKey = matcher_index.MatcherKey;
 const MatcherDatabase = matcher_index.MatcherDatabase;
 const PolicyInfo = matcher_index.PolicyInfo;
 const PatternMeta = matcher_index.PatternMeta;
-pub const MatchCase = matcher_index.MatchCase;
 pub const PolicyRegistry = policy_mod.Registry;
 pub const PolicySnapshot = policy_mod.Snapshot;
+
+// Re-export types for callers
+pub const FieldRef = policy_types.FieldRef;
+pub const FieldMutator = policy_types.FieldMutator;
+pub const MutateOp = policy_types.MutateOp;
 
 // =============================================================================
 // FilterDecision - Result of filter stage evaluation
@@ -102,8 +108,9 @@ pub const FilterResult = FilterDecision;
 // =============================================================================
 
 /// Field accessor function type.
-/// Given a MatchCase and key, returns the field value as a string slice, or null if not found.
-pub const FieldAccessor = *const fn (ctx: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8;
+/// Given a FieldRef, returns the field value as a string slice, or null if not found.
+/// This type is shared with log_transform for both filtering and transform operations.
+pub const FieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
 
 // =============================================================================
 // Observability Events
@@ -111,8 +118,8 @@ pub const FieldAccessor = *const fn (ctx: *const anyopaque, match_case: MatchCas
 
 const EvaluateEmpty = struct {};
 const EvaluateStart = struct { matcher_key_count: usize, policy_count: usize };
-const MatcherKeyFieldNotPresent = struct { match_case: MatchCase, key: []const u8 };
-const MatcherKeyFieldValue = struct { match_case: MatchCase, key: []const u8, value: []const u8 };
+const MatcherKeyFieldNotPresent = struct { field: FieldRef };
+const MatcherKeyFieldValue = struct { field: FieldRef, value: []const u8 };
 const MatcherKeyNoDatabase = struct {};
 const ScanResult = struct { positive_count: usize, negated_count: usize };
 const PolicyFullMatch = struct { policy_index: PolicyIndex, policy_id: []const u8 };
@@ -170,17 +177,39 @@ pub const PolicyEngine = struct {
     ///
     /// The `policy_id_buf` parameter is used to store matched policy IDs.
     /// Caller provides the buffer to avoid allocation.
+    ///
+    /// If `field_mutator` is provided, transforms from matched policies will be applied.
+    /// Pass null to skip transform application.
     pub fn evaluate(
         self: *const Self,
-        ctx: *const anyopaque,
+        ctx: *anyopaque,
         field_accessor: FieldAccessor,
+        field_mutator: ?FieldMutator,
         policy_id_buf: [][]const u8,
     ) PolicyResult {
         const result = self.evaluateFilter(ctx, field_accessor, policy_id_buf);
         if (!result.decision.shouldContinue()) {
             return result;
         }
-        // TODO: Run transforms here.
+
+        // Apply transforms if mutator provided
+        if (field_mutator) |mutator| {
+            const snapshot = self.registry.getSnapshot() orelse return result;
+
+            // For each matched policy, apply its transforms
+            for (result.matched_policy_ids) |policy_id| {
+                // Find policy by ID in snapshot
+                for (snapshot.policies) |*policy| {
+                    if (std.mem.eql(u8, policy.id, policy_id)) {
+                        const log_target = policy.log orelse continue;
+                        const transform = log_target.transform orelse continue;
+                        _ = log_transform.applyTransforms(&transform, ctx, field_accessor, mutator);
+                        break;
+                    }
+                }
+            }
+        }
+
         return result;
     }
 
@@ -235,16 +264,16 @@ pub const PolicyEngine = struct {
         // Iterate through all matcher keys
         for (index.getMatcherKeys()) |matcher_key| {
             // Get field value for this key
-            const value = field_accessor(ctx, matcher_key.match_case, matcher_key.key) orelse {
+            const field_ref = matcher_key.field;
+            const value = field_accessor(ctx, field_ref) orelse {
                 // Field not present - negated matchers succeed (already counted)
                 // Positive matchers fail (no match possible)
-                self.bus.debug(MatcherKeyFieldNotPresent{ .match_case = matcher_key.match_case, .key = matcher_key.key });
+                self.bus.debug(MatcherKeyFieldNotPresent{ .field = field_ref });
                 continue;
             };
 
             self.bus.debug(MatcherKeyFieldValue{
-                .match_case = matcher_key.match_case,
-                .key = matcher_key.key,
+                .field = field_ref,
                 .value = if (value.len > 100) value[0..100] else value,
             });
 
@@ -355,6 +384,7 @@ pub const FilterEngine = PolicyEngine;
 const testing = std.testing;
 const Policy = proto.policy.Policy;
 const SourceType = policy_mod.SourceType;
+const LogField = proto.policy.LogField;
 
 /// Test context for unit tests - simple struct with known fields
 const TestLogContext = struct {
@@ -364,19 +394,22 @@ const TestLogContext = struct {
     ddtags: ?[]const u8 = null,
     env: ?[]const u8 = null,
 
-    pub fn fieldAccessor(ctx_ptr: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8 {
+    pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: FieldRef) ?[]const u8 {
         const self: *const TestLogContext = @ptrCast(@alignCast(ctx_ptr));
-        return switch (match_case) {
-            .log_body => self.message,
-            .log_severity_text => self.level,
-            .log_attribute => {
+        return switch (field) {
+            .log_field => |lf| switch (lf) {
+                .LOG_FIELD_BODY => self.message,
+                .LOG_FIELD_SEVERITY_TEXT => self.level,
+                else => null,
+            },
+            .log_attribute => |key| {
                 if (std.mem.eql(u8, key, "service")) return self.service;
                 if (std.mem.eql(u8, key, "ddtags")) return self.ddtags;
                 if (std.mem.eql(u8, key, "message")) return self.message;
                 if (std.mem.eql(u8, key, "env")) return self.env;
                 return null;
             },
-            else => null,
+            .resource_attribute, .scope_attribute => null,
         };
     }
 };
@@ -394,7 +427,7 @@ test "PolicyEngine: empty registry returns unset" {
     const test_log = TestLogContext{ .message = "hello" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluateFilter(@ptrCast(&test_log), TestLogContext.fieldAccessor, &policy_id_buf);
+    const result = engine.evaluateFilter(&test_log, TestLogContext.fieldAccessor, &policy_id_buf);
 
     try testing.expectEqual(FilterDecision.unset, result.decision);
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
@@ -429,14 +462,14 @@ test "PolicyEngine: single policy drop match" {
     const error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluateFilter(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf);
+    const result = engine.evaluateFilter(&error_log, TestLogContext.fieldAccessor, &policy_id_buf);
     try testing.expectEqual(FilterDecision.drop, result.decision);
     // Dropped results don't include policy IDs (no transform needed)
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
 
     // Non-matching log should be unset (no policy matched)
     const info_log = TestLogContext{ .message = "all good" };
-    const result2 = engine.evaluateFilter(@ptrCast(&info_log), TestLogContext.fieldAccessor, &policy_id_buf);
+    const result2 = engine.evaluateFilter(&info_log, TestLogContext.fieldAccessor, &policy_id_buf);
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -469,7 +502,7 @@ test "PolicyEngine: single policy keep match returns policy ID" {
     const error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluateFilter(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf);
+    const result = engine.evaluateFilter(&error_log, TestLogContext.fieldAccessor, &policy_id_buf);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
@@ -509,15 +542,15 @@ test "PolicyEngine: multiple matchers AND logic" {
 
     // Both match - dropped
     const payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&payment_error), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&payment_error, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Only message matches - unset
     const other_error = TestLogContext{ .message = "an error occurred", .service = "auth-api" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&other_error), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&other_error, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Only service matches - unset
     const payment_info = TestLogContext{ .message = "request completed", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&payment_info), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&payment_info, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: negated matcher" {
@@ -550,11 +583,11 @@ test "PolicyEngine: negated matcher" {
 
     // Non-important log should be dropped (negate: pattern NOT found = success)
     const boring = TestLogContext{ .message = "just a regular log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&boring), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&boring, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Important log should be unset (negate: pattern found = failure, no match)
     const important = TestLogContext{ .message = "this is important data" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&important), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&important, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: mixed negated and non-negated matchers" {
@@ -593,15 +626,15 @@ test "PolicyEngine: mixed negated and non-negated matchers" {
 
     // Error from staging - dropped (error matches, prod not found = both conditions satisfied)
     const staging_error = TestLogContext{ .message = "an error occurred", .env = "staging" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&staging_error), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&staging_error, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Error from production - unset (error matches, but prod IS found = negation failed)
     const prod_error = TestLogContext{ .message = "an error occurred", .env = "production" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&prod_error), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&prod_error, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Non-error from staging - unset (error doesn't match)
     const staging_info = TestLogContext{ .message = "all good", .env = "staging" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&staging_info), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&staging_info, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: most restrictive wins - drop beats keep" {
@@ -652,11 +685,11 @@ test "PolicyEngine: most restrictive wins - drop beats keep" {
 
     // Error from payment - both policies match, most restrictive (DROP) wins
     const payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&payment_error), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&payment_error, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Error from auth - only keep_policy matches (KEEP)
     const auth_error = TestLogContext{ .message = "an error occurred", .service = "auth-api" };
-    const result = engine.evaluateFilter(@ptrCast(&auth_error), TestLogContext.fieldAccessor, &policy_id_buf);
+    const result = engine.evaluateFilter(&auth_error, TestLogContext.fieldAccessor, &policy_id_buf);
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
 }
@@ -689,7 +722,7 @@ test "PolicyEngine: disabled policies are skipped" {
 
     // Would match but policy is disabled - unset
     const error_log = TestLogContext{ .message = "an error occurred" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&error_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: regex pattern matching" {
@@ -721,14 +754,14 @@ test "PolicyEngine: regex pattern matching" {
 
     // Various error formats should match
     const error1 = TestLogContext{ .message = "an error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&error1), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&error1, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     const error2 = TestLogContext{ .message = "Error: something went wrong" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&error2), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&error2, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Non-matching should be unset
     const info = TestLogContext{ .message = "everything is fine" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&info), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&info, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: missing field with negated matcher succeeds" {
@@ -761,15 +794,15 @@ test "PolicyEngine: missing field with negated matcher succeeds" {
 
     // No service attribute = pattern cannot be found = negation succeeds = dropped
     const no_service = TestLogContext{ .message = "hello" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&no_service), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&no_service, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Service without "critical" = negation succeeds = dropped
     const non_critical = TestLogContext{ .message = "hello", .service = "normal-service" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&non_critical), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&non_critical, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Service with "critical" = negation fails = unset
     const critical = TestLogContext{ .message = "hello", .service = "critical-service" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&critical), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&critical, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: multiple policies with different matcher keys" {
@@ -816,15 +849,15 @@ test "PolicyEngine: multiple policies with different matcher keys" {
 
     // Matches policy1
     const error_log = TestLogContext{ .message = "an error occurred", .service = "payment" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&error_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Matches policy2
     const debug_log = TestLogContext{ .message = "all good", .service = "debug-service" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&debug_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&debug_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Matches neither
     const normal_log = TestLogContext{ .message = "all good", .service = "payment" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&normal_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&normal_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: evaluateFilter backwards compatibility" {
@@ -855,10 +888,10 @@ test "PolicyEngine: evaluateFilter backwards compatibility" {
     // Test evaluateFilter returns full PolicyResult
     const error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&error_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     const info_log = TestLogContext{ .message = "all good" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&info_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&info_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "FilterDecision: shouldContinue" {
@@ -911,15 +944,15 @@ test "PolicyEngine: all policies positive only - none start active" {
 
     // No match - no policies become active
     const normal = TestLogContext{ .message = "all good" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&normal), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&normal, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Match policy1 only
     const error_log = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&error_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Match policy2 only
     const warning_log = TestLogContext{ .message = "warning issued" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&warning_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&warning_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: all policies negated only - all start active" {
@@ -964,19 +997,19 @@ test "PolicyEngine: all policies negated only - all start active" {
 
     // Neither "important" nor "critical" - both policies match
     const boring = TestLogContext{ .message = "just a normal log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&boring), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&boring, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains "important" - policy1 fails, policy2 still matches
     const important = TestLogContext{ .message = "important data here" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&important), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&important, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains "critical" - policy1 still matches, policy2 fails
     const critical = TestLogContext{ .message = "critical issue" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&critical), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&critical, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains both - both policies fail
     const both = TestLogContext{ .message = "important and critical" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&both), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&both, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: mix of positive-only and negated policies" {
@@ -1022,19 +1055,19 @@ test "PolicyEngine: mix of positive-only and negated policies" {
 
     // No "error", no "debug" - negated policy matches (drops)
     const normal = TestLogContext{ .message = "normal log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&normal), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&normal, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains "error", no "debug" - both policies match
     const error_log = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&error_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&error_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains "debug" - negated policy fails, positive policy doesn't match
     const debug_log = TestLogContext{ .message = "debug info" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&debug_log), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&debug_log, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains both "error" and "debug" - positive matches, negated fails
     const error_debug = TestLogContext{ .message = "error in debug mode" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&error_debug), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&error_debug, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: multiple negated patterns same policy" {
@@ -1071,19 +1104,19 @@ test "PolicyEngine: multiple negated patterns same policy" {
 
     // Neither word - both negations pass - policy matches
     const normal = TestLogContext{ .message = "normal message" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&normal), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&normal, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains "skip" - first negation fails - policy doesn't match
     const skip = TestLogContext{ .message = "skip this one" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&skip), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&skip, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains "ignore" - second negation fails - policy doesn't match
     const ignore = TestLogContext{ .message = "ignore this" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&ignore), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&ignore, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Contains both - both negations fail - policy doesn't match
     const both = TestLogContext{ .message = "skip and ignore" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&both), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&both, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
 
 test "PolicyEngine: policy becomes active via positive then fails via negated" {
@@ -1120,7 +1153,7 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
 
     // Has "error", no "debug" - positive matches, negation passes - policy matches
     const error_only = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(@ptrCast(&error_only), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluateFilter(&error_only, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Has both "error" and "debug" - positive matches but negation fails
     // required_match_count = 2 (1 positive + 1 negated)
@@ -1129,15 +1162,15 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
     // negated match: -1 -> 1
     // Final: 1 != 2 - policy doesn't match
     const error_debug = TestLogContext{ .message = "debug error message" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&error_debug), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&error_debug, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Has "debug" but no "error" - positive doesn't match, negation fails
     // match_counts starts at 1, negated match: -1 -> 0, final: 0 != 2
     const debug_only = TestLogContext{ .message = "debug info" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&debug_only), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&debug_only, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 
     // Has neither - positive doesn't match, negation passes
     // match_counts stays at 1 (negated_count), final: 1 != 2
     const neither = TestLogContext{ .message = "normal log" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(@ptrCast(&neither), TestLogContext.fieldAccessor, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&neither, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }

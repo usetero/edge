@@ -1,12 +1,12 @@
 //! Matcher Index - Inverted index for efficient policy matching
 //!
-//! This module compiles policies into Hyperscan databases indexed by (MatchCase, Key).
+//! This module compiles policies into Hyperscan databases indexed by FieldRef.
 //! At evaluation time, we scan each field value against its corresponding database
 //! and aggregate matches to determine which policies fully match.
 //!
 //! ## Architecture
 //!
-//! 1. **MatcherKey**: Identifies a unique (MatchCase, attribute_key) tuple
+//! 1. **MatcherKey**: Wraps FieldRef for use as a hash map key
 //! 2. **MatcherDatabase**: Compiled Hyperscan DBs for one MatcherKey (positive + negated)
 //! 3. **MatcherIndex**: Collection of all databases + policy metadata for match aggregation
 //!
@@ -19,9 +19,12 @@
 const std = @import("std");
 const proto = @import("proto");
 const hyperscan = @import("./hyperscan.zig");
+const policy_types = @import("../policy/types.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
+
+const FieldRef = policy_types.FieldRef;
 
 // =============================================================================
 // Observability Events
@@ -43,9 +46,9 @@ const PolicyMatcherCount = struct { id: []const u8, matcher_count: usize, keep: 
 const MatcherNullField = struct { matcher_idx: usize };
 const MatcherNullMatch = struct { matcher_idx: usize };
 const MatcherEmptyRegex = struct { matcher_idx: usize };
-const MatcherDetail = struct { matcher_idx: usize, match_case: MatchCase, key: []const u8, regex: []const u8, negate: bool };
+const MatcherDetail = struct { matcher_idx: usize, field: FieldRef, regex: []const u8, negate: bool };
 const PolicyStored = struct { id: []const u8, index: PolicyIndex, required_matches: u16, negated_count: u16 };
-const CompilingDatabase = struct { match_case: MatchCase, key: []const u8, positive_count: usize, negated_count: usize };
+const CompilingDatabase = struct { field: FieldRef, positive_count: usize, negated_count: usize };
 
 const Policy = proto.policy.Policy;
 const LogMatcher = proto.policy.LogMatcher;
@@ -64,74 +67,54 @@ pub const PolicyIndex = u16;
 pub const MAX_POLICIES: usize = 4096; // Practical limit for stack-allocated bitsets
 
 // =============================================================================
-// MatchCase - Field type being matched
-// =============================================================================
-
-/// MatchCase represents the type of field being matched.
-/// This is derived from the LogMatcher.field oneof.
-pub const MatchCase = enum {
-    // Simple log fields (from LogField enum)
-    log_body,
-    log_severity_text,
-    log_trace_id,
-    log_span_id,
-    log_event_name,
-    resource_schema_url,
-    scope_schema_url,
-
-    // Keyed attribute fields
-    log_attribute,
-    resource_attribute,
-    scope_attribute,
-
-    /// Convert from proto LogMatcher.field_union to MatchCase
-    pub fn fromFieldUnion(field: LogMatcher.field_union) MatchCase {
-        return switch (field) {
-            .log_field => |lf| switch (lf) {
-                .LOG_FIELD_BODY => .log_body,
-                .LOG_FIELD_SEVERITY_TEXT => .log_severity_text,
-                .LOG_FIELD_TRACE_ID => .log_trace_id,
-                .LOG_FIELD_SPAN_ID => .log_span_id,
-                .LOG_FIELD_EVENT_NAME => .log_event_name,
-                .LOG_FIELD_RESOURCE_SCHEMA_URL => .resource_schema_url,
-                .LOG_FIELD_SCOPE_SCHEMA_URL => .scope_schema_url,
-                else => .log_body, // Default for unspecified
-            },
-            .log_attribute => .log_attribute,
-            .resource_attribute => .resource_attribute,
-            .scope_attribute => .scope_attribute,
-        };
-    }
-};
-
-// =============================================================================
 // MatcherKey - Index key for databases
 // =============================================================================
 
 /// Key for indexing Hyperscan databases.
-/// Combines match type and attribute key (empty for non-keyed types).
+/// Wraps FieldRef for use as a hash map key.
 pub const MatcherKey = struct {
-    match_case: MatchCase,
-    key: []const u8, // Empty string for non-keyed types like log_body
+    field: FieldRef,
 
     const Self = @This();
 
     pub fn hash(self: Self) u64 {
         var h = std.hash.Wyhash.init(0);
-        h.update(std.mem.asBytes(&self.match_case));
-        h.update(self.key);
+        switch (self.field) {
+            .log_field => |lf| h.update(std.mem.asBytes(&lf)),
+            .log_attribute => |k| {
+                h.update(&.{0}); // Tag discriminator
+                h.update(k);
+            },
+            .resource_attribute => |k| {
+                h.update(&.{1});
+                h.update(k);
+            },
+            .scope_attribute => |k| {
+                h.update(&.{2});
+                h.update(k);
+            },
+        }
         return h.final();
     }
 
     pub fn eql(a: Self, b: Self) bool {
-        return a.match_case == b.match_case and std.mem.eql(u8, a.key, b.key);
-    }
-
-    /// Check if this match case requires a key (attribute-based matches)
-    pub fn isKeyed(match_case: MatchCase) bool {
-        return switch (match_case) {
-            .resource_attribute, .scope_attribute, .log_attribute => true,
-            else => false,
+        return switch (a.field) {
+            .log_field => |lf_a| switch (b.field) {
+                .log_field => |lf_b| lf_a == lf_b,
+                else => false,
+            },
+            .log_attribute => |k_a| switch (b.field) {
+                .log_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
+                else => false,
+            },
+            .resource_attribute => |k_a| switch (b.field) {
+                .resource_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
+                else => false,
+            },
+            .scope_attribute => |k_a| switch (b.field) {
+                .scope_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
+                else => false,
+            },
         };
     }
 };
@@ -450,12 +433,10 @@ pub const MatcherIndex = struct {
 
             for (log_target.match.items, 0..) |matcher, matcher_idx| {
                 // Get field type from matcher
-                const field = matcher.field orelse {
+                const field_ref = FieldRef.fromMatcherField(matcher.field) orelse {
                     bus.debug(MatcherNullField{ .matcher_idx = matcher_idx });
                     continue;
                 };
-
-                const match_case = MatchCase.fromFieldUnion(field);
 
                 // Get match type - we only support regex for hyperscan
                 const match_union = matcher.match orelse {
@@ -475,11 +456,9 @@ pub const MatcherIndex = struct {
                     continue;
                 }
 
-                // Get key for attribute-based matchers
-                const raw_key = getKeyFromField(field) orelse "";
-                const matcher_key = MatcherKey{ .match_case = match_case, .key = raw_key };
+                const matcher_key = MatcherKey{ .field = field_ref };
 
-                bus.debug(MatcherDetail{ .matcher_idx = matcher_idx, .match_case = match_case, .key = raw_key, .regex = regex, .negate = matcher.negate });
+                bus.debug(MatcherDetail{ .matcher_idx = matcher_idx, .field = field_ref, .regex = regex, .negate = matcher.negate });
 
                 // Track counts
                 if (matcher.negate) {
@@ -491,11 +470,18 @@ pub const MatcherIndex = struct {
                 // Add to patterns collection
                 const gop = try patterns_by_key.getOrPut(matcher_key);
                 if (!gop.found_existing) {
-                    // First time seeing this key - dupe it if needed
-                    if (raw_key.len > 0) {
-                        const key_copy = try allocator.dupe(u8, raw_key);
+                    // First time seeing this key - dupe attribute key if needed
+                    const key = field_ref.getKey();
+                    if (key.len > 0) {
+                        const key_copy = try allocator.dupe(u8, key);
                         try self.key_storage.append(allocator, key_copy);
-                        gop.key_ptr.key = key_copy;
+                        // Update the field ref with the duped key
+                        gop.key_ptr.field = switch (field_ref) {
+                            .log_attribute => .{ .log_attribute = key_copy },
+                            .resource_attribute => .{ .resource_attribute = key_copy },
+                            .scope_attribute => .{ .scope_attribute = key_copy },
+                            .log_field => field_ref,
+                        };
                     }
                     gop.value_ptr.* = .{
                         .positive = .{},
@@ -558,8 +544,7 @@ pub const MatcherIndex = struct {
             if (patterns.positive.items.len == 0 and patterns.negated.items.len == 0) continue;
 
             bus.debug(CompilingDatabase{
-                .match_case = matcher_key.match_case,
-                .key = matcher_key.key,
+                .field = matcher_key.field,
                 .positive_count = patterns.positive.items.len,
                 .negated_count = patterns.negated.items.len,
             });
@@ -664,18 +649,8 @@ pub const MatcherIndex = struct {
 };
 
 // =============================================================================
-// Helper functions
+// Helper types
 // =============================================================================
-
-/// Extract the key from a field union (for keyed attribute types)
-fn getKeyFromField(field: LogMatcher.field_union) ?[]const u8 {
-    return switch (field) {
-        .log_attribute => |key| key,
-        .resource_attribute => |key| key,
-        .scope_attribute => |key| key,
-        .log_field => null, // Simple fields don't have keys
-    };
-}
 
 /// Pattern collector for building databases
 const PatternCollector = struct {
@@ -776,12 +751,12 @@ fn compileDatabase(
 const testing = std.testing;
 
 test "MatcherKey: hash and equality" {
-    const key1 = MatcherKey{ .match_case = .log_body, .key = "" };
-    const key2 = MatcherKey{ .match_case = .log_body, .key = "" };
-    const key3 = MatcherKey{ .match_case = .log_severity_text, .key = "" };
-    const key4 = MatcherKey{ .match_case = .log_attribute, .key = "service" };
-    const key5 = MatcherKey{ .match_case = .log_attribute, .key = "service" };
-    const key6 = MatcherKey{ .match_case = .log_attribute, .key = "env" };
+    const key1 = MatcherKey{ .field = .{ .log_field = .LOG_FIELD_BODY } };
+    const key2 = MatcherKey{ .field = .{ .log_field = .LOG_FIELD_BODY } };
+    const key3 = MatcherKey{ .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT } };
+    const key4 = MatcherKey{ .field = .{ .log_attribute = "service" } };
+    const key5 = MatcherKey{ .field = .{ .log_attribute = "service" } };
+    const key6 = MatcherKey{ .field = .{ .log_attribute = "env" } };
 
     // Same keys should be equal
     try testing.expect(key1.eql(key2));
@@ -796,13 +771,18 @@ test "MatcherKey: hash and equality" {
     try testing.expectEqual(key4.hash(), key5.hash());
 }
 
-test "MatcherKey: isKeyed" {
-    try testing.expect(!MatcherKey.isKeyed(.log_body));
-    try testing.expect(!MatcherKey.isKeyed(.log_severity_text));
-    try testing.expect(!MatcherKey.isKeyed(.resource_schema_url));
-    try testing.expect(MatcherKey.isKeyed(.log_attribute));
-    try testing.expect(MatcherKey.isKeyed(.resource_attribute));
-    try testing.expect(MatcherKey.isKeyed(.scope_attribute));
+test "FieldRef: isKeyed" {
+    const log_body: FieldRef = .{ .log_field = .LOG_FIELD_BODY };
+    const severity: FieldRef = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT };
+    const log_attr: FieldRef = .{ .log_attribute = "service" };
+    const res_attr: FieldRef = .{ .resource_attribute = "host" };
+    const scope_attr: FieldRef = .{ .scope_attribute = "name" };
+
+    try testing.expect(!log_body.isKeyed());
+    try testing.expect(!severity.isKeyed());
+    try testing.expect(log_attr.isKeyed());
+    try testing.expect(res_attr.isKeyed());
+    try testing.expect(scope_attr.isKeyed());
 }
 
 test "KeepValue: parse" {
@@ -901,7 +881,7 @@ test "MatcherIndex: build with single policy" {
     try testing.expectEqualStrings("policy-1", policy_info_by_id.?.id);
 
     // Check database exists for log_body
-    const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } });
     try testing.expect(db != null);
     try testing.expect(db.?.positive_db != null);
     try testing.expect(db.?.negated_db == null);
@@ -937,9 +917,9 @@ test "MatcherIndex: build with keyed matchers" {
     try testing.expectEqual(@as(usize, 2), index.getDatabaseCount());
 
     // Check databases exist
-    try testing.expect(index.getDatabase(.{ .match_case = .log_attribute, .key = "service" }) != null);
-    try testing.expect(index.getDatabase(.{ .match_case = .log_attribute, .key = "env" }) != null);
-    try testing.expect(index.getDatabase(.{ .match_case = .log_attribute, .key = "other" }) == null);
+    try testing.expect(index.getDatabase(.{ .field = .{ .log_attribute = "service" } }) != null);
+    try testing.expect(index.getDatabase(.{ .field = .{ .log_attribute = "env" } }) != null);
+    try testing.expect(index.getDatabase(.{ .field = .{ .log_attribute = "other" } }) == null);
 }
 
 test "MatcherIndex: multiple policies same matcher key" {
@@ -982,7 +962,7 @@ test "MatcherIndex: multiple policies same matcher key" {
     try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
     try testing.expectEqual(@as(usize, 2), index.getPolicyCount());
 
-    const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } });
     try testing.expect(db != null);
     try testing.expectEqual(@as(usize, 2), db.?.positive_patterns.len);
 }
@@ -1018,7 +998,7 @@ test "MatcherIndex: negated matcher creates negated database" {
     try testing.expectEqual(@as(u16, 1), policy_info.?.negated_count);
 
     // Check database has negated patterns
-    const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } });
     try testing.expect(db != null);
     try testing.expect(db.?.positive_db == null);
     try testing.expect(db.?.negated_db != null);
@@ -1062,7 +1042,7 @@ test "MatcherIndex: mixed positive and negated matchers" {
     try testing.expectEqual(@as(u16, 1), policy_info.?.negated_count);
 
     // Check database has both positive and negated
-    const db = index.getDatabase(.{ .match_case = .log_body, .key = "" });
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } });
     try testing.expect(db != null);
     try testing.expect(db.?.positive_db != null);
     try testing.expect(db.?.negated_db != null);
@@ -1096,7 +1076,7 @@ test "MatcherIndex: scan database" {
     var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    var db = index.getDatabase(.{ .match_case = .log_body, .key = "" }).?;
+    var db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
 
     // Scan matching value
     var result_buf: [16]u32 = undefined;

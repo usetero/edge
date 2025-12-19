@@ -15,7 +15,8 @@ const InstrumentationScope = proto.common.InstrumentationScope;
 const PolicyEngine = policy_engine.PolicyEngine;
 const PolicyResult = policy_engine.PolicyResult;
 const FilterDecision = policy_engine.FilterDecision;
-const MatchCase = policy_engine.MatchCase;
+const FieldRef = policy_engine.FieldRef;
+const LogField = proto.policy.LogField;
 const MAX_POLICIES = @import("../hyperscan/matcher_index.zig").MAX_POLICIES;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
@@ -159,21 +160,24 @@ fn findAttribute(attributes: []const KeyValue, key: []const u8) ?[]const u8 {
 }
 
 /// Field accessor for OTLP log format
-/// Maps MatchCase to the appropriate field in the OTLP log structure
-fn otlpFieldAccessor(ctx: *const anyopaque, match_case: MatchCase, key: []const u8) ?[]const u8 {
+/// Maps FieldRef to the appropriate field in the OTLP log structure
+fn otlpFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     const log_ctx: *const OtlpLogContext = @ptrCast(@alignCast(ctx));
 
-    return switch (match_case) {
-        .log_body => getAnyValueString(log_ctx.log_record.body),
-        .log_severity_text => if (log_ctx.log_record.severity_text.len > 0) log_ctx.log_record.severity_text else null,
-        .log_trace_id => if (log_ctx.log_record.trace_id.len > 0) log_ctx.log_record.trace_id else null,
-        .log_span_id => if (log_ctx.log_record.span_id.len > 0) log_ctx.log_record.span_id else null,
-        .log_event_name => null, // OTLP LogRecord doesn't have a dedicated event_name field
-        .log_attribute => findAttribute(log_ctx.log_record.attributes.items, key),
-        .resource_schema_url => if (log_ctx.resource_logs.schema_url.len > 0) log_ctx.resource_logs.schema_url else null,
-        .resource_attribute => if (log_ctx.resource_logs.resource) |res| findAttribute(res.attributes.items, key) else null,
-        .scope_schema_url => if (log_ctx.scope_logs.schema_url.len > 0) log_ctx.scope_logs.schema_url else null,
-        .scope_attribute => if (log_ctx.scope_logs.scope) |scope| findAttribute(scope.attributes.items, key) else null,
+    return switch (field) {
+        .log_field => |lf| switch (lf) {
+            .LOG_FIELD_BODY => getAnyValueString(log_ctx.log_record.body),
+            .LOG_FIELD_SEVERITY_TEXT => if (log_ctx.log_record.severity_text.len > 0) log_ctx.log_record.severity_text else null,
+            .LOG_FIELD_TRACE_ID => if (log_ctx.log_record.trace_id.len > 0) log_ctx.log_record.trace_id else null,
+            .LOG_FIELD_SPAN_ID => if (log_ctx.log_record.span_id.len > 0) log_ctx.log_record.span_id else null,
+            .LOG_FIELD_EVENT_NAME => null, // OTLP LogRecord doesn't have a dedicated event_name field
+            .LOG_FIELD_RESOURCE_SCHEMA_URL => if (log_ctx.resource_logs.schema_url.len > 0) log_ctx.resource_logs.schema_url else null,
+            .LOG_FIELD_SCOPE_SCHEMA_URL => if (log_ctx.scope_logs.schema_url.len > 0) log_ctx.scope_logs.schema_url else null,
+            else => null,
+        },
+        .log_attribute => |key| findAttribute(log_ctx.log_record.attributes.items, key),
+        .resource_attribute => |key| if (log_ctx.resource_logs.resource) |res| findAttribute(res.attributes.items, key) else null,
+        .scope_attribute => |key| if (log_ctx.scope_logs.scope) |scope| findAttribute(scope.attributes.items, key) else null,
     };
 }
 
@@ -218,11 +222,10 @@ fn filterLogsInPlace(
                     .scope_logs = scope_logs,
                 };
 
-                const result = engine.evaluate(@ptrCast(&ctx), otlpFieldAccessor, &policy_id_buf);
+                const result = engine.evaluate(@ptrCast(@constCast(&ctx)), otlpFieldAccessor, null, &policy_id_buf);
 
                 if (result.decision.shouldContinue()) {
                     // Keep this log - move to write position if needed
-                    // TODO: Apply transforms using result.matched_policy_ids
                     if (write_idx != scope_logs.log_records.items.len - 1) {
                         scope_logs.log_records.items[write_idx] = log_record.*;
                     }

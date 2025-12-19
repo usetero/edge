@@ -1,86 +1,18 @@
 const std = @import("std");
 const proto = @import("proto");
+const types = @import("./types.zig");
 
 const LogTransform = proto.policy.LogTransform;
 const LogRemove = proto.policy.LogRemove;
 const LogRedact = proto.policy.LogRedact;
 const LogRename = proto.policy.LogRename;
 const LogAdd = proto.policy.LogAdd;
-const LogField = proto.policy.LogField;
 
-/// Field accessor function type - returns the value for a given field
-/// Returns null if the field doesn't exist
-pub const FieldAccessor = fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
-
-/// Field mutator function type - sets, removes, or renames a field
-/// Returns true if the operation succeeded
-pub const FieldMutator = fn (ctx: *anyopaque, op: MutateOp) bool;
-
-/// Reference to a field for accessor/mutator operations
-pub const FieldRef = union(enum) {
-    log_field: LogField,
-    log_attribute: []const u8,
-    resource_attribute: []const u8,
-    scope_attribute: []const u8,
-
-    pub fn fromRemoveField(field: ?LogRemove.field_union) ?FieldRef {
-        const f = field orelse return null;
-        return switch (f) {
-            .log_field => |v| .{ .log_field = v },
-            .log_attribute => |v| .{ .log_attribute = v },
-            .resource_attribute => |v| .{ .resource_attribute = v },
-            .scope_attribute => |v| .{ .scope_attribute = v },
-        };
-    }
-
-    pub fn fromRedactField(field: ?LogRedact.field_union) ?FieldRef {
-        const f = field orelse return null;
-        return switch (f) {
-            .log_field => |v| .{ .log_field = v },
-            .log_attribute => |v| .{ .log_attribute = v },
-            .resource_attribute => |v| .{ .resource_attribute = v },
-            .scope_attribute => |v| .{ .scope_attribute = v },
-        };
-    }
-
-    pub fn fromRenameFrom(from: ?LogRename.from_union) ?FieldRef {
-        const f = from orelse return null;
-        return switch (f) {
-            .from_log_field => |v| .{ .log_field = v },
-            .from_log_attribute => |v| .{ .log_attribute = v },
-            .from_resource_attribute => |v| .{ .resource_attribute = v },
-            .from_scope_attribute => |v| .{ .scope_attribute = v },
-        };
-    }
-
-    pub fn fromAddField(field: ?LogAdd.field_union) ?FieldRef {
-        const f = field orelse return null;
-        return switch (f) {
-            .log_field => |v| .{ .log_field = v },
-            .log_attribute => |v| .{ .log_attribute = v },
-            .resource_attribute => |v| .{ .resource_attribute = v },
-            .scope_attribute => |v| .{ .scope_attribute = v },
-        };
-    }
-};
-
-/// Mutation operation for field mutator
-pub const MutateOp = union(enum) {
-    /// Remove a field entirely
-    remove: FieldRef,
-    /// Set a field to a value (upsert controls insert vs update behavior)
-    set: struct {
-        field: FieldRef,
-        value: []const u8,
-        upsert: bool,
-    },
-    /// Rename a field (move value from one field to another)
-    rename: struct {
-        from: FieldRef,
-        to: []const u8,
-        upsert: bool,
-    },
-};
+// Re-export types for convenience
+pub const FieldRef = types.FieldRef;
+pub const FieldAccessor = types.FieldAccessor;
+pub const FieldMutator = types.FieldMutator;
+pub const MutateOp = types.MutateOp;
 
 /// Result of applying transforms
 pub const TransformResult = struct {
