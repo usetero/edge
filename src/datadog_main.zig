@@ -174,6 +174,14 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    // var dbg_allo: std.heap.DebugAllocator(.{
+    //     .never_unmap = true,
+    //     .retain_metadata = true,
+    //     .safety = true,
+    // }) = .{};
+    // defer _ = dbg_allo.deinit();
+
+    // const allocator = dbg_allo.allocator();
 
     // Initialize observability with log level from environment
     var stdio_bus: o11y.StdioEventBus = undefined;

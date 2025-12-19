@@ -1174,3 +1174,668 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
     const neither = TestLogContext{ .message = "normal log" };
     try testing.expectEqual(FilterDecision.unset, engine.evaluateFilter(&neither, TestLogContext.fieldAccessor, &policy_id_buf).decision);
 }
+
+// =============================================================================
+// Tests for evaluate() with transforms
+// =============================================================================
+
+/// Mutable test context that supports both FieldAccessor and FieldMutator
+const MutableTestLogContext = struct {
+    level: ?[]const u8 = null,
+    message: ?[]const u8 = null,
+    service: ?[]const u8 = null,
+    ddtags: ?[]const u8 = null,
+    env: ?[]const u8 = null,
+
+    // Dynamic attributes stored in a hash map
+    attributes: std.StringHashMap([]const u8),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) MutableTestLogContext {
+        return .{
+            .attributes = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *MutableTestLogContext) void {
+        var it = self.attributes.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.attributes.deinit();
+    }
+
+    pub fn setAttribute(self: *MutableTestLogContext, key: []const u8, value: []const u8) !void {
+        const value_copy = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(value_copy);
+
+        const gop = try self.attributes.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = value_copy;
+        } else {
+            gop.key_ptr.* = try self.allocator.dupe(u8, key);
+            gop.value_ptr.* = value_copy;
+        }
+    }
+
+    pub fn removeAttribute(self: *MutableTestLogContext, key: []const u8) bool {
+        if (self.attributes.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+            self.allocator.free(removed.value);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: FieldRef) ?[]const u8 {
+        const self: *const MutableTestLogContext = @ptrCast(@alignCast(ctx_ptr));
+        return switch (field) {
+            .log_field => |lf| switch (lf) {
+                .LOG_FIELD_BODY => self.message,
+                .LOG_FIELD_SEVERITY_TEXT => self.level,
+                else => null,
+            },
+            .log_attribute => |key| {
+                // Check fixed fields first
+                if (std.mem.eql(u8, key, "service")) return self.service;
+                if (std.mem.eql(u8, key, "ddtags")) return self.ddtags;
+                if (std.mem.eql(u8, key, "message")) return self.message;
+                if (std.mem.eql(u8, key, "env")) return self.env;
+                // Check dynamic attributes
+                return self.attributes.get(key);
+            },
+            .resource_attribute, .scope_attribute => null,
+        };
+    }
+
+    pub fn fieldMutator(ctx_ptr: *anyopaque, op: policy_types.MutateOp) bool {
+        const self: *MutableTestLogContext = @ptrCast(@alignCast(ctx_ptr));
+        switch (op) {
+            .remove => |field| {
+                switch (field) {
+                    .log_attribute => |key| {
+                        // Handle fixed fields
+                        if (std.mem.eql(u8, key, "service")) {
+                            if (self.service != null) {
+                                self.service = null;
+                                return true;
+                            }
+                            return false;
+                        }
+                        if (std.mem.eql(u8, key, "env")) {
+                            if (self.env != null) {
+                                self.env = null;
+                                return true;
+                            }
+                            return false;
+                        }
+                        // Handle dynamic attributes
+                        return self.removeAttribute(key);
+                    },
+                    else => return false,
+                }
+            },
+            .set => |s| {
+                switch (s.field) {
+                    .log_attribute => |key| {
+                        // For fixed fields, just update the pointer
+                        if (std.mem.eql(u8, key, "service")) {
+                            self.service = s.value;
+                            return true;
+                        }
+                        if (std.mem.eql(u8, key, "env")) {
+                            self.env = s.value;
+                            return true;
+                        }
+                        // For dynamic attributes, store a copy
+                        self.setAttribute(key, s.value) catch return false;
+                        return true;
+                    },
+                    else => return false,
+                }
+            },
+            .rename => |r| {
+                switch (r.from) {
+                    .log_attribute => |from_key| {
+                        // Get the source value
+                        var value: ?[]const u8 = null;
+                        if (std.mem.eql(u8, from_key, "service")) {
+                            value = self.service;
+                            if (value != null) self.service = null;
+                        } else if (std.mem.eql(u8, from_key, "env")) {
+                            value = self.env;
+                            if (value != null) self.env = null;
+                        } else {
+                            if (self.attributes.get(from_key)) |v| {
+                                value = v;
+                                _ = self.removeAttribute(from_key);
+                            }
+                        }
+
+                        if (value == null) return false;
+
+                        // Set the target
+                        self.setAttribute(r.to, value.?) catch return false;
+                        return true;
+                    },
+                    else => return false,
+                }
+            },
+        }
+    }
+};
+
+test "evaluate: policy with keep=all and no transform" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "keep-policy"),
+        .name = try allocator.dupe(u8, "keep-errors"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+        },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "an error occurred";
+    ctx.service = "payment-api";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
+    try testing.expectEqualStrings("keep-policy", result.matched_policy_ids[0]);
+    // No transform, so context unchanged
+    try testing.expectEqualStrings("payment-api", ctx.service.?);
+}
+
+test "evaluate: policy with keep=all and remove transform" {
+    const allocator = testing.allocator;
+
+    var transform = proto.policy.LogTransform{};
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "transform-policy"),
+        .name = try allocator.dupe(u8, "remove-env"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "an error occurred";
+    ctx.service = "payment-api";
+    ctx.env = "production";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    // Transform should have removed 'env'
+    try testing.expect(ctx.env == null);
+    // Other fields unchanged
+    try testing.expectEqualStrings("payment-api", ctx.service.?);
+}
+
+test "evaluate: policy with keep=all and redact transform" {
+    const allocator = testing.allocator;
+
+    var transform = proto.policy.LogTransform{};
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .replacement = try allocator.dupe(u8, "[REDACTED]"),
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "redact-policy"),
+        .name = try allocator.dupe(u8, "redact-service"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "sensitive") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "sensitive data here";
+    ctx.service = "secret-service";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    // Transform should have redacted 'service'
+    try testing.expectEqualStrings("[REDACTED]", ctx.service.?);
+}
+
+test "evaluate: policy with keep=all and add transform" {
+    const allocator = testing.allocator;
+
+    var transform = proto.policy.LogTransform{};
+    try transform.add.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "processed") },
+        .value = try allocator.dupe(u8, "true"),
+        .upsert = true,
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "add-policy"),
+        .name = try allocator.dupe(u8, "add-processed"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "an error occurred";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    // Transform should have added 'processed'
+    try testing.expectEqualStrings("true", ctx.attributes.get("processed").?);
+}
+
+test "evaluate: policy with no keep (drop) skips transform" {
+    const allocator = testing.allocator;
+
+    var transform = proto.policy.LogTransform{};
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "drop-policy"),
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+            .transform = transform, // Transform should NOT be applied for drops
+        },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "an error occurred";
+    ctx.env = "production";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+    // Transform should NOT have been applied (log is dropped)
+    try testing.expectEqualStrings("production", ctx.env.?);
+}
+
+test "evaluate: multiple policies with different transforms" {
+    const allocator = testing.allocator;
+
+    // Policy 1: matches "error", adds tag
+    var transform1 = proto.policy.LogTransform{};
+    try transform1.add.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "error_tag") },
+        .value = try allocator.dupe(u8, "true"),
+        .upsert = true,
+    });
+
+    var policy1 = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "tag-errors"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform1,
+        },
+    };
+    try policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+
+    // Policy 2: matches "payment", removes env
+    var transform2 = proto.policy.LogTransform{};
+    try transform2.remove.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+    });
+
+    var policy2 = Policy{
+        .id = try allocator.dupe(u8, "policy-2"),
+        .name = try allocator.dupe(u8, "clean-payment"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform2,
+        },
+    };
+    try policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .match = .{ .regex = try allocator.dupe(u8, "payment") },
+    });
+
+    defer policy1.deinit(allocator);
+    defer policy2.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ policy1, policy2 }, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    // Log matches BOTH policies
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "payment error occurred";
+    ctx.service = "payment-api";
+    ctx.env = "production";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expectEqual(@as(usize, 2), result.matched_policy_ids.len);
+
+    // Both transforms should have been applied
+    try testing.expectEqualStrings("true", ctx.attributes.get("error_tag").?);
+    try testing.expect(ctx.env == null);
+}
+
+test "evaluate: policy with unset keep applies transform" {
+    const allocator = testing.allocator;
+
+    var transform = proto.policy.LogTransform{};
+    try transform.add.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "tagged") },
+        .value = try allocator.dupe(u8, "yes"),
+        .upsert = true,
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "unset-policy"),
+        .name = try allocator.dupe(u8, "tag-only"),
+        .enabled = true,
+        .log = .{
+            // keep is null (unset) - should still apply transforms
+            .transform = transform,
+        },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "info") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "info log message";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    // When keep is not specified, it defaults to "all" which means keep
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
+    try testing.expectEqualStrings("yes", ctx.attributes.get("tagged").?);
+}
+
+test "evaluate: null mutator skips transforms" {
+    const allocator = testing.allocator;
+
+    var transform = proto.policy.LogTransform{};
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+    });
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "transform-policy"),
+        .name = try allocator.dupe(u8, "remove-env"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "an error occurred";
+    ctx.env = "production";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    // Pass null for mutator - transforms should be skipped
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    // Transform should NOT have been applied (null mutator)
+    try testing.expectEqualStrings("production", ctx.env.?);
+}
+
+test "evaluate: policy without transform field" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "no-transform"),
+        .name = try allocator.dupe(u8, "just-keep"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            // No transform field
+        },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var ctx = MutableTestLogContext.init(allocator);
+    defer ctx.deinit();
+    ctx.message = "an error occurred";
+    ctx.env = "production";
+
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    // No transform, env unchanged
+    try testing.expectEqualStrings("production", ctx.env.?);
+}
+
+test "evaluate: mixed keep and drop policies - only keep applies transforms" {
+    const allocator = testing.allocator;
+
+    // Policy 1: drop errors (no transform should apply)
+    var drop_transform = proto.policy.LogTransform{};
+    try drop_transform.add.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "dropped") },
+        .value = try allocator.dupe(u8, "should-not-appear"),
+        .upsert = true,
+    });
+
+    var drop_policy = Policy{
+        .id = try allocator.dupe(u8, "drop-policy"),
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+            .transform = drop_transform,
+        },
+    };
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "debug") },
+    });
+
+    // Policy 2: keep errors with transform
+    var keep_transform = proto.policy.LogTransform{};
+    try keep_transform.add.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "kept") },
+        .value = try allocator.dupe(u8, "yes"),
+        .upsert = true,
+    });
+
+    var keep_policy = Policy{
+        .id = try allocator.dupe(u8, "keep-policy"),
+        .name = try allocator.dupe(u8, "keep-errors"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = keep_transform,
+        },
+    };
+    try keep_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+
+    defer drop_policy.deinit(allocator);
+    defer keep_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ drop_policy, keep_policy }, "test", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    // Test 1: Log matches only drop policy
+    {
+        var ctx = MutableTestLogContext.init(allocator);
+        defer ctx.deinit();
+        ctx.message = "debug message";
+
+        var policy_id_buf: [16][]const u8 = undefined;
+        const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+        try testing.expectEqual(FilterDecision.drop, result.decision);
+        // Transform should NOT be applied for drop
+        try testing.expect(ctx.attributes.get("dropped") == null);
+    }
+
+    // Test 2: Log matches only keep policy
+    {
+        var ctx = MutableTestLogContext.init(allocator);
+        defer ctx.deinit();
+        ctx.message = "error occurred";
+
+        var policy_id_buf: [16][]const u8 = undefined;
+        const result = engine.evaluate(@ptrCast(&ctx), MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+
+        try testing.expectEqual(FilterDecision.keep, result.decision);
+        // Transform should be applied for keep
+        try testing.expectEqualStrings("yes", ctx.attributes.get("kept").?);
+    }
+}

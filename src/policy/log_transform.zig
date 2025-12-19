@@ -34,8 +34,8 @@ pub const TransformResult = struct {
 pub fn applyTransforms(
     transform: *const LogTransform,
     ctx: *anyopaque,
-    accessor: *const FieldAccessor,
-    mutator: *const FieldMutator,
+    accessor: FieldAccessor,
+    mutator: FieldMutator,
 ) TransformResult {
     var result = TransformResult{};
 
@@ -75,7 +75,7 @@ pub fn applyTransforms(
 pub fn applyRemove(
     rule: *const LogRemove,
     ctx: *anyopaque,
-    mutator: *const FieldMutator,
+    mutator: FieldMutator,
 ) bool {
     const field_ref = FieldRef.fromRemoveField(rule.field) orelse return false;
     return mutator(ctx, .{ .remove = field_ref });
@@ -87,8 +87,8 @@ pub fn applyRemove(
 pub fn applyRedact(
     rule: *const LogRedact,
     ctx: *anyopaque,
-    accessor: *const FieldAccessor,
-    mutator: *const FieldMutator,
+    accessor: FieldAccessor,
+    mutator: FieldMutator,
 ) bool {
     const field_ref = FieldRef.fromRedactField(rule.field) orelse return false;
 
@@ -111,8 +111,8 @@ pub fn applyRedact(
 pub fn applyRename(
     rule: *const LogRename,
     ctx: *anyopaque,
-    accessor: *const FieldAccessor,
-    mutator: *const FieldMutator,
+    accessor: FieldAccessor,
+    mutator: FieldMutator,
 ) bool {
     const from_ref = FieldRef.fromRenameFrom(rule.from) orelse return false;
 
@@ -139,8 +139,8 @@ pub fn applyRename(
 pub fn applyAdd(
     rule: *const LogAdd,
     ctx: *anyopaque,
-    accessor: *const FieldAccessor,
-    mutator: *const FieldMutator,
+    accessor: FieldAccessor,
+    mutator: FieldMutator,
 ) bool {
     const field_ref = FieldRef.fromAddField(rule.field) orelse return false;
 
@@ -287,7 +287,7 @@ test "applyRemove: removes existing field" {
         .field = .{ .log_attribute = "service" },
     };
 
-    const result = applyRemove(&rule, @ptrCast(&ctx), &TestContext.fieldMutator);
+    const result = applyRemove(&rule, @ptrCast(&ctx), TestContext.fieldMutator);
     try testing.expect(result);
     try testing.expect(ctx.fields.get("service") == null);
 }
@@ -301,7 +301,7 @@ test "applyRemove: returns false for non-existent field" {
         .field = .{ .log_attribute = "nonexistent" },
     };
 
-    const result = applyRemove(&rule, @ptrCast(&ctx), &TestContext.fieldMutator);
+    const result = applyRemove(&rule, @ptrCast(&ctx), TestContext.fieldMutator);
     try testing.expect(!result);
 }
 
@@ -330,7 +330,7 @@ test "applyRedact: replaces field value" {
         .replacement = "[REDACTED]",
     };
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.fieldAccessor, &TestContext.fieldMutator);
+    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
     try testing.expect(result);
     try testing.expectEqualStrings("[REDACTED]", ctx.fields.get("password").?);
 }
@@ -345,7 +345,7 @@ test "applyRedact: returns false for non-existent field" {
         .replacement = "[REDACTED]",
     };
 
-    const result = applyRedact(&rule, @ptrCast(&ctx), &TestContext.fieldAccessor, &TestContext.fieldMutator);
+    const result = applyRedact(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
     try testing.expect(!result);
 }
 
@@ -362,7 +362,7 @@ test "applyRename: renames existing field" {
         .upsert = true,
     };
 
-    const result = applyRename(&rule, @ptrCast(&ctx), &TestContext.fieldAccessor, &TestContext.fieldMutator);
+    const result = applyRename(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
     try testing.expect(result);
     try testing.expect(ctx.fields.get("old_name") == null);
     try testing.expectEqualStrings("value123", ctx.fields.get("new_name").?);
@@ -379,7 +379,7 @@ test "applyRename: returns false for non-existent source" {
         .upsert = true,
     };
 
-    const result = applyRename(&rule, @ptrCast(&ctx), &TestContext.fieldAccessor, &TestContext.fieldMutator);
+    const result = applyRename(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
     try testing.expect(!result);
 }
 
@@ -394,7 +394,7 @@ test "applyAdd: adds new field" {
         .upsert = true,
     };
 
-    const result = applyAdd(&rule, @ptrCast(&ctx), &TestContext.fieldAccessor, &TestContext.fieldMutator);
+    const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
     try testing.expect(result);
     try testing.expectEqualStrings("new_value", ctx.fields.get("new_field").?);
 }
@@ -412,7 +412,7 @@ test "applyAdd: upsert=false skips existing field" {
         .upsert = false,
     };
 
-    const result = applyAdd(&rule, @ptrCast(&ctx), &TestContext.fieldAccessor, &TestContext.fieldMutator);
+    const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
     try testing.expect(!result);
     try testing.expectEqualStrings("original", ctx.fields.get("existing").?);
 }
@@ -430,7 +430,7 @@ test "applyAdd: upsert=true overwrites existing field" {
         .upsert = true,
     };
 
-    const result = applyAdd(&rule, @ptrCast(&ctx), &TestContext.fieldAccessor, &TestContext.fieldMutator);
+    const result = applyAdd(&rule, @ptrCast(&ctx), TestContext.fieldAccessor, TestContext.fieldMutator);
     try testing.expect(result);
     try testing.expectEqualStrings("new_value", ctx.fields.get("existing").?);
 }
@@ -481,8 +481,8 @@ test "applyTransforms: applies in correct order" {
     const result = applyTransforms(
         &transform,
         @ptrCast(&ctx),
-        &TestContext.fieldAccessor,
-        &TestContext.fieldMutator,
+        TestContext.fieldAccessor,
+        TestContext.fieldMutator,
     );
 
     try testing.expectEqual(@as(usize, 1), result.removes_applied);

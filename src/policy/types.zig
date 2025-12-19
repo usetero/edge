@@ -129,11 +129,11 @@ pub const FieldRef = union(enum) {
 
 /// Field accessor function type - returns the value for a given field
 /// Returns null if the field doesn't exist
-pub const FieldAccessor = fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
+pub const FieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
 
 /// Field mutator function type - sets, removes, or renames a field
 /// Returns true if the operation succeeded
-pub const FieldMutator = fn (ctx: *anyopaque, op: MutateOp) bool;
+pub const FieldMutator = *const fn (ctx: *anyopaque, op: MutateOp) bool;
 
 /// Mutation operation for field mutator
 pub const MutateOp = union(enum) {
