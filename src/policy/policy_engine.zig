@@ -288,10 +288,14 @@ pub const PolicyEngine = struct {
 
         // Find all matching policies from active set
         // Track both policy IDs (for result) and indices (for O(1) transform lookup)
+        // Also track which policies are KEEP vs DROP for stats recording
         var matched_count: usize = 0;
         var matched_indices: [MAX_POLICIES]PolicyIndex = undefined;
+        var matched_keep_values: [MAX_POLICIES]KeepValue = undefined;
         var best_keep: ?KeepValue = null;
         var best_decision: FilterDecision = .unset;
+        var has_keep_policy = false;
+        var has_drop_policy = false;
 
         for (active_policies[0..active_count]) |policy_index| {
             const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
@@ -307,10 +311,19 @@ pub const PolicyEngine = struct {
                 if (matched_count < policy_id_buf.len) {
                     policy_id_buf[matched_count] = policy_info.id;
                     matched_indices[matched_count] = policy_index;
+                    matched_keep_values[matched_count] = policy_info.keep;
                     matched_count += 1;
+
+                    // Track if we have KEEP or DROP policies
+                    const decision = keepToDecision(policy_info.keep);
+                    if (decision == .keep) {
+                        has_keep_policy = true;
+                    } else if (decision == .drop) {
+                        has_drop_policy = true;
+                    }
                 }
 
-                // Update best decision based on priority
+                // Update best decision based on priority (most restrictive wins)
                 if (best_keep == null or policy_info.keep.isMoreRestrictiveThan(best_keep.?)) {
                     best_keep = policy_info.keep;
                     best_decision = keepToDecision(policy_info.keep);
@@ -320,9 +333,29 @@ pub const PolicyEngine = struct {
 
         self.bus.debug(EvaluateResult{ .decision = best_decision, .matched_count = matched_count });
 
-        // Record policy stats for the winning policy (most restrictive)
+        // Record policy stats based on the decision logic:
+        // - If KEEP and DROP policies both match: KEEP policies get hits, DROP policies get misses
+        // - If all policies have same action: all get hits
         if (matched_count > 0) {
-            self.registry.recordPolicyStats(policy_id_buf[0], 1, 0);
+            const mixed_decisions = has_keep_policy and has_drop_policy;
+
+            for (0..matched_count) |i| {
+                const policy_id = policy_id_buf[i];
+                const keep_value = matched_keep_values[i];
+                const policy_decision = keepToDecision(keep_value);
+
+                if (mixed_decisions) {
+                    // Mixed KEEP and DROP: KEEP policies are hits, DROP policies are misses
+                    if (policy_decision == .keep) {
+                        self.registry.recordPolicyStats(policy_id, 1, 0);
+                    } else {
+                        self.registry.recordPolicyStats(policy_id, 0, 1);
+                    }
+                } else {
+                    // All same action: all policies get hits
+                    self.registry.recordPolicyStats(policy_id, 1, 0);
+                }
+            }
         }
 
         // If drop, return early with empty result (no transform needed)
@@ -1823,4 +1856,443 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
         // Transform should be applied for keep
         try testing.expectEqualStrings("yes", ctx.attributes.get("kept").?);
     }
+}
+
+// =============================================================================
+// Stats Recording Tests
+// =============================================================================
+
+const policy_provider = @import("./provider.zig");
+
+/// Test provider that tracks recordPolicyStats calls
+const StatsTrackingProvider = struct {
+    allocator: std.mem.Allocator,
+    stats_calls: std.ArrayListUnmanaged(StatsCall),
+
+    const StatsCall = struct {
+        policy_id: []const u8,
+        hits: i64,
+        misses: i64,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) StatsTrackingProvider {
+        return .{
+            .allocator = allocator,
+            .stats_calls = .{},
+        };
+    }
+
+    pub fn deinit(self: *StatsTrackingProvider) void {
+        for (self.stats_calls.items) |call| {
+            self.allocator.free(call.policy_id);
+        }
+        self.stats_calls.deinit(self.allocator);
+    }
+
+    pub fn getId(self: *StatsTrackingProvider) []const u8 {
+        _ = self;
+        return "stats-tracking-provider";
+    }
+
+    pub fn subscribe(self: *StatsTrackingProvider, callback: policy_mod.PolicyCallback) !void {
+        _ = self;
+        _ = callback;
+    }
+
+    pub fn recordPolicyError(self: *StatsTrackingProvider, policy_id: []const u8, error_message: []const u8) void {
+        _ = self;
+        _ = policy_id;
+        _ = error_message;
+    }
+
+    pub fn recordPolicyStats(self: *StatsTrackingProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+        const id_copy = self.allocator.dupe(u8, policy_id) catch return;
+        self.stats_calls.append(self.allocator, .{
+            .policy_id = id_copy,
+            .hits = hits,
+            .misses = misses,
+        }) catch {
+            self.allocator.free(id_copy);
+        };
+    }
+
+    pub fn provider(self: *StatsTrackingProvider) policy_provider.PolicyProvider {
+        return policy_provider.PolicyProvider.init(self);
+    }
+
+    /// Find stats for a given policy ID
+    pub fn getStats(self: *const StatsTrackingProvider, policy_id: []const u8) ?StatsCall {
+        for (self.stats_calls.items) |call| {
+            if (std.mem.eql(u8, call.policy_id, policy_id)) {
+                return call;
+            }
+        }
+        return null;
+    }
+
+    /// Count total stats calls
+    pub fn callCount(self: *const StatsTrackingProvider) usize {
+        return self.stats_calls.items.len;
+    }
+};
+
+test "PolicyEngine stats: all DROP policies get hits" {
+    const allocator = testing.allocator;
+
+    // Two DROP policies that both match
+    var drop_policy1 = Policy{
+        .id = try allocator.dupe(u8, "drop-1"),
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try drop_policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer drop_policy1.deinit(allocator);
+
+    var drop_policy2 = Policy{
+        .id = try allocator.dupe(u8, "drop-2"),
+        .name = try allocator.dupe(u8, "drop-critical"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try drop_policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "critical") },
+    });
+    defer drop_policy2.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var stats_provider = StatsTrackingProvider.init(allocator);
+    defer stats_provider.deinit();
+    var provider_iface = stats_provider.provider();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.registerProvider(&provider_iface);
+    try registry.updatePolicies(&.{ drop_policy1, drop_policy2 }, "stats-tracking-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    // Log matches both DROP policies
+    var test_log = TestLogContext{ .message = "critical error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    // Both policies should get hits (all same action)
+    try testing.expectEqual(@as(usize, 2), stats_provider.callCount());
+
+    const stats1 = stats_provider.getStats("drop-1").?;
+    try testing.expectEqual(@as(i64, 1), stats1.hits);
+    try testing.expectEqual(@as(i64, 0), stats1.misses);
+
+    const stats2 = stats_provider.getStats("drop-2").?;
+    try testing.expectEqual(@as(i64, 1), stats2.hits);
+    try testing.expectEqual(@as(i64, 0), stats2.misses);
+}
+
+test "PolicyEngine stats: all KEEP policies get hits" {
+    const allocator = testing.allocator;
+
+    // Two KEEP policies that both match
+    var keep_policy1 = Policy{
+        .id = try allocator.dupe(u8, "keep-1"),
+        .name = try allocator.dupe(u8, "keep-errors"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "all") },
+    };
+    try keep_policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer keep_policy1.deinit(allocator);
+
+    var keep_policy2 = Policy{
+        .id = try allocator.dupe(u8, "keep-2"),
+        .name = try allocator.dupe(u8, "keep-critical"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "all") },
+    };
+    try keep_policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "critical") },
+    });
+    defer keep_policy2.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var stats_provider = StatsTrackingProvider.init(allocator);
+    defer stats_provider.deinit();
+    var provider_iface = stats_provider.provider();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.registerProvider(&provider_iface);
+    try registry.updatePolicies(&.{ keep_policy1, keep_policy2 }, "stats-tracking-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    // Log matches both KEEP policies
+    var test_log = TestLogContext{ .message = "critical error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+
+    // Both policies should get hits (all same action)
+    try testing.expectEqual(@as(usize, 2), stats_provider.callCount());
+
+    const stats1 = stats_provider.getStats("keep-1").?;
+    try testing.expectEqual(@as(i64, 1), stats1.hits);
+    try testing.expectEqual(@as(i64, 0), stats1.misses);
+
+    const stats2 = stats_provider.getStats("keep-2").?;
+    try testing.expectEqual(@as(i64, 1), stats2.hits);
+    try testing.expectEqual(@as(i64, 0), stats2.misses);
+}
+
+test "PolicyEngine stats: mixed KEEP and DROP - KEEP gets hits, DROP gets misses" {
+    const allocator = testing.allocator;
+
+    // One KEEP and one DROP policy that both match
+    var keep_policy = Policy{
+        .id = try allocator.dupe(u8, "keep-policy"),
+        .name = try allocator.dupe(u8, "keep-errors"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "all") },
+    };
+    try keep_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer keep_policy.deinit(allocator);
+
+    var drop_policy = Policy{
+        .id = try allocator.dupe(u8, "drop-policy"),
+        .name = try allocator.dupe(u8, "drop-critical"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try drop_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "critical") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var stats_provider = StatsTrackingProvider.init(allocator);
+    defer stats_provider.deinit();
+    var provider_iface = stats_provider.provider();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.registerProvider(&provider_iface);
+    try registry.updatePolicies(&.{ keep_policy, drop_policy }, "stats-tracking-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    // Log matches both policies (KEEP and DROP)
+    var test_log = TestLogContext{ .message = "critical error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    // DROP wins (most restrictive)
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    // Both policies should have stats recorded
+    try testing.expectEqual(@as(usize, 2), stats_provider.callCount());
+
+    // KEEP policy gets hit (it matched)
+    const keep_stats = stats_provider.getStats("keep-policy").?;
+    try testing.expectEqual(@as(i64, 1), keep_stats.hits);
+    try testing.expectEqual(@as(i64, 0), keep_stats.misses);
+
+    // DROP policy gets miss (KEEP was also present)
+    const drop_stats = stats_provider.getStats("drop-policy").?;
+    try testing.expectEqual(@as(i64, 0), drop_stats.hits);
+    try testing.expectEqual(@as(i64, 1), drop_stats.misses);
+}
+
+test "PolicyEngine stats: single policy match gets hit" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "single-policy"),
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var stats_provider = StatsTrackingProvider.init(allocator);
+    defer stats_provider.deinit();
+    var provider_iface = stats_provider.provider();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.registerProvider(&provider_iface);
+    try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var test_log = TestLogContext{ .message = "an error occurred" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    _ = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    // Single policy should get a hit
+    try testing.expectEqual(@as(usize, 1), stats_provider.callCount());
+    const stats = stats_provider.getStats("single-policy").?;
+    try testing.expectEqual(@as(i64, 1), stats.hits);
+    try testing.expectEqual(@as(i64, 0), stats.misses);
+}
+
+test "PolicyEngine stats: multiple KEEPs and DROPs - all KEEPs get hits, all DROPs get misses" {
+    const allocator = testing.allocator;
+
+    // Two KEEP policies
+    var keep_policy1 = Policy{
+        .id = try allocator.dupe(u8, "keep-1"),
+        .name = try allocator.dupe(u8, "keep-errors"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "all") },
+    };
+    try keep_policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer keep_policy1.deinit(allocator);
+
+    var keep_policy2 = Policy{
+        .id = try allocator.dupe(u8, "keep-2"),
+        .name = try allocator.dupe(u8, "keep-critical"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "all") },
+    };
+    try keep_policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "critical") },
+    });
+    defer keep_policy2.deinit(allocator);
+
+    // Two DROP policies
+    var drop_policy1 = Policy{
+        .id = try allocator.dupe(u8, "drop-1"),
+        .name = try allocator.dupe(u8, "drop-warning"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try drop_policy1.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "warning") },
+    });
+    defer drop_policy1.deinit(allocator);
+
+    var drop_policy2 = Policy{
+        .id = try allocator.dupe(u8, "drop-2"),
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try drop_policy2.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "debug") },
+    });
+    defer drop_policy2.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var stats_provider = StatsTrackingProvider.init(allocator);
+    defer stats_provider.deinit();
+    var provider_iface = stats_provider.provider();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.registerProvider(&provider_iface);
+    try registry.updatePolicies(&.{ keep_policy1, keep_policy2, drop_policy1, drop_policy2 }, "stats-tracking-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    // Log matches all 4 policies (2 KEEP, 2 DROP)
+    var test_log = TestLogContext{ .message = "critical error with warning and debug info" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    // DROP wins (most restrictive)
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    // All 4 policies should have stats recorded
+    try testing.expectEqual(@as(usize, 4), stats_provider.callCount());
+
+    // Both KEEP policies get hits
+    const keep1_stats = stats_provider.getStats("keep-1").?;
+    try testing.expectEqual(@as(i64, 1), keep1_stats.hits);
+    try testing.expectEqual(@as(i64, 0), keep1_stats.misses);
+
+    const keep2_stats = stats_provider.getStats("keep-2").?;
+    try testing.expectEqual(@as(i64, 1), keep2_stats.hits);
+    try testing.expectEqual(@as(i64, 0), keep2_stats.misses);
+
+    // Both DROP policies get misses (because KEEP policies were also present)
+    const drop1_stats = stats_provider.getStats("drop-1").?;
+    try testing.expectEqual(@as(i64, 0), drop1_stats.hits);
+    try testing.expectEqual(@as(i64, 1), drop1_stats.misses);
+
+    const drop2_stats = stats_provider.getStats("drop-2").?;
+    try testing.expectEqual(@as(i64, 0), drop2_stats.hits);
+    try testing.expectEqual(@as(i64, 1), drop2_stats.misses);
+}
+
+test "PolicyEngine stats: no match records no stats" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "no-match-policy"),
+        .name = try allocator.dupe(u8, "drop-errors"),
+        .enabled = true,
+        .log = .{ .keep = try allocator.dupe(u8, "none") },
+    };
+    try policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var stats_provider = StatsTrackingProvider.init(allocator);
+    defer stats_provider.deinit();
+    var provider_iface = stats_provider.provider();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.registerProvider(&provider_iface);
+    try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    // Log doesn't match the policy
+    var test_log = TestLogContext{ .message = "all good here" };
+    var policy_id_buf: [16][]const u8 = undefined;
+    _ = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    // No stats should be recorded
+    try testing.expectEqual(@as(usize, 0), stats_provider.callCount());
 }

@@ -181,11 +181,11 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             for (array.value) |*log_obj| {
                 original_count += 1;
 
-                const field_ctx = FieldAccessorContext{
+                var field_ctx = FieldAccessorContext{
                     .log = log_obj,
                 };
 
-                const result = engine.evaluate(@ptrCast(@constCast(&field_ctx)), datadogFieldAccessor, null, &policy_id_buf);
+                const result = engine.evaluate(&field_ctx, datadogFieldAccessor, null, &policy_id_buf);
                 if (result.decision.shouldContinue()) {
                     try kept_objects.append(allocator, log_obj.*);
                 } else {
@@ -240,13 +240,13 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             };
             defer log_obj.deinit();
 
-            const field_ctx = FieldAccessorContext{
+            var field_ctx = FieldAccessorContext{
                 .log = &log_obj.value,
             };
 
             // Buffer for matched policy IDs (stack allocated)
             var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
-            const eval_result = engine.evaluate(@ptrCast(@constCast(&field_ctx)), datadogFieldAccessor, null, &policy_id_buf);
+            const eval_result = engine.evaluate(&field_ctx, datadogFieldAccessor, null, &policy_id_buf);
             if (!eval_result.decision.shouldContinue()) {
                 // Return empty array for dropped single log
                 const output = try allocator.alloc(u8, 2);
