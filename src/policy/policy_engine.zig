@@ -56,6 +56,11 @@ pub const FieldRef = policy_types.FieldRef;
 pub const FieldMutator = policy_types.FieldMutator;
 pub const MutateOp = policy_types.MutateOp;
 
+/// Optional callback to measure byte size of the context.
+/// Used to track bytes before/after transforms for each policy.
+/// Returns the current byte size of the context (e.g., serialized log record size).
+pub const ByteCounter = ?*const fn (ctx: *const anyopaque) usize;
+
 // =============================================================================
 // FilterDecision - Result of filter stage evaluation
 // =============================================================================
@@ -125,6 +130,15 @@ const ScanResult = struct { positive_count: usize, negated_count: usize };
 const PolicyFullMatch = struct { policy_index: PolicyIndex, policy_id: []const u8 };
 const PolicyNegationFailed = struct { policy_index: PolicyIndex };
 const EvaluateResult = struct { decision: FilterDecision, matched_count: usize };
+const TransformApplied = struct {
+    policy_id: []const u8,
+    removes: usize,
+    redacts: usize,
+    renames: usize,
+    adds: usize,
+    bytes_before: usize,
+    bytes_after: usize,
+};
 
 // =============================================================================
 // PolicyEngine - Main evaluation engine
@@ -180,15 +194,42 @@ pub const PolicyEngine = struct {
     ///
     /// If `field_mutator` is provided, transforms from matched policies will be applied.
     /// Pass null to skip transform application.
+    ///
+    /// If `byte_counter` is provided, bytes before/after each transform will be measured
+    /// and recorded in policy stats. Pass null to skip byte tracking.
+    ///
     /// Full policy evaluation with filter decision, matched policy IDs, and optional transforms.
     /// Returns PolicyResult containing the filter decision and list of matched policy IDs.
     /// If field_mutator is provided, transforms are applied to matched policies.
+    /// Result of scanning all matcher keys against field values
+    const ScanState = struct {
+        match_counts: [MAX_POLICIES]u16,
+        active_policies: [MAX_POLICIES]PolicyIndex,
+        is_active: [MAX_POLICIES]bool,
+        active_count: usize,
+    };
+
+    /// Result of finding matching policies from scan state
+    const MatchState = struct {
+        matched_indices: [MAX_POLICIES]PolicyIndex,
+        matched_keep_values: [MAX_POLICIES]KeepValue,
+        matched_count: usize,
+        best_decision: FilterDecision,
+        has_keep_policy: bool,
+        has_drop_policy: bool,
+
+        inline fn hasMixedDecisions(self: *const MatchState) bool {
+            return self.has_keep_policy and self.has_drop_policy;
+        }
+    };
+
     pub fn evaluate(
         self: *const Self,
         ctx: *anyopaque,
         field_accessor: FieldAccessor,
         field_mutator: ?FieldMutator,
         policy_id_buf: [][]const u8,
+        byte_counter: ByteCounter,
     ) PolicyResult {
         // Get current snapshot from registry (lock-free)
         const snapshot = self.registry.getSnapshot() orelse {
@@ -203,42 +244,62 @@ pub const PolicyEngine = struct {
             return PolicyResult.unmatched;
         }
 
-        const policy_count = index.getPolicyCount();
-        self.bus.debug(EvaluateStart{ .matcher_key_count = index.getMatcherKeys().len, .policy_count = policy_count });
+        self.bus.debug(EvaluateStart{ .matcher_key_count = index.getMatcherKeys().len, .policy_count = index.getPolicyCount() });
 
-        // Stack-allocated arrays for O(1) per-policy operations
-        // Initialize match_counts[i] = negated_count[i] (assume all negated patterns pass)
-        // Positive matches increment, negated matches decrement
-        // Policy matches when match_counts[i] == required_match_count[i]
-        var match_counts: [MAX_POLICIES]u16 = undefined;
-        @memset(&match_counts, 0);
+        // Phase 1: Scan all matcher keys and compute match counts
+        var scan_state = self.scanMatcherKeys(ctx, field_accessor, index);
 
-        // Track which policies had any match activity
-        var active_policies: [MAX_POLICIES]PolicyIndex = undefined;
-        var active_count: usize = 0;
-        var is_active: [MAX_POLICIES]bool = undefined;
-        @memset(&is_active, false);
+        // Phase 2: Find matching policies and determine decision
+        var match_state = self.findMatchingPolicies(index, &scan_state, policy_id_buf);
 
-        // Initialize match counts and mark policies with negated patterns as active
-        // Uses precomputed list from index build time - no iteration over all policies
-        for (index.getPoliciesWithNegation()) |policy_index| {
-            const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
-            match_counts[policy_index] = policy_info.negated_count;
-            is_active[policy_index] = true;
-            active_policies[active_count] = policy_index;
-            active_count += 1;
+        self.bus.debug(EvaluateResult{ .decision = match_state.best_decision, .matched_count = match_state.matched_count });
+
+        // Phase 3: Handle drop case (record stats, return early)
+        if (match_state.best_decision == .drop) {
+            self.recordDropStats(ctx, byte_counter, policy_id_buf, &match_state);
+            return PolicyResult.dropped;
         }
 
-        // Buffer for scan results
+        // Phase 4: Apply transforms and record stats for keep case
+        self.applyTransformsAndRecordStats(ctx, field_accessor, field_mutator, byte_counter, snapshot, policy_id_buf, &match_state);
+
+        return PolicyResult{
+            .decision = match_state.best_decision,
+            .matched_policy_ids = policy_id_buf[0..match_state.matched_count],
+        };
+    }
+
+    /// Scan all matcher keys and compute match counts for each policy.
+    /// Returns state needed for determining which policies matched.
+    inline fn scanMatcherKeys(
+        self: *const Self,
+        ctx: *anyopaque,
+        field_accessor: FieldAccessor,
+        index: *const MatcherIndex,
+    ) ScanState {
+        var state = ScanState{
+            .match_counts = undefined,
+            .active_policies = undefined,
+            .is_active = undefined,
+            .active_count = 0,
+        };
+        @memset(&state.match_counts, 0);
+        @memset(&state.is_active, false);
+
+        // Initialize match counts for policies with negated patterns
+        for (index.getPoliciesWithNegation()) |policy_index| {
+            const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
+            state.match_counts[policy_index] = policy_info.negated_count;
+            state.is_active[policy_index] = true;
+            state.active_policies[state.active_count] = policy_index;
+            state.active_count += 1;
+        }
+
         var result_buf: [MAX_MATCHES_PER_SCAN]u32 = undefined;
 
-        // Iterate through all matcher keys
         for (index.getMatcherKeys()) |matcher_key| {
-            // Get field value for this key
             const field_ref = matcher_key.field;
             const value = field_accessor(ctx, field_ref) orelse {
-                // Field not present - negated matchers succeed (already counted)
-                // Positive matchers fail (no match possible)
                 self.bus.debug(MatcherKeyFieldNotPresent{ .field = field_ref });
                 continue;
             };
@@ -248,7 +309,6 @@ pub const PolicyEngine = struct {
                 .value = if (value.len > 100) value[0..100] else value,
             });
 
-            // Get database for this key
             const db = index.getDatabase(matcher_key) orelse {
                 self.bus.debug(MatcherKeyNoDatabase{});
                 continue;
@@ -259,25 +319,25 @@ pub const PolicyEngine = struct {
             for (positive_result.matches()) |pattern_id| {
                 if (pattern_id < db.positive_patterns.len) {
                     const meta = db.positive_patterns[pattern_id];
-                    match_counts[meta.policy_index] += 1;
-                    if (!is_active[meta.policy_index]) {
-                        is_active[meta.policy_index] = true;
-                        active_policies[active_count] = meta.policy_index;
-                        active_count += 1;
+                    state.match_counts[meta.policy_index] += 1;
+                    if (!state.is_active[meta.policy_index]) {
+                        state.is_active[meta.policy_index] = true;
+                        state.active_policies[state.active_count] = meta.policy_index;
+                        state.active_count += 1;
                     }
                 }
             }
 
-            // Scan negated patterns - decrement match counts (negated pattern matched = failed)
+            // Scan negated patterns - decrement match counts
             const negated_result = db.scanNegated(value, &result_buf);
             for (negated_result.matches()) |pattern_id| {
                 if (pattern_id < db.negated_patterns.len) {
                     const meta = db.negated_patterns[pattern_id];
-                    match_counts[meta.policy_index] -= 1;
-                    if (!is_active[meta.policy_index]) {
-                        is_active[meta.policy_index] = true;
-                        active_policies[active_count] = meta.policy_index;
-                        active_count += 1;
+                    state.match_counts[meta.policy_index] -= 1;
+                    if (!state.is_active[meta.policy_index]) {
+                        state.is_active[meta.policy_index] = true;
+                        state.active_policies[state.active_count] = meta.policy_index;
+                        state.active_count += 1;
                     }
                     self.bus.debug(PolicyNegationFailed{ .policy_index = meta.policy_index });
                 }
@@ -286,99 +346,141 @@ pub const PolicyEngine = struct {
             self.bus.debug(ScanResult{ .positive_count = positive_result.count, .negated_count = negated_result.count });
         }
 
-        // Find all matching policies from active set
-        // Track both policy IDs (for result) and indices (for O(1) transform lookup)
-        // Also track which policies are KEEP vs DROP for stats recording
-        var matched_count: usize = 0;
-        var matched_indices: [MAX_POLICIES]PolicyIndex = undefined;
-        var matched_keep_values: [MAX_POLICIES]KeepValue = undefined;
-        var best_keep: ?KeepValue = null;
-        var best_decision: FilterDecision = .unset;
-        var has_keep_policy = false;
-        var has_drop_policy = false;
+        return state;
+    }
 
-        for (active_policies[0..active_count]) |policy_index| {
+    /// Find all matching policies from active set and determine best decision.
+    inline fn findMatchingPolicies(
+        self: *const Self,
+        index: *const MatcherIndex,
+        scan_state: *const ScanState,
+        policy_id_buf: [][]const u8,
+    ) MatchState {
+        var state = MatchState{
+            .matched_indices = undefined,
+            .matched_keep_values = undefined,
+            .matched_count = 0,
+            .best_decision = .unset,
+            .has_keep_policy = false,
+            .has_drop_policy = false,
+        };
+        var best_keep: ?KeepValue = null;
+
+        for (scan_state.active_policies[0..scan_state.active_count]) |policy_index| {
             const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
 
-            // Skip disabled policies
             if (!policy_info.enabled) continue;
 
-            // Policy matches when count equals required
-            if (match_counts[policy_index] == policy_info.required_match_count) {
+            if (scan_state.match_counts[policy_index] == policy_info.required_match_count) {
                 self.bus.debug(PolicyFullMatch{ .policy_index = policy_info.index, .policy_id = policy_info.id });
 
-                // Add to matched list if buffer has space
-                if (matched_count < policy_id_buf.len) {
-                    policy_id_buf[matched_count] = policy_info.id;
-                    matched_indices[matched_count] = policy_index;
-                    matched_keep_values[matched_count] = policy_info.keep;
-                    matched_count += 1;
+                if (state.matched_count < policy_id_buf.len) {
+                    policy_id_buf[state.matched_count] = policy_info.id;
+                    state.matched_indices[state.matched_count] = policy_index;
+                    state.matched_keep_values[state.matched_count] = policy_info.keep;
+                    state.matched_count += 1;
 
-                    // Track if we have KEEP or DROP policies
                     const decision = keepToDecision(policy_info.keep);
                     if (decision == .keep) {
-                        has_keep_policy = true;
+                        state.has_keep_policy = true;
                     } else if (decision == .drop) {
-                        has_drop_policy = true;
+                        state.has_drop_policy = true;
                     }
                 }
 
-                // Update best decision based on priority (most restrictive wins)
                 if (best_keep == null or policy_info.keep.isMoreRestrictiveThan(best_keep.?)) {
                     best_keep = policy_info.keep;
-                    best_decision = keepToDecision(policy_info.keep);
+                    state.best_decision = keepToDecision(policy_info.keep);
                 }
             }
         }
 
-        self.bus.debug(EvaluateResult{ .decision = best_decision, .matched_count = matched_count });
+        return state;
+    }
 
-        // Record policy stats based on the decision logic:
-        // - If KEEP and DROP policies both match: KEEP policies get hits, DROP policies get misses
-        // - If all policies have same action: all get hits
-        if (matched_count > 0) {
-            const mixed_decisions = has_keep_policy and has_drop_policy;
+    /// Record stats for all matched policies when decision is drop.
+    inline fn recordDropStats(
+        self: *const Self,
+        ctx: *anyopaque,
+        byte_counter: ByteCounter,
+        policy_id_buf: [][]const u8,
+        match_state: *const MatchState,
+    ) void {
+        if (match_state.matched_count == 0) return;
 
-            for (0..matched_count) |i| {
-                const policy_id = policy_id_buf[i];
-                const keep_value = matched_keep_values[i];
-                const policy_decision = keepToDecision(keep_value);
+        const current_bytes: i64 = if (byte_counter) |counter| @intCast(counter(ctx)) else 0;
 
-                if (mixed_decisions) {
-                    // Mixed KEEP and DROP: KEEP policies are hits, DROP policies are misses
-                    if (policy_decision == .keep) {
-                        self.registry.recordPolicyStats(policy_id, 1, 0);
-                    } else {
-                        self.registry.recordPolicyStats(policy_id, 0, 1);
-                    }
+        for (0..match_state.matched_count) |i| {
+            const policy_id = policy_id_buf[i];
+            const keep_value = match_state.matched_keep_values[i];
+            const policy_decision = keepToDecision(keep_value);
+
+            if (match_state.hasMixedDecisions()) {
+                if (policy_decision == .keep) {
+                    self.registry.recordPolicyStats(policy_id, 1, 0, current_bytes, current_bytes);
                 } else {
-                    // All same action: all policies get hits
-                    self.registry.recordPolicyStats(policy_id, 1, 0);
+                    self.registry.recordPolicyStats(policy_id, 0, 1, current_bytes, current_bytes);
+                }
+            } else {
+                self.registry.recordPolicyStats(policy_id, 1, 0, current_bytes, current_bytes);
+            }
+        }
+    }
+
+    /// Apply transforms for each matched policy and record stats with byte measurements.
+    inline fn applyTransformsAndRecordStats(
+        self: *const Self,
+        ctx: *anyopaque,
+        field_accessor: FieldAccessor,
+        field_mutator: ?FieldMutator,
+        byte_counter: ByteCounter,
+        snapshot: *const PolicySnapshot,
+        policy_id_buf: [][]const u8,
+        match_state: *const MatchState,
+    ) void {
+        for (0..match_state.matched_count) |i| {
+            const policy_id = policy_id_buf[i];
+            const policy_index = match_state.matched_indices[i];
+            const keep_value = match_state.matched_keep_values[i];
+            const policy_decision = keepToDecision(keep_value);
+
+            const bytes_before: usize = if (byte_counter) |counter| counter(ctx) else 0;
+
+            var transform_result = log_transform.TransformResult{};
+            if (field_mutator) |mutator| {
+                if (snapshot.getPolicy(policy_index)) |policy| {
+                    if (policy.log) |log_target| {
+                        if (log_target.transform) |transform| {
+                            transform_result = log_transform.applyTransforms(&transform, ctx, field_accessor, mutator);
+                        }
+                    }
                 }
             }
-        }
 
-        // If drop, return early with empty result (no transform needed)
-        if (best_decision == .drop) {
-            return PolicyResult.dropped;
-        }
+            const bytes_after: usize = if (byte_counter) |counter| counter(ctx) else 0;
 
-        // Apply transforms if mutator provided and decision allows continuation
-        if (field_mutator) |mutator| {
-            // Use matched indices for O(1) policy lookup
-            for (matched_indices[0..matched_count]) |policy_index| {
-                const policy = snapshot.getPolicy(policy_index) orelse continue;
-                const log_target = policy.log orelse continue;
-                const transform = log_target.transform orelse continue;
-                _ = log_transform.applyTransforms(&transform, ctx, field_accessor, mutator);
+            if (transform_result.totalApplied() > 0 or byte_counter != null) {
+                self.bus.debug(TransformApplied{
+                    .policy_id = policy_id,
+                    .removes = transform_result.removes_applied,
+                    .redacts = transform_result.redacts_applied,
+                    .renames = transform_result.renames_applied,
+                    .adds = transform_result.adds_applied,
+                    .bytes_before = bytes_before,
+                    .bytes_after = bytes_after,
+                });
+            }
+
+            if (match_state.hasMixedDecisions()) {
+                if (policy_decision == .keep) {
+                    self.registry.recordPolicyStats(policy_id, 1, 0, @intCast(bytes_before), @intCast(bytes_after));
+                } else {
+                    self.registry.recordPolicyStats(policy_id, 0, 1, @intCast(bytes_before), @intCast(bytes_after));
+                }
+            } else {
+                self.registry.recordPolicyStats(policy_id, 1, 0, @intCast(bytes_before), @intCast(bytes_after));
             }
         }
-
-        // Return keep/unset with matched policy IDs
-        return PolicyResult{
-            .decision = best_decision,
-            .matched_policy_ids = policy_id_buf[0..matched_count],
-        };
     }
 
     /// Convert KeepValue to FilterDecision
@@ -445,7 +547,7 @@ test "PolicyEngine: empty registry returns unset" {
     var test_log = TestLogContext{ .message = "hello" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.unset, result.decision);
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
@@ -480,14 +582,14 @@ test "PolicyEngine: single policy drop match" {
     var error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
     try testing.expectEqual(FilterDecision.drop, result.decision);
     // Dropped results don't include policy IDs (no transform needed)
     try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
 
     // Non-matching log should be unset (no policy matched)
     var info_log = TestLogContext{ .message = "all good" };
-    const result2 = engine.evaluate(&info_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(&info_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
     try testing.expectEqual(FilterDecision.unset, result2.decision);
 }
 
@@ -520,7 +622,7 @@ test "PolicyEngine: single policy keep match returns policy ID" {
     var error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
 
-    const result = engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
@@ -560,15 +662,15 @@ test "PolicyEngine: multiple matchers AND logic" {
 
     // Both match - dropped
     var payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&payment_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&payment_error, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Only message matches - unset
     var other_error = TestLogContext{ .message = "an error occurred", .service = "auth-api" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&other_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&other_error, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Only service matches - unset
     var payment_info = TestLogContext{ .message = "request completed", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&payment_info, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&payment_info, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: negated matcher" {
@@ -601,11 +703,11 @@ test "PolicyEngine: negated matcher" {
 
     // Non-important log should be dropped (negate: pattern NOT found = success)
     var boring = TestLogContext{ .message = "just a regular log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&boring, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&boring, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Important log should be unset (negate: pattern found = failure, no match)
     var important = TestLogContext{ .message = "this is important data" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&important, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&important, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: mixed negated and non-negated matchers" {
@@ -644,15 +746,15 @@ test "PolicyEngine: mixed negated and non-negated matchers" {
 
     // Error from staging - dropped (error matches, prod not found = both conditions satisfied)
     var staging_error = TestLogContext{ .message = "an error occurred", .env = "staging" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&staging_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&staging_error, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Error from production - unset (error matches, but prod IS found = negation failed)
     var prod_error = TestLogContext{ .message = "an error occurred", .env = "production" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&prod_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&prod_error, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Non-error from staging - unset (error doesn't match)
     var staging_info = TestLogContext{ .message = "all good", .env = "staging" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&staging_info, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&staging_info, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: most restrictive wins - drop beats keep" {
@@ -703,11 +805,11 @@ test "PolicyEngine: most restrictive wins - drop beats keep" {
 
     // Error from payment - both policies match, most restrictive (DROP) wins
     var payment_error = TestLogContext{ .message = "an error occurred", .service = "payment-api" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&payment_error, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&payment_error, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Error from auth - only keep_policy matches (KEEP)
     var auth_error = TestLogContext{ .message = "an error occurred", .service = "auth-api" };
-    const result = engine.evaluate(&auth_error, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&auth_error, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
 }
@@ -740,7 +842,7 @@ test "PolicyEngine: disabled policies are skipped" {
 
     // Would match but policy is disabled - unset
     var error_log = TestLogContext{ .message = "an error occurred" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: regex pattern matching" {
@@ -772,14 +874,14 @@ test "PolicyEngine: regex pattern matching" {
 
     // Various error formats should match
     var error1 = TestLogContext{ .message = "an error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error1, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error1, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     var error2 = TestLogContext{ .message = "Error: something went wrong" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error2, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error2, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Non-matching should be unset
     var info = TestLogContext{ .message = "everything is fine" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&info, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&info, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: missing field with negated matcher succeeds" {
@@ -812,15 +914,15 @@ test "PolicyEngine: missing field with negated matcher succeeds" {
 
     // No service attribute = pattern cannot be found = negation succeeds = dropped
     var no_service = TestLogContext{ .message = "hello" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&no_service, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&no_service, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Service without "critical" = negation succeeds = dropped
     var non_critical = TestLogContext{ .message = "hello", .service = "normal-service" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&non_critical, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&non_critical, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Service with "critical" = negation fails = unset
     var critical = TestLogContext{ .message = "hello", .service = "critical-service" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&critical, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&critical, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: multiple policies with different matcher keys" {
@@ -867,15 +969,15 @@ test "PolicyEngine: multiple policies with different matcher keys" {
 
     // Matches policy1
     var error_log = TestLogContext{ .message = "an error occurred", .service = "payment" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Matches policy2
     var debug_log = TestLogContext{ .message = "all good", .service = "debug-service" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&debug_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&debug_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Matches neither
     var normal_log = TestLogContext{ .message = "all good", .service = "payment" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&normal_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&normal_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: evaluate with null mutator" {
@@ -906,10 +1008,10 @@ test "PolicyEngine: evaluate with null mutator" {
     // Test evaluate with null mutator returns full PolicyResult
     var error_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     var info_log = TestLogContext{ .message = "all good" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&info_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&info_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "FilterDecision: shouldContinue" {
@@ -962,15 +1064,15 @@ test "PolicyEngine: all policies positive only - none start active" {
 
     // No match - no policies become active
     var normal = TestLogContext{ .message = "all good" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&normal, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&normal, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Match policy1 only
     var error_log = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Match policy2 only
     var warning_log = TestLogContext{ .message = "warning issued" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&warning_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&warning_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: all policies negated only - all start active" {
@@ -1015,19 +1117,19 @@ test "PolicyEngine: all policies negated only - all start active" {
 
     // Neither "important" nor "critical" - both policies match
     var boring = TestLogContext{ .message = "just a normal log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&boring, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&boring, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains "important" - policy1 fails, policy2 still matches
     var important = TestLogContext{ .message = "important data here" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&important, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&important, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains "critical" - policy1 still matches, policy2 fails
     var critical = TestLogContext{ .message = "critical issue" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&critical, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&critical, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains both - both policies fail
     var both = TestLogContext{ .message = "important and critical" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&both, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&both, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: mix of positive-only and negated policies" {
@@ -1073,19 +1175,19 @@ test "PolicyEngine: mix of positive-only and negated policies" {
 
     // No "error", no "debug" - negated policy matches (drops)
     var normal = TestLogContext{ .message = "normal log" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&normal, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&normal, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains "error", no "debug" - both policies match
     var error_log = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains "debug" - negated policy fails, positive policy doesn't match
     var debug_log = TestLogContext{ .message = "debug info" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&debug_log, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&debug_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains both "error" and "debug" - positive matches, negated fails
     var error_debug = TestLogContext{ .message = "error in debug mode" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_debug, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_debug, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: multiple negated patterns same policy" {
@@ -1122,19 +1224,19 @@ test "PolicyEngine: multiple negated patterns same policy" {
 
     // Neither word - both negations pass - policy matches
     var normal = TestLogContext{ .message = "normal message" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&normal, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&normal, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains "skip" - first negation fails - policy doesn't match
     var skip = TestLogContext{ .message = "skip this one" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&skip, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&skip, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains "ignore" - second negation fails - policy doesn't match
     var ignore = TestLogContext{ .message = "ignore this" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&ignore, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&ignore, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Contains both - both negations fail - policy doesn't match
     var both = TestLogContext{ .message = "skip and ignore" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&both, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&both, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 test "PolicyEngine: policy becomes active via positive then fails via negated" {
@@ -1171,7 +1273,7 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
 
     // Has "error", no "debug" - positive matches, negation passes - policy matches
     var error_only = TestLogContext{ .message = "error occurred" };
-    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_only, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(&error_only, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Has both "error" and "debug" - positive matches but negation fails
     // required_match_count = 2 (1 positive + 1 negated)
@@ -1180,17 +1282,17 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
     // negated match: -1 -> 1
     // Final: 1 != 2 - policy doesn't match
     var error_debug = TestLogContext{ .message = "debug error message" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&error_debug, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&error_debug, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Has "debug" but no "error" - positive doesn't match, negation fails
     // match_counts starts at 1, negated match: -1 -> 0, final: 0 != 2
     var debug_only = TestLogContext{ .message = "debug info" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&debug_only, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&debug_only, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 
     // Has neither - positive doesn't match, negation passes
     // match_counts stays at 1 (negated_count), final: 1 != 2
     var neither = TestLogContext{ .message = "normal log" };
-    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&neither, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(&neither, TestLogContext.fieldAccessor, null, &policy_id_buf, null).decision);
 }
 
 // =============================================================================
@@ -1377,7 +1479,7 @@ test "evaluate: policy with keep=all and no transform" {
     ctx.service = "payment-api";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
@@ -1424,7 +1526,7 @@ test "evaluate: policy with keep=all and remove transform" {
     ctx.env = "production";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // Transform should have removed 'env'
@@ -1471,7 +1573,7 @@ test "evaluate: policy with keep=all and redact transform" {
     ctx.service = "secret-service";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // Transform should have redacted 'service'
@@ -1516,7 +1618,7 @@ test "evaluate: policy with keep=all and add transform" {
     ctx.message = "an error occurred";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // Transform should have added 'processed'
@@ -1560,7 +1662,7 @@ test "evaluate: policy with no keep (drop) skips transform" {
     ctx.env = "production";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.drop, result.decision);
     // Transform should NOT have been applied (log is dropped)
@@ -1631,7 +1733,7 @@ test "evaluate: multiple policies with different transforms" {
     ctx.env = "production";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     try testing.expectEqual(@as(usize, 2), result.matched_policy_ids.len);
@@ -1679,7 +1781,7 @@ test "evaluate: policy with unset keep applies transform" {
     ctx.message = "info log message";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
     // When keep is not specified, it defaults to "all" which means keep
     try testing.expectEqual(FilterDecision.keep, result.decision);
@@ -1725,7 +1827,7 @@ test "evaluate: null mutator skips transforms" {
 
     var policy_id_buf: [16][]const u8 = undefined;
     // Pass null for mutator - transforms should be skipped
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // Transform should NOT have been applied (null mutator)
@@ -1764,7 +1866,7 @@ test "evaluate: policy without transform field" {
     ctx.env = "production";
 
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+    const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
     // No transform, env unchanged
@@ -1836,7 +1938,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
         ctx.message = "debug message";
 
         var policy_id_buf: [16][]const u8 = undefined;
-        const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+        const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
         try testing.expectEqual(FilterDecision.drop, result.decision);
         // Transform should NOT be applied for drop
@@ -1850,7 +1952,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
         ctx.message = "error occurred";
 
         var policy_id_buf: [16][]const u8 = undefined;
-        const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf);
+        const result = engine.evaluate(&ctx, MutableTestLogContext.fieldAccessor, MutableTestLogContext.fieldMutator, &policy_id_buf, null);
 
         try testing.expectEqual(FilterDecision.keep, result.decision);
         // Transform should be applied for keep
@@ -1905,7 +2007,9 @@ const StatsTrackingProvider = struct {
         _ = error_message;
     }
 
-    pub fn recordPolicyStats(self: *StatsTrackingProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+    pub fn recordPolicyStats(self: *StatsTrackingProvider, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
+        _ = bytes_before;
+        _ = bytes_after;
         const id_copy = self.allocator.dupe(u8, policy_id) catch return;
         self.stats_calls.append(self.allocator, .{
             .policy_id = id_copy,
@@ -1981,7 +2085,7 @@ test "PolicyEngine stats: all DROP policies get hits" {
     // Log matches both DROP policies
     var test_log = TestLogContext{ .message = "critical error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
@@ -2042,7 +2146,7 @@ test "PolicyEngine stats: all KEEP policies get hits" {
     // Log matches both KEEP policies
     var test_log = TestLogContext{ .message = "critical error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
 
@@ -2103,7 +2207,7 @@ test "PolicyEngine stats: mixed KEEP and DROP - KEEP gets hits, DROP gets misses
     // Log matches both policies (KEEP and DROP)
     var test_log = TestLogContext{ .message = "critical error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     // DROP wins (most restrictive)
     try testing.expectEqual(FilterDecision.drop, result.decision);
@@ -2153,7 +2257,7 @@ test "PolicyEngine stats: single policy match gets hit" {
 
     var test_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
-    _ = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    _ = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     // Single policy should get a hit
     try testing.expectEqual(@as(usize, 1), stats_provider.callCount());
@@ -2232,7 +2336,7 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - all KEEPs get hits, all DRO
     // Log matches all 4 policies (2 KEEP, 2 DROP)
     var test_log = TestLogContext{ .message = "critical error with warning and debug info" };
     var policy_id_buf: [16][]const u8 = undefined;
-    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     // DROP wins (most restrictive)
     try testing.expectEqual(FilterDecision.drop, result.decision);
@@ -2291,7 +2395,7 @@ test "PolicyEngine stats: no match records no stats" {
     // Log doesn't match the policy
     var test_log = TestLogContext{ .message = "all good here" };
     var policy_id_buf: [16][]const u8 = undefined;
-    _ = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    _ = engine.evaluate(&test_log, TestLogContext.fieldAccessor, null, &policy_id_buf, null);
 
     // No stats should be recorded
     try testing.expectEqual(@as(usize, 0), stats_provider.callCount());

@@ -216,13 +216,13 @@ fn filterLogsInPlace(
             // Filter log records in place by shrinking the list
             var write_idx: usize = 0;
             for (scope_logs.log_records.items) |*log_record| {
-                const ctx = OtlpLogContext{
+                var ctx = OtlpLogContext{
                     .log_record = log_record,
                     .resource_logs = resource_logs,
                     .scope_logs = scope_logs,
                 };
 
-                const result = engine.evaluate(@ptrCast(@constCast(&ctx)), otlpFieldAccessor, null, &policy_id_buf);
+                const result = engine.evaluate(&ctx, otlpFieldAccessor, null, &policy_id_buf, null);
 
                 if (result.decision.shouldContinue()) {
                     // Keep this log - move to write position if needed

@@ -36,10 +36,12 @@ const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
 const HTTPFetchStarted = struct {};
 const HTTPFetchCompleted = struct {};
 
-/// Tracks status for a specific policy (hits, misses, errors)
+/// Tracks status for a specific policy (hits, misses, errors, bytes)
 const PolicyStatusRecord = struct {
     hits: i64 = 0,
     misses: i64 = 0,
+    bytes_before: i64 = 0,
+    bytes_after: i64 = 0,
     errors: std.ArrayListUnmanaged([]const u8) = .{},
 
     fn deinit(self: *PolicyStatusRecord, allocator: std.mem.Allocator) void {
@@ -206,10 +208,10 @@ pub const HttpProvider = struct {
         }
     }
 
-    /// Record statistics about policy hits and misses.
+    /// Record statistics about policy hits, misses, and byte changes.
     /// These stats will be sent in subsequent sync requests.
     /// Conforms to PolicyProvider interface (void return, logs errors internally).
-    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
         self.sync_state_mutex.lock();
         defer self.sync_state_mutex.unlock();
 
@@ -217,6 +219,8 @@ pub const HttpProvider = struct {
             // Update existing record
             record.hits += hits;
             record.misses += misses;
+            record.bytes_before += bytes_before;
+            record.bytes_after += bytes_after;
         } else {
             // Create new entry
             const id_copy = self.allocator.dupe(u8, policy_id) catch {
@@ -227,6 +231,8 @@ pub const HttpProvider = struct {
             self.policy_statuses.put(self.allocator, id_copy, .{
                 .hits = hits,
                 .misses = misses,
+                .bytes_before = bytes_before,
+                .bytes_after = bytes_after,
             }) catch {
                 self.allocator.free(id_copy);
                 self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
