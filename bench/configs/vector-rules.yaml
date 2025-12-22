@@ -1,5 +1,5 @@
-# Vector configuration with filtering rules
-# Receives Datadog and OTLP logs, applies VRL filtering, forwards to echo server
+# Vector configuration with filtering and transform rules
+# Receives Datadog and OTLP logs, applies VRL filtering/transforms, forwards to echo server
 
 data_dir: "/tmp/vector-rules"
 
@@ -17,83 +17,129 @@ sources:
     response_code: 202
 
 transforms:
-  # Filter Datadog logs using VRL
+  # Filter and transform Datadog logs using VRL
   # Equivalent to policies.json rules
-  filter_datadog:
-    type: filter
+  process_datadog:
+    type: remap
     inputs: ["datadog_logs"]
-    condition:
-      type: vrl
-      source: |
-        # Keep errors (high priority - check first)
-        status = string(.status) ?? ""
-        if match(status, r'(?i)^(ERROR|FATAL)$') {
-          true
-        } else {
-          # Drop debug logs
-          if match(status, r'(?i)^DEBUG$') {
-            false
-          } else {
-            # Drop health check logs
-            msg = string(.message) ?? ""
-            if match(msg, r'/health|/ready|/live') {
-              false
-            } else if match(msg, r'Database query executed') {
-              # Drop database query logs
-              false
-            } else if match(msg, r'Log entry 0:') {
-              # Drop first log entry pattern
-              false
-            } else {
-              # Keep everything else
-              true
-            }
-          }
-        }
+    source: |
+      # Get status and message for matching
+      status = string(.status) ?? ""
+      msg = string(.message) ?? ""
 
-  # Filter OTLP logs using VRL
-  filter_otlp:
-    type: filter
+      # Drop debug logs
+      if match(status, r'(?i)^DEBUG$') {
+        abort
+      }
+
+      # Drop health check logs
+      if match(msg, r'/health|/ready|/live') {
+        abort
+      }
+
+      # Drop database query logs
+      if match(msg, r'Database query executed') {
+        abort
+      }
+
+      # Drop first log entry pattern
+      if match(msg, r'Log entry 0:') {
+        abort
+      }
+
+      # redact-sensitive-data: Redact sensitive fields from payment logs
+      if match(msg, r'(?i)payment') {
+        if exists(.credit_card) {
+          .credit_card = "[REDACTED]"
+        }
+        if exists(.ssn) {
+          .ssn = "[REDACTED]"
+        }
+      }
+
+      # enrich-auth-logs: Add metadata to authentication logs
+      if match(msg, r'(?i)(authentication|login)') {
+        .security_category = "auth"
+        .compliance_required = "true"
+      }
+
+      # normalize-api-logs: Normalize API request logs
+      if match(msg, r'(?i)(HTTP request|API call)') {
+        if exists(.http_method) {
+          .method = .http_method
+          del(.http_method)
+        }
+        if exists(.http_path) {
+          .path = .http_path
+          del(.http_path)
+        }
+        del(.internal_trace_id)
+      }
+
+      # drop-and-transform-cache: Transform cache logs (10% sampling simulated by adding flag)
+      if match(msg, r'(?i)(cache hit|cache miss)') {
+        .sampled = "true"
+        del(.cache_key)
+        del(.cache_ttl)
+      }
+
+  # Filter and transform OTLP logs using VRL
+  process_otlp:
+    type: remap
     inputs: ["otlp_logs"]
-    condition:
-      type: vrl
-      source: |
-        # For OTLP via http_server, the message is in .message as bytes
-        msg = string(.message) ?? ""
+    source: |
+      # For OTLP via http_server, the message is in .message as bytes
+      msg = string(.message) ?? ""
 
-        # Keep errors (high priority)
-        if match(msg, r'(?i)"severity_text"\s*:\s*"(ERROR|FATAL)"') {
-          true
-        } else {
-          # Drop debug logs
-          if match(msg, r'(?i)"severity_text"\s*:\s*"DEBUG"') {
-            false
-          } else if match(msg, r'/health|/ready|/live') {
-            # Drop health check logs
-            false
-          } else if match(msg, r'Database query executed') {
-            # Drop database query logs
-            false
-          } else if match(msg, r'Log entry 0:') {
-            # Drop first log entry pattern
-            false
-          } else {
-            # Keep everything else
-            true
-          }
-        }
+      # Drop debug logs
+      if match(msg, r'(?i)"severity_text"\s*:\s*"DEBUG"') {
+        abort
+      }
+
+      # Drop health check logs
+      if match(msg, r'/health|/ready|/live') {
+        abort
+      }
+
+      # Drop database query logs
+      if match(msg, r'Database query executed') {
+        abort
+      }
+
+      # Drop first log entry pattern
+      if match(msg, r'Log entry 0:') {
+        abort
+      }
+
+      # Note: For OTLP logs received as raw bytes, transforms would need to parse
+      # and modify the JSON. For benchmarking purposes, we apply pattern-based
+      # transforms similar to the filtering above.
+
+      # redact-sensitive-data: Redact credit_card and ssn in payment logs
+      if match(msg, r'(?i)payment') {
+        msg = replace(msg, r'"credit_card"\s*:\s*\{[^}]+\}', "\"credit_card\":{\"stringValue\":\"[REDACTED]\"}")
+        msg = replace(msg, r'"ssn"\s*:\s*\{[^}]+\}', "\"ssn\":{\"stringValue\":\"[REDACTED]\"}")
+        .message = msg
+      }
+
+      # enrich-auth-logs: Add security metadata to auth logs
+      if match(msg, r'(?i)(authentication|login)') {
+        # In real scenarios, would parse and add attributes to the OTLP structure
+        .security_category = "auth"
+        .compliance_required = "true"
+      }
 
 sinks:
   datadog_sink:
     type: datadog_logs
-    inputs: ["filter_datadog"]
+    inputs: ["process_datadog"]
     default_api_key: "dummy-key"
     endpoint: "http://127.0.0.1:9999"
     compression: none
 
   otlp_sink:
     type: http
-    inputs: ["filter_otlp"]
+    inputs: ["process_otlp"]
     uri: "http://127.0.0.1:9999"
     encoding:
       codec: json

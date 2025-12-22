@@ -5,6 +5,11 @@ const Policy = proto.policy.Policy;
 const LogTarget = proto.policy.LogTarget;
 const LogMatcher = proto.policy.LogMatcher;
 const LogField = proto.policy.LogField;
+const LogTransform = proto.policy.LogTransform;
+const LogRemove = proto.policy.LogRemove;
+const LogRedact = proto.policy.LogRedact;
+const LogRename = proto.policy.LogRename;
+const LogAdd = proto.policy.LogAdd;
 
 /// JSON schema for a matcher
 const MatcherJson = struct {
@@ -20,6 +25,56 @@ const MatcherJson = struct {
     negate: bool = false,
 };
 
+/// JSON schema for a remove transform
+const RemoveJson = struct {
+    /// Field type: "log_attribute", "resource_attribute", "scope_attribute"
+    field: []const u8,
+    /// Key for the attribute to remove
+    key: []const u8,
+};
+
+/// JSON schema for a redact transform
+const RedactJson = struct {
+    /// Field type: "log_attribute", "resource_attribute", "scope_attribute"
+    field: []const u8,
+    /// Key for the attribute to redact
+    key: []const u8,
+    /// Replacement value (defaults to "[REDACTED]")
+    replacement: []const u8 = "[REDACTED]",
+};
+
+/// JSON schema for a rename transform
+const RenameJson = struct {
+    /// Field type: "log_attribute", "resource_attribute", "scope_attribute"
+    from_field: []const u8,
+    /// Key for the source attribute
+    from_key: []const u8,
+    /// Target attribute name
+    to: []const u8,
+    /// Whether to overwrite if target exists
+    upsert: bool = true,
+};
+
+/// JSON schema for an add transform
+const AddJson = struct {
+    /// Field type: "log_attribute", "resource_attribute", "scope_attribute"
+    field: []const u8,
+    /// Key for the attribute to add
+    key: []const u8,
+    /// Value to set
+    value: []const u8,
+    /// Whether to overwrite if exists
+    upsert: bool = true,
+};
+
+/// JSON schema for transforms
+const TransformJson = struct {
+    remove: ?[]RemoveJson = null,
+    redact: ?[]RedactJson = null,
+    rename: ?[]RenameJson = null,
+    add: ?[]AddJson = null,
+};
+
 /// JSON schema for a policy
 const PolicyJson = struct {
     /// Unique identifier for the policy (required)
@@ -31,6 +86,8 @@ const PolicyJson = struct {
     matchers: ?[]MatcherJson = null,
     /// Keep value: "all", "none", "N%", "N/s", "N/m"
     keep: []const u8 = "all",
+    /// Transforms to apply to matching logs
+    transform: ?TransformJson = null,
 };
 
 /// JSON schema for a policies-only file
@@ -75,7 +132,7 @@ pub fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) 
 
         // Build log target config
         var log_target: ?LogTarget = null;
-        if (json_policy.matchers != null or json_policy.keep.len > 0) {
+        if (json_policy.matchers != null or json_policy.keep.len > 0 or json_policy.transform != null) {
             // Parse matchers
             var matchers = std.ArrayListUnmanaged(LogMatcher){};
             if (json_policy.matchers) |json_matchers| {
@@ -86,9 +143,16 @@ pub fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) 
                 }
             }
 
+            // Parse transforms
+            var transform: ?LogTransform = null;
+            if (json_policy.transform) |jt| {
+                transform = try parseLogTransform(allocator, jt);
+            }
+
             log_target = LogTarget{
                 .match = matchers,
                 .keep = try allocator.dupe(u8, json_policy.keep),
+                .transform = transform,
             };
         }
 
@@ -153,6 +217,128 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: MatcherJson) !LogMatcher {
         .negate = jm.negate,
         .field = field,
         .match = match,
+    };
+}
+
+/// Parse a LogTransform from JSON
+fn parseLogTransform(allocator: std.mem.Allocator, jt: TransformJson) !LogTransform {
+    var transform = LogTransform{};
+
+    // Parse remove operations
+    if (jt.remove) |removes| {
+        try transform.remove.ensureTotalCapacity(allocator, removes.len);
+        for (removes) |jr| {
+            const remove = try parseLogRemove(allocator, jr);
+            transform.remove.appendAssumeCapacity(remove);
+        }
+    }
+
+    // Parse redact operations
+    if (jt.redact) |redacts| {
+        try transform.redact.ensureTotalCapacity(allocator, redacts.len);
+        for (redacts) |jr| {
+            const redact = try parseLogRedact(allocator, jr);
+            transform.redact.appendAssumeCapacity(redact);
+        }
+    }
+
+    // Parse rename operations
+    if (jt.rename) |renames| {
+        try transform.rename.ensureTotalCapacity(allocator, renames.len);
+        for (renames) |jr| {
+            const rename = try parseLogRename(allocator, jr);
+            transform.rename.appendAssumeCapacity(rename);
+        }
+    }
+
+    // Parse add operations
+    if (jt.add) |adds| {
+        try transform.add.ensureTotalCapacity(allocator, adds.len);
+        for (adds) |ja| {
+            const add = try parseLogAdd(allocator, ja);
+            transform.add.appendAssumeCapacity(add);
+        }
+    }
+
+    return transform;
+}
+
+/// Parse a LogRemove from JSON
+fn parseLogRemove(allocator: std.mem.Allocator, jr: RemoveJson) !LogRemove {
+    const field: LogRemove.field_union = blk: {
+        if (std.mem.eql(u8, jr.field, "log_attribute")) {
+            break :blk .{ .log_attribute = try allocator.dupe(u8, jr.key) };
+        } else if (std.mem.eql(u8, jr.field, "resource_attribute")) {
+            break :blk .{ .resource_attribute = try allocator.dupe(u8, jr.key) };
+        } else if (std.mem.eql(u8, jr.field, "scope_attribute")) {
+            break :blk .{ .scope_attribute = try allocator.dupe(u8, jr.key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
+
+    return LogRemove{ .field = field };
+}
+
+/// Parse a LogRedact from JSON
+fn parseLogRedact(allocator: std.mem.Allocator, jr: RedactJson) !LogRedact {
+    const field: LogRedact.field_union = blk: {
+        if (std.mem.eql(u8, jr.field, "log_attribute")) {
+            break :blk .{ .log_attribute = try allocator.dupe(u8, jr.key) };
+        } else if (std.mem.eql(u8, jr.field, "resource_attribute")) {
+            break :blk .{ .resource_attribute = try allocator.dupe(u8, jr.key) };
+        } else if (std.mem.eql(u8, jr.field, "scope_attribute")) {
+            break :blk .{ .scope_attribute = try allocator.dupe(u8, jr.key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
+
+    return LogRedact{
+        .field = field,
+        .replacement = try allocator.dupe(u8, jr.replacement),
+    };
+}
+
+/// Parse a LogRename from JSON
+fn parseLogRename(allocator: std.mem.Allocator, jr: RenameJson) !LogRename {
+    const from: LogRename.from_union = blk: {
+        if (std.mem.eql(u8, jr.from_field, "log_attribute")) {
+            break :blk .{ .from_log_attribute = try allocator.dupe(u8, jr.from_key) };
+        } else if (std.mem.eql(u8, jr.from_field, "resource_attribute")) {
+            break :blk .{ .from_resource_attribute = try allocator.dupe(u8, jr.from_key) };
+        } else if (std.mem.eql(u8, jr.from_field, "scope_attribute")) {
+            break :blk .{ .from_scope_attribute = try allocator.dupe(u8, jr.from_key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
+
+    return LogRename{
+        .from = from,
+        .to = try allocator.dupe(u8, jr.to),
+        .upsert = jr.upsert,
+    };
+}
+
+/// Parse a LogAdd from JSON
+fn parseLogAdd(allocator: std.mem.Allocator, ja: AddJson) !LogAdd {
+    const field: LogAdd.field_union = blk: {
+        if (std.mem.eql(u8, ja.field, "log_attribute")) {
+            break :blk .{ .log_attribute = try allocator.dupe(u8, ja.key) };
+        } else if (std.mem.eql(u8, ja.field, "resource_attribute")) {
+            break :blk .{ .resource_attribute = try allocator.dupe(u8, ja.key) };
+        } else if (std.mem.eql(u8, ja.field, "scope_attribute")) {
+            break :blk .{ .scope_attribute = try allocator.dupe(u8, ja.key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
+
+    return LogAdd{
+        .field = field,
+        .value = try allocator.dupe(u8, ja.value),
+        .upsert = ja.upsert,
     };
 }
 

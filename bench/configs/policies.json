@@ -42,6 +42,100 @@
       "name": "Drop first log entry (matches 1 log in 1MB payloads)",
       "matchers": [{ "field": "log_body", "pattern": "Log entry 0:" }],
       "keep": "none"
+    },
+    {
+      "id": "redact-sensitive-data",
+      "name": "Redact sensitive fields from payment logs",
+      "matchers": [{ "field": "log_body", "pattern": "payment" }],
+      "keep": "all",
+      "transform": {
+        "redact": [
+          {
+            "field": "log_attribute",
+            "key": "credit_card",
+            "replacement": "[REDACTED]"
+          },
+          {
+            "field": "log_attribute",
+            "key": "ssn",
+            "replacement": "[REDACTED]"
+          }
+        ]
+      }
+    },
+    {
+      "id": "enrich-auth-logs",
+      "name": "Add metadata to authentication logs",
+      "matchers": [
+        { "field": "log_body", "pattern": "authentication" },
+        { "field": "log_body", "pattern": "login" }
+      ],
+      "keep": "all",
+      "transform": {
+        "add": [
+          {
+            "field": "log_attribute",
+            "key": "security_category",
+            "value": "auth",
+            "upsert": true
+          },
+          {
+            "field": "log_attribute",
+            "key": "compliance_required",
+            "value": "true",
+            "upsert": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "normalize-api-logs",
+      "name": "Normalize API request logs",
+      "matchers": [
+        { "field": "log_body", "pattern": "HTTP request" },
+        { "field": "log_body", "pattern": "API call" }
+      ],
+      "keep": "all",
+      "transform": {
+        "rename": [
+          {
+            "from_field": "log_attribute",
+            "from_key": "http_method",
+            "to": "method",
+            "upsert": true
+          },
+          {
+            "from_field": "log_attribute",
+            "from_key": "http_path",
+            "to": "path",
+            "upsert": true
+          }
+        ],
+        "remove": [{ "field": "log_attribute", "key": "internal_trace_id" }]
+      }
+    },
+    {
+      "id": "drop-and-transform-cache",
+      "name": "Drop verbose cache logs but keep summaries with metadata",
+      "matchers": [
+        { "field": "log_body", "pattern": "cache hit" },
+        { "field": "log_body", "pattern": "cache miss" }
+      ],
+      "keep": "10%",
+      "transform": {
+        "add": [
+          {
+            "field": "log_attribute",
+            "key": "sampled",
+            "value": "true",
+            "upsert": true
+          }
+        ],
+        "remove": [
+          { "field": "log_attribute", "key": "cache_key" },
+          { "field": "log_attribute", "key": "cache_ttl" }
+        ]
+      }
     }
   ]
 }

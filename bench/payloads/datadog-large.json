@@ -15,15 +15,168 @@
     "ddsource": "nodejs",
     "ddtags": "env:prod,version:1.2.3,team:platform,query_type:select,table:users",
     "status": "debug",
-    "timestamp": 1733946000000
+    "timestamp": 1733946000100
   },
   {
     "message": "HTTP request completed with status 200 for GET /api/v1/users/profile in 85ms",
+    "service": "api-gateway",
+    "hostname": "web-01.us-east-1.prod.example.com",
+    "ddsource": "nodejs",
+    "ddtags": "env:prod,version:1.2.3,http_method:GET,http_path:/api/v1/users/profile,http_status:200,internal_trace_id:trace-abc123",
+    "status": "info",
+    "timestamp": 1733946000200
+  },
+  {
+    "message": "Payment processing initiated for order #12345 with credit_card ending in 4242",
+    "service": "payment-service",
+    "hostname": "payment-01.us-east-1.prod.example.com",
+    "ddsource": "java",
+    "ddtags": "env:prod,version:2.1.0,team:payments,order_id:12345,credit_card:4111111111114242,ssn:123-45-6789",
+    "status": "info",
+    "timestamp": 1733946000300
+  },
+  {
+    "message": "User login successful - authentication flow completed",
     "service": "auth-service",
     "hostname": "web-01.us-east-1.prod.example.com",
     "ddsource": "nodejs",
-    "ddtags": "env:prod,version:1.2.3,http_method:GET,http_path:/api/v1/users/profile,http_status:200",
+    "ddtags": "env:prod,version:1.2.3,team:platform,user_id:user-67890",
     "status": "info",
-    "timestamp": 1733946000000
+    "timestamp": 1733946000400
+  },
+  {
+    "message": "API call to /api/v2/orders completed in 120ms",
+    "service": "order-service",
+    "hostname": "order-01.us-east-1.prod.example.com",
+    "ddsource": "python",
+    "ddtags": "env:prod,version:3.0.0,team:commerce,http_method:POST,http_path:/api/v2/orders,internal_trace_id:trace-def456",
+    "status": "info",
+    "timestamp": 1733946000500
+  },
+  {
+    "message": "Cache hit for user profile data with key user:12345:profile",
+    "service": "cache-service",
+    "hostname": "cache-01.us-east-1.prod.example.com",
+    "ddsource": "go",
+    "ddtags": "env:prod,version:1.0.0,team:platform,cache_key:user:12345:profile,cache_ttl:3600",
+    "status": "debug",
+    "timestamp": 1733946000600
+  },
+  {
+    "message": "Cache miss for order data - fetching from database",
+    "service": "cache-service",
+    "hostname": "cache-01.us-east-1.prod.example.com",
+    "ddsource": "go",
+    "ddtags": "env:prod,version:1.0.0,team:platform,cache_key:order:67890:data,cache_ttl:1800",
+    "status": "debug",
+    "timestamp": 1733946000700
+  },
+  {
+    "message": "ERROR: Failed to connect to database - connection timeout after 30s",
+    "service": "order-service",
+    "hostname": "order-01.us-east-1.prod.example.com",
+    "ddsource": "python",
+    "ddtags": "env:prod,version:3.0.0,team:commerce,error_code:DB_TIMEOUT",
+    "status": "error",
+    "timestamp": 1733946000800
+  },
+  {
+    "message": "Health check endpoint /health responded with status 200",
+    "service": "api-gateway",
+    "hostname": "web-01.us-east-1.prod.example.com",
+    "ddsource": "nodejs",
+    "ddtags": "env:prod,version:1.2.3",
+    "status": "info",
+    "timestamp": 1733946000900
+  },
+  {
+    "message": "Readiness probe /ready passed - service is ready to accept traffic",
+    "service": "auth-service",
+    "hostname": "web-01.us-east-1.prod.example.com",
+    "ddsource": "nodejs",
+    "ddtags": "env:prod,version:1.2.3",
+    "status": "info",
+    "timestamp": 1733946001000
+  },
+  {
+    "message": "Liveness check /live completed successfully",
+    "service": "payment-service",
+    "hostname": "payment-01.us-east-1.prod.example.com",
+    "ddsource": "java",
+    "ddtags": "env:prod,version:2.1.0",
+    "status": "info",
+    "timestamp": 1733946001100
+  },
+  {
+    "message": "Payment refund processed for transaction txn-98765",
+    "service": "payment-service",
+    "hostname": "payment-01.us-east-1.prod.example.com",
+    "ddsource": "java",
+    "ddtags": "env:prod,version:2.1.0,team:payments,transaction_id:txn-98765,credit_card:5555555555554444",
+    "status": "info",
+    "timestamp": 1733946001200
+  },
+  {
+    "message": "DEBUG: Verbose cache statistics - hits: 1234, misses: 56, evictions: 12",
+    "service": "cache-service",
+    "hostname": "cache-01.us-east-1.prod.example.com",
+    "ddsource": "go",
+    "ddtags": "env:prod,version:1.0.0",
+    "status": "debug",
+    "timestamp": 1733946001300
+  },
+  {
+    "message": "HTTP request received for API call to /api/v1/inventory",
+    "service": "inventory-service",
+    "hostname": "inventory-01.us-east-1.prod.example.com",
+    "ddsource": "rust",
+    "ddtags": "env:prod,version:0.9.0,team:logistics,http_method:GET,http_path:/api/v1/inventory,internal_trace_id:trace-ghi789",
+    "status": "info",
+    "timestamp": 1733946001400
+  },
+  {
+    "message": "FATAL: Critical system failure - shutting down service",
+    "service": "order-service",
+    "hostname": "order-01.us-east-1.prod.example.com",
+    "ddsource": "python",
+    "ddtags": "env:prod,version:3.0.0,team:commerce,error_code:CRITICAL_FAILURE",
+    "status": "fatal",
+    "timestamp": 1733946001500
+  },
+  {
+    "message": "User session created after successful authentication via OAuth2",
+    "service": "auth-service",
+    "hostname": "web-01.us-east-1.prod.example.com",
+    "ddsource": "nodejs",
+    "ddtags": "env:prod,version:1.2.3,team:platform,session_id:sess-11111",
+    "status": "info",
+    "timestamp": 1733946001600
+  },
+  {
+    "message": "Cache hit for product catalog with high performance metrics",
+    "service": "cache-service",
+    "hostname": "cache-01.us-east-1.prod.example.com",
+    "ddsource": "go",
+    "ddtags": "env:prod,version:1.0.0,team:platform,cache_key:catalog:main,cache_ttl:7200",
+    "status": "info",
+    "timestamp": 1733946001700
+  },
+  {
+    "message": "Database query executed: UPDATE orders SET status = ? WHERE id = ?",
+    "service": "order-service",
+    "hostname": "order-01.us-east-1.prod.example.com",
+    "ddsource": "python",
+    "ddtags": "env:prod,version:3.0.0,team:commerce,query_type:update,table:orders",
+    "status": "debug",
+    "timestamp": 1733946001800
+  },
+  {
+    "message": "Notification sent to user for order confirmation via email",
+    "service": "notification-service",
+    "hostname": "notify-01.us-east-1.prod.example.com",
+    "ddsource": "nodejs",
+    "ddtags": "env:prod,version:1.5.0,team:platform,channel:email,user_id:user-12345",
+    "status": "info",
+    "timestamp": 1733946001900
   }
 ]

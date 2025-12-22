@@ -3,6 +3,7 @@ const zimdjson = @import("zimdjson");
 const policy_engine = @import("../policy/policy_engine.zig");
 const policy = @import("../policy/root.zig");
 const o11y = @import("../observability/root.zig");
+const datadog_log = @import("datadog_log.zig");
 
 const PolicyEngine = policy_engine.PolicyEngine;
 const PolicyResult = policy_engine.PolicyResult;
@@ -13,126 +14,12 @@ const MAX_POLICIES = @import("../hyperscan/matcher_index.zig").MAX_POLICIES;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
+const DatadogLog = datadog_log.DatadogLog;
 
 const StreamParser = zimdjson.ondemand.StreamParser(.default);
 const Object = StreamParser.Object;
 const Document = StreamParser.Document;
 const ArrayList = std.ArrayListUnmanaged;
-
-/// Datadog log schema for parsing and serialization
-/// Uses zimdjson schema inference for deserialization
-const DatadogLog = struct {
-    pub const schema: StreamParser.schema.Infer(@This()) = .{
-        .fields = .{ .extra = .{ .skip = true } },
-        .on_unknown_field = .{ .handle = @This().handleUnknownField },
-    };
-
-    message: ?[]const u8 = null,
-    status: ?[]const u8 = null,
-    level: ?[]const u8 = null,
-    service: ?[]const u8 = null,
-    hostname: ?[]const u8 = null,
-    ddsource: ?[]const u8 = null,
-    ddtags: ?[]const u8 = null,
-    timestamp: ?i64 = null,
-    environment: ?[]const u8 = null,
-    custom_field: ?[]const u8 = null,
-
-    extra: std.StringHashMapUnmanaged(StreamParser.AnyValue) = .empty,
-
-    pub fn handleUnknownField(self: *@This(), alloc: ?std.mem.Allocator, key: []const u8, value: StreamParser.Value) StreamParser.schema.Error!void {
-        const gpa = alloc orelse return error.ExpectedAllocator;
-        return self.extra.put(gpa, key, try value.asAny());
-    }
-
-    /// Custom JSON serialization for known fields only.
-    /// Note: Extra fields cannot be serialized because zimdjson AnyValue contains
-    /// lazy iterators that may become invalid after document parsing.
-    /// When no logs are dropped, original data is returned unchanged preserving all fields.
-    pub fn jsonStringify(self: *const @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-        try jw.beginObject();
-
-        if (self.message) |v| {
-            try jw.objectField("message");
-            try jw.write(v);
-        }
-        if (self.status) |v| {
-            try jw.objectField("status");
-            try jw.write(v);
-        }
-        if (self.level) |v| {
-            try jw.objectField("level");
-            try jw.write(v);
-        }
-        if (self.service) |v| {
-            try jw.objectField("service");
-            try jw.write(v);
-        }
-        if (self.hostname) |v| {
-            try jw.objectField("hostname");
-            try jw.write(v);
-        }
-        if (self.ddsource) |v| {
-            try jw.objectField("ddsource");
-            try jw.write(v);
-        }
-        if (self.ddtags) |v| {
-            try jw.objectField("ddtags");
-            try jw.write(v);
-        }
-        if (self.timestamp) |v| {
-            try jw.objectField("timestamp");
-            try jw.write(v);
-        }
-        if (self.environment) |v| {
-            try jw.objectField("environment");
-            try jw.write(v);
-        }
-        if (self.custom_field) |v| {
-            try jw.objectField("custom_field");
-            try jw.write(v);
-        }
-        // Write extra fields
-        var it = self.extra.iterator();
-        while (it.next()) |entry| {
-            try jw.objectField(entry.key_ptr.*);
-            try writeAnyValue(jw, entry.value_ptr.*);
-        }
-
-        try jw.endObject();
-    }
-
-    /// Write a zimdjson AnyValue to a JSON writer
-    fn writeAnyValue(jw: anytype, value: StreamParser.AnyValue) @TypeOf(jw.*).Error!void {
-        switch (value) {
-            .null => try jw.write(null),
-            .bool => |v| try jw.write(v),
-            .number => |n| switch (n) {
-                .unsigned => |v| try jw.write(v),
-                .signed => |v| try jw.write(v),
-                .double => |v| try jw.write(v),
-            },
-            .string => |v| try jw.write(v.get() catch ""),
-            .array => |arr| {
-                try jw.beginArray();
-                var it = arr.iterator();
-                while (it.next() catch null) |item| {
-                    try writeAnyValue(jw, item.asAny() catch continue);
-                }
-                try jw.endArray();
-            },
-            .object => |obj| {
-                try jw.beginObject();
-                var it = obj.iterator();
-                while (it.next() catch null) |field| {
-                    try jw.objectField(field.key.get() catch continue);
-                    try writeAnyValue(jw, field.value.asAny() catch continue);
-                }
-                try jw.endObject();
-            },
-        }
-    }
-};
 
 /// Result of processing logs
 pub const ProcessResult = struct {
@@ -183,10 +70,13 @@ pub fn processLogs(
     };
 }
 
-/// Context for field accessor - holds the DatadogLog struct
+/// Context for field accessor and mutator - holds the DatadogLog struct
 const FieldAccessorContext = struct {
-    log: *const DatadogLog,
+    log: *DatadogLog,
 };
+
+const MutateOp = policy.MutateOp;
+const FieldMutator = policy.FieldMutator;
 
 /// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
@@ -209,7 +99,7 @@ fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             if (std.mem.eql(u8, key, "ddtags")) return log.ddtags;
             if (std.mem.eql(u8, key, "environment")) return log.environment;
             if (std.mem.eql(u8, key, "custom_field")) return log.custom_field;
-            // TODO: handle additional dynamic fields
+            // TODO: handle additional dynamic fields from extra
             return null;
         },
         // Datadog JSON format doesn't have resource/scope attributes
@@ -217,12 +107,174 @@ fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     };
 }
 
-/// Evaluate a single log against policies.
-/// Returns true if the log should be kept, false if it should be dropped.
-fn filterLog(engine: *const PolicyEngine, log: *const DatadogLog, policy_id_buf: [][]const u8) bool {
+/// Field mutator for Datadog JSON log format
+/// Supports remove and set operations on known fields
+fn datadogFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
+    const field_ctx: *FieldAccessorContext = @ptrCast(@alignCast(ctx));
+    const log = field_ctx.log;
+
+    switch (op) {
+        .remove => |field| {
+            switch (field) {
+                .log_field => |lf| switch (lf) {
+                    .LOG_FIELD_BODY => {
+                        if (log.message != null) {
+                            log.message = null;
+                            return true;
+                        }
+                        return false;
+                    },
+                    .LOG_FIELD_SEVERITY_TEXT => {
+                        var removed = false;
+                        if (log.status != null) {
+                            log.status = null;
+                            removed = true;
+                        }
+                        if (log.level != null) {
+                            log.level = null;
+                            removed = true;
+                        }
+                        return removed;
+                    },
+                    else => return false,
+                },
+                .log_attribute => |key| {
+                    if (std.mem.eql(u8, key, "service")) {
+                        if (log.service != null) {
+                            log.service = null;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "hostname")) {
+                        if (log.hostname != null) {
+                            log.hostname = null;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "ddsource")) {
+                        if (log.ddsource != null) {
+                            log.ddsource = null;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "ddtags")) {
+                        if (log.ddtags != null) {
+                            log.ddtags = null;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "environment")) {
+                        if (log.environment != null) {
+                            log.environment = null;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "custom_field")) {
+                        if (log.custom_field != null) {
+                            log.custom_field = null;
+                            return true;
+                        }
+                        return false;
+                    }
+                    return false;
+                },
+                .resource_attribute, .scope_attribute => return false,
+            }
+        },
+        .set => |s| {
+            switch (s.field) {
+                .log_field => |lf| switch (lf) {
+                    .LOG_FIELD_BODY => {
+                        if (s.upsert or log.message != null) {
+                            log.message = s.value;
+                            return true;
+                        }
+                        return false;
+                    },
+                    .LOG_FIELD_SEVERITY_TEXT => {
+                        if (s.upsert or log.status != null) {
+                            log.status = s.value;
+                            return true;
+                        }
+                        return false;
+                    },
+                    else => return false,
+                },
+                .log_attribute => |key| {
+                    if (std.mem.eql(u8, key, "service")) {
+                        if (s.upsert or log.service != null) {
+                            log.service = s.value;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "hostname")) {
+                        if (s.upsert or log.hostname != null) {
+                            log.hostname = s.value;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "ddsource")) {
+                        if (s.upsert or log.ddsource != null) {
+                            log.ddsource = s.value;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "ddtags")) {
+                        if (s.upsert or log.ddtags != null) {
+                            log.ddtags = s.value;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "environment")) {
+                        if (s.upsert or log.environment != null) {
+                            log.environment = s.value;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (std.mem.eql(u8, key, "custom_field")) {
+                        if (s.upsert or log.custom_field != null) {
+                            log.custom_field = s.value;
+                            return true;
+                        }
+                        return false;
+                    }
+                    return false;
+                },
+                .resource_attribute, .scope_attribute => return false,
+            }
+        },
+        .rename => {
+            // Rename not yet supported for Datadog logs
+            return false;
+        },
+    }
+}
+
+/// Result of evaluating a single log
+const FilterLogResult = struct {
+    keep: bool,
+    mutated: bool,
+};
+
+/// Evaluate a single log against policies, applying transforms if matched.
+/// Returns whether to keep the log and whether it was mutated.
+fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, policy_id_buf: [][]const u8) FilterLogResult {
     var field_ctx = FieldAccessorContext{ .log = log };
-    const result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, null, policy_id_buf, null);
-    return result.decision.shouldContinue();
+    const result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, datadogFieldMutator, policy_id_buf, null);
+    return .{
+        .keep = result.decision.shouldContinue(),
+        .mutated = result.matched_policy_ids.len > 0,
+    };
 }
 
 /// Accumulated state for filtering logs
@@ -230,6 +282,7 @@ const FilterState = struct {
     kept: ArrayList(DatadogLog) = .empty,
     original_count: usize = 0,
     dropped_count: usize = 0,
+    mutated: bool = false,
 
     fn deinit(self: *FilterState, allocator: std.mem.Allocator) void {
         self.kept.deinit(allocator);
@@ -237,14 +290,14 @@ const FilterState = struct {
 };
 
 /// Build the final ProcessResult from filtering state.
-/// Handles the three cases: nothing dropped, everything dropped, or partial drop.
+/// Handles the cases: nothing changed, everything dropped, or needs reserialization.
 fn buildResult(
     allocator: std.mem.Allocator,
     state: *const FilterState,
     original_data: []const u8,
 ) !ProcessResult {
-    // If nothing was dropped, return original data
-    if (state.dropped_count == 0) {
+    // If nothing was dropped and nothing mutated, return original data
+    if (state.dropped_count == 0 and !state.mutated) {
         const result = try allocator.alloc(u8, original_data.len);
         @memcpy(result, original_data);
         return .{
@@ -266,7 +319,7 @@ fn buildResult(
         };
     }
 
-    // Serialize kept logs
+    // Serialize kept logs (either some dropped or mutations applied)
     var out: std.Io.Writer.Allocating = .init(allocator);
     try std.json.Stringify.value(state.kept.items, .{}, &out.writer);
 
@@ -318,7 +371,9 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
 
             for (array.value) |*log_obj| {
                 state.original_count += 1;
-                if (filterLog(&engine, log_obj, &policy_id_buf)) {
+                const filter_result = filterLog(&engine, log_obj, &policy_id_buf);
+                if (filter_result.mutated) state.mutated = true;
+                if (filter_result.keep) {
                     try state.kept.append(allocator, log_obj.*);
                 } else {
                     state.dropped_count += 1;
@@ -334,7 +389,9 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             defer log_obj.deinit();
 
             state.original_count = 1;
-            if (filterLog(&engine, &log_obj.value, &policy_id_buf)) {
+            const filter_result = filterLog(&engine, &log_obj.value, &policy_id_buf);
+            if (filter_result.mutated) state.mutated = true;
+            if (filter_result.keep) {
                 try state.kept.append(allocator, log_obj.value);
             } else {
                 state.dropped_count = 1;
@@ -576,4 +633,61 @@ test "processLogs - extra fields are preserved when no logs dropped" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "array_field") != null);
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 1), result.original_count);
+}
+
+test "processLogs - mutation triggers reserialization and removes field" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a policy with keep=all and a transform that removes the 'service' field
+    var transform = proto.policy.LogTransform{};
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+    });
+
+    var test_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "remove-service-policy"),
+        .name = try allocator.dupe(u8, "remove-service"),
+        .enabled = true,
+        .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        },
+    };
+    // Match on message containing "test"
+    try test_policy.log.?.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer test_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{test_policy}, "test", .file);
+
+    // Log with service field that should be removed
+    const logs =
+        \\[{"message": "test log message", "service": "my-service", "status": "info"}]
+    ;
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    defer allocator.free(result.data);
+
+    std.debug.print("-----------\n", .{});
+    std.debug.print("{s}\n", .{result.data});
+    std.debug.print("-----------\n", .{});
+
+    // The log should be kept (keep=all)
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+
+    // The message and status should still be present
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "test log message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "info") != null);
+
+    // The service field should be removed by the transform
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "my-service") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"service\"") == null);
 }
