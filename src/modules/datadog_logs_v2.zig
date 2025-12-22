@@ -118,166 +118,131 @@ fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     };
 }
 
+/// Evaluate a slice of logs against policies and collect kept logs.
+/// Returns the kept logs, dropped count, and original count.
+fn filterLogs(
+    allocator: std.mem.Allocator,
+    engine: *const PolicyEngine,
+    logs: []const DatadogLog,
+) !struct { kept: ArrayList(DatadogLog), dropped_count: usize } {
+    var kept_objects: ArrayList(DatadogLog) = .empty;
+    errdefer kept_objects.deinit(allocator);
+
+    var dropped_count: usize = 0;
+    var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
+
+    for (logs) |*log_obj| {
+        var field_ctx = FieldAccessorContext{ .log = log_obj };
+        const result = engine.evaluate(&field_ctx, datadogFieldAccessor, null, &policy_id_buf, null);
+
+        if (result.decision.shouldContinue()) {
+            try kept_objects.append(allocator, log_obj.*);
+        } else {
+            dropped_count += 1;
+        }
+    }
+
+    return .{ .kept = kept_objects, .dropped_count = dropped_count };
+}
+
+/// Build the final ProcessResult from filtering results.
+/// Handles the three cases: nothing dropped, everything dropped, or partial drop.
+fn buildResult(
+    allocator: std.mem.Allocator,
+    kept_logs: []const DatadogLog,
+    original_count: usize,
+    dropped_count: usize,
+    original_data: []const u8,
+) !ProcessResult {
+    // If nothing was dropped, return original data
+    if (dropped_count == 0) {
+        const result = try allocator.alloc(u8, original_data.len);
+        @memcpy(result, original_data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = original_count,
+        };
+    }
+
+    // If everything was dropped, return empty array
+    if (kept_logs.len == 0) {
+        const result = try allocator.alloc(u8, 2);
+        result[0] = '[';
+        result[1] = ']';
+        return .{
+            .data = result,
+            .dropped_count = dropped_count,
+            .original_count = original_count,
+        };
+    }
+
+    // Serialize kept logs
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    try std.json.Stringify.value(kept_logs, .{}, &out.writer);
+
+    return .{
+        .data = try out.toOwnedSlice(),
+        .dropped_count = dropped_count,
+        .original_count = original_count,
+    };
+}
+
+/// Return data unchanged (fail-open behavior)
+fn returnUnchanged(allocator: std.mem.Allocator, data: []const u8, original_count: usize) !ProcessResult {
+    const result = try allocator.alloc(u8, data.len);
+    @memcpy(result, data);
+    return .{
+        .data = result,
+        .dropped_count = 0,
+        .original_count = original_count,
+    };
+}
+
 /// Process JSON logs with filter evaluation using zimdjson streaming parser
 /// Detects if input is an array or single object, applies filter to each log
 fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const PolicyRegistry, bus: *EventBus, data: []const u8) !ProcessResult {
-    // Initialize zimdjson streaming parser
     var parser: StreamParser = .init;
     defer parser.deinit(allocator);
 
-    // Create a fixed reader from the data slice for streaming parsing
     var reader = std.Io.Reader.fixed(data);
-
-    // Parse the JSON document using streaming parser
     const document: Document = parser.parseFromReader(allocator, &reader) catch {
-        // If JSON parsing fails, return data unchanged (fail-open)
-        const result = try allocator.alloc(u8, data.len);
-        @memcpy(result, data);
-        return .{
-            .data = result,
-            .dropped_count = 0,
-            .original_count = 0,
-        };
+        return returnUnchanged(allocator, data, 0);
     };
 
-    // Create policy engine for evaluation (gets snapshot from registry internally)
     const engine = PolicyEngine.init(allocator, bus, @constCast(registry));
-    // Get the value type to determine if it's an array or object
+
     const value_type = document.getType() catch {
-        // If we can't determine the type, return unchanged
-        const result = try allocator.alloc(u8, data.len);
-        @memcpy(result, data);
-        return .{
-            .data = result,
-            .dropped_count = 0,
-            .original_count = 0,
-        };
+        return returnUnchanged(allocator, data, 0);
     };
 
     switch (value_type) {
         .array => {
-            // Process array of logs using schema-based parsing
             var array: std.json.Parsed([]DatadogLog) = document.as([]DatadogLog, allocator, .{}) catch {
-                const result = try allocator.alloc(u8, data.len);
-                @memcpy(result, data);
-                return .{
-                    .data = result,
-                    .dropped_count = 0,
-                    .original_count = 0,
-                };
+                return returnUnchanged(allocator, data, 0);
             };
             defer array.deinit();
 
-            // Collect objects of kept logs
-            var kept_objects: ArrayList(DatadogLog) = .empty;
-            defer kept_objects.deinit(allocator);
+            const original_count = array.value.len;
+            var filter_result = try filterLogs(allocator, &engine, array.value);
+            defer filter_result.kept.deinit(allocator);
 
-            var dropped_count: usize = 0;
-            var original_count: usize = 0;
-
-            // Buffer for matched policy IDs (stack allocated)
-            var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
-
-            for (array.value) |*log_obj| {
-                original_count += 1;
-
-                var field_ctx = FieldAccessorContext{
-                    .log = log_obj,
-                };
-
-                const result = engine.evaluate(&field_ctx, datadogFieldAccessor, null, &policy_id_buf, null);
-                if (result.decision.shouldContinue()) {
-                    try kept_objects.append(allocator, log_obj.*);
-                } else {
-                    dropped_count += 1;
-                }
-            }
-
-            // If nothing was dropped, return original data
-            if (dropped_count == 0) {
-                const result = try allocator.alloc(u8, data.len);
-                @memcpy(result, data);
-                return .{
-                    .data = result,
-                    .dropped_count = 0,
-                    .original_count = original_count,
-                };
-            }
-
-            // If everything was dropped, return empty array
-            if (kept_objects.items.len == 0) {
-                const result = try allocator.alloc(u8, 2);
-                result[0] = '[';
-                result[1] = ']';
-                return .{
-                    .data = result,
-                    .dropped_count = dropped_count,
-                    .original_count = original_count,
-                };
-            }
-
-            // Serialize kept logs
-            var out: std.Io.Writer.Allocating = .init(allocator);
-            try std.json.Stringify.value(kept_objects.items, .{}, &out.writer);
-
-            return .{
-                .data = try out.toOwnedSlice(),
-                .dropped_count = dropped_count,
-                .original_count = original_count,
-            };
+            return buildResult(allocator, filter_result.kept.items, original_count, filter_result.dropped_count, data);
         },
         .object => {
-            // Process single log object
             var log_obj: std.json.Parsed(DatadogLog) = document.as(DatadogLog, allocator, .{}) catch {
-                // If not an object, return unchanged (fail-open)
-                const result = try allocator.alloc(u8, data.len);
-                @memcpy(result, data);
-                return .{
-                    .data = result,
-                    .dropped_count = 0,
-                    .original_count = 1,
-                };
+                return returnUnchanged(allocator, data, 1);
             };
             defer log_obj.deinit();
 
-            var field_ctx = FieldAccessorContext{
-                .log = &log_obj.value,
-            };
+            // Evaluate single log using shared filter logic
+            const logs = @as(*const [1]DatadogLog, &log_obj.value);
+            var filter_result = try filterLogs(allocator, &engine, logs);
+            defer filter_result.kept.deinit(allocator);
 
-            // Buffer for matched policy IDs (stack allocated)
-            var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
-            const eval_result = engine.evaluate(&field_ctx, datadogFieldAccessor, null, &policy_id_buf, null);
-            if (!eval_result.decision.shouldContinue()) {
-                // Return empty array for dropped single log
-                const output = try allocator.alloc(u8, 2);
-                output[0] = '[';
-                output[1] = ']';
-                return .{
-                    .data = output,
-                    .dropped_count = 1,
-                    .original_count = 1,
-                };
-            }
-            // Keep the log - return as-is
-            // TODO: Apply transforms using eval_result.matched_policy_ids
-            const output = try allocator.alloc(u8, data.len);
-            @memcpy(output, data);
-            return .{
-                .data = output,
-                .dropped_count = 0,
-                .original_count = 1,
-            };
+            return buildResult(allocator, filter_result.kept.items, 1, filter_result.dropped_count, data);
         },
-        else => {
-            // Not an array or object, return unchanged
-            const result = try allocator.alloc(u8, data.len);
-            @memcpy(result, data);
-            return .{
-                .data = result,
-                .dropped_count = 0,
-                .original_count = 0,
-            };
-        },
+        else => return returnUnchanged(allocator, data, 0),
     }
 }
 
