@@ -4,54 +4,54 @@
       "id": "drop-echo-logs",
       "name": "drop-echo-logs",
       "matchers": [
-        { "match_type": "log_attribute", "key": "ddsource", "regex": "nginx" }
+        { "field": "log_attribute", "key": "ddsource", "pattern": "nginx" }
       ],
-      "action": "drop"
+      "keep": "none"
     },
     {
       "id": "drop-debug-logs",
       "name": "drop-debug-logs",
       "matchers": [
-        { "match_type": "log_body", "regex": "debug" },
-        { "match_type": "log_body", "regex": "trace" }
+        { "field": "log_body", "pattern": "debug" },
+        { "field": "log_body", "pattern": "trace" }
       ],
-      "action": "drop"
+      "keep": "none"
     },
     {
       "id": "drop-no-such-file-or-directory-logs",
       "name": "drop-no-such-file-or-directory-logs",
       "matchers": [
-        { "match_type": "log_body", "regex": "no such file or directory" }
+        { "field": "log_body", "pattern": "no such file or directory" }
       ],
-      "action": "drop"
+      "keep": "none"
     },
     {
       "id": "drop-debug-level",
       "name": "drop-debug-level",
-      "matchers": [{ "match_type": "log_severity_text", "regex": "DEBUG" }],
-      "action": "drop"
+      "matchers": [{ "field": "log_severity_text", "pattern": "DEBUG" }],
+      "keep": "none"
     },
     {
       "id": "drop-edge-logs",
       "name": "drop-edge-logs",
       "matchers": [
         {
-          "match_type": "resource_attribute",
+          "field": "resource_attribute",
           "key": "service.name",
-          "regex": "^.*edge$"
+          "pattern": "^.*edge$"
         }
       ],
-      "action": "drop"
+      "keep": "none"
     },
     {
       "id": "keep-error-logs",
       "name": "keep-error-logs",
       "matchers": [
-        { "match_type": "log_severity_text", "regex": "error" },
-        { "match_type": "log_severity_text", "regex": "critical" },
-        { "match_type": "log_severity_text", "regex": "fatal" }
+        { "field": "log_severity_text", "pattern": "error" },
+        { "field": "log_severity_text", "pattern": "critical" },
+        { "field": "log_severity_text", "pattern": "fatal" }
       ],
-      "action": "keep"
+      "keep": "all"
     }
   ]
 }

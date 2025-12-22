@@ -30,6 +30,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zimdjson = b.dependency("zimdjson", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Create a proto module for generated protobuf files
     const proto_mod = b.addModule("proto", .{
@@ -58,6 +62,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{ .name = "proto", .module = proto_mod },
+            .{ .name = "zimdjson", .module = zimdjson.module("zimdjson") },
         },
     });
 
@@ -105,6 +110,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("httpz", httpz.module("httpz"));
     exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
     exe.root_module.addImport("proto", proto_mod);
+    exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
 
     // Link zlib for gzip compression
     exe.root_module.link_libc = true;
@@ -146,6 +152,7 @@ pub fn build(b: *std.Build) void {
         dist_exe.root_module.addImport("httpz", httpz.module("httpz"));
         dist_exe.root_module.addImport("protobuf", protobuf_dep.module("protobuf"));
         dist_exe.root_module.addImport("proto", proto_mod);
+        dist_exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
         dist_exe.root_module.link_libc = true;
         dist_exe.root_module.linkSystemLibrary("z", .{});
         dist_exe.root_module.linkSystemLibrary("zstd", .{});
@@ -239,7 +246,8 @@ pub fn build(b: *std.Build) void {
         const protoc_step = protobuf.RunProtocStep.create(protobuf_dep.builder, target, .{
             .destination_directory = b.path("src/proto"),
             .source_files = &.{
-                "proto/opentelemetry/proto/policy/v1/policy.proto",
+                "proto/tero/policy/v1/policy.proto",
+                "proto/tero/policy/v1/log.proto",
                 "proto/opentelemetry/proto/logs/v1/logs.proto",
             },
             .include_directories = &.{

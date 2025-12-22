@@ -10,7 +10,7 @@ const SyncRequest = proto.policy.SyncRequest;
 const SyncResponse = proto.policy.SyncResponse;
 const ClientMetadata = proto.policy.ClientMetadata;
 const PolicySyncStatus = proto.policy.PolicySyncStatus;
-const PolicyType = proto.policy.PolicyType;
+const PolicyStage = proto.policy.PolicyStage;
 const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
 const ServiceMetadata = types.ServiceMetadata;
@@ -36,10 +36,12 @@ const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
 const HTTPFetchStarted = struct {};
 const HTTPFetchCompleted = struct {};
 
-/// Tracks status for a specific policy (hits, misses, errors)
+/// Tracks status for a specific policy (hits, misses, errors, bytes)
 const PolicyStatusRecord = struct {
     hits: i64 = 0,
     misses: i64 = 0,
+    bytes_before: i64 = 0,
+    bytes_after: i64 = 0,
     errors: std.ArrayListUnmanaged([]const u8) = .{},
 
     fn deinit(self: *PolicyStatusRecord, allocator: std.mem.Allocator) void {
@@ -206,10 +208,10 @@ pub const HttpProvider = struct {
         }
     }
 
-    /// Record statistics about policy hits and misses.
+    /// Record statistics about policy hits, misses, and byte changes.
     /// These stats will be sent in subsequent sync requests.
     /// Conforms to PolicyProvider interface (void return, logs errors internally).
-    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64) void {
+    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
         self.sync_state_mutex.lock();
         defer self.sync_state_mutex.unlock();
 
@@ -217,6 +219,8 @@ pub const HttpProvider = struct {
             // Update existing record
             record.hits += hits;
             record.misses += misses;
+            record.bytes_before += bytes_before;
+            record.bytes_after += bytes_after;
         } else {
             // Create new entry
             const id_copy = self.allocator.dupe(u8, policy_id) catch {
@@ -227,6 +231,8 @@ pub const HttpProvider = struct {
             self.policy_statuses.put(self.allocator, id_copy, .{
                 .hits = hits,
                 .misses = misses,
+                .bytes_before = bytes_before,
+                .bytes_after = bytes_after,
             }) catch {
                 self.allocator.free(id_copy);
                 self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
@@ -372,6 +378,12 @@ pub const HttpProvider = struct {
     }
 
     fn fetchPolicies(self: *HttpProvider) !FetchResult {
+        // Use arena allocator for all temporary structures during fetch.
+        // This reduces fragmentation by freeing all temporary memory at once.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const temp_allocator = arena.allocator();
+
         // Build resource_attributes with required fields:
         // - service.name
         // - service.instance.id
@@ -390,12 +402,12 @@ pub const HttpProvider = struct {
             .{ .key = "workspace.id", .value = .{ .value = .{ .string_value = self.workspace_id } } },
         };
 
-        // Build supported_policy_types
-        const supported_policy_types = [_]PolicyType{.POLICY_TYPE_LOG_FILTER};
+        // Build supported_policy_stages
+        const supported_policy_stages = [_]PolicyStage{.POLICY_STAGE_LOG_FILTER};
 
         // Build policy_statuses from our tracked state
         var policy_statuses_list = std.ArrayListUnmanaged(PolicySyncStatus){};
-        defer policy_statuses_list.deinit(self.allocator);
+        // No defer needed - arena handles cleanup
 
         // Get last successful hash (if any) - read under lock
         var last_hash: []const u8 = &.{};
@@ -406,7 +418,7 @@ pub const HttpProvider = struct {
             // Build PolicySyncStatus entries from tracked policy statuses
             var ps_it = self.policy_statuses.iterator();
             while (ps_it.next()) |entry| {
-                try policy_statuses_list.append(self.allocator, .{
+                try policy_statuses_list.append(temp_allocator, .{
                     .id = entry.key_ptr.*,
                     .hits = entry.value_ptr.hits,
                     .misses = entry.value_ptr.misses,
@@ -420,7 +432,7 @@ pub const HttpProvider = struct {
         // Create SyncRequest with the new structure
         const sync_request = SyncRequest{
             .client_metadata = ClientMetadata{
-                .supported_policy_types = .{ .items = @constCast(&supported_policy_types), .capacity = supported_policy_types.len },
+                .supported_policy_stages = .{ .items = @constCast(&supported_policy_stages), .capacity = supported_policy_stages.len },
                 .resource_attributes = .{ .items = @constCast(&resource_attributes), .capacity = resource_attributes.len },
                 .labels = .{ .items = @constCast(&labels), .capacity = labels.len },
             },
@@ -432,14 +444,14 @@ pub const HttpProvider = struct {
 
         // Encode SyncRequest to JSON
         protobuf.json.pb_options.emit_oneof_field_name = false;
-        const request_body = try sync_request.jsonEncode(.{}, self.allocator);
-        defer self.allocator.free(request_body);
+        const request_body = try sync_request.jsonEncode(.{}, temp_allocator);
+        // No defer needed - arena handles cleanup
 
         // Prepare headers: content-type + custom headers
         const max_builtin_headers: usize = 1;
         const total_headers = max_builtin_headers + self.custom_headers.len;
-        const headers_buffer = try self.allocator.alloc(std.http.Header, total_headers);
-        defer self.allocator.free(headers_buffer);
+        const headers_buffer = try temp_allocator.alloc(std.http.Header, total_headers);
+        // No defer needed - arena handles cleanup
 
         var headers_count: usize = 0;
 

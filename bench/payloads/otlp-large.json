@@ -64,19 +64,345 @@
               "severityText": "INFO",
               "severityNumber": 9,
               "attributes": [
-                { "key": "http.method", "value": { "stringValue": "GET" } },
+                { "key": "http_method", "value": { "stringValue": "GET" } },
                 {
-                  "key": "http.path",
+                  "key": "http_path",
                   "value": { "stringValue": "/api/v1/users/profile" }
                 },
-                { "key": "http.status_code", "value": { "intValue": "200" } },
+                { "key": "http_status_code", "value": { "intValue": "200" } },
                 {
-                  "key": "http.response_time_ms",
-                  "value": { "intValue": "85" }
+                  "key": "internal_trace_id",
+                  "value": { "stringValue": "trace-abc123" }
                 }
               ],
               "traceId": "00000000000000000000000000000003",
               "spanId": "0000000000000003"
+            },
+            {
+              "timeUnixNano": "1705315803000000000",
+              "observedTimeUnixNano": "1705315803000000000",
+              "body": {
+                "stringValue": "User login successful - authentication flow completed"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [
+                { "key": "user_id", "value": { "stringValue": "user-67890" } },
+                {
+                  "key": "session_id",
+                  "value": { "stringValue": "sess-11111" }
+                }
+              ],
+              "traceId": "00000000000000000000000000000004",
+              "spanId": "0000000000000004"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": { "stringValue": "payment-service" }
+          },
+          { "key": "service.version", "value": { "stringValue": "2.1.0" } },
+          {
+            "key": "host.name",
+            "value": { "stringValue": "payment-01.us-east-1.prod.example.com" }
+          },
+          {
+            "key": "deployment.environment",
+            "value": { "stringValue": "production" }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "payment-logger", "version": "1.0.0" },
+          "logRecords": [
+            {
+              "timeUnixNano": "1705315804000000000",
+              "observedTimeUnixNano": "1705315804000000000",
+              "body": {
+                "stringValue": "Payment processing initiated for order #12345"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [
+                { "key": "order_id", "value": { "stringValue": "12345" } },
+                {
+                  "key": "credit_card",
+                  "value": { "stringValue": "4111111111114242" }
+                },
+                { "key": "ssn", "value": { "stringValue": "123-45-6789" } },
+                { "key": "amount", "value": { "doubleValue": 99.99 } }
+              ],
+              "traceId": "00000000000000000000000000000005",
+              "spanId": "0000000000000005"
+            },
+            {
+              "timeUnixNano": "1705315805000000000",
+              "observedTimeUnixNano": "1705315805000000000",
+              "body": {
+                "stringValue": "Payment refund processed for transaction txn-98765"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [
+                {
+                  "key": "transaction_id",
+                  "value": { "stringValue": "txn-98765" }
+                },
+                {
+                  "key": "credit_card",
+                  "value": { "stringValue": "5555555555554444" }
+                },
+                { "key": "refund_amount", "value": { "doubleValue": 49.99 } }
+              ],
+              "traceId": "00000000000000000000000000000006",
+              "spanId": "0000000000000006"
+            },
+            {
+              "timeUnixNano": "1705315806000000000",
+              "observedTimeUnixNano": "1705315806000000000",
+              "body": {
+                "stringValue": "Liveness check /live completed successfully"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [],
+              "traceId": "00000000000000000000000000000007",
+              "spanId": "0000000000000007"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": { "stringValue": "cache-service" }
+          },
+          { "key": "service.version", "value": { "stringValue": "1.0.0" } },
+          {
+            "key": "host.name",
+            "value": { "stringValue": "cache-01.us-east-1.prod.example.com" }
+          },
+          {
+            "key": "deployment.environment",
+            "value": { "stringValue": "production" }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "cache-logger", "version": "1.0.0" },
+          "logRecords": [
+            {
+              "timeUnixNano": "1705315807000000000",
+              "observedTimeUnixNano": "1705315807000000000",
+              "body": { "stringValue": "Cache hit for user profile data" },
+              "severityText": "DEBUG",
+              "severityNumber": 5,
+              "attributes": [
+                {
+                  "key": "cache_key",
+                  "value": { "stringValue": "user:12345:profile" }
+                },
+                { "key": "cache_ttl", "value": { "intValue": "3600" } }
+              ],
+              "traceId": "00000000000000000000000000000008",
+              "spanId": "0000000000000008"
+            },
+            {
+              "timeUnixNano": "1705315808000000000",
+              "observedTimeUnixNano": "1705315808000000000",
+              "body": {
+                "stringValue": "Cache miss for order data - fetching from database"
+              },
+              "severityText": "DEBUG",
+              "severityNumber": 5,
+              "attributes": [
+                {
+                  "key": "cache_key",
+                  "value": { "stringValue": "order:67890:data" }
+                },
+                { "key": "cache_ttl", "value": { "intValue": "1800" } }
+              ],
+              "traceId": "00000000000000000000000000000009",
+              "spanId": "0000000000000009"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": { "stringValue": "order-service" }
+          },
+          { "key": "service.version", "value": { "stringValue": "3.0.0" } },
+          {
+            "key": "host.name",
+            "value": { "stringValue": "order-01.us-east-1.prod.example.com" }
+          },
+          {
+            "key": "deployment.environment",
+            "value": { "stringValue": "production" }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "order-logger", "version": "1.0.0" },
+          "logRecords": [
+            {
+              "timeUnixNano": "1705315809000000000",
+              "observedTimeUnixNano": "1705315809000000000",
+              "body": {
+                "stringValue": "API call to /api/v2/orders completed in 120ms"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [
+                { "key": "http_method", "value": { "stringValue": "POST" } },
+                {
+                  "key": "http_path",
+                  "value": { "stringValue": "/api/v2/orders" }
+                },
+                {
+                  "key": "internal_trace_id",
+                  "value": { "stringValue": "trace-def456" }
+                },
+                { "key": "duration_ms", "value": { "intValue": "120" } }
+              ],
+              "traceId": "00000000000000000000000000000010",
+              "spanId": "0000000000000010"
+            },
+            {
+              "timeUnixNano": "1705315810000000000",
+              "observedTimeUnixNano": "1705315810000000000",
+              "body": {
+                "stringValue": "Failed to connect to database - connection timeout after 30s"
+              },
+              "severityText": "ERROR",
+              "severityNumber": 17,
+              "attributes": [
+                {
+                  "key": "error_code",
+                  "value": { "stringValue": "DB_TIMEOUT" }
+                },
+                { "key": "retry_count", "value": { "intValue": "3" } }
+              ],
+              "traceId": "00000000000000000000000000000011",
+              "spanId": "0000000000000011"
+            },
+            {
+              "timeUnixNano": "1705315811000000000",
+              "observedTimeUnixNano": "1705315811000000000",
+              "body": {
+                "stringValue": "Critical system failure - shutting down service"
+              },
+              "severityText": "FATAL",
+              "severityNumber": 21,
+              "attributes": [
+                {
+                  "key": "error_code",
+                  "value": { "stringValue": "CRITICAL_FAILURE" }
+                }
+              ],
+              "traceId": "00000000000000000000000000000012",
+              "spanId": "0000000000000012"
+            },
+            {
+              "timeUnixNano": "1705315812000000000",
+              "observedTimeUnixNano": "1705315812000000000",
+              "body": {
+                "stringValue": "Database query executed: UPDATE orders SET status = ? WHERE id = ?"
+              },
+              "severityText": "DEBUG",
+              "severityNumber": 5,
+              "attributes": [
+                { "key": "query_type", "value": { "stringValue": "update" } },
+                { "key": "table", "value": { "stringValue": "orders" } }
+              ],
+              "traceId": "00000000000000000000000000000013",
+              "spanId": "0000000000000013"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "api-gateway" } },
+          { "key": "service.version", "value": { "stringValue": "1.2.3" } },
+          {
+            "key": "host.name",
+            "value": { "stringValue": "web-01.us-east-1.prod.example.com" }
+          },
+          {
+            "key": "deployment.environment",
+            "value": { "stringValue": "production" }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "gateway-logger", "version": "1.0.0" },
+          "logRecords": [
+            {
+              "timeUnixNano": "1705315813000000000",
+              "observedTimeUnixNano": "1705315813000000000",
+              "body": {
+                "stringValue": "Health check endpoint /health responded with status 200"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [],
+              "traceId": "00000000000000000000000000000014",
+              "spanId": "0000000000000014"
+            },
+            {
+              "timeUnixNano": "1705315814000000000",
+              "observedTimeUnixNano": "1705315814000000000",
+              "body": {
+                "stringValue": "Readiness probe /ready passed - service is ready to accept traffic"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [],
+              "traceId": "00000000000000000000000000000015",
+              "spanId": "0000000000000015"
+            },
+            {
+              "timeUnixNano": "1705315815000000000",
+              "observedTimeUnixNano": "1705315815000000000",
+              "body": {
+                "stringValue": "HTTP request received for API call to /api/v1/inventory"
+              },
+              "severityText": "INFO",
+              "severityNumber": 9,
+              "attributes": [
+                { "key": "http_method", "value": { "stringValue": "GET" } },
+                {
+                  "key": "http_path",
+                  "value": { "stringValue": "/api/v1/inventory" }
+                },
+                {
+                  "key": "internal_trace_id",
+                  "value": { "stringValue": "trace-ghi789" }
+                }
+              ],
+              "traceId": "00000000000000000000000000000016",
+              "spanId": "0000000000000016"
             }
           ]
         }

@@ -16,7 +16,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 // =============================================================================
 
 const PolicyError = struct { policy_id: []const u8, message: []const u8 };
-const PolicyStats = struct { policy_id: []const u8, hits: i64, misses: i64 };
+const PolicyStats = struct { policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64 };
 const PoliciesLoading = struct { path: []const u8 };
 const PoliciesLoaded = struct { count: usize, path: []const u8 };
 const PoliciesUnchanged = struct { hash: []const u8 };
@@ -101,10 +101,10 @@ pub const FileProvider = struct {
         self.bus.err(PolicyError{ .policy_id = policy_id, .message = error_message });
     }
 
-    /// Report statistics about policy hits and misses.
+    /// Report statistics about policy hits, misses, and byte changes.
     /// For file provider, this logs to stdout since there's no remote server to report to.
-    pub fn recordPolicyStats(self: *FileProvider, policy_id: []const u8, hits: i64, misses: i64) void {
-        self.bus.debug(PolicyStats{ .policy_id = policy_id, .hits = hits, .misses = misses });
+    pub fn recordPolicyStats(self: *FileProvider, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
+        self.bus.debug(PolicyStats{ .policy_id = policy_id, .hits = hits, .misses = misses, .bytes_before = bytes_before, .bytes_after = bytes_after });
     }
 
     fn loadAndNotify(self: *FileProvider) !void {

@@ -15,9 +15,8 @@ processors:
   batch:
     send_batch_size: 10000
 
-  # Filter processor - equivalent to policies.json rules
+  # Filter processor - equivalent to policies.json drop rules
   # Note: filter processor drops matching logs (no "keep" action, only exclude)
-  # The "keep-errors" policy can't be directly translated as filter only drops
   filter:
     error_mode: ignore
     logs:
@@ -32,6 +31,32 @@ processors:
         - 'IsMatch(body, ".*Database query executed.*")'
         # drop-first-entry: Drop first log entry in 1MB payloads
         - 'IsMatch(body, ".*Log entry 0:.*")'
+
+  # Transform processor - equivalent to policies.json transform rules
+  transform:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          # redact-sensitive-data: Redact sensitive fields from payment logs
+          - set(attributes["credit_card"], "[REDACTED]") where IsMatch(body, ".*payment.*") and attributes["credit_card"] != nil
+          - set(attributes["ssn"], "[REDACTED]") where IsMatch(body, ".*payment.*") and attributes["ssn"] != nil
+
+          # enrich-auth-logs: Add metadata to authentication logs
+          - set(attributes["security_category"], "auth") where IsMatch(body, ".*(authentication|login).*")
+          - set(attributes["compliance_required"], "true") where IsMatch(body, ".*(authentication|login).*")
+
+          # normalize-api-logs: Normalize API request logs (rename http_method -> method, http_path -> path)
+          - set(attributes["method"], attributes["http_method"]) where IsMatch(body, ".*(HTTP request|API call).*") and attributes["http_method"] != nil
+          - delete_key(attributes, "http_method") where IsMatch(body, ".*(HTTP request|API call).*") and attributes["method"] != nil
+          - set(attributes["path"], attributes["http_path"]) where IsMatch(body, ".*(HTTP request|API call).*") and attributes["http_path"] != nil
+          - delete_key(attributes, "http_path") where IsMatch(body, ".*(HTTP request|API call).*") and attributes["path"] != nil
+          - delete_key(attributes, "internal_trace_id") where IsMatch(body, ".*(HTTP request|API call).*")
+
+          # drop-and-transform-cache: Add sampled flag to cache logs (sampling done by filter)
+          - set(attributes["sampled"], "true") where IsMatch(body, ".*(cache hit|cache miss).*")
+          - delete_key(attributes, "cache_key") where IsMatch(body, ".*(cache hit|cache miss).*")
+          - delete_key(attributes, "cache_ttl") where IsMatch(body, ".*(cache hit|cache miss).*")
 
 exporters:
   # Debug exporter for logging
@@ -60,9 +85,9 @@ service:
   pipelines:
     logs/datadog:
       receivers: [datadog]
-      processors: [filter, batch]
+      processors: [filter, transform, batch]
       exporters: [datadog, debug]
     logs/otlp:
       receivers: [otlp]
-      processors: [filter, batch]
+      processors: [filter, transform, batch]
       exporters: [otlphttp, debug]

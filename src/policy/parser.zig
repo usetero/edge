@@ -2,16 +2,77 @@ const std = @import("std");
 const proto = @import("proto");
 
 const Policy = proto.policy.Policy;
-const FilterAction = proto.policy.FilterAction;
-const LogFilterConfig = proto.policy.LogFilterConfig;
+const LogTarget = proto.policy.LogTarget;
 const LogMatcher = proto.policy.LogMatcher;
+const LogField = proto.policy.LogField;
+const LogTransform = proto.policy.LogTransform;
+const LogRemove = proto.policy.LogRemove;
+const LogRedact = proto.policy.LogRedact;
+const LogRename = proto.policy.LogRename;
+const LogAdd = proto.policy.LogAdd;
 
 /// JSON schema for a matcher
 const MatcherJson = struct {
-    match_type: []const u8,
+    /// Field type: "log_body", "log_severity_text", "log_attribute", "resource_attribute", "scope_attribute"
+    field: []const u8,
+    /// Key for attribute-based fields (required for *_attribute types)
     key: []const u8 = "",
-    regex: []const u8,
+    /// Match type: "regex", "exact", or "exists"
+    match_type: []const u8 = "regex",
+    /// Pattern for regex or exact matching
+    pattern: []const u8 = "",
+    /// Whether to negate the match
     negate: bool = false,
+};
+
+/// JSON schema for a remove transform
+const RemoveJson = struct {
+    /// Field type: "log_attribute", "resource_attribute", "scope_attribute"
+    field: []const u8,
+    /// Key for the attribute to remove
+    key: []const u8,
+};
+
+/// JSON schema for a redact transform
+const RedactJson = struct {
+    /// Field type: "log_attribute", "resource_attribute", "scope_attribute"
+    field: []const u8,
+    /// Key for the attribute to redact
+    key: []const u8,
+    /// Replacement value (defaults to "[REDACTED]")
+    replacement: []const u8 = "[REDACTED]",
+};
+
+/// JSON schema for a rename transform
+const RenameJson = struct {
+    /// Field type: "log_attribute", "resource_attribute", "scope_attribute"
+    from_field: []const u8,
+    /// Key for the source attribute
+    from_key: []const u8,
+    /// Target attribute name
+    to: []const u8,
+    /// Whether to overwrite if target exists
+    upsert: bool = true,
+};
+
+/// JSON schema for an add transform
+const AddJson = struct {
+    /// Field type: "log_attribute", "resource_attribute", "scope_attribute"
+    field: []const u8,
+    /// Key for the attribute to add
+    key: []const u8,
+    /// Value to set
+    value: []const u8,
+    /// Whether to overwrite if exists
+    upsert: bool = true,
+};
+
+/// JSON schema for transforms
+const TransformJson = struct {
+    remove: ?[]RemoveJson = null,
+    redact: ?[]RedactJson = null,
+    rename: ?[]RenameJson = null,
+    add: ?[]AddJson = null,
 };
 
 /// JSON schema for a policy
@@ -20,11 +81,13 @@ const PolicyJson = struct {
     id: []const u8,
     name: []const u8,
     description: ?[]const u8 = null,
-    priority: i32 = 0,
     enabled: bool = true,
-    // For filter policies
+    /// Matchers for log policies
     matchers: ?[]MatcherJson = null,
-    action: ?[]const u8 = null,
+    /// Keep value: "all", "none", "N%", "N/s", "N/m"
+    keep: []const u8 = "all",
+    /// Transforms to apply to matching logs
+    transform: ?TransformJson = null,
 };
 
 /// JSON schema for a policies-only file
@@ -67,9 +130,9 @@ pub fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) 
         const name = try allocator.dupe(u8, json_policy.name);
         const description = if (json_policy.description) |desc| try allocator.dupe(u8, desc) else &.{};
 
-        // Build filter config
-        var filter: ?LogFilterConfig = null;
-        if (json_policy.matchers != null or json_policy.action != null) {
+        // Build log target config
+        var log_target: ?LogTarget = null;
+        if (json_policy.matchers != null or json_policy.keep.len > 0 or json_policy.transform != null) {
             // Parse matchers
             var matchers = std.ArrayListUnmanaged(LogMatcher){};
             if (json_policy.matchers) |json_matchers| {
@@ -79,12 +142,17 @@ pub fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) 
                     matchers.appendAssumeCapacity(matcher);
                 }
             }
-            // Parse action
-            const action = if (json_policy.action) |a| try parseFilterAction(a) else .FILTER_ACTION_UNSPECIFIED;
 
-            filter = LogFilterConfig{
-                .matchers = matchers,
-                .action = action,
+            // Parse transforms
+            var transform: ?LogTransform = null;
+            if (json_policy.transform) |jt| {
+                transform = try parseLogTransform(allocator, jt);
+            }
+
+            log_target = LogTarget{
+                .match = matchers,
+                .keep = try allocator.dupe(u8, json_policy.keep),
+                .transform = transform,
             };
         }
 
@@ -92,9 +160,8 @@ pub fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) 
             .id = id,
             .name = name,
             .description = description,
-            .priority = json_policy.priority,
             .enabled = json_policy.enabled,
-            .log_filter = filter,
+            .log = log_target,
         };
     }
 
@@ -103,91 +170,319 @@ pub fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) 
 
 /// Parse a LogMatcher from JSON
 fn parseLogMatcher(allocator: std.mem.Allocator, jm: MatcherJson) !LogMatcher {
-    // Validate match_type before allocating to avoid leaks on error
-    const match_case: enum { log_body, log_severity_text, log_attribute, resource_attribute, resource_schema_url, scope_name, scope_version, scope_attribute, scope_schema_url } =
-        if (std.mem.eql(u8, jm.match_type, "log_body")) .log_body else if (std.mem.eql(u8, jm.match_type, "log_severity_text")) .log_severity_text else if (std.mem.eql(u8, jm.match_type, "log_attribute")) .log_attribute else if (std.mem.eql(u8, jm.match_type, "resource_attribute")) .resource_attribute else if (std.mem.eql(u8, jm.match_type, "resource_schema_url")) .resource_schema_url else if (std.mem.eql(u8, jm.match_type, "scope_name")) .scope_name else if (std.mem.eql(u8, jm.match_type, "scope_version")) .scope_version else if (std.mem.eql(u8, jm.match_type, "scope_attribute")) .scope_attribute else if (std.mem.eql(u8, jm.match_type, "scope_schema_url")) .scope_schema_url else return error.InvalidMatchType;
+    // Parse field type
+    const field: LogMatcher.field_union = blk: {
+        if (std.mem.eql(u8, jm.field, "log_body")) {
+            break :blk .{ .log_field = .LOG_FIELD_BODY };
+        } else if (std.mem.eql(u8, jm.field, "log_severity_text")) {
+            break :blk .{ .log_field = .LOG_FIELD_SEVERITY_TEXT };
+        } else if (std.mem.eql(u8, jm.field, "log_trace_id")) {
+            break :blk .{ .log_field = .LOG_FIELD_TRACE_ID };
+        } else if (std.mem.eql(u8, jm.field, "log_span_id")) {
+            break :blk .{ .log_field = .LOG_FIELD_SPAN_ID };
+        } else if (std.mem.eql(u8, jm.field, "log_event_name")) {
+            break :blk .{ .log_field = .LOG_FIELD_EVENT_NAME };
+        } else if (std.mem.eql(u8, jm.field, "resource_schema_url")) {
+            break :blk .{ .log_field = .LOG_FIELD_RESOURCE_SCHEMA_URL };
+        } else if (std.mem.eql(u8, jm.field, "scope_schema_url")) {
+            break :blk .{ .log_field = .LOG_FIELD_SCOPE_SCHEMA_URL };
+        } else if (std.mem.eql(u8, jm.field, "log_attribute")) {
+            if (jm.key.len == 0) return error.MissingKey;
+            break :blk .{ .log_attribute = try allocator.dupe(u8, jm.key) };
+        } else if (std.mem.eql(u8, jm.field, "resource_attribute")) {
+            if (jm.key.len == 0) return error.MissingKey;
+            break :blk .{ .resource_attribute = try allocator.dupe(u8, jm.key) };
+        } else if (std.mem.eql(u8, jm.field, "scope_attribute")) {
+            if (jm.key.len == 0) return error.MissingKey;
+            break :blk .{ .scope_attribute = try allocator.dupe(u8, jm.key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
 
-    const regex = try allocator.dupe(u8, jm.regex);
-    const key = if (jm.key.len > 0) try allocator.dupe(u8, jm.key) else &.{};
-
-    // Map match_type string to the appropriate union variant
-    const match: LogMatcher.match_union = switch (match_case) {
-        .log_body => .{ .log_body = .{ .regex = regex } },
-        .log_severity_text => .{ .log_severity_text = .{ .regex = regex } },
-        .log_attribute => .{ .log_attribute = .{ .key = key, .regex = regex } },
-        .resource_attribute => .{ .resource_attribute = .{ .key = key, .regex = regex } },
-        .resource_schema_url => .{ .resource_schema_url = .{ .regex = regex } },
-        .scope_name => .{ .scope_name = .{ .regex = regex } },
-        .scope_version => .{ .scope_version = .{ .regex = regex } },
-        .scope_attribute => .{ .scope_attribute = .{ .key = key, .regex = regex } },
-        .scope_schema_url => .{ .scope_schema_url = .{ .regex = regex } },
+    // Parse match type
+    const match: LogMatcher.match_union = blk: {
+        if (std.mem.eql(u8, jm.match_type, "regex")) {
+            break :blk .{ .regex = try allocator.dupe(u8, jm.pattern) };
+        } else if (std.mem.eql(u8, jm.match_type, "exact")) {
+            break :blk .{ .exact = try allocator.dupe(u8, jm.pattern) };
+        } else if (std.mem.eql(u8, jm.match_type, "exists")) {
+            break :blk .{ .exists = true };
+        } else {
+            return error.InvalidMatchType;
+        }
     };
 
     return LogMatcher{
         .negate = jm.negate,
+        .field = field,
         .match = match,
     };
 }
 
-/// Parse FilterAction from string
-pub fn parseFilterAction(s: []const u8) !FilterAction {
-    if (std.mem.eql(u8, s, "keep")) return .FILTER_ACTION_KEEP;
-    if (std.mem.eql(u8, s, "drop")) return .FILTER_ACTION_DROP;
-    return error.InvalidAction;
+/// Parse a LogTransform from JSON
+fn parseLogTransform(allocator: std.mem.Allocator, jt: TransformJson) !LogTransform {
+    var transform = LogTransform{};
+
+    // Parse remove operations
+    if (jt.remove) |removes| {
+        try transform.remove.ensureTotalCapacity(allocator, removes.len);
+        for (removes) |jr| {
+            const remove = try parseLogRemove(allocator, jr);
+            transform.remove.appendAssumeCapacity(remove);
+        }
+    }
+
+    // Parse redact operations
+    if (jt.redact) |redacts| {
+        try transform.redact.ensureTotalCapacity(allocator, redacts.len);
+        for (redacts) |jr| {
+            const redact = try parseLogRedact(allocator, jr);
+            transform.redact.appendAssumeCapacity(redact);
+        }
+    }
+
+    // Parse rename operations
+    if (jt.rename) |renames| {
+        try transform.rename.ensureTotalCapacity(allocator, renames.len);
+        for (renames) |jr| {
+            const rename = try parseLogRename(allocator, jr);
+            transform.rename.appendAssumeCapacity(rename);
+        }
+    }
+
+    // Parse add operations
+    if (jt.add) |adds| {
+        try transform.add.ensureTotalCapacity(allocator, adds.len);
+        for (adds) |ja| {
+            const add = try parseLogAdd(allocator, ja);
+            transform.add.appendAssumeCapacity(add);
+        }
+    }
+
+    return transform;
 }
 
-test "parseFilterAction" {
-    try std.testing.expect(try parseFilterAction("keep") == .FILTER_ACTION_KEEP);
-    try std.testing.expect(try parseFilterAction("drop") == .FILTER_ACTION_DROP);
-    try std.testing.expectError(error.InvalidAction, parseFilterAction("invalid"));
+/// Parse a LogRemove from JSON
+fn parseLogRemove(allocator: std.mem.Allocator, jr: RemoveJson) !LogRemove {
+    const field: LogRemove.field_union = blk: {
+        if (std.mem.eql(u8, jr.field, "log_attribute")) {
+            break :blk .{ .log_attribute = try allocator.dupe(u8, jr.key) };
+        } else if (std.mem.eql(u8, jr.field, "resource_attribute")) {
+            break :blk .{ .resource_attribute = try allocator.dupe(u8, jr.key) };
+        } else if (std.mem.eql(u8, jr.field, "scope_attribute")) {
+            break :blk .{ .scope_attribute = try allocator.dupe(u8, jr.key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
+
+    return LogRemove{ .field = field };
 }
 
-test "parseLogMatcher" {
+/// Parse a LogRedact from JSON
+fn parseLogRedact(allocator: std.mem.Allocator, jr: RedactJson) !LogRedact {
+    const field: LogRedact.field_union = blk: {
+        if (std.mem.eql(u8, jr.field, "log_attribute")) {
+            break :blk .{ .log_attribute = try allocator.dupe(u8, jr.key) };
+        } else if (std.mem.eql(u8, jr.field, "resource_attribute")) {
+            break :blk .{ .resource_attribute = try allocator.dupe(u8, jr.key) };
+        } else if (std.mem.eql(u8, jr.field, "scope_attribute")) {
+            break :blk .{ .scope_attribute = try allocator.dupe(u8, jr.key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
+
+    return LogRedact{
+        .field = field,
+        .replacement = try allocator.dupe(u8, jr.replacement),
+    };
+}
+
+/// Parse a LogRename from JSON
+fn parseLogRename(allocator: std.mem.Allocator, jr: RenameJson) !LogRename {
+    const from: LogRename.from_union = blk: {
+        if (std.mem.eql(u8, jr.from_field, "log_attribute")) {
+            break :blk .{ .from_log_attribute = try allocator.dupe(u8, jr.from_key) };
+        } else if (std.mem.eql(u8, jr.from_field, "resource_attribute")) {
+            break :blk .{ .from_resource_attribute = try allocator.dupe(u8, jr.from_key) };
+        } else if (std.mem.eql(u8, jr.from_field, "scope_attribute")) {
+            break :blk .{ .from_scope_attribute = try allocator.dupe(u8, jr.from_key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
+
+    return LogRename{
+        .from = from,
+        .to = try allocator.dupe(u8, jr.to),
+        .upsert = jr.upsert,
+    };
+}
+
+/// Parse a LogAdd from JSON
+fn parseLogAdd(allocator: std.mem.Allocator, ja: AddJson) !LogAdd {
+    const field: LogAdd.field_union = blk: {
+        if (std.mem.eql(u8, ja.field, "log_attribute")) {
+            break :blk .{ .log_attribute = try allocator.dupe(u8, ja.key) };
+        } else if (std.mem.eql(u8, ja.field, "resource_attribute")) {
+            break :blk .{ .resource_attribute = try allocator.dupe(u8, ja.key) };
+        } else if (std.mem.eql(u8, ja.field, "scope_attribute")) {
+            break :blk .{ .scope_attribute = try allocator.dupe(u8, ja.key) };
+        } else {
+            return error.InvalidFieldType;
+        }
+    };
+
+    return LogAdd{
+        .field = field,
+        .value = try allocator.dupe(u8, ja.value),
+        .upsert = ja.upsert,
+    };
+}
+
+/// Parse keep value - validates format
+/// Valid formats: "all", "none", "N%", "N/s", "N/m"
+pub fn parseKeepValue(s: []const u8) !void {
+    if (s.len == 0 or std.mem.eql(u8, s, "all") or std.mem.eql(u8, s, "none")) {
+        return;
+    }
+    // Check for percentage: "N%"
+    if (s.len >= 2 and s[s.len - 1] == '%') {
+        const num_str = s[0 .. s.len - 1];
+        const pct = std.fmt.parseInt(u8, num_str, 10) catch return error.InvalidKeepValue;
+        if (pct > 100) return error.InvalidKeepValue;
+        return;
+    }
+    // Check for rate limit: "N/s" or "N/m"
+    if (s.len >= 3 and s[s.len - 2] == '/') {
+        const num_str = s[0 .. s.len - 2];
+        _ = std.fmt.parseInt(u32, num_str, 10) catch return error.InvalidKeepValue;
+        if (s[s.len - 1] != 's' and s[s.len - 1] != 'm') {
+            return error.InvalidKeepValue;
+        }
+        return;
+    }
+    return error.InvalidKeepValue;
+}
+
+test "parseKeepValue" {
+    try parseKeepValue("all");
+    try parseKeepValue("none");
+    try parseKeepValue("");
+    try parseKeepValue("50%");
+    try parseKeepValue("0%");
+    try parseKeepValue("100%");
+    try parseKeepValue("100/s");
+    try parseKeepValue("1000/m");
+
+    try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("101%"));
+    try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("invalid"));
+    try std.testing.expectError(error.InvalidKeepValue, parseKeepValue("100/x"));
+}
+
+test "parseLogMatcher: log_body with regex" {
     const allocator = std.testing.allocator;
 
-    // Test log_body matcher
-    const body_matcher = try parseLogMatcher(allocator, .{
-        .match_type = "log_body",
-        .regex = "test.*",
+    const matcher = try parseLogMatcher(allocator, .{
+        .field = "log_body",
+        .match_type = "regex",
+        .pattern = "test.*",
     });
     defer {
-        if (body_matcher.match) |m| {
+        if (matcher.match) |m| {
             switch (m) {
-                .log_body => |b| allocator.free(b.regex),
-                else => {},
+                .regex => |r| allocator.free(r),
+                .exact => |e| allocator.free(e),
+                .exists => {},
             }
         }
     }
-    try std.testing.expect(body_matcher.match != null);
-    try std.testing.expect(body_matcher.match.? == .log_body);
-    try std.testing.expectEqualStrings("test.*", body_matcher.match.?.log_body.regex);
 
-    // Test log_attribute matcher with key
-    const attr_matcher = try parseLogMatcher(allocator, .{
-        .match_type = "log_attribute",
+    try std.testing.expect(matcher.field != null);
+    try std.testing.expect(matcher.field.? == .log_field);
+    try std.testing.expectEqual(LogField.LOG_FIELD_BODY, matcher.field.?.log_field);
+    try std.testing.expect(matcher.match != null);
+    try std.testing.expect(matcher.match.? == .regex);
+    try std.testing.expectEqualStrings("test.*", matcher.match.?.regex);
+}
+
+test "parseLogMatcher: log_attribute with key" {
+    const allocator = std.testing.allocator;
+
+    const matcher = try parseLogMatcher(allocator, .{
+        .field = "log_attribute",
         .key = "service.name",
-        .regex = "payment.*",
+        .match_type = "exact",
+        .pattern = "payment-api",
         .negate = true,
     });
     defer {
-        if (attr_matcher.match) |m| {
+        if (matcher.field) |f| {
+            switch (f) {
+                .log_attribute => |k| allocator.free(k),
+                .resource_attribute => |k| allocator.free(k),
+                .scope_attribute => |k| allocator.free(k),
+                .log_field => {},
+            }
+        }
+        if (matcher.match) |m| {
             switch (m) {
-                .log_attribute => |a| {
-                    allocator.free(a.key);
-                    allocator.free(a.regex);
-                },
-                else => {},
+                .regex => |r| allocator.free(r),
+                .exact => |e| allocator.free(e),
+                .exists => {},
             }
         }
     }
-    try std.testing.expect(attr_matcher.negate == true);
-    try std.testing.expect(attr_matcher.match.? == .log_attribute);
-    try std.testing.expectEqualStrings("service.name", attr_matcher.match.?.log_attribute.key);
-    try std.testing.expectEqualStrings("payment.*", attr_matcher.match.?.log_attribute.regex);
 
-    // Test invalid match type
-    try std.testing.expectError(error.InvalidMatchType, parseLogMatcher(allocator, .{
-        .match_type = "invalid_type",
-        .regex = "test",
+    try std.testing.expect(matcher.negate == true);
+    try std.testing.expect(matcher.field != null);
+    try std.testing.expect(matcher.field.? == .log_attribute);
+    try std.testing.expectEqualStrings("service.name", matcher.field.?.log_attribute);
+    try std.testing.expect(matcher.match != null);
+    try std.testing.expect(matcher.match.? == .exact);
+    try std.testing.expectEqualStrings("payment-api", matcher.match.?.exact);
+}
+
+test "parseLogMatcher: exists match type" {
+    const allocator = std.testing.allocator;
+
+    const matcher = try parseLogMatcher(allocator, .{
+        .field = "log_attribute",
+        .key = "trace_id",
+        .match_type = "exists",
+    });
+    defer {
+        if (matcher.field) |f| {
+            switch (f) {
+                .log_attribute => |k| allocator.free(k),
+                .resource_attribute => |k| allocator.free(k),
+                .scope_attribute => |k| allocator.free(k),
+                .log_field => {},
+            }
+        }
+    }
+
+    try std.testing.expect(matcher.field != null);
+    try std.testing.expect(matcher.field.? == .log_attribute);
+    try std.testing.expect(matcher.match != null);
+    try std.testing.expect(matcher.match.? == .exists);
+    try std.testing.expectEqual(true, matcher.match.?.exists);
+}
+
+test "parseLogMatcher: invalid field type" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidFieldType, parseLogMatcher(allocator, .{
+        .field = "invalid_field",
+        .pattern = "test",
+    }));
+}
+
+test "parseLogMatcher: missing key for attribute" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.MissingKey, parseLogMatcher(allocator, .{
+        .field = "log_attribute",
+        .pattern = "test",
     }));
 }

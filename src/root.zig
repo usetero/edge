@@ -63,7 +63,7 @@ test {
     _ = @import("config/types.zig");
     _ = @import("config/parser.zig");
     _ = @import("policy/root.zig");
-    _ = @import("policy/filter_engine.zig");
+    _ = @import("policy/policy_engine.zig");
     _ = @import("hyperscan/matcher_index.zig");
     _ = @import("modules/proxy_module.zig");
     _ = @import("proxy/compress.zig");

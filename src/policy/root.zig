@@ -65,11 +65,29 @@ pub const ProviderType = types.ProviderType;
 pub const ProviderConfig = types.ProviderConfig;
 pub const Header = types.Header;
 
+// Field reference types (shared across policy engine and transforms)
+pub const FieldRef = types.FieldRef;
+pub const FieldAccessor = types.FieldAccessor;
+pub const FieldMutator = types.FieldMutator;
+pub const MutateOp = types.MutateOp;
+
 // =============================================================================
 // Parsing
 // =============================================================================
 
 pub const parser = @import("./parser.zig");
+
+// =============================================================================
+// Transforms
+// =============================================================================
+
+pub const log_transform = @import("./log_transform.zig");
+pub const TransformResult = log_transform.TransformResult;
+pub const applyTransforms = log_transform.applyTransforms;
+pub const applyRemove = log_transform.applyRemove;
+pub const applyRedact = log_transform.applyRedact;
+pub const applyRename = log_transform.applyRename;
+pub const applyAdd = log_transform.applyAdd;
 
 // =============================================================================
 // Tests
