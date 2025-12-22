@@ -621,10 +621,6 @@ test "processLogs - extra fields are preserved when no logs dropped" {
     const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
     defer allocator.free(result.data);
 
-    std.debug.print("-----------\n", .{});
-    std.debug.print("{s}\n", .{result.data});
-    std.debug.print("-----------\n", .{});
-
     // When nothing is dropped, original data is returned unchanged - extra fields preserved
     try std.testing.expect(std.mem.indexOf(u8, result.data, "kept log") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.data, "extra_field") != null);
@@ -674,10 +670,6 @@ test "processLogs - mutation triggers reserialization and removes field" {
 
     const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
     defer allocator.free(result.data);
-
-    std.debug.print("-----------\n", .{});
-    std.debug.print("{s}\n", .{result.data});
-    std.debug.print("-----------\n", .{});
 
     // The log should be kept (keep=all)
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
