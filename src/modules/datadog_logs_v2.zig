@@ -22,6 +22,11 @@ const ArrayList = std.ArrayListUnmanaged;
 /// Datadog log schema for parsing and serialization
 /// Uses zimdjson schema inference for deserialization
 const DatadogLog = struct {
+    pub const schema: StreamParser.schema.Infer(@This()) = .{
+        .fields = .{ .extra = .{ .skip = true } },
+        .on_unknown_field = .{ .handle = @This().handleUnknownField },
+    };
+
     message: ?[]const u8 = null,
     status: ?[]const u8 = null,
     level: ?[]const u8 = null,
@@ -32,7 +37,101 @@ const DatadogLog = struct {
     timestamp: ?i64 = null,
     environment: ?[]const u8 = null,
     custom_field: ?[]const u8 = null,
-    // TODO: may need to handle additional fields dynamically
+
+    extra: std.StringHashMapUnmanaged(StreamParser.AnyValue) = .empty,
+
+    pub fn handleUnknownField(self: *@This(), alloc: ?std.mem.Allocator, key: []const u8, value: StreamParser.Value) StreamParser.schema.Error!void {
+        const gpa = alloc orelse return error.ExpectedAllocator;
+        return self.extra.put(gpa, key, try value.asAny());
+    }
+
+    /// Custom JSON serialization for known fields only.
+    /// Note: Extra fields cannot be serialized because zimdjson AnyValue contains
+    /// lazy iterators that may become invalid after document parsing.
+    /// When no logs are dropped, original data is returned unchanged preserving all fields.
+    pub fn jsonStringify(self: *const @This(), jw: anytype) @TypeOf(jw.*).Error!void {
+        try jw.beginObject();
+
+        if (self.message) |v| {
+            try jw.objectField("message");
+            try jw.write(v);
+        }
+        if (self.status) |v| {
+            try jw.objectField("status");
+            try jw.write(v);
+        }
+        if (self.level) |v| {
+            try jw.objectField("level");
+            try jw.write(v);
+        }
+        if (self.service) |v| {
+            try jw.objectField("service");
+            try jw.write(v);
+        }
+        if (self.hostname) |v| {
+            try jw.objectField("hostname");
+            try jw.write(v);
+        }
+        if (self.ddsource) |v| {
+            try jw.objectField("ddsource");
+            try jw.write(v);
+        }
+        if (self.ddtags) |v| {
+            try jw.objectField("ddtags");
+            try jw.write(v);
+        }
+        if (self.timestamp) |v| {
+            try jw.objectField("timestamp");
+            try jw.write(v);
+        }
+        if (self.environment) |v| {
+            try jw.objectField("environment");
+            try jw.write(v);
+        }
+        if (self.custom_field) |v| {
+            try jw.objectField("custom_field");
+            try jw.write(v);
+        }
+        // Write extra fields
+        var it = self.extra.iterator();
+        while (it.next()) |entry| {
+            try jw.objectField(entry.key_ptr.*);
+            try writeAnyValue(jw, entry.value_ptr.*);
+        }
+
+        try jw.endObject();
+    }
+
+    /// Write a zimdjson AnyValue to a JSON writer
+    fn writeAnyValue(jw: anytype, value: StreamParser.AnyValue) @TypeOf(jw.*).Error!void {
+        switch (value) {
+            .null => try jw.write(null),
+            .bool => |v| try jw.write(v),
+            .number => |n| switch (n) {
+                .unsigned => |v| try jw.write(v),
+                .signed => |v| try jw.write(v),
+                .double => |v| try jw.write(v),
+            },
+            .string => |v| try jw.write(v.get() catch ""),
+            .array => |arr| {
+                try jw.beginArray();
+                var it = arr.iterator();
+                while (it.next() catch null) |item| {
+                    try writeAnyValue(jw, item.asAny() catch continue);
+                }
+                try jw.endArray();
+            },
+            .object => |obj| {
+                try jw.beginObject();
+                var it = obj.iterator();
+                while (it.next() catch null) |field| {
+                    try jw.objectField(field.key.get() catch continue);
+                    try writeAnyValue(jw, field.value.asAny() catch continue);
+                }
+                try jw.endObject();
+            },
+        }
+    }
 };
 
 /// Result of processing logs
@@ -118,73 +217,63 @@ fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     };
 }
 
-/// Evaluate a slice of logs against policies and collect kept logs.
-/// Returns the kept logs, dropped count, and original count.
-fn filterLogs(
-    allocator: std.mem.Allocator,
-    engine: *const PolicyEngine,
-    logs: []const DatadogLog,
-) !struct { kept: ArrayList(DatadogLog), dropped_count: usize } {
-    var kept_objects: ArrayList(DatadogLog) = .empty;
-    errdefer kept_objects.deinit(allocator);
-
-    var dropped_count: usize = 0;
-    var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
-
-    for (logs) |*log_obj| {
-        var field_ctx = FieldAccessorContext{ .log = log_obj };
-        const result = engine.evaluate(&field_ctx, datadogFieldAccessor, null, &policy_id_buf, null);
-
-        if (result.decision.shouldContinue()) {
-            try kept_objects.append(allocator, log_obj.*);
-        } else {
-            dropped_count += 1;
-        }
-    }
-
-    return .{ .kept = kept_objects, .dropped_count = dropped_count };
+/// Evaluate a single log against policies.
+/// Returns true if the log should be kept, false if it should be dropped.
+fn filterLog(engine: *const PolicyEngine, log: *const DatadogLog, policy_id_buf: [][]const u8) bool {
+    var field_ctx = FieldAccessorContext{ .log = log };
+    const result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, null, policy_id_buf, null);
+    return result.decision.shouldContinue();
 }
 
-/// Build the final ProcessResult from filtering results.
+/// Accumulated state for filtering logs
+const FilterState = struct {
+    kept: ArrayList(DatadogLog) = .empty,
+    original_count: usize = 0,
+    dropped_count: usize = 0,
+
+    fn deinit(self: *FilterState, allocator: std.mem.Allocator) void {
+        self.kept.deinit(allocator);
+    }
+};
+
+/// Build the final ProcessResult from filtering state.
 /// Handles the three cases: nothing dropped, everything dropped, or partial drop.
 fn buildResult(
     allocator: std.mem.Allocator,
-    kept_logs: []const DatadogLog,
-    original_count: usize,
-    dropped_count: usize,
+    state: *const FilterState,
     original_data: []const u8,
 ) !ProcessResult {
     // If nothing was dropped, return original data
-    if (dropped_count == 0) {
+    if (state.dropped_count == 0) {
         const result = try allocator.alloc(u8, original_data.len);
         @memcpy(result, original_data);
         return .{
             .data = result,
             .dropped_count = 0,
-            .original_count = original_count,
+            .original_count = state.original_count,
         };
     }
 
     // If everything was dropped, return empty array
-    if (kept_logs.len == 0) {
+    if (state.kept.items.len == 0) {
         const result = try allocator.alloc(u8, 2);
         result[0] = '[';
         result[1] = ']';
         return .{
             .data = result,
-            .dropped_count = dropped_count,
-            .original_count = original_count,
+            .dropped_count = state.dropped_count,
+            .original_count = state.original_count,
         };
     }
 
     // Serialize kept logs
     var out: std.Io.Writer.Allocating = .init(allocator);
-    try std.json.Stringify.value(kept_logs, .{}, &out.writer);
+    try std.json.Stringify.value(state.kept.items, .{}, &out.writer);
 
     return .{
         .data = try out.toOwnedSlice(),
-        .dropped_count = dropped_count,
-        .original_count = original_count,
+        .dropped_count = state.dropped_count,
+        .original_count = state.original_count,
     };
 }
 
@@ -216,6 +305,10 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
         return returnUnchanged(allocator, data, 0);
     };
 
+    var state = FilterState{};
+    defer state.deinit(allocator);
+    var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
+
     switch (value_type) {
         .array => {
             var array: std.json.Parsed([]DatadogLog) = document.as([]DatadogLog, allocator, .{}) catch {
@@ -223,11 +316,16 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             };
             defer array.deinit();
 
-            const original_count = array.value.len;
-            var filter_result = try filterLogs(allocator, &engine, array.value);
-            defer filter_result.kept.deinit(allocator);
+            for (array.value) |*log_obj| {
+                state.original_count += 1;
+                if (filterLog(&engine, log_obj, &policy_id_buf)) {
+                    try state.kept.append(allocator, log_obj.*);
+                } else {
+                    state.dropped_count += 1;
+                }
+            }
 
-            return buildResult(allocator, filter_result.kept.items, original_count, filter_result.dropped_count, data);
+            return buildResult(allocator, &state, data);
         },
         .object => {
             var log_obj: std.json.Parsed(DatadogLog) = document.as(DatadogLog, allocator, .{}) catch {
@@ -235,12 +333,14 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             };
             defer log_obj.deinit();
 
-            // Evaluate single log using shared filter logic
-            const logs = @as(*const [1]DatadogLog, &log_obj.value);
-            var filter_result = try filterLogs(allocator, &engine, logs);
-            defer filter_result.kept.deinit(allocator);
+            state.original_count = 1;
+            if (filterLog(&engine, &log_obj.value, &policy_id_buf)) {
+                try state.kept.append(allocator, log_obj.value);
+            } else {
+                state.dropped_count = 1;
+            }
 
-            return buildResult(allocator, filter_result.kept.items, 1, filter_result.dropped_count, data);
+            return buildResult(allocator, &state, data);
         },
         else => return returnUnchanged(allocator, data, 0),
     }
@@ -444,4 +544,36 @@ test "processLogs - filter on arbitrary custom field" {
     try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
     try std.testing.expect(result.wasModified());
+}
+
+test "processLogs - extra fields are preserved when no logs dropped" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // No policies - all logs kept, original data returned unchanged
+
+    // Logs with extra fields not in the DatadogLog schema
+    const logs =
+        \\[{"status": "info", "message": "kept log", "extra_field": "should_be_preserved", "nested": {"key": "value"}, "array_field": [1, 2, 3]}]
+    ;
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    defer allocator.free(result.data);
+
+    std.debug.print("-----------\n", .{});
+    std.debug.print("{s}\n", .{result.data});
+    std.debug.print("-----------\n", .{});
+
+    // When nothing is dropped, original data is returned unchanged - extra fields preserved
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "kept log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "extra_field") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "should_be_preserved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "nested") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "array_field") != null);
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
 }
