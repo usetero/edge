@@ -41,8 +41,8 @@
             .hash = "protobuf-3.0.0-0e82amfxKAB0IUqYIztvAVCHz3NAmOc3NxYzZdYHx-Jb",
         },
         .zimdjson = .{
-            .url = "git+https://github.com/jaronoff97/zimdjson?ref=zig-0.15.1-support#038ecd924c2db0ebeb62a2d10e5e42f74b7a6845",
-            .hash = "zimdjson-0.1.1-89pgxYZPBgDNfPA-UlmlokcYHyAQ1uEJB6vY6K4C8tQi",
+            .url = "git+https://github.com/jaronoff97/zimdjson?ref=zig-0.15.1-support#6a19ca121858f37e0261aab4eff306d55d7500ad",
+            .hash = "zimdjson-0.1.1-89pgxYZPBgBe_LSOgDGyNdqGfsYDuOH2Z4d2mx5zRqeu",
         },
     },
     .paths = .{
