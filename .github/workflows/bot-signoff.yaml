@@ -50,8 +50,6 @@ jobs:
           fetch-depth: 0
           submodules: "true"
       - uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
-        env:
-          HERMIT_DIST_URL: https://github.com/cashapp/hermit/releases/download/v0.46.2
 
       - run: git config --global url.https://x-access-token:${{ steps.generate-token.outputs.token }}@github.com/.insteadOf https://github.com/
 
