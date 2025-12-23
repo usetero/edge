@@ -13,22 +13,7 @@ pub const FieldRef = types.FieldRef;
 pub const FieldAccessor = types.FieldAccessor;
 pub const FieldMutator = types.FieldMutator;
 pub const MutateOp = types.MutateOp;
-
-/// Result of applying transforms
-pub const TransformResult = struct {
-    /// Number of remove operations applied
-    removes_applied: usize = 0,
-    /// Number of redact operations applied
-    redacts_applied: usize = 0,
-    /// Number of rename operations applied
-    renames_applied: usize = 0,
-    /// Number of add operations applied
-    adds_applied: usize = 0,
-
-    pub fn totalApplied(self: TransformResult) usize {
-        return self.removes_applied + self.redacts_applied + self.renames_applied + self.adds_applied;
-    }
-};
+pub const TransformResult = types.TransformResult;
 
 /// Apply all transforms from a LogTransform in order: remove → redact → rename → add
 pub fn applyTransforms(
@@ -40,6 +25,7 @@ pub fn applyTransforms(
     var result = TransformResult{};
 
     // 1. Remove
+    result.removes_attempted = transform.remove.items.len;
     for (transform.remove.items) |*rule| {
         if (applyRemove(rule, ctx, mutator)) {
             result.removes_applied += 1;
@@ -47,6 +33,7 @@ pub fn applyTransforms(
     }
 
     // 2. Redact
+    result.redacts_attempted = transform.redact.items.len;
     for (transform.redact.items) |*rule| {
         if (applyRedact(rule, ctx, accessor, mutator)) {
             result.redacts_applied += 1;
@@ -54,6 +41,7 @@ pub fn applyTransforms(
     }
 
     // 3. Rename
+    result.renames_attempted = transform.rename.items.len;
     for (transform.rename.items) |*rule| {
         if (applyRename(rule, ctx, accessor, mutator)) {
             result.renames_applied += 1;
@@ -61,6 +49,7 @@ pub fn applyTransforms(
     }
 
     // 4. Add
+    result.adds_attempted = transform.add.items.len;
     for (transform.add.items) |*rule| {
         if (applyAdd(rule, ctx, accessor, mutator)) {
             result.adds_applied += 1;

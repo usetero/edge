@@ -82,6 +82,15 @@ message ClientMetadata {
   repeated opentelemetry.proto.common.v1.KeyValue resource_attributes = 3;
 }
 
+// TransformStageStatus reports hits and misses for a single transform stage.
+message TransformStageStatus {
+  // Number of times this stage was applied.
+  int64 hits = 1;
+
+  // Number of times this stage was evaluated but the field selected nothing.
+  int64 misses = 2;
+}
+
 // PolicySyncStatus reports the status of an individual policy during sync.
 // Used to communicate policy execution metrics and errors back to the provider.
 message PolicySyncStatus {
@@ -89,19 +98,19 @@ message PolicySyncStatus {
   string id = 1;
 
   // Number of times this policy matched telemetry since the last sync.
-  int64 hits = 2;
+  int64 match_hits = 2;
 
   // Number of times this policy was evaluated but did not match.
-  int64 misses = 3;
+  int64 match_misses = 3;
 
   // Error messages encountered while applying this policy.
   repeated string errors = 4;
 
-  // Total number of bytes prior to policy evaluation.
-  int64 bytes = 5;
-
-  // Total number of bytes after policy evaluation.
-  int64 bytes_after = 6;
+  // Transform stage statistics
+  TransformStageStatus remove = 10;
+  TransformStageStatus redact = 11;
+  TransformStageStatus rename = 12;
+  TransformStageStatus add = 13;
 }
 
 // SyncRequest is sent by clients to request policy updates.
