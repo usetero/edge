@@ -152,3 +152,37 @@ pub const MutateOp = union(enum) {
         upsert: bool,
     },
 };
+
+// =============================================================================
+// Transform Result
+// =============================================================================
+
+/// Result of applying transforms to a log record.
+/// Tracks both attempted and applied counts for each transform stage.
+/// Used for reporting transform hit/miss statistics.
+pub const TransformResult = struct {
+    /// Number of remove operations attempted
+    removes_attempted: usize = 0,
+    /// Number of remove operations applied (hits)
+    removes_applied: usize = 0,
+    /// Number of redact operations attempted
+    redacts_attempted: usize = 0,
+    /// Number of redact operations applied (hits)
+    redacts_applied: usize = 0,
+    /// Number of rename operations attempted
+    renames_attempted: usize = 0,
+    /// Number of rename operations applied (hits)
+    renames_applied: usize = 0,
+    /// Number of add operations attempted
+    adds_attempted: usize = 0,
+    /// Number of add operations applied (hits)
+    adds_applied: usize = 0,
+
+    pub fn totalApplied(self: TransformResult) usize {
+        return self.removes_applied + self.redacts_applied + self.renames_applied + self.adds_applied;
+    }
+
+    pub fn totalAttempted(self: TransformResult) usize {
+        return self.removes_attempted + self.redacts_attempted + self.renames_attempted + self.adds_attempted;
+    }
+};

@@ -194,15 +194,15 @@ pub const PolicyRegistry = struct {
         }
     }
 
-    /// Report statistics about policy hits, misses, and byte changes.
+    /// Report statistics about policy hits, misses, and transform results.
     /// Routes the stats to the appropriate provider based on the policy's source.
-    pub fn recordPolicyStats(self: *PolicyRegistry, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
+    pub fn recordPolicyStats(self: *PolicyRegistry, policy_id: []const u8, hits: i64, misses: i64, transform_result: policy_provider.TransformResult) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.policy_sources.get(policy_id)) |metadata| {
             if (self.providers.get(metadata.provider_id)) |provider| {
-                provider.recordPolicyStats(policy_id, hits, misses, bytes_before, bytes_after);
+                provider.recordPolicyStats(policy_id, hits, misses, transform_result);
             }
             // No fallback logging for stats - silent drop if no provider
         }
@@ -608,13 +608,12 @@ pub const TestPolicyProvider = struct {
     }
 
     /// Record policy stats (no-op for tests)
-    pub fn recordPolicyStats(self: *TestPolicyProvider, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
+    pub fn recordPolicyStats(self: *TestPolicyProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: policy_provider.TransformResult) void {
         _ = self;
         _ = policy_id;
         _ = hits;
         _ = misses;
-        _ = bytes_before;
-        _ = bytes_after;
+        _ = transform_result;
     }
 
     /// Get as PolicyProvider interface
@@ -1491,14 +1490,13 @@ const MockErrorProvider = struct {
         };
     }
 
-    pub fn recordPolicyStats(self: *MockErrorProvider, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
+    pub fn recordPolicyStats(self: *MockErrorProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: policy_provider.TransformResult) void {
         // No-op for mock - stats tracking not needed for error tests
         _ = self;
         _ = policy_id;
         _ = hits;
         _ = misses;
-        _ = bytes_before;
-        _ = bytes_after;
+        _ = transform_result;
     }
 
     fn getErrorCount(self: *MockErrorProvider) usize {

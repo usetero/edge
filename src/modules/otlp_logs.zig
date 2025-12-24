@@ -400,7 +400,7 @@ fn filterLogsInPlace(
                     .scope_logs = scope_logs,
                 };
 
-                const result = engine.evaluate(&ctx, otlpFieldAccessor, otlpFieldMutator, &policy_id_buf, null);
+                const result = engine.evaluate(&ctx, otlpFieldAccessor, otlpFieldMutator, &policy_id_buf);
 
                 if (result.decision.shouldContinue()) {
                     // Keep this log - move to write position if needed

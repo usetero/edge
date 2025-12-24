@@ -6,10 +6,12 @@ const protobuf = @import("protobuf");
 const o11y = @import("../observability/root.zig");
 
 const PolicyCallback = policy_provider.PolicyCallback;
+const TransformResult = policy_provider.TransformResult;
 const SyncRequest = proto.policy.SyncRequest;
 const SyncResponse = proto.policy.SyncResponse;
 const ClientMetadata = proto.policy.ClientMetadata;
 const PolicySyncStatus = proto.policy.PolicySyncStatus;
+const TransformStageStatus = proto.policy.TransformStageStatus;
 const PolicyStage = proto.policy.PolicyStage;
 const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
@@ -36,19 +38,30 @@ const HttpSyncRequestFailed = struct { url: []const u8, status: u16 };
 const HTTPFetchStarted = struct {};
 const HTTPFetchCompleted = struct {};
 
-/// Tracks status for a specific policy (hits, misses, errors, bytes)
+/// Tracks status for a specific policy (hits, misses, errors, transform results)
 const PolicyStatusRecord = struct {
     hits: i64 = 0,
     misses: i64 = 0,
-    bytes_before: i64 = 0,
-    bytes_after: i64 = 0,
     errors: std.ArrayListUnmanaged([]const u8) = .{},
+    /// Accumulated transform results (attempted/applied counts)
+    transform_result: TransformResult = .{},
 
     fn deinit(self: *PolicyStatusRecord, allocator: std.mem.Allocator) void {
         for (self.errors.items) |msg| {
             allocator.free(msg);
         }
         self.errors.deinit(allocator);
+    }
+
+    fn addTransformResult(self: *PolicyStatusRecord, result: TransformResult) void {
+        self.transform_result.removes_attempted += result.removes_attempted;
+        self.transform_result.removes_applied += result.removes_applied;
+        self.transform_result.redacts_attempted += result.redacts_attempted;
+        self.transform_result.redacts_applied += result.redacts_applied;
+        self.transform_result.renames_attempted += result.renames_attempted;
+        self.transform_result.renames_applied += result.renames_applied;
+        self.transform_result.adds_attempted += result.adds_attempted;
+        self.transform_result.adds_applied += result.adds_applied;
     }
 };
 
@@ -208,10 +221,10 @@ pub const HttpProvider = struct {
         }
     }
 
-    /// Record statistics about policy hits, misses, and byte changes.
+    /// Record statistics about policy hits, misses, and transform stats.
     /// These stats will be sent in subsequent sync requests.
     /// Conforms to PolicyProvider interface (void return, logs errors internally).
-    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
+    pub fn recordPolicyStats(self: *HttpProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
         self.sync_state_mutex.lock();
         defer self.sync_state_mutex.unlock();
 
@@ -219,8 +232,7 @@ pub const HttpProvider = struct {
             // Update existing record
             record.hits += hits;
             record.misses += misses;
-            record.bytes_before += bytes_before;
-            record.bytes_after += bytes_after;
+            record.addTransformResult(transform_result);
         } else {
             // Create new entry
             const id_copy = self.allocator.dupe(u8, policy_id) catch {
@@ -231,8 +243,7 @@ pub const HttpProvider = struct {
             self.policy_statuses.put(self.allocator, id_copy, .{
                 .hits = hits,
                 .misses = misses,
-                .bytes_before = bytes_before,
-                .bytes_after = bytes_after,
+                .transform_result = transform_result,
             }) catch {
                 self.allocator.free(id_copy);
                 self.bus.err(PolicyErrorRecordFailed{ .policy_id = policy_id });
@@ -418,11 +429,41 @@ pub const HttpProvider = struct {
             // Build PolicySyncStatus entries from tracked policy statuses
             var ps_it = self.policy_statuses.iterator();
             while (ps_it.next()) |entry| {
+                const tr = entry.value_ptr.transform_result;
+                // Convert TransformResult to TransformStageStatus: hits = applied, misses = attempted - applied
                 try policy_statuses_list.append(temp_allocator, .{
                     .id = entry.key_ptr.*,
-                    .hits = entry.value_ptr.hits,
-                    .misses = entry.value_ptr.misses,
+                    .match_hits = entry.value_ptr.hits,
+                    .match_misses = entry.value_ptr.misses,
                     .errors = entry.value_ptr.errors,
+                    .remove = if (tr.removes_attempted > 0)
+                        TransformStageStatus{
+                            .hits = @intCast(tr.removes_applied),
+                            .misses = @intCast(tr.removes_attempted - tr.removes_applied),
+                        }
+                    else
+                        null,
+                    .redact = if (tr.redacts_attempted > 0)
+                        TransformStageStatus{
+                            .hits = @intCast(tr.redacts_applied),
+                            .misses = @intCast(tr.redacts_attempted - tr.redacts_applied),
+                        }
+                    else
+                        null,
+                    .rename = if (tr.renames_attempted > 0)
+                        TransformStageStatus{
+                            .hits = @intCast(tr.renames_applied),
+                            .misses = @intCast(tr.renames_attempted - tr.renames_applied),
+                        }
+                    else
+                        null,
+                    .add = if (tr.adds_attempted > 0)
+                        TransformStageStatus{
+                            .hits = @intCast(tr.adds_applied),
+                            .misses = @intCast(tr.adds_attempted - tr.adds_applied),
+                        }
+                    else
+                        null,
                 });
             }
 

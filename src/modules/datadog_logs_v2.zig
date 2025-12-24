@@ -270,7 +270,7 @@ const FilterLogResult = struct {
 /// Returns whether to keep the log and whether it was mutated.
 fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, policy_id_buf: [][]const u8) FilterLogResult {
     var field_ctx = FieldAccessorContext{ .log = log };
-    const result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, datadogFieldMutator, policy_id_buf, null);
+    const result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, datadogFieldMutator, policy_id_buf);
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.matched_policy_ids.len > 0,

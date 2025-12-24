@@ -1,7 +1,11 @@
 const std = @import("std");
 const proto = @import("proto");
+const types = @import("types.zig");
 
 const Policy = proto.policy.Policy;
+
+/// Re-export TransformResult for use by providers
+pub const TransformResult = types.TransformResult;
 
 /// Update notification sent by providers to subscribers
 pub const PolicyUpdate = struct {
@@ -31,7 +35,7 @@ pub const PolicyProvider = struct {
         getId: *const fn (ptr: *anyopaque) []const u8,
         subscribe: *const fn (ptr: *anyopaque, callback: PolicyCallback) anyerror!void,
         recordPolicyError: *const fn (ptr: *anyopaque, policy_id: []const u8, error_message: []const u8) void,
-        recordPolicyStats: *const fn (ptr: *anyopaque, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void,
+        recordPolicyStats: *const fn (ptr: *anyopaque, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -55,12 +59,12 @@ pub const PolicyProvider = struct {
         self.vtable.recordPolicyError(self.ptr, policy_id, error_message);
     }
 
-    /// Report statistics about policy hits, misses, and byte changes.
+    /// Report statistics about policy hits, misses, and transform results.
     /// How this is handled depends on the provider:
     /// - HttpProvider: Records stats to send in next sync request
     /// - FileProvider: Logs stats to stdout
-    pub fn recordPolicyStats(self: PolicyProvider, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
-        self.vtable.recordPolicyStats(self.ptr, policy_id, hits, misses, bytes_before, bytes_after);
+    pub fn recordPolicyStats(self: PolicyProvider, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
+        self.vtable.recordPolicyStats(self.ptr, policy_id, hits, misses, transform_result);
     }
 
     /// Cleanup provider resources
@@ -73,7 +77,7 @@ pub const PolicyProvider = struct {
     /// - getId(*Self) []const u8
     /// - subscribe(*Self, PolicyCallback) !void
     /// - recordPolicyError(*Self, []const u8, []const u8) void
-    /// - recordPolicyStats(*Self, []const u8, i64, i64, i64, i64) void
+    /// - recordPolicyStats(*Self, []const u8, i64, i64, TransformResult) void
     /// - deinit(*Self) void
     pub fn init(provider: anytype) PolicyProvider {
         const Ptr = @TypeOf(provider);
@@ -107,9 +111,9 @@ pub const PolicyProvider = struct {
                 self.recordPolicyError(policy_id, error_message);
             }
 
-            fn recordPolicyStatsImpl(ptr: *anyopaque, policy_id: []const u8, hits: i64, misses: i64, bytes_before: i64, bytes_after: i64) void {
+            fn recordPolicyStatsImpl(ptr: *anyopaque, policy_id: []const u8, hits: i64, misses: i64, transform_result: TransformResult) void {
                 const self: Ptr = @ptrCast(@alignCast(ptr));
-                self.recordPolicyStats(policy_id, hits, misses, bytes_before, bytes_after);
+                self.recordPolicyStats(policy_id, hits, misses, transform_result);
             }
 
             fn deinitImpl(ptr: *anyopaque) void {
