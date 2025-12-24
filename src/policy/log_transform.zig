@@ -474,6 +474,14 @@ test "applyTransforms: applies in correct order" {
         TestContext.fieldMutator,
     );
 
+    // Verify attempted counts
+    try testing.expectEqual(@as(usize, 1), result.removes_attempted);
+    try testing.expectEqual(@as(usize, 1), result.redacts_attempted);
+    try testing.expectEqual(@as(usize, 1), result.renames_attempted);
+    try testing.expectEqual(@as(usize, 1), result.adds_attempted);
+    try testing.expectEqual(@as(usize, 4), result.totalAttempted());
+
+    // Verify applied counts
     try testing.expectEqual(@as(usize, 1), result.removes_applied);
     try testing.expectEqual(@as(usize, 1), result.redacts_applied);
     try testing.expectEqual(@as(usize, 1), result.renames_applied);
@@ -486,4 +494,181 @@ test "applyTransforms: applies in correct order" {
     try testing.expect(ctx.fields.get("to_rename") == null);
     try testing.expectEqualStrings("rename_me", ctx.fields.get("renamed").?);
     try testing.expectEqualStrings("new_value", ctx.fields.get("added").?);
+}
+
+test "applyTransforms: counts attempted vs applied when some operations fail" {
+    const allocator = testing.allocator;
+    var ctx = TestContext.init(allocator);
+    defer ctx.deinit();
+
+    // Setup: only some fields exist
+    try ctx.set("exists1", "value1");
+    try ctx.set("exists2", "value2");
+    try ctx.set("existing_field", "original");
+
+    var transform = LogTransform{};
+
+    // 3 removes: 2 exist, 1 doesn't
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = "exists1" } });
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = "missing1" } });
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = "exists2" } });
+
+    // 2 redacts: 1 exists, 1 doesn't
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = "missing2" },
+        .replacement = "[REDACTED]",
+    });
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = "existing_field" },
+        .replacement = "[REDACTED]",
+    });
+
+    // 2 renames: 1 source exists, 1 doesn't
+    try transform.rename.append(allocator, .{
+        .from = .{ .from_log_attribute = "existing_field" },
+        .to = "renamed_field",
+        .upsert = true,
+    });
+    try transform.rename.append(allocator, .{
+        .from = .{ .from_log_attribute = "missing3" },
+        .to = "wont_exist",
+        .upsert = true,
+    });
+
+    // 3 adds: 2 with upsert=true succeed, 1 with upsert=false on existing field fails
+    try transform.add.append(allocator, .{
+        .field = .{ .log_attribute = "new1" },
+        .value = "added1",
+        .upsert = true,
+    });
+    try transform.add.append(allocator, .{
+        .field = .{ .log_attribute = "renamed_field" }, // Will exist after rename
+        .value = "should_not_overwrite",
+        .upsert = false, // Won't overwrite existing
+    });
+    try transform.add.append(allocator, .{
+        .field = .{ .log_attribute = "new2" },
+        .value = "added2",
+        .upsert = true,
+    });
+
+    defer transform.remove.deinit(allocator);
+    defer transform.redact.deinit(allocator);
+    defer transform.rename.deinit(allocator);
+    defer transform.add.deinit(allocator);
+
+    const result = applyTransforms(
+        &transform,
+        @ptrCast(&ctx),
+        TestContext.fieldAccessor,
+        TestContext.fieldMutator,
+    );
+
+    // Verify attempted counts (total rules defined)
+    try testing.expectEqual(@as(usize, 3), result.removes_attempted);
+    try testing.expectEqual(@as(usize, 2), result.redacts_attempted);
+    try testing.expectEqual(@as(usize, 2), result.renames_attempted);
+    try testing.expectEqual(@as(usize, 3), result.adds_attempted);
+
+    // Verify applied counts (only successful operations)
+    try testing.expectEqual(@as(usize, 2), result.removes_applied); // exists1, exists2
+    try testing.expectEqual(@as(usize, 1), result.redacts_applied); // existing_field
+    try testing.expectEqual(@as(usize, 1), result.renames_applied); // existing_field -> renamed_field
+    try testing.expectEqual(@as(usize, 2), result.adds_applied); // new1, new2 (not renamed_field due to upsert=false)
+
+    // Verify misses can be computed
+    try testing.expectEqual(@as(usize, 1), result.removes_attempted - result.removes_applied);
+    try testing.expectEqual(@as(usize, 1), result.redacts_attempted - result.redacts_applied);
+    try testing.expectEqual(@as(usize, 1), result.renames_attempted - result.renames_applied);
+    try testing.expectEqual(@as(usize, 1), result.adds_attempted - result.adds_applied);
+}
+
+test "applyTransforms: empty transform returns zero counts" {
+    const allocator = testing.allocator;
+    var ctx = TestContext.init(allocator);
+    defer ctx.deinit();
+
+    try ctx.set("field", "value");
+
+    const transform = LogTransform{};
+
+    const result = applyTransforms(
+        &transform,
+        @ptrCast(&ctx),
+        TestContext.fieldAccessor,
+        TestContext.fieldMutator,
+    );
+
+    try testing.expectEqual(@as(usize, 0), result.removes_attempted);
+    try testing.expectEqual(@as(usize, 0), result.redacts_attempted);
+    try testing.expectEqual(@as(usize, 0), result.renames_attempted);
+    try testing.expectEqual(@as(usize, 0), result.adds_attempted);
+    try testing.expectEqual(@as(usize, 0), result.totalAttempted());
+    try testing.expectEqual(@as(usize, 0), result.totalApplied());
+
+    // Field should be unchanged
+    try testing.expectEqualStrings("value", ctx.fields.get("field").?);
+}
+
+test "applyTransforms: all operations fail returns zero applied" {
+    const allocator = testing.allocator;
+    var ctx = TestContext.init(allocator);
+    defer ctx.deinit();
+
+    // Don't set any fields - all operations will fail
+
+    var transform = LogTransform{};
+
+    // Remove non-existent field
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = "missing" } });
+
+    // Redact non-existent field
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = "missing" },
+        .replacement = "[REDACTED]",
+    });
+
+    // Rename non-existent field
+    try transform.rename.append(allocator, .{
+        .from = .{ .from_log_attribute = "missing" },
+        .to = "new_name",
+        .upsert = true,
+    });
+
+    // Add with upsert=false to non-existent field (this actually succeeds - it's an insert)
+    // So let's test add with upsert=false when field exists
+    try ctx.set("blocker", "blocks_add");
+    try transform.add.append(allocator, .{
+        .field = .{ .log_attribute = "blocker" },
+        .value = "wont_work",
+        .upsert = false,
+    });
+
+    defer transform.remove.deinit(allocator);
+    defer transform.redact.deinit(allocator);
+    defer transform.rename.deinit(allocator);
+    defer transform.add.deinit(allocator);
+
+    const result = applyTransforms(
+        &transform,
+        &ctx,
+        TestContext.fieldAccessor,
+        TestContext.fieldMutator,
+    );
+
+    // All attempted
+    try testing.expectEqual(@as(usize, 1), result.removes_attempted);
+    try testing.expectEqual(@as(usize, 1), result.redacts_attempted);
+    try testing.expectEqual(@as(usize, 1), result.renames_attempted);
+    try testing.expectEqual(@as(usize, 1), result.adds_attempted);
+
+    // None applied
+    try testing.expectEqual(@as(usize, 0), result.removes_applied);
+    try testing.expectEqual(@as(usize, 0), result.redacts_applied);
+    try testing.expectEqual(@as(usize, 0), result.renames_applied);
+    try testing.expectEqual(@as(usize, 0), result.adds_applied);
+    try testing.expectEqual(@as(usize, 0), result.totalApplied());
+
+    // Blocker field unchanged
+    try testing.expectEqualStrings("blocks_add", ctx.fields.get("blocker").?);
 }
