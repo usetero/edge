@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.6.0](https://github.com/usetero/edge/compare/v1.5.1...v1.6.0) (2025-12-24)
+
+
+### Features
+
+* accept log transform policies ([#54](https://github.com/usetero/edge/issues/54)) ([a6718b8](https://github.com/usetero/edge/commit/a6718b8fb474c6a2291c0a02370f9e84abb4de7c))
+* report hits and misses for transforms ([#57](https://github.com/usetero/edge/issues/57)) ([375da93](https://github.com/usetero/edge/commit/375da9394726373981f12eb4ad3bf97d3705c8b7))
+
+
+### Bug Fixes
+
+* pin version for gh action ([#55](https://github.com/usetero/edge/issues/55)) ([4a5e6bc](https://github.com/usetero/edge/commit/4a5e6bc6072686f5552e05fe8db24ab361cc187e))
+
 ## [1.5.1](https://github.com/usetero/edge/compare/v1.5.0...v1.5.1) (2025-12-15)
 
 
