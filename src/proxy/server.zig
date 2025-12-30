@@ -1,11 +1,17 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const compress = @import("compress.zig");
+const intercepting_writer = @import("intercepting_writer.zig");
 const proxy_module = @import("../modules/proxy_module.zig");
 const router_mod = @import("router.zig");
 const upstream_client = @import("upstream_client.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
+
+const InterceptingWriter = intercepting_writer.InterceptingWriter;
+const InterceptFn = intercepting_writer.InterceptFn;
+const LinePrinterContext = intercepting_writer.LinePrinterContext;
+const linePrinterCallback = intercepting_writer.linePrinterCallback;
 
 const ModuleId = proxy_module.ModuleId;
 const ModuleConfig = proxy_module.ModuleConfig;
@@ -408,16 +414,18 @@ fn compressIfNeeded(
 
 /// Check if header should be skipped when forwarding request
 fn shouldSkipRequestHeader(name: []const u8) bool {
-    return std.mem.eql(u8, name, "host") or
-        std.mem.eql(u8, name, "connection") or
-        std.mem.eql(u8, name, "content-length") or
-        std.mem.eql(u8, name, "transfer-encoding");
+    return std.ascii.eqlIgnoreCase(name, "host") or
+        std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "accept-encoding"); // Avoid compressed responses from upstream
 }
 
 /// Check if header should be skipped when forwarding response
 fn shouldSkipResponseHeader(name: []const u8) bool {
-    return std.mem.eql(u8, name, "content-length") or
-        std.mem.eql(u8, name, "transfer-encoding");
+    return std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "content-encoding"); // httpz manages response encoding
 }
 
 /// Build headers array in single pass
@@ -621,8 +629,13 @@ fn proxyToUpstreamOnce(
     };
 
     // Create upstream request
+    // Disable accept-encoding to prevent compressed responses from upstream
+    // (we want raw bytes to pass through unchanged)
     var upstream_req = client.request(method, uri, .{
         .extra_headers = headers,
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+        },
     }) catch |err| {
         ctx.bus.err(UpstreamConnectionError{
             .err = @errorName(err),
@@ -687,36 +700,54 @@ fn proxyToUpstreamOnce(
         res.header(header_name, header_value);
     }
 
-    // Stream response body
+    // Stream response body with line-by-line interception
     const max_size = ctx.upstreams.getMaxResponseBody(module_id);
     var read_buffer: [8192]u8 = undefined;
     var upstream_body_reader = upstream_res.reader(&read_buffer);
     const response_writer = res.writer();
 
+    // Set up line printer for intercepting response body
+    var line_printer_ctx = LinePrinterContext.init(req.arena);
+    defer line_printer_ctx.deinit();
+
+    // Stream response body, intercepting each chunk
+    // We read into a local buffer, intercept it, then write to response
     var total_bytes: usize = 0;
+    var chunk_buffer: [8192]u8 = undefined;
+
     while (total_bytes < max_size) {
-        const bytes = upstream_body_reader.stream(
-            response_writer,
-            std.Io.Limit.limited(max_size - total_bytes),
-        ) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => {
-                ctx.bus.err(UpstreamStreamError{
-                    .err = @errorName(err),
-                    .bytes_streamed = total_bytes,
-                });
-                return err;
-            },
+        // Read a chunk from upstream
+        const chunk_size = @min(chunk_buffer.len, max_size - total_bytes);
+        const bytes_read = upstream_body_reader.readSliceShort(chunk_buffer[0..chunk_size]) catch |err| {
+            ctx.bus.err(UpstreamStreamError{
+                .err = @errorName(err),
+                .bytes_streamed = total_bytes,
+            });
+            return err;
         };
-        if (bytes == 0) break;
-        total_bytes += bytes;
+        if (bytes_read == 0) break; // End of stream
+        const chunk = chunk_buffer[0..bytes_read];
+
+        // Intercept the chunk (print line by line)
+        linePrinterCallback(chunk, @ptrCast(&line_printer_ctx));
+
+        // Write to response
+        response_writer.writeAll(chunk) catch |err| {
+            ctx.bus.err(UpstreamStreamError{
+                .err = @errorName(err),
+                .bytes_streamed = total_bytes,
+            });
+            return err;
+        };
+
+        total_bytes += chunk.len;
     }
 
     if (total_bytes >= max_size) {
         ctx.bus.warn(ResponseTruncated{ .max_size = max_size });
     }
 
-    // Flush the response writer to ensure all data is sent to client
+    // Flush the writer to ensure all data is sent to client
     response_writer.flush() catch |err| {
         ctx.bus.err(ResponseFlushError{
             .err = @errorName(err),
@@ -724,6 +755,9 @@ fn proxyToUpstreamOnce(
         });
         return err;
     };
+
+    // Flush any remaining partial line from the line printer
+    line_printer_ctx.flush();
 
     return total_bytes;
 }
@@ -749,6 +783,7 @@ test "shouldSkipRequestHeader" {
     try std.testing.expect(shouldSkipRequestHeader("host"));
     try std.testing.expect(shouldSkipRequestHeader("connection"));
     try std.testing.expect(shouldSkipRequestHeader("content-length"));
+    try std.testing.expect(shouldSkipRequestHeader("accept-encoding"));
     try std.testing.expect(!shouldSkipRequestHeader("content-type"));
     try std.testing.expect(!shouldSkipRequestHeader("x-custom-header"));
 }
@@ -756,6 +791,7 @@ test "shouldSkipRequestHeader" {
 test "shouldSkipResponseHeader" {
     try std.testing.expect(shouldSkipResponseHeader("content-length"));
     try std.testing.expect(shouldSkipResponseHeader("transfer-encoding"));
+    try std.testing.expect(shouldSkipResponseHeader("content-encoding"));
     try std.testing.expect(!shouldSkipResponseHeader("content-type"));
     try std.testing.expect(!shouldSkipResponseHeader("x-custom-header"));
 }

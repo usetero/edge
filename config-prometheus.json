@@ -1,0 +1,9 @@
+{
+  "listen_address": "127.0.0.1",
+  "listen_port": 8081,
+  "upstream_url": "http://localhost:9090",
+  "workspace_id": "",
+  "log_level": "info",
+  "max_body_size": 1048576,
+  "policy_providers": []
+}

@@ -35,6 +35,9 @@ pub const datadog_distribution = @import("datadog_main.zig");
 /// OTLP distribution - focused edge proxy for OpenTelemetry log ingestion
 pub const otlp_distribution = @import("otlp_main.zig");
 
+/// Prometheus distribution - edge proxy for Prometheus remote write
+pub const prometheus_distribution = @import("prometheus_main.zig");
+
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
     // are implementing gzip, then only the compressed bytes should be sent to
@@ -69,6 +72,7 @@ test {
     _ = @import("proxy/compress.zig");
     _ = @import("proxy/router.zig");
     _ = @import("proxy/upstream_client.zig");
+    _ = @import("proxy/intercepting_writer.zig");
     // Note: proxy/server.zig requires httpz which is only available in exe build
     _ = @import("modules/passthrough_module.zig");
     _ = @import("modules/datadog_module.zig");
