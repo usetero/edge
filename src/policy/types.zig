@@ -5,6 +5,18 @@ const provider_http = @import("./provider_http.zig");
 pub const Header = provider_http.Header;
 
 // =============================================================================
+// TelemetryType - Distinguishes between log and metric telemetry
+// =============================================================================
+
+/// Type of telemetry being evaluated
+pub const TelemetryType = enum {
+    /// Log telemetry (OTLP logs, Datadog logs, etc.)
+    log,
+    /// Metric telemetry (Prometheus, OTLP metrics, etc.)
+    metric,
+};
+
+// =============================================================================
 // Service and Provider Configuration
 // =============================================================================
 
@@ -50,6 +62,8 @@ const LogRename = proto.policy.LogRename;
 const LogAdd = proto.policy.LogAdd;
 const LogMatcher = proto.policy.LogMatcher;
 const LogField = proto.policy.LogField;
+const MetricMatcher = proto.policy.MetricMatcher;
+const MetricField = proto.policy.MetricField;
 
 /// Reference to a field for accessor/mutator operations
 pub const FieldRef = union(enum) {
@@ -123,6 +137,50 @@ pub const FieldRef = union(enum) {
             .resource_attribute => |k| k,
             .scope_attribute => |k| k,
             .log_field => "",
+        };
+    }
+};
+
+// =============================================================================
+// Metric Field Reference Types
+// =============================================================================
+
+/// Reference to a metric field for accessor/mutator operations.
+/// Note: metric_type and aggregation_temporality are enum matches, not string/regex,
+/// so they are handled separately and not included here.
+pub const MetricFieldRef = union(enum) {
+    metric_field: MetricField,
+    datapoint_attribute: []const u8,
+    resource_attribute: []const u8,
+    scope_attribute: []const u8,
+
+    pub fn fromMatcherField(field: ?MetricMatcher.field_union) ?MetricFieldRef {
+        const f = field orelse return null;
+        return switch (f) {
+            .metric_field => |v| .{ .metric_field = v },
+            .datapoint_attribute => |v| .{ .datapoint_attribute = v },
+            .resource_attribute => |v| .{ .resource_attribute = v },
+            .scope_attribute => |v| .{ .scope_attribute = v },
+            // Enum fields don't use Hyperscan - handled separately
+            .metric_type, .aggregation_temporality => null,
+        };
+    }
+
+    /// Check if this field ref requires a key (attribute-based fields)
+    pub fn isKeyed(self: MetricFieldRef) bool {
+        return switch (self) {
+            .datapoint_attribute, .resource_attribute, .scope_attribute => true,
+            .metric_field => false,
+        };
+    }
+
+    /// Get the key for attribute-based fields, empty string for metric_field
+    pub fn getKey(self: MetricFieldRef) []const u8 {
+        return switch (self) {
+            .datapoint_attribute => |k| k,
+            .resource_attribute => |k| k,
+            .scope_attribute => |k| k,
+            .metric_field => "",
         };
     }
 };

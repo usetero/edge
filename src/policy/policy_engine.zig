@@ -28,7 +28,7 @@
 
 const std = @import("std");
 const proto = @import("proto");
-const matcher_index = @import("../hyperscan/matcher_index.zig");
+const matcher_index = @import("./matcher_index.zig");
 const policy_mod = @import("./root.zig");
 const policy_types = @import("./types.zig");
 const log_transform = @import("./log_transform.zig");
@@ -55,23 +55,12 @@ pub const PolicySnapshot = policy_mod.Snapshot;
 pub const FieldRef = policy_types.FieldRef;
 pub const FieldMutator = policy_types.FieldMutator;
 pub const MutateOp = policy_types.MutateOp;
+pub const TelemetryType = policy_types.TelemetryType;
 
 // Proto types
 const Policy = proto.policy.Policy;
 const LogTarget = proto.policy.LogTarget;
 const MetricTarget = proto.policy.MetricTarget;
-
-// =============================================================================
-// TelemetryType - Distinguishes between log and metric telemetry
-// =============================================================================
-
-/// Type of telemetry being evaluated
-pub const TelemetryType = enum {
-    /// Log telemetry (OTLP logs, Datadog logs, etc.)
-    log,
-    /// Metric telemetry (Prometheus, OTLP metrics, etc.)
-    metric,
-};
 
 /// Helper to extract the log target from a policy (handles target union)
 pub fn getLogTarget(policy: *const Policy) ?*const LogTarget {
@@ -333,7 +322,13 @@ pub const PolicyEngine = struct {
         var result_buf: [MAX_MATCHES_PER_SCAN]u32 = undefined;
 
         for (index.getMatcherKeys()) |matcher_key| {
-            const field_ref = matcher_key.field;
+            // Currently only log telemetry uses this path
+            // Skip metric keys when evaluating log telemetry
+            const field_ref = switch (matcher_key) {
+                .log => |k| k.field,
+                .metric => continue, // Skip metric keys for now - metric evaluation handled separately
+            };
+
             const value = field_accessor(ctx, field_ref) orelse {
                 self.bus.debug(MatcherKeyFieldNotPresent{ .field = field_ref });
                 continue;

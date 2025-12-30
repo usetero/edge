@@ -67,9 +67,22 @@ pub const Header = types.Header;
 
 // Field reference types (shared across policy engine and transforms)
 pub const FieldRef = types.FieldRef;
+pub const MetricFieldRef = types.MetricFieldRef;
 pub const FieldAccessor = types.FieldAccessor;
 pub const FieldMutator = types.FieldMutator;
 pub const MutateOp = types.MutateOp;
+pub const TelemetryType = types.TelemetryType;
+
+// =============================================================================
+// Matcher Index (Hyperscan-based pattern matching)
+// =============================================================================
+
+pub const matcher_index = @import("./matcher_index.zig");
+pub const MatcherIndex = matcher_index.MatcherIndex;
+pub const MatcherKey = matcher_index.MatcherKey;
+pub const LogMatcherKey = matcher_index.LogMatcherKey;
+pub const MetricMatcherKey = matcher_index.MetricMatcherKey;
+pub const MAX_POLICIES = matcher_index.MAX_POLICIES;
 
 // =============================================================================
 // Parsing
