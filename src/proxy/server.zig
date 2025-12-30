@@ -698,55 +698,48 @@ fn proxyToUpstreamOnce(
         res.header(header_name, header_value);
     }
 
-    // Stream response body with line-by-line interception
+    // Stream response body with interception
     const max_size = ctx.upstreams.getMaxResponseBody(module_id);
     var read_buffer: [8192]u8 = undefined;
     var upstream_body_reader = upstream_res.reader(&read_buffer);
-    const response_writer = res.writer();
 
-    // Set up line printer for intercepting response body
+    // Wrap with a limited reader to respect max_size
+    var limited_buffer: [8192]u8 = undefined;
+    var limited_reader = upstream_body_reader.limited(
+        std.Io.Limit.limited(max_size),
+        &limited_buffer,
+    );
+
+    // Set up line printer context for intercepting response body
     var line_printer_ctx = LinePrinterContext.init(req.arena);
     defer line_printer_ctx.deinit();
 
-    // Stream response body, intercepting each chunk
-    // We read into a local buffer, intercept it, then write to response
-    var total_bytes: usize = 0;
-    var chunk_buffer: [8192]u8 = undefined;
+    // Wrap the response writer with an intercepting writer
+    var intercept_buffer: [8192]u8 = undefined;
+    var intercepting = InterceptingWriter.init(
+        res.writer(),
+        &intercept_buffer,
+        linePrinterCallback,
+        @ptrCast(&line_printer_ctx),
+    );
+    const writer = intercepting.writer();
 
-    while (total_bytes < max_size) {
-        // Read a chunk from upstream
-        const chunk_size = @min(chunk_buffer.len, max_size - total_bytes);
-        const bytes_read = upstream_body_reader.readSliceShort(chunk_buffer[0..chunk_size]) catch |err| {
-            ctx.bus.err(UpstreamStreamError{
-                .err = @errorName(err),
-                .bytes_streamed = total_bytes,
-            });
-            return err;
-        };
-        if (bytes_read == 0) break; // End of stream
-        const chunk = chunk_buffer[0..bytes_read];
-
-        // Intercept the chunk (print line by line)
-        linePrinterCallback(chunk, @ptrCast(&line_printer_ctx));
-
-        // Write to response
-        response_writer.writeAll(chunk) catch |err| {
-            ctx.bus.err(UpstreamStreamError{
-                .err = @errorName(err),
-                .bytes_streamed = total_bytes,
-            });
-            return err;
-        };
-
-        total_bytes += chunk.len;
-    }
+    // Stream from limited reader to intercepting writer
+    // streamRemaining handles EndOfStream as success, not an error
+    const total_bytes = limited_reader.interface.streamRemaining(writer) catch |err| {
+        ctx.bus.err(UpstreamStreamError{
+            .err = @errorName(err),
+            .bytes_streamed = 0,
+        });
+        return err;
+    };
 
     if (total_bytes >= max_size) {
         ctx.bus.warn(ResponseTruncated{ .max_size = max_size });
     }
 
-    // Flush the writer to ensure all data is sent to client
-    response_writer.flush() catch |err| {
+    // Flush the intercepting writer (which flushes to the response writer)
+    writer.flush() catch |err| {
         ctx.bus.err(ResponseFlushError{
             .err = @errorName(err),
             .bytes_written = total_bytes,

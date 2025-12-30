@@ -2,8 +2,17 @@ const std = @import("std");
 
 /// Callback function type for intercepting response body chunks.
 /// Called with each chunk of data as it streams through the writer.
-/// The callback can inspect or log the data.
-pub const InterceptFn = *const fn (data: []const u8, context: ?*anyopaque) void;
+/// The callback can inspect, log, modify, or filter the data.
+///
+/// Return values:
+/// - `null`: Remove/filter this chunk (don't write it to the inner writer)
+/// - `data`: Pass through unchanged (return the input slice)
+/// - Other slice: Replace with different content (e.g., from context's buffer)
+///
+/// Note: If returning a modified slice, the caller is responsible for ensuring
+/// the returned slice remains valid until the write completes. Typically this
+/// means storing modified data in the context struct's buffer.
+pub const InterceptFn = *const fn (data: []const u8, context: ?*anyopaque) ?[]const u8;
 
 /// Context for line-by-line printing of intercepted data
 pub const LinePrinterContext = struct {
@@ -31,8 +40,9 @@ pub const LinePrinterContext = struct {
     }
 };
 
-/// Intercept callback that prints data line by line
-pub fn linePrinterCallback(data: []const u8, context: ?*anyopaque) void {
+/// Intercept callback that prints data line by line.
+/// Returns the data unchanged (pass-through) after printing.
+pub fn linePrinterCallback(data: []const u8, context: ?*anyopaque) ?[]const u8 {
     const ctx: *LinePrinterContext = @ptrCast(@alignCast(context.?));
 
     var start: usize = 0;
@@ -42,7 +52,7 @@ pub fn linePrinterCallback(data: []const u8, context: ?*anyopaque) void {
             const segment = data[start .. i + 1];
             if (ctx.line_buffer.items.len > 0) {
                 // Have buffered data - append segment and print
-                ctx.line_buffer.appendSlice(ctx.allocator, segment) catch return;
+                ctx.line_buffer.appendSlice(ctx.allocator, segment) catch return data;
                 // Print without the trailing newline for cleaner output
                 const line = ctx.line_buffer.items;
                 const trimmed = if (line.len > 0 and line[line.len - 1] == '\n')
@@ -65,8 +75,11 @@ pub fn linePrinterCallback(data: []const u8, context: ?*anyopaque) void {
 
     // Buffer any remaining data after the last newline
     if (start < data.len) {
-        ctx.line_buffer.appendSlice(ctx.allocator, data[start..]) catch return;
+        ctx.line_buffer.appendSlice(ctx.allocator, data[start..]) catch return data;
     }
+
+    // Pass through unchanged
+    return data;
 }
 
 /// A writer wrapper that intercepts data before passing it to the inner writer.
@@ -112,52 +125,51 @@ pub const InterceptingWriter = struct {
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *InterceptingWriter = @fieldParentPtr("interface", w);
 
-        // Intercept buffered data first (before forwarding)
+        // Intercept and forward buffered data first
         const buffered = w.buffer[0..w.end];
         if (buffered.len > 0) {
             if (self.intercept_fn) |intercept| {
-                intercept(buffered, self.intercept_context);
+                // Intercept can modify or filter the data
+                if (intercept(buffered, self.intercept_context)) |to_write| {
+                    try self.inner.writeAll(to_write);
+                }
+                // If intercept returns null, data is filtered out
+            } else {
+                // No intercept function - pass through unchanged
+                try self.inner.writeAll(buffered);
             }
         }
 
-        // Intercept the data slices
+        // Clear our buffer since we processed it
+        w.end = 0;
+
+        // Process the data slices
         const slice = data[0..data.len -| 1]; // all but last (pattern)
         const pattern: []const u8 = if (data.len > 0) data[data.len - 1] else "";
 
         for (slice) |s| {
             if (self.intercept_fn) |intercept| {
-                intercept(s, self.intercept_context);
+                if (intercept(s, self.intercept_context)) |to_write| {
+                    try self.inner.writeAll(to_write);
+                }
+            } else {
+                try self.inner.writeAll(s);
             }
         }
 
-        // Intercept the pattern repeated splat times
+        // Process the pattern repeated splat times
         for (0..splat) |_| {
             if (self.intercept_fn) |intercept| {
-                intercept(pattern, self.intercept_context);
+                if (intercept(pattern, self.intercept_context)) |to_write| {
+                    try self.inner.writeAll(to_write);
+                }
+            } else {
+                try self.inner.writeAll(pattern);
             }
-        }
-
-        // Now forward to inner writer by copying our buffer state and calling its drain
-        // We need to transfer our buffered data to the inner writer's buffer first
-        if (buffered.len > 0) {
-            // Write our buffered data to inner writer
-            try self.inner.writeAll(buffered);
-        }
-
-        // Clear our buffer since we forwarded it
-        w.end = 0;
-
-        // Forward the data slices to inner writer
-        for (slice) |s| {
-            try self.inner.writeAll(s);
-        }
-
-        // Forward the pattern repeated splat times
-        for (0..splat) |_| {
-            try self.inner.writeAll(pattern);
         }
 
         // Calculate and return bytes consumed from input data (NOT including our buffer)
+        // Note: We return the original input size regardless of filtering
         var written: usize = pattern.len * splat;
         for (slice) |s| {
             written += s.len;
@@ -168,14 +180,18 @@ pub const InterceptingWriter = struct {
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *InterceptingWriter = @fieldParentPtr("interface", w);
 
-        // Intercept any remaining buffered data
+        // Intercept and forward any remaining buffered data
         const buffered = w.buffer[0..w.end];
         if (buffered.len > 0) {
             if (self.intercept_fn) |intercept| {
-                intercept(buffered, self.intercept_context);
+                if (intercept(buffered, self.intercept_context)) |to_write| {
+                    try self.inner.writeAll(to_write);
+                }
+                // If intercept returns null, data is filtered out
+            } else {
+                // No intercept function - pass through unchanged
+                try self.inner.writeAll(buffered);
             }
-            // Forward buffered data to inner writer
-            try self.inner.writeAll(buffered);
             w.end = 0;
         }
 
@@ -226,12 +242,14 @@ const TestInterceptContext = struct {
     }
 };
 
-fn testInterceptCallback(data: []const u8, context: ?*anyopaque) void {
+fn testInterceptCallback(data: []const u8, context: ?*anyopaque) ?[]const u8 {
     const ctx: *TestInterceptContext = @ptrCast(@alignCast(context.?));
-    const copy = ctx.allocator.dupe(u8, data) catch return;
+    const copy = ctx.allocator.dupe(u8, data) catch return data;
     ctx.chunks.append(ctx.allocator, copy) catch {
         ctx.allocator.free(copy);
     };
+    // Pass through unchanged
+    return data;
 }
 
 test "InterceptingWriter: basic write without interception" {
@@ -445,4 +463,131 @@ test "InterceptingWriter: works with fixed buffer inner writer" {
 
     const result = fixed_writer.buffered();
     try testing.expectEqualStrings("Hello, Fixed!", result);
+}
+
+/// Test context for filtering (removing) data
+const FilterContext = struct {
+    /// Pattern to filter out
+    filter_pattern: []const u8,
+};
+
+fn filterCallback(data: []const u8, context: ?*anyopaque) ?[]const u8 {
+    const ctx: *FilterContext = @ptrCast(@alignCast(context.?));
+    // If the data contains the filter pattern, remove it entirely
+    if (std.mem.indexOf(u8, data, ctx.filter_pattern) != null) {
+        return null; // Filter out this chunk
+    }
+    return data; // Pass through unchanged
+}
+
+test "InterceptingWriter: filter removes matching data" {
+    var inner_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer inner_writer.deinit();
+
+    var ctx = FilterContext{ .filter_pattern = "SECRET" };
+
+    var intercept_buffer: [256]u8 = undefined;
+    var intercepting = InterceptingWriter.init(
+        &inner_writer.writer,
+        &intercept_buffer,
+        filterCallback,
+        @ptrCast(&ctx),
+    );
+
+    const w = intercepting.writer();
+    try w.writeAll("public data");
+    try w.flush();
+    try w.writeAll("SECRET_KEY=abc123");
+    try w.flush();
+    try w.writeAll("more public");
+    try w.flush();
+
+    const result = inner_writer.writer.buffered();
+    // The SECRET line should be filtered out
+    try testing.expectEqualStrings("public datamore public", result);
+}
+
+/// Test context for modifying data
+const ModifyContext = struct {
+    /// Buffer to hold modified data
+    modified_buffer: [256]u8 = undefined,
+    /// Length of modified data
+    modified_len: usize = 0,
+
+    fn setModified(self: *ModifyContext, data: []const u8) []const u8 {
+        @memcpy(self.modified_buffer[0..data.len], data);
+        self.modified_len = data.len;
+        return self.modified_buffer[0..self.modified_len];
+    }
+};
+
+fn modifyCallback(data: []const u8, context: ?*anyopaque) ?[]const u8 {
+    const ctx: *ModifyContext = @ptrCast(@alignCast(context.?));
+
+    // Replace "foo" with "bar" if found
+    if (std.mem.indexOf(u8, data, "foo")) |_| {
+        // Simple replacement for test - copy and modify
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < data.len) {
+            if (i + 3 <= data.len and std.mem.eql(u8, data[i .. i + 3], "foo")) {
+                ctx.modified_buffer[j] = 'b';
+                ctx.modified_buffer[j + 1] = 'a';
+                ctx.modified_buffer[j + 2] = 'r';
+                i += 3;
+                j += 3;
+            } else {
+                ctx.modified_buffer[j] = data[i];
+                i += 1;
+                j += 1;
+            }
+        }
+        ctx.modified_len = j;
+        return ctx.modified_buffer[0..ctx.modified_len];
+    }
+    return data; // Pass through unchanged
+}
+
+test "InterceptingWriter: modify changes data content" {
+    var inner_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer inner_writer.deinit();
+
+    var ctx = ModifyContext{};
+
+    var intercept_buffer: [256]u8 = undefined;
+    var intercepting = InterceptingWriter.init(
+        &inner_writer.writer,
+        &intercept_buffer,
+        modifyCallback,
+        @ptrCast(&ctx),
+    );
+
+    const w = intercepting.writer();
+    try w.writeAll("foo is great");
+    try w.flush();
+
+    const result = inner_writer.writer.buffered();
+    try testing.expectEqualStrings("bar is great", result);
+}
+
+test "InterceptingWriter: modify with multiple replacements" {
+    var inner_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer inner_writer.deinit();
+
+    var ctx = ModifyContext{};
+
+    var intercept_buffer: [256]u8 = undefined;
+    var intercepting = InterceptingWriter.init(
+        &inner_writer.writer,
+        &intercept_buffer,
+        modifyCallback,
+        @ptrCast(&ctx),
+    );
+
+    const w = intercepting.writer();
+    try w.writeAll("foo and foo");
+    try w.flush();
+
+    const result = inner_writer.writer.buffered();
+    try testing.expectEqualStrings("bar and bar", result);
 }
