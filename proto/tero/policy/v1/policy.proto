@@ -5,6 +5,7 @@ package tero.policy.v1;
 import "google/api/annotations.proto";
 import "opentelemetry/proto/common/v1/common.proto";
 import "tero/policy/v1/log.proto";
+import "tero/policy/v1/metric.proto";
 
 option go_package = "github.com/usetero/policy/gen/go/tero/policy/v1";
 
@@ -44,7 +45,7 @@ message Policy {
   // Target configuration. Exactly one must be set.
   oneof target {
     LogTarget log = 10;
-    // MetricTarget metric = 11; // Reserved for future use
+    MetricTarget metric = 11;
   }
 }
 

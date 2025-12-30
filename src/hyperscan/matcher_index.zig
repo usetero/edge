@@ -20,6 +20,7 @@ const std = @import("std");
 const proto = @import("proto");
 const hyperscan = @import("./hyperscan.zig");
 const policy_types = @import("../policy/types.zig");
+const policy_engine = @import("../policy/policy_engine.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -417,7 +418,7 @@ pub const MatcherIndex = struct {
         // First pass: collect patterns and build policy info
         var policy_index: PolicyIndex = 0;
         for (policies_slice) |*policy| {
-            const log_target = policy.log orelse {
+            const log_target = policy_engine.getLogTarget(policy) orelse {
                 bus.debug(SkippingPolicyNoFilter{ .id = policy.id });
                 continue;
             };
@@ -847,11 +848,11 @@ test "MatcherIndex: build with single policy" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
@@ -893,15 +894,15 @@ test "MatcherIndex: build with keyed matchers" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
         .match = .{ .regex = try allocator.dupe(u8, "payment") },
     });
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
         .match = .{ .regex = try allocator.dupe(u8, "prod") },
     });
@@ -928,11 +929,11 @@ test "MatcherIndex: multiple policies same matcher key" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "policy-1"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try policy1.log.?.match.append(allocator, .{
+    try policy1.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
@@ -942,11 +943,11 @@ test "MatcherIndex: multiple policies same matcher key" {
         .id = try allocator.dupe(u8, "policy-2"),
         .name = try allocator.dupe(u8, "policy-2"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "all"),
-        },
+        } },
     };
-    try policy2.log.?.match.append(allocator, .{
+    try policy2.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "warning") },
     });
@@ -973,11 +974,11 @@ test "MatcherIndex: negated matcher creates negated database" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "error") },
         .negate = true,
@@ -1011,17 +1012,17 @@ test "MatcherIndex: mixed positive and negated matchers" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
     // Positive matcher
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     // Negated matcher on same field
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "ignore") },
         .negate = true,
@@ -1056,15 +1057,15 @@ test "MatcherIndex: scan database" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "warning") },
     });
@@ -1098,17 +1099,17 @@ test "MatcherIndex: exists matcher excluded from regex matchers" {
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
     // Add a regex matcher
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     // Add an exists matcher (should be excluded from hyperscan index)
-    try policy.log.?.match.append(allocator, .{
+    try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
         .match = .{ .exists = true },
     });

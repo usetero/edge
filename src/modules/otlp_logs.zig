@@ -400,7 +400,7 @@ fn filterLogsInPlace(
                     .scope_logs = scope_logs,
                 };
 
-                const result = engine.evaluate(&ctx, otlpFieldAccessor, otlpFieldMutator, &policy_id_buf);
+                const result = engine.evaluate(.log, &ctx, otlpFieldAccessor, otlpFieldMutator, &policy_id_buf);
 
                 if (result.decision.shouldContinue()) {
                     // Keep this log - move to write position if needed
@@ -609,11 +609,11 @@ test "processLogs - DROP policy filters logs by severity" {
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
         .match = .{ .regex = try allocator.dupe(u8, "DEBUG") },
     });
@@ -649,11 +649,11 @@ test "processLogs - DROP policy filters logs by body content" {
         .id = try allocator.dupe(u8, "drop-secret"),
         .name = try allocator.dupe(u8, "drop-secret"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "secret") },
     });
@@ -687,11 +687,11 @@ test "processLogs - DROP policy filters logs by resource attribute" {
         .id = try allocator.dupe(u8, "drop-test-service"),
         .name = try allocator.dupe(u8, "drop-test-service"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .resource_attribute = try allocator.dupe(u8, "service.name") },
         .match = .{ .regex = try allocator.dupe(u8, "test-service") },
     });
@@ -726,11 +726,11 @@ test "processLogs - all logs dropped returns empty structure" {
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "msg") },
     });
@@ -819,11 +819,11 @@ test "processLogs - protobuf DROP policy filters logs" {
         .id = try allocator.dupe(u8, "drop-secret"),
         .name = try allocator.dupe(u8, "drop-secret"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "secret") },
     });
@@ -871,11 +871,11 @@ test "processLogs - protobuf all logs dropped" {
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "msg") },
     });
@@ -921,13 +921,13 @@ test "processLogs - JSON transform removes severity_text field" {
         .id = try allocator.dupe(u8, "remove-severity-policy"),
         .name = try allocator.dupe(u8, "remove-severity"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "all"),
             .transform = transform,
-        },
+        } },
     };
     // Match on body containing "test"
-    try test_policy.log.?.match.append(allocator, .{
+    try test_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "test") },
     });
@@ -973,13 +973,13 @@ test "processLogs - JSON transform removes log attribute" {
         .id = try allocator.dupe(u8, "remove-attr-policy"),
         .name = try allocator.dupe(u8, "remove-attr"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "all"),
             .transform = transform,
-        },
+        } },
     };
     // Match on body containing "test"
-    try test_policy.log.?.match.append(allocator, .{
+    try test_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "test") },
     });

@@ -28,19 +28,22 @@ const PolicyErrorNotFound = struct {
 
 const PolicyRegistryUnchanged = struct {};
 
-/// Policy config types - derived from the Policy.log field
+/// Policy config types - derived from the Policy.target field
 pub const PolicyConfigType = enum {
-    /// Policy has a LogTarget (log field set)
+    /// Policy has a LogTarget (target.log)
     log_target,
+    /// Policy has a MetricTarget (target.metric)
+    metric_target,
     /// Policy has no config set
     none,
 
     /// Get the config type from a policy
     pub fn fromPolicy(policy: *const Policy) PolicyConfigType {
-        if (policy.log != null) {
-            return .log_target;
-        }
-        return .none;
+        const target = policy.target orelse return .none;
+        return switch (target) {
+            .log => .log_target,
+            .metric => .metric_target,
+        };
     }
 };
 
@@ -49,11 +52,14 @@ pub const PolicySnapshot = struct {
     /// All policies in this snapshot
     policies: []const Policy,
 
-    /// Indices into policies array for each config type
+    /// Indices into policies array for log target policies
     /// Allows efficient lookup of policies by their config type
     log_target_indices: []const u32,
 
-    /// Compiled Hyperscan-based matcher index for efficient evaluation
+    /// Indices into policies array for metric target policies
+    metric_target_indices: []const u32,
+
+    /// Compiled Hyperscan-based matcher index for efficient log evaluation
     /// Indexed by (MatchCase, key) for O(k*n) evaluation
     matcher_index: MatcherIndex,
 
@@ -64,6 +70,7 @@ pub const PolicySnapshot = struct {
         self.matcher_index.deinit();
         self.allocator.free(self.policies);
         self.allocator.free(self.log_target_indices);
+        self.allocator.free(self.metric_target_indices);
     }
 
     /// Get a policy by index
@@ -88,8 +95,21 @@ pub const PolicySnapshot = struct {
         return self.log_target_indices;
     }
 
+    /// Get metric target policy indices for iteration
+    pub fn getMetricTargetIndices(self: *const PolicySnapshot) []const u32 {
+        return self.metric_target_indices;
+    }
+
     /// Iterator for log target policies
     pub fn iterateLogTargetPolicies(self: *const PolicySnapshot) LogTargetPolicyIterator {
+        return .{
+            .snapshot = self,
+            .index = 0,
+        };
+    }
+
+    /// Iterator for metric target policies
+    pub fn iterateMetricTargetPolicies(self: *const PolicySnapshot) MetricTargetPolicyIterator {
         return .{
             .snapshot = self,
             .index = 0,
@@ -105,6 +125,20 @@ pub const PolicySnapshot = struct {
                 return null;
             }
             const policy_idx = self.snapshot.log_target_indices[self.index];
+            self.index += 1;
+            return &self.snapshot.policies[policy_idx];
+        }
+    };
+
+    pub const MetricTargetPolicyIterator = struct {
+        snapshot: *const PolicySnapshot,
+        index: usize,
+
+        pub fn next(self: *MetricTargetPolicyIterator) ?*const Policy {
+            if (self.index >= self.snapshot.metric_target_indices.len) {
+                return null;
+            }
+            const policy_idx = self.snapshot.metric_target_indices[self.index];
             self.index += 1;
             return &self.snapshot.policies[policy_idx];
         }
@@ -390,10 +424,12 @@ pub const PolicyRegistry = struct {
         // Build indices by config type
         // First pass: count policies of each type
         var log_target_count: usize = 0;
+        var metric_target_count: usize = 0;
         for (policies_slice) |*policy| {
             const config_type = PolicyConfigType.fromPolicy(policy);
             switch (config_type) {
                 .log_target => log_target_count += 1,
+                .metric_target => metric_target_count += 1,
                 .none => {},
             }
         }
@@ -402,14 +438,22 @@ pub const PolicyRegistry = struct {
         const log_target_indices = try self.allocator.alloc(u32, log_target_count);
         errdefer self.allocator.free(log_target_indices);
 
+        const metric_target_indices = try self.allocator.alloc(u32, metric_target_count);
+        errdefer self.allocator.free(metric_target_indices);
+
         // Second pass: populate indices
         var log_target_idx: usize = 0;
+        var metric_target_idx: usize = 0;
         for (policies_slice, 0..) |*policy, i| {
             const config_type = PolicyConfigType.fromPolicy(policy);
             switch (config_type) {
                 .log_target => {
                     log_target_indices[log_target_idx] = @intCast(i);
                     log_target_idx += 1;
+                },
+                .metric_target => {
+                    metric_target_indices[metric_target_idx] = @intCast(i);
+                    metric_target_idx += 1;
                 },
                 .none => {},
             }
@@ -428,6 +472,7 @@ pub const PolicyRegistry = struct {
         snapshot.* = .{
             .policies = policies_slice,
             .log_target_indices = log_target_indices,
+            .metric_target_indices = metric_target_indices,
             .matcher_index = idx,
             .version = new_version,
             .allocator = self.allocator,
@@ -1231,10 +1276,10 @@ fn createTestPolicyWithFilter(
         .id = try allocator.dupe(u8, name), // Use name as id for tests
         .name = try allocator.dupe(u8, name),
         .enabled = true,
-        .log = LogTarget{
+        .target = .{ .log = LogTarget{
             .match = .empty,
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
     _ = &policy;
 
@@ -1290,7 +1335,7 @@ test "PolicySnapshot: log_target_indices contains only log policies" {
     // The indexed policy should be the one with log target
     const indexed_policy = snapshot.?.policies[snapshot.?.log_target_indices[0]];
     try testing.expectEqualStrings("with-filter", indexed_policy.name);
-    try testing.expect(indexed_policy.log != null);
+    try testing.expect(indexed_policy.target != null);
 }
 
 test "PolicySnapshot: multiple log policies are indexed" {
@@ -1371,7 +1416,7 @@ test "PolicySnapshot: iterateLogTargetPolicies returns all log policies" {
 
     while (iter.next()) |policy| {
         count += 1;
-        try testing.expect(policy.log != null);
+        try testing.expect(policy.target != null);
 
         if (std.mem.eql(u8, policy.name, "filter-1")) {
             found_filter1 = true;
@@ -1688,4 +1733,156 @@ test "PolicyRegistry: policy update by id replaces correctly" {
     snapshot = registry.getSnapshot();
     try testing.expectEqualStrings("version 2", snapshot.?.policies[0].description);
     try testing.expectEqualStrings("my-policy-renamed", snapshot.?.policies[0].name);
+}
+
+// -----------------------------------------------------------------------------
+// Metric Policy Tests
+// -----------------------------------------------------------------------------
+
+const MetricTarget = proto.policy.MetricTarget;
+
+test "PolicyConfigType: fromPolicy returns metric_target when metric is set" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy"),
+        .name = try allocator.dupe(u8, "metric-policy"),
+        .enabled = true,
+        .target = .{ .metric = MetricTarget{
+            .match = .empty,
+            .keep = true,
+        } },
+    };
+    defer policy.deinit(allocator);
+
+    const config_type = PolicyConfigType.fromPolicy(&policy);
+    try testing.expectEqual(PolicyConfigType.metric_target, config_type);
+}
+
+test "PolicySnapshot: metric_target_indices contains only metric policies" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a log policy
+    var log_policy = Policy{
+        .id = try allocator.dupe(u8, "log-policy"),
+        .name = try allocator.dupe(u8, "log-policy"),
+        .enabled = true,
+        .target = .{ .log = LogTarget{
+            .match = .empty,
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    defer log_policy.deinit(allocator);
+
+    // Create a metric policy
+    var metric_policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy"),
+        .name = try allocator.dupe(u8, "metric-policy"),
+        .enabled = true,
+        .target = .{ .metric = MetricTarget{
+            .match = .empty,
+            .keep = true,
+        } },
+    };
+    defer metric_policy.deinit(allocator);
+
+    // Create a policy with no target
+    var no_target_policy = try createTestPolicy(allocator, "no-target");
+    defer freeTestPolicy(allocator, &no_target_policy);
+
+    // Add all policies
+    try registry.updatePolicies(&.{ log_policy, metric_policy, no_target_policy }, "file-provider", .file);
+
+    const snapshot = registry.getSnapshot();
+    try testing.expect(snapshot != null);
+
+    // Should have 3 policies total
+    try testing.expectEqual(@as(usize, 3), snapshot.?.policies.len);
+
+    // Should have 1 log policy indexed
+    try testing.expectEqual(@as(usize, 1), snapshot.?.log_target_indices.len);
+
+    // Should have 1 metric policy indexed
+    try testing.expectEqual(@as(usize, 1), snapshot.?.metric_target_indices.len);
+
+    // Verify the log policy is correct
+    const log_policy_idx = snapshot.?.log_target_indices[0];
+    try testing.expectEqualStrings("log-policy", snapshot.?.policies[log_policy_idx].name);
+
+    // Verify the metric policy is correct
+    const metric_policy_idx = snapshot.?.metric_target_indices[0];
+    try testing.expectEqualStrings("metric-policy", snapshot.?.policies[metric_policy_idx].name);
+}
+
+test "PolicySnapshot: iterateMetricTargetPolicies iterates only metric policies" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create two metric policies
+    var metric_policy1 = Policy{
+        .id = try allocator.dupe(u8, "metric-1"),
+        .name = try allocator.dupe(u8, "metric-1"),
+        .enabled = true,
+        .target = .{ .metric = MetricTarget{
+            .match = .empty,
+            .keep = true,
+        } },
+    };
+    defer metric_policy1.deinit(allocator);
+
+    var metric_policy2 = Policy{
+        .id = try allocator.dupe(u8, "metric-2"),
+        .name = try allocator.dupe(u8, "metric-2"),
+        .enabled = true,
+        .target = .{ .metric = MetricTarget{
+            .match = .empty,
+            .keep = false,
+        } },
+    };
+    defer metric_policy2.deinit(allocator);
+
+    // Create a log policy (should not be in metric iteration)
+    var log_policy = Policy{
+        .id = try allocator.dupe(u8, "log-policy"),
+        .name = try allocator.dupe(u8, "log-policy"),
+        .enabled = true,
+        .target = .{ .log = LogTarget{
+            .match = .empty,
+            .keep = try allocator.dupe(u8, "all"),
+        } },
+    };
+    defer log_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{ metric_policy1, log_policy, metric_policy2 }, "file-provider", .file);
+
+    const snapshot = registry.getSnapshot();
+    try testing.expect(snapshot != null);
+
+    // Iterate metric policies
+    var iter = snapshot.?.iterateMetricTargetPolicies();
+    var count: usize = 0;
+    var found_metric1 = false;
+    var found_metric2 = false;
+
+    while (iter.next()) |policy| {
+        count += 1;
+        try testing.expect(policy.target != null);
+
+        if (std.mem.eql(u8, policy.name, "metric-1")) {
+            found_metric1 = true;
+        } else if (std.mem.eql(u8, policy.name, "metric-2")) {
+            found_metric2 = true;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(found_metric1);
+    try testing.expect(found_metric2);
 }

@@ -240,11 +240,11 @@ test "DatadogModule filters logs with DROP policy" {
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
         .match = .{ .regex = try allocator.dupe(u8, "DEBUG") },
     });
@@ -307,11 +307,11 @@ test "DatadogModule returns 202 when all logs dropped" {
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_all.log.?.match.append(allocator, .{
+    try drop_all.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
         .match = .{ .regex = try allocator.dupe(u8, "INFO") },
     });

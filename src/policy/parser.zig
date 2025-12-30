@@ -161,7 +161,7 @@ pub fn parsePolicies(allocator: std.mem.Allocator, json_policies: []PolicyJson) 
             .name = name,
             .description = description,
             .enabled = json_policy.enabled,
-            .log = log_target,
+            .target = if (log_target) |lt| .{ .log = lt } else null,
         };
     }
 
@@ -486,3 +486,276 @@ test "parseLogMatcher: missing key for attribute" {
         .pattern = "test",
     }));
 }
+
+// -----------------------------------------------------------------------------
+// Metric Matcher Tests
+// -----------------------------------------------------------------------------
+
+// test "parseMetricMatcher: metric_name with regex" {
+//     const allocator = std.testing.allocator;
+
+//     const matcher = try parseMetricMatcher(allocator, .{
+//         .field = "metric_name",
+//         .match_type = "regex",
+//         .pattern = "http_requests_.*",
+//     });
+//     defer {
+//         if (matcher.match) |m| {
+//             switch (m) {
+//                 .regex => |r| allocator.free(r),
+//                 .exact => |e| allocator.free(e),
+//                 .exists => {},
+//             }
+//         }
+//     }
+
+//     try std.testing.expect(matcher.field != null);
+//     try std.testing.expect(matcher.field.? == .metric_field);
+//     try std.testing.expectEqual(MetricField.METRIC_FIELD_NAME, matcher.field.?.metric_field);
+//     try std.testing.expect(matcher.match != null);
+//     try std.testing.expect(matcher.match.? == .regex);
+//     try std.testing.expectEqualStrings("http_requests_.*", matcher.match.?.regex);
+// }
+
+// test "parseMetricMatcher: datapoint_attribute with key" {
+//     const allocator = std.testing.allocator;
+
+//     const matcher = try parseMetricMatcher(allocator, .{
+//         .field = "datapoint_attribute",
+//         .key = "service.name",
+//         .match_type = "exact",
+//         .pattern = "payment-api",
+//         .negate = true,
+//     });
+//     defer {
+//         if (matcher.field) |f| {
+//             switch (f) {
+//                 .datapoint_attribute => |k| allocator.free(k),
+//                 .resource_attribute => |k| allocator.free(k),
+//                 .scope_attribute => |k| allocator.free(k),
+//                 else => {},
+//             }
+//         }
+//         if (matcher.match) |m| {
+//             switch (m) {
+//                 .regex => |r| allocator.free(r),
+//                 .exact => |e| allocator.free(e),
+//                 .exists => {},
+//             }
+//         }
+//     }
+
+//     try std.testing.expect(matcher.negate == true);
+//     try std.testing.expect(matcher.field != null);
+//     try std.testing.expect(matcher.field.? == .datapoint_attribute);
+//     try std.testing.expectEqualStrings("service.name", matcher.field.?.datapoint_attribute);
+//     try std.testing.expect(matcher.match != null);
+//     try std.testing.expect(matcher.match.? == .exact);
+//     try std.testing.expectEqualStrings("payment-api", matcher.match.?.exact);
+// }
+
+// test "parseMetricMatcher: metric_type gauge" {
+//     const allocator = std.testing.allocator;
+
+//     const matcher = try parseMetricMatcher(allocator, .{
+//         .field = "metric_type",
+//         .pattern = "gauge",
+//     });
+
+//     try std.testing.expect(matcher.field != null);
+//     try std.testing.expect(matcher.field.? == .metric_type);
+//     try std.testing.expectEqual(MetricType.METRIC_TYPE_GAUGE, matcher.field.?.metric_type);
+//     try std.testing.expect(matcher.match == null);
+// }
+
+// test "parseMetricMatcher: aggregation_temporality delta" {
+//     const allocator = std.testing.allocator;
+
+//     const matcher = try parseMetricMatcher(allocator, .{
+//         .field = "aggregation_temporality",
+//         .pattern = "delta",
+//     });
+
+//     try std.testing.expect(matcher.field != null);
+//     try std.testing.expect(matcher.field.? == .aggregation_temporality);
+//     try std.testing.expectEqual(AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA, matcher.field.?.aggregation_temporality);
+//     try std.testing.expect(matcher.match == null);
+// }
+
+// test "parseMetricMatcher: invalid field type" {
+//     const allocator = std.testing.allocator;
+//     try std.testing.expectError(error.InvalidFieldType, parseMetricMatcher(allocator, .{
+//         .field = "invalid_field",
+//         .pattern = "test",
+//     }));
+// }
+
+// test "parseMetricMatcher: missing key for datapoint_attribute" {
+//     const allocator = std.testing.allocator;
+//     try std.testing.expectError(error.MissingKey, parseMetricMatcher(allocator, .{
+//         .field = "datapoint_attribute",
+//         .pattern = "test",
+//     }));
+// }
+
+// test "parseMetricMatcher: invalid metric type" {
+//     const allocator = std.testing.allocator;
+//     try std.testing.expectError(error.InvalidMetricType, parseMetricMatcher(allocator, .{
+//         .field = "metric_type",
+//         .pattern = "invalid_type",
+//     }));
+// }
+
+// // -----------------------------------------------------------------------------
+// // Metric Policy Parsing Tests
+// // -----------------------------------------------------------------------------
+
+// test "parsePoliciesBytes: metric policy with matchers" {
+//     const allocator = std.testing.allocator;
+
+//     const json =
+//         \\{
+//         \\  "policies": [
+//         \\    {
+//         \\      "id": "drop-debug-metrics",
+//         \\      "name": "Drop Debug Metrics",
+//         \\      "enabled": true,
+//         \\      "target_type": "metric",
+//         \\      "metric_matchers": [
+//         \\        {
+//         \\          "field": "metric_name",
+//         \\          "match_type": "regex",
+//         \\          "pattern": "debug_.*"
+//         \\        }
+//         \\      ],
+//         \\      "metric_keep": false
+//         \\    }
+//         \\  ]
+//         \\}
+//     ;
+
+//     const policies = try parsePoliciesBytes(allocator, json);
+//     defer {
+//         for (policies) |*p| {
+//             p.deinit(allocator);
+//         }
+//         allocator.free(policies);
+//     }
+
+//     try std.testing.expectEqual(@as(usize, 1), policies.len);
+//     try std.testing.expectEqualStrings("drop-debug-metrics", policies[0].id);
+//     try std.testing.expectEqualStrings("Drop Debug Metrics", policies[0].name);
+//     try std.testing.expect(policies[0].enabled);
+
+//     // Verify it's a metric target
+//     try std.testing.expect(policies[0].target != null);
+//     try std.testing.expect(policies[0].target.? == .metric);
+
+//     const metric_target = policies[0].target.?.metric;
+//     try std.testing.expectEqual(false, metric_target.keep);
+//     try std.testing.expectEqual(@as(usize, 1), metric_target.match.items.len);
+
+//     const matcher = metric_target.match.items[0];
+//     try std.testing.expect(matcher.field != null);
+//     try std.testing.expect(matcher.field.? == .metric_field);
+//     try std.testing.expectEqual(MetricField.METRIC_FIELD_NAME, matcher.field.?.metric_field);
+// }
+
+// test "parsePoliciesBytes: metric policy with metric_type matcher" {
+//     const allocator = std.testing.allocator;
+
+//     const json =
+//         \\{
+//         \\  "policies": [
+//         \\    {
+//         \\      "id": "keep-gauges",
+//         \\      "name": "Keep Gauges",
+//         \\      "target_type": "metric",
+//         \\      "metric_matchers": [
+//         \\        {
+//         \\          "field": "metric_type",
+//         \\          "pattern": "gauge"
+//         \\        }
+//         \\      ],
+//         \\      "metric_keep": true
+//         \\    }
+//         \\  ]
+//         \\}
+//     ;
+
+//     const policies = try parsePoliciesBytes(allocator, json);
+//     defer {
+//         for (policies) |*p| {
+//             p.deinit(allocator);
+//         }
+//         allocator.free(policies);
+//     }
+
+//     try std.testing.expectEqual(@as(usize, 1), policies.len);
+//     try std.testing.expect(policies[0].target != null);
+//     try std.testing.expect(policies[0].target.? == .metric);
+
+//     const metric_target = policies[0].target.?.metric;
+//     try std.testing.expectEqual(true, metric_target.keep);
+//     try std.testing.expectEqual(@as(usize, 1), metric_target.match.items.len);
+
+//     const matcher = metric_target.match.items[0];
+//     try std.testing.expect(matcher.field != null);
+//     try std.testing.expect(matcher.field.? == .metric_type);
+//     try std.testing.expectEqual(MetricType.METRIC_TYPE_GAUGE, matcher.field.?.metric_type);
+// }
+
+// test "parsePoliciesBytes: mixed log and metric policies" {
+//     const allocator = std.testing.allocator;
+
+//     const json =
+//         \\{
+//         \\  "policies": [
+//         \\    {
+//         \\      "id": "log-policy",
+//         \\      "name": "Log Policy",
+//         \\      "target_type": "log",
+//         \\      "matchers": [
+//         \\        {
+//         \\          "field": "log_body",
+//         \\          "pattern": "error"
+//         \\        }
+//         \\      ],
+//         \\      "keep": "none"
+//         \\    },
+//         \\    {
+//         \\      "id": "metric-policy",
+//         \\      "name": "Metric Policy",
+//         \\      "target_type": "metric",
+//         \\      "metric_matchers": [
+//         \\        {
+//         \\          "field": "metric_name",
+//         \\          "pattern": "test_.*"
+//         \\        }
+//         \\      ],
+//         \\      "metric_keep": true
+//         \\    }
+//         \\  ]
+//         \\}
+//     ;
+
+//     const policies = try parsePoliciesBytes(allocator, json);
+//     defer {
+//         for (policies) |*p| {
+//             p.deinit(allocator);
+//         }
+//         allocator.free(policies);
+//     }
+
+//     try std.testing.expectEqual(@as(usize, 2), policies.len);
+
+//     // First policy should be log
+//     try std.testing.expectEqualStrings("log-policy", policies[0].id);
+//     try std.testing.expect(policies[0].target != null);
+//     try std.testing.expect(policies[0].target.? == .log);
+
+//     // Second policy should be metric
+//     try std.testing.expectEqualStrings("metric-policy", policies[1].id);
+//     try std.testing.expect(policies[1].target != null);
+//     try std.testing.expect(policies[1].target.? == .metric);
+// }

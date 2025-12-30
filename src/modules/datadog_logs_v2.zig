@@ -270,7 +270,7 @@ const FilterLogResult = struct {
 /// Returns whether to keep the log and whether it was mutated.
 fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, policy_id_buf: [][]const u8) FilterLogResult {
     var field_ctx = FieldAccessorContext{ .log = log };
-    const result = engine.evaluate(@ptrCast(&field_ctx), datadogFieldAccessor, datadogFieldMutator, policy_id_buf);
+    const result = engine.evaluate(.log, @ptrCast(&field_ctx), datadogFieldAccessor, datadogFieldMutator, policy_id_buf);
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.matched_policy_ids.len > 0,
@@ -444,11 +444,11 @@ test "processLogs - DROP policy filters logs from array" {
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
         .match = .{ .regex = try allocator.dupe(u8, "debug") },
     });
@@ -483,11 +483,11 @@ test "processLogs - DROP policy drops single object" {
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
         .match = .{ .regex = try allocator.dupe(u8, "debug") },
     });
@@ -575,11 +575,11 @@ test "processLogs - filter on arbitrary custom field" {
         .id = try allocator.dupe(u8, "drop-dev-env"),
         .name = try allocator.dupe(u8, "drop-dev-env"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "none"),
-        },
+        } },
     };
-    try drop_policy.log.?.match.append(allocator, .{
+    try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = try allocator.dupe(u8, "environment") },
         .match = .{ .regex = try allocator.dupe(u8, "development") },
     });
@@ -649,13 +649,13 @@ test "processLogs - mutation triggers reserialization and removes field" {
         .id = try allocator.dupe(u8, "remove-service-policy"),
         .name = try allocator.dupe(u8, "remove-service"),
         .enabled = true,
-        .log = .{
+        .target = .{ .log = .{
             .keep = try allocator.dupe(u8, "all"),
             .transform = transform,
-        },
+        } },
     };
     // Match on message containing "test"
-    try test_policy.log.?.match.append(allocator, .{
+    try test_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "test") },
     });

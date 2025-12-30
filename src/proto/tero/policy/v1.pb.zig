@@ -670,6 +670,239 @@ pub const LogAdd = struct {
     }
 };
 
+/// MetricField identifies simple metric fields (non-keyed).
+pub const MetricField = enum(i32) {
+    METRIC_FIELD_UNSPECIFIED = 0,
+    METRIC_FIELD_NAME = 1,
+    METRIC_FIELD_DESCRIPTION = 2,
+    METRIC_FIELD_UNIT = 3,
+    METRIC_FIELD_RESOURCE_SCHEMA_URL = 10,
+    METRIC_FIELD_SCOPE_SCHEMA_URL = 11,
+    METRIC_FIELD_SCOPE_NAME = 12,
+    METRIC_FIELD_SCOPE_VERSION = 13,
+    _,
+};
+
+/// MetricType identifies the type of metric for matching.
+pub const MetricType = enum(i32) {
+    METRIC_TYPE_UNSPECIFIED = 0,
+    METRIC_TYPE_GAUGE = 1,
+    METRIC_TYPE_SUM = 2,
+    METRIC_TYPE_HISTOGRAM = 3,
+    METRIC_TYPE_EXPONENTIAL_HISTOGRAM = 4,
+    METRIC_TYPE_SUMMARY = 5,
+    _,
+};
+
+/// AggregationTemporality defines how a metric aggregator reports aggregated values.
+/// Mirrors opentelemetry.proto.metrics.v1.AggregationTemporality.
+pub const AggregationTemporality = enum(i32) {
+    AGGREGATION_TEMPORALITY_UNSPECIFIED = 0,
+    AGGREGATION_TEMPORALITY_DELTA = 1,
+    AGGREGATION_TEMPORALITY_CUMULATIVE = 2,
+    _,
+};
+
+/// MetricTarget defines matching and actions for metrics.
+pub const MetricTarget = struct {
+    match: std.ArrayListUnmanaged(MetricMatcher) = .empty,
+    keep: bool = false,
+
+    pub const _desc_table = .{
+        .match = fd(1, .{ .repeated = .submessage }),
+        .keep = fd(2, .{ .scalar = .bool }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
+/// MetricMatcher provides a way to match against metric telemetry data using known fields.
+///
+/// IMPORTANT CONSTRAINTS:
+/// - Multiple matchers are ANDed together: all matchers must match for the
+/// overall match to succeed.
+/// - The list of matchers should uniquely identify a specific pattern of telemetry
+/// for that policy. Matchers should NOT be used as a catch-all; they should be
+/// specific enough to target the intended telemetry precisely.
+///
+/// All regex fields use RE2 syntax for consistency across implementations.
+pub const MetricMatcher = struct {
+    negate: bool = false,
+    field: ?field_union = null,
+    match: ?match_union = null,
+
+    pub const _field_case = enum {
+        metric_field,
+        datapoint_attribute,
+        resource_attribute,
+        scope_attribute,
+        metric_type,
+        aggregation_temporality,
+    };
+    pub const field_union = union(_field_case) {
+        metric_field: MetricField,
+        datapoint_attribute: []const u8,
+        resource_attribute: []const u8,
+        scope_attribute: []const u8,
+        metric_type: MetricType,
+        aggregation_temporality: AggregationTemporality,
+        pub const _desc_table = .{
+            .metric_field = fd(1, .@"enum"),
+            .datapoint_attribute = fd(2, .{ .scalar = .string }),
+            .resource_attribute = fd(3, .{ .scalar = .string }),
+            .scope_attribute = fd(4, .{ .scalar = .string }),
+            .metric_type = fd(5, .@"enum"),
+            .aggregation_temporality = fd(6, .@"enum"),
+        };
+    };
+
+    pub const _match_case = enum {
+        exact,
+        regex,
+        exists,
+    };
+    pub const match_union = union(_match_case) {
+        exact: []const u8,
+        regex: []const u8,
+        exists: bool,
+        pub const _desc_table = .{
+            .exact = fd(10, .{ .scalar = .string }),
+            .regex = fd(11, .{ .scalar = .string }),
+            .exists = fd(12, .{ .scalar = .bool }),
+        };
+    };
+
+    pub const _desc_table = .{
+        .negate = fd(20, .{ .scalar = .bool }),
+        .field = fd(null, .{ .oneof = field_union }),
+        .match = fd(null, .{ .oneof = match_union }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
 /// PolicyStage identifies the execution stage for a policy.
 pub const PolicyStage = enum(i32) {
     POLICY_STAGE_UNSPECIFIED = 0,
@@ -699,7 +932,20 @@ pub const Policy = struct {
     created_at_unix_nano: u64 = 0,
     modified_at_unix_nano: u64 = 0,
     labels: std.ArrayListUnmanaged(opentelemetry_proto_common_v1.KeyValue) = .empty,
-    log: ?LogTarget = null,
+    target: ?target_union = null,
+
+    pub const _target_case = enum {
+        log,
+        metric,
+    };
+    pub const target_union = union(_target_case) {
+        log: LogTarget,
+        metric: MetricTarget,
+        pub const _desc_table = .{
+            .log = fd(10, .submessage),
+            .metric = fd(11, .submessage),
+        };
+    };
 
     pub const _desc_table = .{
         .id = fd(1, .{ .scalar = .string }),
@@ -709,7 +955,7 @@ pub const Policy = struct {
         .created_at_unix_nano = fd(5, .{ .scalar = .fixed64 }),
         .modified_at_unix_nano = fd(6, .{ .scalar = .fixed64 }),
         .labels = fd(7, .{ .repeated = .submessage }),
-        .log = fd(10, .submessage),
+        .target = fd(null, .{ .oneof = target_union }),
     };
 
     /// Encodes the message to the writer
