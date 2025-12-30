@@ -117,6 +117,14 @@ pub const RoutePattern = struct {
     }
 };
 
+/// Response intercept function type.
+/// Called with each chunk of response data as it streams through.
+/// Return values:
+/// - `null`: Remove/filter this chunk (don't write to client)
+/// - `data`: Pass through unchanged (return the input slice)
+/// - Other slice: Replace with modified content
+pub const ResponseInterceptFn = *const fn (data: []const u8, context: ?*anyopaque) ?[]const u8;
+
 /// Upstream configuration with pre-allocated resources
 pub const UpstreamConfig = struct {
     /// Pre-parsed upstream URL components
@@ -143,6 +151,18 @@ pub const ModuleConfig = struct {
 
     /// Module-specific configuration (opaque, read-only)
     module_data: ?*const anyopaque,
+
+    /// Optional response intercept function for transforming/filtering response body
+    /// If null, response is streamed through unchanged
+    response_intercept_fn: ?ResponseInterceptFn = null,
+
+    /// Factory function to create intercept context for each request
+    /// Called once per request, context is passed to response_intercept_fn
+    /// Returns opaque pointer to context (managed by caller)
+    create_intercept_context_fn: ?*const fn (allocator: std.mem.Allocator) ?*anyopaque = null,
+
+    /// Cleanup function for intercept context
+    destroy_intercept_context_fn: ?*const fn (context: ?*anyopaque) void = null,
 };
 
 /// Module request context - passed to handlers
@@ -299,6 +319,15 @@ pub const ModuleRegistration = struct {
 
     /// Module-specific configuration data (opaque)
     module_data: ?*const anyopaque = null,
+
+    /// Optional response intercept function for transforming/filtering response body
+    response_intercept_fn: ?ResponseInterceptFn = null,
+
+    /// Factory function to create intercept context for each request
+    create_intercept_context_fn: ?*const fn (allocator: std.mem.Allocator) ?*anyopaque = null,
+
+    /// Cleanup function for intercept context
+    destroy_intercept_context_fn: ?*const fn (context: ?*anyopaque) void = null,
 };
 
 // =============================================================================

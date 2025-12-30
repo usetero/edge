@@ -9,9 +9,6 @@ const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
 
 const InterceptingWriter = intercepting_writer.InterceptingWriter;
-const InterceptFn = intercepting_writer.InterceptFn;
-const LinePrinterContext = intercepting_writer.LinePrinterContext;
-const linePrinterCallback = intercepting_writer.linePrinterCallback;
 
 const ModuleId = proxy_module.ModuleId;
 const ModuleConfig = proxy_module.ModuleConfig;
@@ -20,6 +17,7 @@ const ModuleResult = proxy_module.ModuleResult;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const ProxyModule = proxy_module.ProxyModule;
 const HttpMethod = proxy_module.HttpMethod;
+const ResponseInterceptFn = proxy_module.ResponseInterceptFn;
 const Router = router_mod.Router;
 const UpstreamClientManager = upstream_client.UpstreamClientManager;
 
@@ -284,6 +282,9 @@ pub const ProxyServer = struct {
                 .routes = reg.routes,
                 .upstream = upstream_config,
                 .module_data = reg.module_data,
+                .response_intercept_fn = reg.response_intercept_fn,
+                .create_intercept_context_fn = reg.create_intercept_context_fn,
+                .destroy_intercept_context_fn = reg.destroy_intercept_context_fn,
             };
 
             // Initialize the module
@@ -516,7 +517,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
 
         .proxy_unchanged => {
             // Proxy original (potentially compressed) body to upstream
-            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, original_body);
+            response_bytes.* = try proxyToUpstream(ctx, req, res, &module_entry.config, original_body);
         },
 
         .proxy_modified => {
@@ -534,7 +535,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
             }
             defer if (compressed_allocated) req.arena.free(body_to_send);
 
-            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, body_to_send);
+            response_bytes.* = try proxyToUpstream(ctx, req, res, &module_entry.config, body_to_send);
         },
     }
 }
@@ -553,7 +554,7 @@ fn proxyToUpstream(
     ctx: *ServerContext,
     req: *httpz.Request,
     res: *httpz.Response,
-    module_id: ModuleId,
+    module_config: *const ModuleConfig,
     body_to_send: []const u8,
 ) !usize {
     const max_retries = ctx.max_upstream_retries;
@@ -562,7 +563,7 @@ fn proxyToUpstream(
     // https://codeberg.org/ziglang/zig/issues/30165
     // TODO: Once the above is fixed, we should re-evaluate this logic.
     while (attempt < max_retries) : (attempt += 1) {
-        const result = proxyToUpstreamOnce(ctx, req, res, module_id, body_to_send);
+        const result = proxyToUpstreamOnce(ctx, req, res, module_config, body_to_send);
         if (result) |bytes| {
             return bytes;
         } else |err| {
@@ -595,9 +596,10 @@ fn proxyToUpstreamOnce(
     ctx: *ServerContext,
     req: *httpz.Request,
     res: *httpz.Response,
-    module_id: ModuleId,
+    module_config: *const ModuleConfig,
     body_to_send: []const u8,
 ) !usize {
+    const module_id = module_config.id;
     // Build upstream URI using pre-allocated buffer
     const upstream_uri_str = try ctx.upstreams.buildUpstreamUri(
         module_id,
@@ -698,7 +700,7 @@ fn proxyToUpstreamOnce(
         res.header(header_name, header_value);
     }
 
-    // Stream response body with interception
+    // Stream response body (with optional interception)
     const max_size = ctx.upstreams.getMaxResponseBody(module_id);
     var read_buffer: [8192]u8 = undefined;
     var upstream_body_reader = upstream_res.reader(&read_buffer);
@@ -710,21 +712,26 @@ fn proxyToUpstreamOnce(
         &limited_buffer,
     );
 
-    // Set up line printer context for intercepting response body
-    var line_printer_ctx = LinePrinterContext.init(req.arena);
-    defer line_printer_ctx.deinit();
+    // Create intercept context if module provides a factory
+    var intercept_context: ?*anyopaque = null;
+    if (module_config.create_intercept_context_fn) |create_fn| {
+        intercept_context = create_fn(req.arena);
+    }
+    defer if (module_config.destroy_intercept_context_fn) |destroy_fn| {
+        destroy_fn(intercept_context);
+    };
 
-    // Wrap the response writer with an intercepting writer
+    // Set up writer - use intercepting writer if module has intercept function, otherwise direct
     var intercept_buffer: [8192]u8 = undefined;
     var intercepting = InterceptingWriter.init(
         res.writer(),
         &intercept_buffer,
-        linePrinterCallback,
-        @ptrCast(&line_printer_ctx),
+        module_config.response_intercept_fn,
+        intercept_context,
     );
     const writer = intercepting.writer();
 
-    // Stream from limited reader to intercepting writer
+    // Stream from limited reader to writer
     // streamRemaining handles EndOfStream as success, not an error
     const total_bytes = limited_reader.interface.streamRemaining(writer) catch |err| {
         ctx.bus.err(UpstreamStreamError{
@@ -738,7 +745,7 @@ fn proxyToUpstreamOnce(
         ctx.bus.warn(ResponseTruncated{ .max_size = max_size });
     }
 
-    // Flush the intercepting writer (which flushes to the response writer)
+    // Flush the writer
     writer.flush() catch |err| {
         ctx.bus.err(ResponseFlushError{
             .err = @errorName(err),
@@ -746,9 +753,6 @@ fn proxyToUpstreamOnce(
         });
         return err;
     };
-
-    // Flush any remaining partial line from the line printer
-    line_printer_ctx.flush();
 
     return total_bytes;
 }

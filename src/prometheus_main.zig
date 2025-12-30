@@ -10,6 +10,7 @@ const edge = @import("root.zig");
 const config_parser = edge.config_parser;
 const server_mod = edge.server;
 const proxy_module = edge.proxy_module;
+const prometheus_mod = edge.prometheus_module;
 const passthrough_mod = edge.passthrough_module;
 
 const o11y = @import("observability/root.zig");
@@ -19,6 +20,7 @@ const Level = o11y.Level;
 
 const ProxyServer = server_mod.ProxyServer;
 const ModuleRegistration = proxy_module.ModuleRegistration;
+const PrometheusModule = prometheus_mod.PrometheusModule;
 const PassthroughModule = passthrough_mod.PassthroughModule;
 
 /// Route std.log through our EventBus adapter
@@ -175,11 +177,25 @@ pub fn main() !void {
     // Install signal handlers
     installShutdownHandlers(bus);
 
-    // Create passthrough module
+    // Create modules
+    var prometheus_module = PrometheusModule{};
     var passthrough_module = PassthroughModule{};
 
-    // Register modules
+    // Register modules - prometheus for /metrics, passthrough for everything else
     const module_registrations = [_]ModuleRegistration{
+        // Prometheus module for /metrics endpoint with response interception
+        .{
+            .module = prometheus_module.asProxyModule(),
+            .routes = &prometheus_mod.routes,
+            .upstream_url = config.upstream_url,
+            .max_request_body = config.max_body_size,
+            .max_response_body = config.max_body_size,
+            .module_data = null,
+            .response_intercept_fn = prometheus_mod.prometheusInterceptCallback,
+            .create_intercept_context_fn = prometheus_mod.createInterceptContext,
+            .destroy_intercept_context_fn = prometheus_mod.destroyInterceptContext,
+        },
+        // Passthrough module for all other routes
         .{
             .module = passthrough_module.asProxyModule(),
             .routes = &passthrough_mod.default_routes,
