@@ -417,15 +417,13 @@ fn shouldSkipRequestHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "host") or
         std.ascii.eqlIgnoreCase(name, "connection") or
         std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
-        std.ascii.eqlIgnoreCase(name, "accept-encoding"); // Avoid compressed responses from upstream
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
 }
 
 /// Check if header should be skipped when forwarding response
 fn shouldSkipResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
-        std.ascii.eqlIgnoreCase(name, "content-encoding"); // httpz manages response encoding
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
 }
 
 /// Build headers array in single pass
@@ -629,13 +627,13 @@ fn proxyToUpstreamOnce(
     };
 
     // Create upstream request
-    // Disable accept-encoding to prevent compressed responses from upstream
-    // (we want raw bytes to pass through unchanged)
+    // Note: We omit accept_encoding so we only forward the client's Accept-Encoding header
+    // (if present in extra_headers), preventing std.http.Client from adding its default
+    // "Accept-Encoding: gzip, deflate" which would cause upstream to compress when client
+    // didn't request it.
     var upstream_req = client.request(method, uri, .{
         .extra_headers = headers,
-        .headers = .{
-            .accept_encoding = .{ .override = "identity" },
-        },
+        .headers = .{ .accept_encoding = .omit },
     }) catch |err| {
         ctx.bus.err(UpstreamConnectionError{
             .err = @errorName(err),
@@ -781,17 +779,23 @@ test "toHttpMethod" {
 
 test "shouldSkipRequestHeader" {
     try std.testing.expect(shouldSkipRequestHeader("host"));
+    try std.testing.expect(shouldSkipRequestHeader("Host"));
+    try std.testing.expect(shouldSkipRequestHeader("HOST"));
     try std.testing.expect(shouldSkipRequestHeader("connection"));
+    try std.testing.expect(shouldSkipRequestHeader("Connection"));
     try std.testing.expect(shouldSkipRequestHeader("content-length"));
-    try std.testing.expect(shouldSkipRequestHeader("accept-encoding"));
+    try std.testing.expect(shouldSkipRequestHeader("Content-Length"));
+    try std.testing.expect(shouldSkipRequestHeader("transfer-encoding"));
+    try std.testing.expect(shouldSkipRequestHeader("Transfer-Encoding"));
     try std.testing.expect(!shouldSkipRequestHeader("content-type"));
     try std.testing.expect(!shouldSkipRequestHeader("x-custom-header"));
 }
 
 test "shouldSkipResponseHeader" {
     try std.testing.expect(shouldSkipResponseHeader("content-length"));
+    try std.testing.expect(shouldSkipResponseHeader("Content-Length"));
     try std.testing.expect(shouldSkipResponseHeader("transfer-encoding"));
-    try std.testing.expect(shouldSkipResponseHeader("content-encoding"));
+    try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
     try std.testing.expect(!shouldSkipResponseHeader("content-type"));
     try std.testing.expect(!shouldSkipResponseHeader("x-custom-header"));
 }
