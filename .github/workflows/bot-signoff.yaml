@@ -39,6 +39,12 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Skip if triggered by a pull_request event where the branch has been deleted
+    # This happens when release-please PRs are merged - the branch is deleted but
+    # a stale workflow run may still reference it
+    if: |
+      github.event_name != 'pull_request' ||
+      !startsWith(github.head_ref, 'release-please--')
     steps:
       - name: Generate a token
         id: generate-token
