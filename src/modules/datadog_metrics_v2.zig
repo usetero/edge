@@ -122,6 +122,21 @@ fn datadogMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]c
             return null;
         },
         .scope_attribute => null, // Datadog format doesn't have scope attributes
+        .metric_type => getDatadogMetricTypeString(series),
+        .aggregation_temporality => null, // Datadog format doesn't have aggregation temporality
+    };
+}
+
+/// Returns the Datadog metric type as a string for regex matching
+/// Datadog types: 0=unspecified, 1=count, 2=rate, 3=gauge
+fn getDatadogMetricTypeString(series: *MetricSeries) ?[]const u8 {
+    const metric_type = series.type orelse return null;
+    return switch (metric_type) {
+        0 => "unspecified",
+        1 => "count",
+        2 => "rate",
+        3 => "gauge",
+        else => null,
     };
 }
 
@@ -168,7 +183,7 @@ fn datadogMetricFieldMutator(ctx: *anyopaque, op: MetricMutateOp) bool {
                     }
                     return false;
                 },
-                .resource_attribute, .scope_attribute => return false,
+                .resource_attribute, .scope_attribute, .metric_type, .aggregation_temporality => return false,
             }
         },
         .set => |s| {
@@ -200,7 +215,7 @@ fn datadogMetricFieldMutator(ctx: *anyopaque, op: MetricMutateOp) bool {
                     }
                     return false;
                 },
-                .resource_attribute, .scope_attribute => return false,
+                .resource_attribute, .scope_attribute, .metric_type, .aggregation_temporality => return false,
             }
         },
         .rename => {

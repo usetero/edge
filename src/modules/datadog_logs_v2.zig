@@ -99,7 +99,13 @@ fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             if (std.mem.eql(u8, key, "ddtags")) return log.ddtags;
             if (std.mem.eql(u8, key, "environment")) return log.environment;
             if (std.mem.eql(u8, key, "custom_field")) return log.custom_field;
-            // TODO: handle additional dynamic fields from extra
+            // Check extra fields for dynamic attributes
+            if (log.extra.get(key)) |any_value| {
+                // Only string values can be matched with regex
+                if (any_value == .string) {
+                    return any_value.string.get() catch null;
+                }
+            }
             return null;
         },
         // Datadog JSON format doesn't have resource/scope attributes
@@ -409,6 +415,41 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
 
 const proto = @import("proto");
 
+test "datadogFieldAccessor - extra field lookup" {
+    // Unit test to verify the field accessor can retrieve extra fields
+    const allocator = std.testing.allocator;
+
+    var parser: StreamParser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message": "test", "trace_id": "abc123-def456"}
+    ;
+
+    var reader = std.Io.Reader.fixed(json);
+    var doc = try parser.parseFromReader(allocator, &reader);
+
+    var parsed = try doc.as(DatadogLog, allocator, .{});
+    defer parsed.deinit();
+
+    // Verify the extra field was parsed
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.extra.count());
+    try std.testing.expect(parsed.value.extra.contains("trace_id"));
+
+    // Test the accessor directly
+    var field_ctx = FieldAccessorContext{ .log = &parsed.value };
+
+    // Test known field
+    const message_val = datadogFieldAccessor(&field_ctx, .{ .log_field = .LOG_FIELD_BODY });
+    try std.testing.expect(message_val != null);
+    try std.testing.expectEqualStrings("test", message_val.?);
+
+    // Test extra field - this is the critical test
+    const trace_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = "trace_id" });
+    try std.testing.expect(trace_val != null);
+    try std.testing.expectEqualStrings("abc123-def456", trace_val.?);
+}
+
 test "processLogs - no policies keeps all logs in array" {
     const allocator = std.testing.allocator;
 
@@ -682,4 +723,93 @@ test "processLogs - mutation triggers reserialization and removes field" {
     // The service field should be removed by the transform
     try std.testing.expect(std.mem.indexOf(u8, result.data, "my-service") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.data, "\"service\"") == null);
+}
+
+test "processLogs - filter on dynamic extra field not in schema" {
+    // Tests that we can filter on arbitrary fields that are not part of the
+    // known DatadogLog schema (stored in the 'extra' hashmap)
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy that matches on a dynamic field "trace_id" (not in schema)
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-trace"),
+        .name = try allocator.dupe(u8, "drop-trace-logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .match = .{ .regex = try allocator.dupe(u8, "^abc123") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // Logs with dynamic "trace_id" field - one matches pattern, one doesn't
+    // Using unique message strings to avoid substring matching issues
+    const logs =
+        \\[{"message": "first-log-match", "trace_id": "abc123-def456"}, {"message": "second-log-nomatch", "trace_id": "xyz789-other"}, {"message": "third-log-notrace"}]
+    ;
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    defer allocator.free(result.data);
+
+    // Check counts
+    try std.testing.expectEqual(@as(usize, 3), result.original_count);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+
+    // Log with trace_id starting with "abc123" should be dropped
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "first-log-match") == null);
+    // Logs with other trace_id or no trace_id should remain
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "second-log-nomatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "third-log-notrace") != null);
+}
+
+test "processLogs - filter on nested extra field with exists" {
+    // Tests using exists matching on dynamic extra fields
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy that drops logs where "debug_info" field exists
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-debug-info"),
+        .name = try allocator.dupe(u8, "drop-debug-info-logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "debug_info") },
+        .match = .{ .exists = true },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // Mix of logs with and without the debug_info field
+    const logs =
+        \\[{"message": "debug log", "debug_info": "stack trace here"}, {"message": "normal log", "service": "api"}]
+    ;
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    defer allocator.free(result.data);
+
+    // Log with debug_info should be dropped
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "debug log") == null);
+    // Log without debug_info should remain
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "normal log") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
 }

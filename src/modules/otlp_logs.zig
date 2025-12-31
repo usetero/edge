@@ -170,7 +170,7 @@ fn otlpFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             .LOG_FIELD_SEVERITY_TEXT => if (log_ctx.log_record.severity_text.len > 0) log_ctx.log_record.severity_text else null,
             .LOG_FIELD_TRACE_ID => if (log_ctx.log_record.trace_id.len > 0) log_ctx.log_record.trace_id else null,
             .LOG_FIELD_SPAN_ID => if (log_ctx.log_record.span_id.len > 0) log_ctx.log_record.span_id else null,
-            .LOG_FIELD_EVENT_NAME => null, // OTLP LogRecord doesn't have a dedicated event_name field
+            .LOG_FIELD_EVENT_NAME => if (log_ctx.log_record.event_name.len > 0) log_ctx.log_record.event_name else null,
             .LOG_FIELD_RESOURCE_SCHEMA_URL => if (log_ctx.resource_logs.schema_url.len > 0) log_ctx.resource_logs.schema_url else null,
             .LOG_FIELD_SCOPE_SCHEMA_URL => if (log_ctx.scope_logs.schema_url.len > 0) log_ctx.scope_logs.schema_url else null,
             else => null,
@@ -255,6 +255,13 @@ fn otlpFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
                         }
                         return false;
                     },
+                    .LOG_FIELD_EVENT_NAME => {
+                        if (log_ctx.log_record.event_name.len > 0) {
+                            log_ctx.log_record.event_name = &.{};
+                            return true;
+                        }
+                        return false;
+                    },
                     .LOG_FIELD_RESOURCE_SCHEMA_URL => {
                         if (log_ctx.resource_logs.schema_url.len > 0) {
                             log_ctx.resource_logs.schema_url = &.{};
@@ -315,6 +322,13 @@ fn otlpFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
                     .LOG_FIELD_SPAN_ID => {
                         if (s.upsert or log_ctx.log_record.span_id.len > 0) {
                             log_ctx.log_record.span_id = s.value;
+                            return true;
+                        }
+                        return false;
+                    },
+                    .LOG_FIELD_EVENT_NAME => {
+                        if (s.upsert or log_ctx.log_record.event_name.len > 0) {
+                            log_ctx.log_record.event_name = s.value;
                             return true;
                         }
                         return false;
@@ -1005,4 +1019,93 @@ test "processLogs - JSON transform removes log attribute" {
     // The safe attribute should still be present
     try std.testing.expect(std.mem.indexOf(u8, result.data, "safe.data") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.data, "public") != null);
+}
+
+test "processLogs - DROP policy filters logs by event_name" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy for logs with event_name matching "user.login"
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-login-events"),
+        .name = try allocator.dupe(u8, "drop-login-events"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_EVENT_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^user\\.login$") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // Two logs: one with event_name "user.login" (should be dropped), one with "user.logout" (should be kept)
+    const logs =
+        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"eventName":"user.login","body":{"stringValue":"login event"}},{"eventName":"user.logout","body":{"stringValue":"logout event"}}]}]}]}
+    ;
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    defer allocator.free(result.data);
+
+    // Login event should be dropped, logout event should remain
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "login event") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "logout event") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+}
+
+test "processLogs - JSON transform removes event_name field" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a policy with keep=all and a transform that removes event_name
+    var transform = proto.policy.LogTransform{};
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_EVENT_NAME },
+    });
+
+    var transform_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "remove-event-name"),
+        .name = try allocator.dupe(u8, "remove-event-name"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    // Match on body containing "test" to trigger the transform
+    try transform_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer transform_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{transform_policy}, "file-provider", .file);
+
+    const logs =
+        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"eventName":"sensitive.event","body":{"stringValue":"test message"}}]}]}]}
+    ;
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    defer allocator.free(result.data);
+
+    // The log should be kept
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+
+    // The event_name should be removed (empty string in serialization)
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "sensitive.event") == null);
+    // But the body should still be present
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "test message") != null);
 }

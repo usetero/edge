@@ -290,4 +290,492 @@ test "OtlpModule ignores GET requests" {
     pm.deinit();
 }
 
-// TODO: Add filtering tests once otlp_logs.zig filtering is implemented
+// =============================================================================
+// Log Filtering Tests
+// =============================================================================
+
+test "OtlpModule: DROP policy filters matching logs" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy for logs with severity "DEBUG"
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-debug"),
+        .name = try allocator.dupe(u8, "drop-debug-logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .regex = try allocator.dupe(u8, "DEBUG") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+
+    var module = OtlpModule{};
+    const pm = module.asProxyModule();
+
+    try pm.init(allocator, .{
+        .id = @enumFromInt(0),
+        .routes = &routes,
+        .upstream = .{
+            .scheme = "https",
+            .host = "localhost",
+            .port = 4318,
+            .base_path = "",
+            .max_request_body = 10 * 1024 * 1024,
+            .max_response_body = 10 * 1024 * 1024,
+        },
+        .module_data = @ptrCast(&otlp_config),
+    });
+    defer pm.deinit();
+
+    // Request with DEBUG log (should be dropped) and INFO log (should be kept)
+    const req = ModuleRequest{
+        .method = .POST,
+        .path = "/v1/logs",
+        .query = "",
+        .upstream = undefined,
+        .module_ctx = null,
+        .body =
+        \\{"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"debug message"},"severityText":"DEBUG"},{"body":{"stringValue":"info message"},"severityText":"INFO"}]}]}]}
+        ,
+        .headers_ctx = null,
+        .get_header_fn = null,
+    };
+
+    const result = try pm.processRequest(&req, allocator);
+
+    // Should be modified (one log dropped)
+    try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
+
+    // Verify DEBUG log was dropped and INFO log remains
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "DEBUG") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "INFO") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "info message") != null);
+
+    allocator.free(result.modified_body);
+}
+
+test "OtlpModule: all logs dropped returns empty response" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy that matches all logs
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-all"),
+        .name = try allocator.dupe(u8, "drop-all-logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .exists = true },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+
+    var module = OtlpModule{};
+    const pm = module.asProxyModule();
+
+    try pm.init(allocator, .{
+        .id = @enumFromInt(0),
+        .routes = &routes,
+        .upstream = .{
+            .scheme = "https",
+            .host = "localhost",
+            .port = 4318,
+            .base_path = "",
+            .max_request_body = 10 * 1024 * 1024,
+            .max_response_body = 10 * 1024 * 1024,
+        },
+        .module_data = @ptrCast(&otlp_config),
+    });
+    defer pm.deinit();
+
+    const req = ModuleRequest{
+        .method = .POST,
+        .path = "/v1/logs",
+        .query = "",
+        .upstream = undefined,
+        .module_ctx = null,
+        .body =
+        \\{"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"test"},"severityText":"INFO"}]}]}]}
+        ,
+        .headers_ctx = null,
+        .get_header_fn = null,
+    };
+
+    const result = try pm.processRequest(&req, allocator);
+
+    // Should respond with empty response (200 OK with {})
+    try std.testing.expectEqual(ModuleResult.Action.respond_immediately, result.action);
+    try std.testing.expectEqual(@as(u16, 200), result.status);
+    try std.testing.expectEqualStrings("{}", result.response_body);
+}
+
+test "OtlpModule: filter logs by resource attribute" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy for logs from "test-service"
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-test-service"),
+        .name = try allocator.dupe(u8, "drop-test-service-logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .resource_attribute = try allocator.dupe(u8, "service.name") },
+        .match = .{ .regex = try allocator.dupe(u8, "test-service") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+
+    var module = OtlpModule{};
+    const pm = module.asProxyModule();
+
+    try pm.init(allocator, .{
+        .id = @enumFromInt(0),
+        .routes = &routes,
+        .upstream = .{
+            .scheme = "https",
+            .host = "localhost",
+            .port = 4318,
+            .base_path = "",
+            .max_request_body = 10 * 1024 * 1024,
+            .max_response_body = 10 * 1024 * 1024,
+        },
+        .module_data = @ptrCast(&otlp_config),
+    });
+    defer pm.deinit();
+
+    // Request with logs from test-service (should be dropped) and prod-service (should be kept)
+    const req = ModuleRequest{
+        .method = .POST,
+        .path = "/v1/logs",
+        .query = "",
+        .upstream = undefined,
+        .module_ctx = null,
+        .body =
+        \\{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test-service"}}]},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"from test"},"severityText":"INFO"}]}]},{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"prod-service"}}]},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"from prod"},"severityText":"INFO"}]}]}]}
+        ,
+        .headers_ctx = null,
+        .get_header_fn = null,
+    };
+
+    const result = try pm.processRequest(&req, allocator);
+
+    try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
+
+    // Verify test-service log was dropped and prod-service log remains
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "from test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "from prod") != null);
+
+    allocator.free(result.modified_body);
+}
+
+// =============================================================================
+// Metric Filtering Tests
+// =============================================================================
+
+test "OtlpModule: DROP policy filters matching metrics" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy for metrics with "debug" in the name
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-debug-metrics"),
+        .name = try allocator.dupe(u8, "drop-debug-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "debug") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+
+    var module = OtlpModule{};
+    const pm = module.asProxyModule();
+
+    try pm.init(allocator, .{
+        .id = @enumFromInt(0),
+        .routes = &routes,
+        .upstream = .{
+            .scheme = "https",
+            .host = "localhost",
+            .port = 4318,
+            .base_path = "",
+            .max_request_body = 10 * 1024 * 1024,
+            .max_response_body = 10 * 1024 * 1024,
+        },
+        .module_data = @ptrCast(&otlp_config),
+    });
+    defer pm.deinit();
+
+    // Request with debug metric (should be dropped) and http metric (should be kept)
+    const req = ModuleRequest{
+        .method = .POST,
+        .path = "/v1/metrics",
+        .query = "",
+        .upstream = undefined,
+        .module_ctx = null,
+        .body =
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"debug.internal"},{"name":"http.requests"}]}]}]}
+        ,
+        .headers_ctx = null,
+        .get_header_fn = null,
+    };
+
+    const result = try pm.processRequest(&req, allocator);
+
+    // Should be modified (one metric dropped)
+    try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
+
+    // Verify debug metric was dropped and http metric remains
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "debug.internal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "http.requests") != null);
+
+    allocator.free(result.modified_body);
+}
+
+test "OtlpModule: all metrics dropped returns empty response" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy that matches all metrics
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-all"),
+        .name = try allocator.dupe(u8, "drop-all-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .exists = true },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+
+    var module = OtlpModule{};
+    const pm = module.asProxyModule();
+
+    try pm.init(allocator, .{
+        .id = @enumFromInt(0),
+        .routes = &routes,
+        .upstream = .{
+            .scheme = "https",
+            .host = "localhost",
+            .port = 4318,
+            .base_path = "",
+            .max_request_body = 10 * 1024 * 1024,
+            .max_response_body = 10 * 1024 * 1024,
+        },
+        .module_data = @ptrCast(&otlp_config),
+    });
+    defer pm.deinit();
+
+    const req = ModuleRequest{
+        .method = .POST,
+        .path = "/v1/metrics",
+        .query = "",
+        .upstream = undefined,
+        .module_ctx = null,
+        .body =
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"metric1"},{"name":"metric2"}]}]}]}
+        ,
+        .headers_ctx = null,
+        .get_header_fn = null,
+    };
+
+    const result = try pm.processRequest(&req, allocator);
+
+    // Should respond with empty response (200 OK with {})
+    try std.testing.expectEqual(ModuleResult.Action.respond_immediately, result.action);
+    try std.testing.expectEqual(@as(u16, 200), result.status);
+    try std.testing.expectEqualStrings("{}", result.response_body);
+}
+
+test "OtlpModule: filter metrics by metric type" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    const MetricType = proto.policy.MetricType;
+
+    // Create a DROP policy for gauge metrics
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-gauges"),
+        .name = try allocator.dupe(u8, "drop-gauge-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_type = MetricType.METRIC_TYPE_GAUGE },
+        .match = .{ .regex = try allocator.dupe(u8, "^gauge$") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+
+    var module = OtlpModule{};
+    const pm = module.asProxyModule();
+
+    try pm.init(allocator, .{
+        .id = @enumFromInt(0),
+        .routes = &routes,
+        .upstream = .{
+            .scheme = "https",
+            .host = "localhost",
+            .port = 4318,
+            .base_path = "",
+            .max_request_body = 10 * 1024 * 1024,
+            .max_response_body = 10 * 1024 * 1024,
+        },
+        .module_data = @ptrCast(&otlp_config),
+    });
+    defer pm.deinit();
+
+    // Request with gauge metric (should be dropped) and sum metric (should be kept)
+    const req = ModuleRequest{
+        .method = .POST,
+        .path = "/v1/metrics",
+        .query = "",
+        .upstream = undefined,
+        .module_ctx = null,
+        .body =
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"cpu.usage","gauge":{"dataPoints":[{"asDouble":0.5}]}},{"name":"http.requests","sum":{"dataPoints":[{"asInt":"100"}]}}]}]}]}
+        ,
+        .headers_ctx = null,
+        .get_header_fn = null,
+    };
+
+    const result = try pm.processRequest(&req, allocator);
+
+    // Should be modified (gauge metric dropped)
+    try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
+
+    // Verify gauge metric was dropped and sum metric remains
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "cpu.usage") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "http.requests") != null);
+
+    allocator.free(result.modified_body);
+}
+
+test "OtlpModule: metrics route unchanged when no matching policy" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy that won't match any metrics
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-nonexistent"),
+        .name = try allocator.dupe(u8, "drop-nonexistent"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "nonexistent_metric_name") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+
+    var module = OtlpModule{};
+    const pm = module.asProxyModule();
+
+    try pm.init(allocator, .{
+        .id = @enumFromInt(0),
+        .routes = &routes,
+        .upstream = .{
+            .scheme = "https",
+            .host = "localhost",
+            .port = 4318,
+            .base_path = "",
+            .max_request_body = 10 * 1024 * 1024,
+            .max_response_body = 10 * 1024 * 1024,
+        },
+        .module_data = @ptrCast(&otlp_config),
+    });
+    defer pm.deinit();
+
+    const req = ModuleRequest{
+        .method = .POST,
+        .path = "/v1/metrics",
+        .query = "",
+        .upstream = undefined,
+        .module_ctx = null,
+        .body =
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"http.requests"}]}]}]}
+        ,
+        .headers_ctx = null,
+        .get_header_fn = null,
+    };
+
+    const result = try pm.processRequest(&req, allocator);
+
+    // Should pass through unchanged (no metrics matched the policy)
+    try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
+}

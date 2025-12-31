@@ -29,6 +29,7 @@ const ScopeMetrics = proto.metrics.ScopeMetrics;
 const Metric = proto.metrics.Metric;
 const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
+const AggregationTemporality = proto.metrics.AggregationTemporality;
 
 const PolicyEngine = policy_engine.PolicyEngine;
 const PolicyResult = policy_engine.PolicyResult;
@@ -191,6 +192,38 @@ fn otlpMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]cons
         },
         .resource_attribute => |key| if (metric_ctx.resource_metrics.resource) |res| findAttribute(res.attributes.items, key) else null,
         .scope_attribute => |key| if (metric_ctx.scope_metrics.scope) |scope| findAttribute(scope.attributes.items, key) else null,
+        .metric_type => getMetricTypeString(metric_ctx.metric),
+        .aggregation_temporality => getAggregationTemporalityString(metric_ctx.metric),
+    };
+}
+
+/// Returns the metric type as a string for regex matching
+fn getMetricTypeString(metric: *Metric) ?[]const u8 {
+    const data = metric.data orelse return null;
+    return switch (data) {
+        .gauge => "gauge",
+        .sum => "sum",
+        .histogram => "histogram",
+        .exponential_histogram => "exponential_histogram",
+        .summary => "summary",
+    };
+}
+
+/// Returns the aggregation temporality as a string for regex matching
+/// Only sum, histogram, and exponential_histogram have temporality
+fn getAggregationTemporalityString(metric: *Metric) ?[]const u8 {
+    const data = metric.data orelse return null;
+    const temporality: AggregationTemporality = switch (data) {
+        .sum => |s| s.aggregation_temporality,
+        .histogram => |h| h.aggregation_temporality,
+        .exponential_histogram => |eh| eh.aggregation_temporality,
+        .gauge, .summary => return null, // These don't have temporality
+    };
+    return switch (temporality) {
+        .AGGREGATION_TEMPORALITY_UNSPECIFIED => "unspecified",
+        .AGGREGATION_TEMPORALITY_DELTA => "delta",
+        .AGGREGATION_TEMPORALITY_CUMULATIVE => "cumulative",
+        _ => null,
     };
 }
 
