@@ -53,8 +53,13 @@ pub const PolicySnapshot = policy_mod.Snapshot;
 
 // Re-export types for callers
 pub const FieldRef = policy_types.FieldRef;
-pub const FieldMutator = policy_types.FieldMutator;
+pub const MetricFieldRef = policy_types.MetricFieldRef;
+pub const LogFieldAccessor = policy_types.LogFieldAccessor;
+pub const LogFieldMutator = policy_types.LogFieldMutator;
+pub const MetricFieldAccessor = policy_types.MetricFieldAccessor;
+pub const MetricFieldMutator = policy_types.MetricFieldMutator;
 pub const MutateOp = policy_types.MutateOp;
+pub const MetricMutateOp = policy_types.MetricMutateOp;
 pub const TelemetryType = policy_types.TelemetryType;
 
 // Proto types
@@ -128,13 +133,32 @@ pub const PolicyResult = struct {
 pub const FilterResult = FilterDecision;
 
 // =============================================================================
-// FieldAccessor - Interface for accessing field values
+// Comptime Type Helpers - Select types based on telemetry type
 // =============================================================================
 
-/// Field accessor function type.
-/// Given a FieldRef, returns the field value as a string slice, or null if not found.
-/// This type is shared with log_transform for both filtering and transform operations.
-pub const FieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
+/// Returns the field reference type for the given telemetry type
+fn FieldRefType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => FieldRef,
+        .metric => MetricFieldRef,
+    };
+}
+
+/// Returns the field accessor function type for the given telemetry type
+fn FieldAccessorType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => LogFieldAccessor,
+        .metric => MetricFieldAccessor,
+    };
+}
+
+/// Returns the field mutator function type for the given telemetry type
+fn FieldMutatorType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => LogFieldMutator,
+        .metric => MetricFieldMutator,
+    };
+}
 
 // =============================================================================
 // Observability Events
@@ -142,8 +166,19 @@ pub const FieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]
 
 const EvaluateEmpty = struct {};
 const EvaluateStart = struct { matcher_key_count: usize, policy_count: usize };
-const MatcherKeyFieldNotPresent = struct { field: FieldRef };
-const MatcherKeyFieldValue = struct { field: FieldRef, value: []const u8 };
+const MatcherKeyFieldNotPresent = struct {
+    telemetry_type: TelemetryType,
+    field: MatcherFieldRef,
+};
+const MatcherKeyFieldValue = struct {
+    telemetry_type: TelemetryType,
+    field: MatcherFieldRef,
+    value: []const u8,
+};
+const MatcherFieldRef = union(TelemetryType) {
+    log: FieldRef,
+    metric: MetricFieldRef,
+};
 const MatcherKeyNoDatabase = struct {};
 const ScanResult = struct { positive_count: usize, negated_count: usize };
 const PolicyFullMatch = struct { policy_index: PolicyIndex, policy_id: []const u8 };
@@ -242,10 +277,10 @@ pub const PolicyEngine = struct {
 
     pub fn evaluate(
         self: *const Self,
-        telemetry_type: TelemetryType,
+        comptime T: TelemetryType,
         ctx: *anyopaque,
-        field_accessor: FieldAccessor,
-        field_mutator: ?FieldMutator,
+        field_accessor: FieldAccessorType(T),
+        field_mutator: ?FieldMutatorType(T),
         policy_id_buf: [][]const u8,
     ) PolicyResult {
         // Get current snapshot from registry (lock-free)
@@ -253,13 +288,6 @@ pub const PolicyEngine = struct {
             self.bus.debug(EvaluateEmpty{});
             return PolicyResult.unmatched;
         };
-
-        // Currently only log telemetry type uses Hyperscan matcher index
-        // Metric matching will be implemented separately
-        if (telemetry_type != .log) {
-            self.bus.debug(EvaluateEmpty{});
-            return PolicyResult.unmatched;
-        }
 
         const index = &snapshot.matcher_index;
 
@@ -271,7 +299,7 @@ pub const PolicyEngine = struct {
         self.bus.debug(EvaluateStart{ .matcher_key_count = index.getMatcherKeys().len, .policy_count = index.getPolicyCount() });
 
         // Phase 1: Scan all matcher keys and compute match counts
-        var scan_state = self.scanMatcherKeys(ctx, field_accessor, index);
+        var scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
 
         // Phase 2: Find matching policies and determine decision
         var match_state = self.findMatchingPolicies(index, &scan_state, policy_id_buf);
@@ -280,12 +308,16 @@ pub const PolicyEngine = struct {
 
         // Phase 3: Handle drop case (record stats, return early)
         if (match_state.best_decision == .drop) {
-            self.recordDropStats(policy_id_buf, &match_state);
+            self.recordMatchStats(policy_id_buf, &match_state);
             return PolicyResult.dropped;
         }
 
         // Phase 4: Apply transforms and record stats for keep case
-        self.applyTransformsAndRecordStats(ctx, field_accessor, field_mutator, snapshot, policy_id_buf, &match_state);
+        if (T == .log) {
+            self.applyTransformsAndRecordStats(ctx, field_accessor, field_mutator, snapshot, policy_id_buf, &match_state);
+        } else {
+            self.recordMatchStats(policy_id_buf, &match_state);
+        }
 
         return PolicyResult{
             .decision = match_state.best_decision,
@@ -297,8 +329,9 @@ pub const PolicyEngine = struct {
     /// Returns state needed for determining which policies matched.
     inline fn scanMatcherKeys(
         self: *const Self,
+        comptime T: TelemetryType,
         ctx: *anyopaque,
-        field_accessor: FieldAccessor,
+        field_accessor: FieldAccessorType(T),
         index: *const MatcherIndex,
     ) ScanState {
         var state = ScanState{
@@ -310,9 +343,11 @@ pub const PolicyEngine = struct {
         @memset(&state.match_counts, 0);
         @memset(&state.is_active, false);
 
-        // Initialize match counts for policies with negated patterns
+        // Initialize match counts for policies with negated patterns (of matching telemetry type)
         for (index.getPoliciesWithNegation()) |policy_index| {
             const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
+            // Only initialize policies of the matching telemetry type
+            if (policy_info.telemetry_type != T) continue;
             state.match_counts[policy_index] = policy_info.negated_count;
             state.is_active[policy_index] = true;
             state.active_policies[state.active_count] = policy_index;
@@ -322,20 +357,29 @@ pub const PolicyEngine = struct {
         var result_buf: [MAX_MATCHES_PER_SCAN]u32 = undefined;
 
         for (index.getMatcherKeys()) |matcher_key| {
-            // Currently only log telemetry uses this path
-            // Skip metric keys when evaluating log telemetry
-            const field_ref = switch (matcher_key) {
-                .log => |k| k.field,
-                .metric => continue, // Skip metric keys for now - metric evaluation handled separately
+            // Extract field ref based on telemetry type, skip keys of other types
+            const field_ref: FieldRefType(T) = switch (T) {
+                .log => switch (matcher_key) {
+                    .log => |k| k.field,
+                    .metric => continue,
+                },
+                .metric => switch (matcher_key) {
+                    .metric => |k| k.field,
+                    .log => continue,
+                },
             };
 
             const value = field_accessor(ctx, field_ref) orelse {
-                self.bus.debug(MatcherKeyFieldNotPresent{ .field = field_ref });
+                self.bus.debug(MatcherKeyFieldNotPresent{
+                    .telemetry_type = T,
+                    .field = if (T == .log) .{ .log = field_ref } else .{ .metric = field_ref },
+                });
                 continue;
             };
 
             self.bus.debug(MatcherKeyFieldValue{
-                .field = field_ref,
+                .telemetry_type = T,
+                .field = if (T == .log) .{ .log = field_ref } else .{ .metric = field_ref },
                 .value = if (value.len > 100) value[0..100] else value,
             });
 
@@ -428,8 +472,8 @@ pub const PolicyEngine = struct {
         return state;
     }
 
-    /// Record stats for all matched policies when decision is drop.
-    inline fn recordDropStats(
+    /// Record stats for all matched policies (without transforms).
+    inline fn recordMatchStats(
         self: *const Self,
         policy_id_buf: [][]const u8,
         match_state: *const MatchState,
@@ -456,11 +500,12 @@ pub const PolicyEngine = struct {
     }
 
     /// Apply transforms for each matched policy and record stats.
+    /// Only used for log telemetry.
     inline fn applyTransformsAndRecordStats(
         self: *const Self,
         ctx: *anyopaque,
-        field_accessor: FieldAccessor,
-        field_mutator: ?FieldMutator,
+        field_accessor: LogFieldAccessor,
+        field_mutator: ?LogFieldMutator,
         snapshot: *const PolicySnapshot,
         policy_id_buf: [][]const u8,
         match_state: *const MatchState,
@@ -2425,4 +2470,648 @@ test "PolicyEngine stats: no match records no stats" {
 
     // No stats should be recorded
     try testing.expectEqual(@as(usize, 0), stats_provider.callCount());
+}
+
+// =============================================================================
+// Metric Policy Tests
+// =============================================================================
+
+const MetricField = proto.policy.MetricField;
+const MetricMatcher = proto.policy.MetricMatcher;
+
+/// Test context for metric unit tests - simple struct with known fields
+const TestMetricContext = struct {
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    unit: ?[]const u8 = null,
+    scope_name: ?[]const u8 = null,
+    datapoint_attributes: ?std.StringHashMap([]const u8) = null,
+    resource_attributes: ?std.StringHashMap([]const u8) = null,
+
+    pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
+        const self: *const TestMetricContext = @ptrCast(@alignCast(ctx_ptr));
+        return switch (field) {
+            .metric_field => |mf| switch (mf) {
+                .METRIC_FIELD_NAME => self.name,
+                .METRIC_FIELD_DESCRIPTION => self.description,
+                .METRIC_FIELD_UNIT => self.unit,
+                .METRIC_FIELD_SCOPE_NAME => self.scope_name,
+                else => null,
+            },
+            .datapoint_attribute => |key| {
+                if (self.datapoint_attributes) |attrs| {
+                    return attrs.get(key);
+                }
+                return null;
+            },
+            .resource_attribute => |key| {
+                if (self.resource_attributes) |attrs| {
+                    return attrs.get(key);
+                }
+                return null;
+            },
+            .scope_attribute => null,
+        };
+    }
+};
+
+test "MetricPolicyEngine: empty registry returns unset" {
+    const allocator = testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var test_metric = TestMetricContext{ .name = "http_requests_total" };
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.unset, result.decision);
+    try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
+}
+
+test "MetricPolicyEngine: single policy drop match" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-1"),
+        .name = try allocator.dupe(u8, "drop-debug-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "debug_.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    // Verify the registry has the policy
+    const snapshot = registry.getSnapshot().?;
+    try testing.expectEqual(@as(usize, 1), snapshot.policies.len);
+
+    // Verify the index has the matcher key
+    const index = &snapshot.matcher_index;
+    try testing.expect(!index.isEmpty());
+    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+
+    // Verify we can get the database for the metric key
+    const db = index.getDatabase(.{ .metric = .{ .field = .{ .metric_field = .METRIC_FIELD_NAME } } });
+    try testing.expect(db != null);
+
+    // Test that scanning works directly
+    var result_buf: [256]u32 = undefined;
+    const scan_result = db.?.scanPositive("debug_memory_usage", &result_buf);
+    try testing.expect(scan_result.count > 0); // Pattern should match
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Matching metric should be dropped
+    var debug_metric = TestMetricContext{ .name = "debug_memory_usage" };
+    const result = engine.evaluate(.metric, &debug_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    // Non-matching metric should pass
+    var normal_metric = TestMetricContext{ .name = "http_requests_total" };
+    const result2 = engine.evaluate(.metric, &normal_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+test "MetricPolicyEngine: single policy keep match returns policy ID" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-keep"),
+        .name = try allocator.dupe(u8, "keep-important-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = true,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "http_.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+
+    var test_metric = TestMetricContext{ .name = "http_requests_total" };
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+    try testing.expectEqual(@as(usize, 1), result.matched_policy_ids.len);
+    try testing.expectEqualStrings("metric-policy-keep", result.matched_policy_ids[0]);
+}
+
+test "MetricPolicyEngine: multiple matchers AND logic" {
+    const allocator = testing.allocator;
+
+    // Policy requires BOTH metric name AND unit to match
+    // Use anchored regex patterns to ensure exact matching
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-and"),
+        .name = try allocator.dupe(u8, "drop-slow-requests"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^request_duration$") },
+    });
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_UNIT },
+        .match = .{ .regex = try allocator.dupe(u8, "^seconds$") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Both match - should drop
+    var both_match = TestMetricContext{ .name = "request_duration", .unit = "seconds" };
+    const result1 = engine.evaluate(.metric, &both_match, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result1.decision);
+
+    // Only name matches - should pass (unit "milliseconds" doesn't match "^seconds$")
+    var name_only = TestMetricContext{ .name = "request_duration", .unit = "milliseconds" };
+    const result2 = engine.evaluate(.metric, &name_only, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
+
+    // Only unit matches - should pass (name "response_size" doesn't match "^request_duration$")
+    var unit_only = TestMetricContext{ .name = "response_size", .unit = "seconds" };
+    const result3 = engine.evaluate(.metric, &unit_only, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result3.decision);
+}
+
+test "MetricPolicyEngine: negated matcher" {
+    const allocator = testing.allocator;
+
+    // Keep metrics that do NOT have "internal" in the name
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-negate"),
+        .name = try allocator.dupe(u8, "drop-internal-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "internal_.*") },
+        .negate = true,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Internal metric matches pattern, negation fails -> policy doesn't match -> passes
+    var internal_metric = TestMetricContext{ .name = "internal_queue_size" };
+    const result1 = engine.evaluate(.metric, &internal_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result1.decision);
+
+    // Non-internal metric doesn't match pattern, negation succeeds -> policy matches -> drops
+    var public_metric = TestMetricContext{ .name = "http_requests_total" };
+    const result2 = engine.evaluate(.metric, &public_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result2.decision);
+}
+
+test "MetricPolicyEngine: datapoint attribute matching" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-dp-attr"),
+        .name = try allocator.dupe(u8, "drop-error-status"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .datapoint_attribute = try allocator.dupe(u8, "status_code") },
+        .match = .{ .regex = try allocator.dupe(u8, "5[0-9][0-9]") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Metric with 500 status should be dropped
+    var dp_attrs = std.StringHashMap([]const u8).init(allocator);
+    defer dp_attrs.deinit();
+    try dp_attrs.put("status_code", "503");
+
+    var error_metric = TestMetricContext{
+        .name = "http_response",
+        .datapoint_attributes = dp_attrs,
+    };
+    const result1 = engine.evaluate(.metric, &error_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result1.decision);
+
+    // Metric with 200 status should pass
+    var ok_attrs = std.StringHashMap([]const u8).init(allocator);
+    defer ok_attrs.deinit();
+    try ok_attrs.put("status_code", "200");
+
+    var ok_metric = TestMetricContext{
+        .name = "http_response",
+        .datapoint_attributes = ok_attrs,
+    };
+    const result2 = engine.evaluate(.metric, &ok_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+test "MetricPolicyEngine: resource attribute matching" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-res-attr"),
+        .name = try allocator.dupe(u8, "drop-test-env"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .resource_attribute = try allocator.dupe(u8, "deployment.environment") },
+        .match = .{ .regex = try allocator.dupe(u8, "test|staging") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Metric from test environment should be dropped
+    var test_attrs = std.StringHashMap([]const u8).init(allocator);
+    defer test_attrs.deinit();
+    try test_attrs.put("deployment.environment", "test");
+
+    var test_metric = TestMetricContext{
+        .name = "http_requests_total",
+        .resource_attributes = test_attrs,
+    };
+    const result1 = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result1.decision);
+
+    // Metric from production environment should pass
+    var prod_attrs = std.StringHashMap([]const u8).init(allocator);
+    defer prod_attrs.deinit();
+    try prod_attrs.put("deployment.environment", "production");
+
+    var prod_metric = TestMetricContext{
+        .name = "http_requests_total",
+        .resource_attributes = prod_attrs,
+    };
+    const result2 = engine.evaluate(.metric, &prod_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result2.decision);
+}
+
+test "MetricPolicyEngine: log policies don't affect metrics" {
+    const allocator = testing.allocator;
+
+    // Create a log policy that would match if applied to metrics
+    var log_policy = Policy{
+        .id = try allocator.dupe(u8, "log-policy-only"),
+        .name = try allocator.dupe(u8, "drop-error-logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try log_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "error") },
+    });
+    defer log_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{log_policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Metric evaluation should not be affected by log policies
+    var test_metric = TestMetricContext{ .name = "error_count" };
+    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.unset, result.decision);
+    try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
+}
+
+test "MetricPolicyEngine: metric policies don't affect logs" {
+    const allocator = testing.allocator;
+
+    // Create a metric policy
+    var metric_policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-only"),
+        .name = try allocator.dupe(u8, "drop-debug-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try metric_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "debug_.*") },
+    });
+    defer metric_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{metric_policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Log evaluation should not be affected by metric policies
+    var test_log = TestLogContext{ .message = "debug_info: something happened" };
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.unset, result.decision);
+    try testing.expectEqual(@as(usize, 0), result.matched_policy_ids.len);
+}
+
+test "MetricPolicyEngine: most restrictive wins - drop beats keep" {
+    const allocator = testing.allocator;
+
+    // Keep policy for all http metrics
+    var keep_policy = Policy{
+        .id = try allocator.dupe(u8, "metric-keep-http"),
+        .name = try allocator.dupe(u8, "keep-http-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = true,
+        } },
+    };
+    try keep_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "http_.*") },
+    });
+    defer keep_policy.deinit(allocator);
+
+    // Drop policy for error metrics
+    var drop_policy = Policy{
+        .id = try allocator.dupe(u8, "metric-drop-errors"),
+        .name = try allocator.dupe(u8, "drop-error-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "http_errors") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ keep_policy, drop_policy }, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // http_errors matches both policies - drop should win
+    var error_metric = TestMetricContext{ .name = "http_errors" };
+    const result1 = engine.evaluate(.metric, &error_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result1.decision);
+
+    // http_requests matches only keep policy
+    var requests_metric = TestMetricContext{ .name = "http_requests_total" };
+    const result2 = engine.evaluate(.metric, &requests_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.keep, result2.decision);
+}
+
+test "MetricPolicyEngine: disabled policies are skipped" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-disabled"),
+        .name = try allocator.dupe(u8, "disabled-drop-policy"),
+        .enabled = false, // Disabled!
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, ".+") }, // Match any non-empty name
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Even though the pattern matches, the disabled policy should be skipped
+    var test_metric = TestMetricContext{ .name = "any_metric_name" };
+    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+
+    try testing.expectEqual(FilterDecision.unset, result.decision);
+}
+
+test "MetricPolicyEngine: mixed log and metric policies" {
+    const allocator = testing.allocator;
+
+    // Metric drop policy
+    var metric_policy = Policy{
+        .id = try allocator.dupe(u8, "metric-drop"),
+        .name = try allocator.dupe(u8, "drop-debug-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try metric_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "debug_.*") },
+    });
+    defer metric_policy.deinit(allocator);
+
+    // Log drop policy
+    var log_policy = Policy{
+        .id = try allocator.dupe(u8, "log-drop"),
+        .name = try allocator.dupe(u8, "drop-debug-logs"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try log_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "DEBUG:.*") },
+    });
+    defer log_policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{ metric_policy, log_policy }, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Debug metric should be dropped by metric policy
+    var debug_metric = TestMetricContext{ .name = "debug_memory" };
+    const result1 = engine.evaluate(.metric, &debug_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result1.decision);
+
+    // Debug log should be dropped by log policy
+    var debug_log = TestLogContext{ .message = "DEBUG: test message" };
+    const result2 = engine.evaluate(.log, &debug_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result2.decision);
+
+    // Non-debug metric should pass
+    var normal_metric = TestMetricContext{ .name = "http_requests" };
+    const result3 = engine.evaluate(.metric, &normal_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result3.decision);
+
+    // Non-debug log should pass
+    var normal_log = TestLogContext{ .message = "INFO: test message" };
+    const result4 = engine.evaluate(.log, &normal_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result4.decision);
+}
+
+test "MetricPolicyEngine: regex pattern matching" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-regex"),
+        .name = try allocator.dupe(u8, "drop-by-regex"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    // Match any metric starting with "internal_" or ending with "_debug"
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "(^internal_|_debug$)") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Matches: starts with internal_
+    var m1 = TestMetricContext{ .name = "internal_queue_size" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.metric, &m1, TestMetricContext.fieldAccessor, null, &policy_id_buf).decision);
+
+    // Matches: ends with _debug
+    var m2 = TestMetricContext{ .name = "http_latency_debug" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.metric, &m2, TestMetricContext.fieldAccessor, null, &policy_id_buf).decision);
+
+    // Does not match
+    var m3 = TestMetricContext{ .name = "http_requests_total" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.metric, &m3, TestMetricContext.fieldAccessor, null, &policy_id_buf).decision);
+}
+
+test "MetricPolicyEngine: stats recording for matched policies" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-stats-test"),
+        .name = try allocator.dupe(u8, "drop-test-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "test_.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var stats_provider = StatsTrackingProvider.init(allocator);
+    defer stats_provider.deinit();
+    var provider_iface = stats_provider.provider();
+
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.registerProvider(&provider_iface);
+    try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
+
+    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Matching metric - should record stats
+    var test_metric = TestMetricContext{ .name = "test_counter" };
+    const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+
+    // Verify stats were recorded
+    try testing.expectEqual(@as(usize, 1), stats_provider.callCount());
+    const stats = stats_provider.getStats("metric-stats-test").?;
+    try testing.expectEqual(@as(i64, 1), stats.hits);
+    try testing.expectEqual(@as(i64, 0), stats.misses);
 }

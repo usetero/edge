@@ -68,9 +68,12 @@ pub const Header = types.Header;
 // Field reference types (shared across policy engine and transforms)
 pub const FieldRef = types.FieldRef;
 pub const MetricFieldRef = types.MetricFieldRef;
-pub const FieldAccessor = types.FieldAccessor;
-pub const FieldMutator = types.FieldMutator;
+pub const LogFieldAccessor = types.LogFieldAccessor;
+pub const LogFieldMutator = types.LogFieldMutator;
+pub const MetricFieldAccessor = types.MetricFieldAccessor;
+pub const MetricFieldMutator = types.MetricFieldMutator;
 pub const MutateOp = types.MutateOp;
+pub const MetricMutateOp = types.MetricMutateOp;
 pub const TelemetryType = types.TelemetryType;
 
 // =============================================================================

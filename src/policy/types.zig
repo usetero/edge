@@ -185,15 +185,31 @@ pub const MetricFieldRef = union(enum) {
     }
 };
 
-/// Field accessor function type - returns the value for a given field
+// =============================================================================
+// Log Field Accessor/Mutator Types
+// =============================================================================
+
+/// Log field accessor function type - returns the value for a given log field
 /// Returns null if the field doesn't exist
-pub const FieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
+pub const LogFieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
 
-/// Field mutator function type - sets, removes, or renames a field
+/// Log field mutator function type - sets, removes, or renames a log field
 /// Returns true if the operation succeeded
-pub const FieldMutator = *const fn (ctx: *anyopaque, op: MutateOp) bool;
+pub const LogFieldMutator = *const fn (ctx: *anyopaque, op: MutateOp) bool;
 
-/// Mutation operation for field mutator
+// =============================================================================
+// Metric Field Accessor/Mutator Types
+// =============================================================================
+
+/// Metric field accessor function type - returns the value for a given metric field
+/// Returns null if the field doesn't exist
+pub const MetricFieldAccessor = *const fn (ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8;
+
+/// Metric field mutator function type - sets, removes, or renames a metric field
+/// Returns true if the operation succeeded
+pub const MetricFieldMutator = *const fn (ctx: *anyopaque, op: MetricMutateOp) bool;
+
+/// Mutation operation for log field mutator
 pub const MutateOp = union(enum) {
     /// Remove a field entirely
     remove: FieldRef,
@@ -206,6 +222,24 @@ pub const MutateOp = union(enum) {
     /// Rename a field (move value from one field to another)
     rename: struct {
         from: FieldRef,
+        to: []const u8,
+        upsert: bool,
+    },
+};
+
+/// Mutation operation for metric field mutator
+pub const MetricMutateOp = union(enum) {
+    /// Remove a field entirely
+    remove: MetricFieldRef,
+    /// Set a field to a value (upsert controls insert vs update behavior)
+    set: struct {
+        field: MetricFieldRef,
+        value: []const u8,
+        upsert: bool,
+    },
+    /// Rename a field (move value from one field to another)
+    rename: struct {
+        from: MetricFieldRef,
         to: []const u8,
         upsert: bool,
     },

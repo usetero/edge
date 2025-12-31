@@ -284,6 +284,7 @@ pub const PolicyInfo = struct {
     negated_count: u16,
     keep: KeepValue,
     enabled: bool,
+    telemetry_type: TelemetryType,
 };
 
 // =============================================================================
@@ -367,6 +368,13 @@ pub const MatcherDatabase = struct {
 
     fn scanCallback(ctx: *ScanResult, match: hyperscan.Match) bool {
         if (ctx.count < ctx.buf.len) {
+            // Deduplicate: only store each pattern ID once
+            // (Hyperscan calls back multiple times for different match positions)
+            for (ctx.buf[0..ctx.count]) |existing_id| {
+                if (existing_id == match.id) {
+                    return true; // Already recorded, skip
+                }
+            }
             ctx.buf[ctx.count] = match.id;
             ctx.count += 1;
             return true;
@@ -458,7 +466,7 @@ const Builder = struct {
             try self.processLogMatcher(&matcher, matcher_idx);
         }
 
-        try self.storePolicyInfo(policy, KeepValue.parse(log_target.keep));
+        try self.storePolicyInfo(policy, KeepValue.parse(log_target.keep), .log);
     }
 
     fn processLogMatcher(self: *Self, matcher: *const LogMatcher, matcher_idx: usize) !void {
@@ -499,7 +507,7 @@ const Builder = struct {
         }
 
         const keep_value: KeepValue = if (metric_target.keep) .all else .none;
-        try self.storePolicyInfo(policy, keep_value);
+        try self.storePolicyInfo(policy, keep_value, .metric);
     }
 
     fn processMetricMatcher(self: *Self, matcher: *const MetricMatcher, matcher_idx: usize) !void {
@@ -611,7 +619,7 @@ const Builder = struct {
         return regex;
     }
 
-    fn storePolicyInfo(self: *Self, policy: *const Policy, keep: KeepValue) !void {
+    fn storePolicyInfo(self: *Self, policy: *const Policy, keep: KeepValue, telemetry_type: TelemetryType) !void {
         const policy_id_copy = try self.allocator.dupe(u8, policy.id);
         try self.policy_id_storage.append(self.allocator, policy_id_copy);
 
@@ -622,6 +630,7 @@ const Builder = struct {
             .negated_count = self.current_negated_count,
             .keep = keep,
             .enabled = policy.enabled,
+            .telemetry_type = telemetry_type,
         });
 
         self.bus.debug(PolicyStored{

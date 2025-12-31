@@ -10,8 +10,8 @@ const LogAdd = proto.policy.LogAdd;
 
 // Re-export types for convenience
 pub const FieldRef = types.FieldRef;
-pub const FieldAccessor = types.FieldAccessor;
-pub const FieldMutator = types.FieldMutator;
+pub const LogFieldAccessor = types.LogFieldAccessor;
+pub const LogFieldMutator = types.LogFieldMutator;
 pub const MutateOp = types.MutateOp;
 pub const TransformResult = types.TransformResult;
 
@@ -19,8 +19,8 @@ pub const TransformResult = types.TransformResult;
 pub fn applyTransforms(
     transform: *const LogTransform,
     ctx: *anyopaque,
-    accessor: FieldAccessor,
-    mutator: FieldMutator,
+    accessor: LogFieldAccessor,
+    mutator: LogFieldMutator,
 ) TransformResult {
     var result = TransformResult{};
 
@@ -64,7 +64,7 @@ pub fn applyTransforms(
 pub fn applyRemove(
     rule: *const LogRemove,
     ctx: *anyopaque,
-    mutator: FieldMutator,
+    mutator: LogFieldMutator,
 ) bool {
     const field_ref = FieldRef.fromRemoveField(rule.field) orelse return false;
     return mutator(ctx, .{ .remove = field_ref });
@@ -76,8 +76,8 @@ pub fn applyRemove(
 pub fn applyRedact(
     rule: *const LogRedact,
     ctx: *anyopaque,
-    accessor: FieldAccessor,
-    mutator: FieldMutator,
+    accessor: LogFieldAccessor,
+    mutator: LogFieldMutator,
 ) bool {
     const field_ref = FieldRef.fromRedactField(rule.field) orelse return false;
 
@@ -100,8 +100,8 @@ pub fn applyRedact(
 pub fn applyRename(
     rule: *const LogRename,
     ctx: *anyopaque,
-    accessor: FieldAccessor,
-    mutator: FieldMutator,
+    accessor: LogFieldAccessor,
+    mutator: LogFieldMutator,
 ) bool {
     const from_ref = FieldRef.fromRenameFrom(rule.from) orelse return false;
 
@@ -128,8 +128,8 @@ pub fn applyRename(
 pub fn applyAdd(
     rule: *const LogAdd,
     ctx: *anyopaque,
-    accessor: FieldAccessor,
-    mutator: FieldMutator,
+    accessor: LogFieldAccessor,
+    mutator: LogFieldMutator,
 ) bool {
     const field_ref = FieldRef.fromAddField(rule.field) orelse return false;
 
