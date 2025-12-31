@@ -2,6 +2,7 @@ const std = @import("std");
 const proxy_module = @import("./proxy_module.zig");
 const policy = @import("../policy/root.zig");
 const otlp_logs = @import("./otlp_logs.zig");
+const otlp_metrics = @import("./otlp_metrics.zig");
 const o11y = @import("../observability/root.zig");
 
 const ProxyModule = proxy_module.ProxyModule;
@@ -20,6 +21,8 @@ const NoopEventBus = o11y.NoopEventBus;
 
 const LogsProcessed = struct { dropped: usize, kept: usize };
 const LogsProcessingFailed = struct { err: []const u8 };
+const MetricsProcessed = struct { dropped: usize, kept: usize };
+const MetricsProcessingFailed = struct { err: []const u8 };
 
 /// OTLP module configuration
 pub const OtlpConfig = struct {
@@ -85,13 +88,29 @@ pub const OtlpModule = struct {
         // Get content type from headers
         const content_type = req.getHeader("content-type") orelse "application/json";
 
+        // Route to appropriate processor based on path
+        if (std.mem.endsWith(u8, req.path, "/v1/logs")) {
+            return self.processLogs(allocator, req.body, content_type);
+        } else if (std.mem.endsWith(u8, req.path, "/v1/metrics")) {
+            return self.processMetrics(allocator, req.body, content_type);
+        }
+
+        return ModuleResult.unchanged();
+    }
+
+    fn processLogs(
+        self: *OtlpModule,
+        allocator: std.mem.Allocator,
+        body: []const u8,
+        content_type: []const u8,
+    ) !ModuleResult {
         // Process logs through filter
         // FAIL OPEN: If processing fails, pass original through
         const result = otlp_logs.processLogs(
             allocator,
             self.registry,
             self.bus,
-            req.body,
+            body,
             content_type,
         ) catch |err| {
             self.bus.warn(LogsProcessingFailed{ .err = @errorName(err) });
@@ -120,14 +139,56 @@ pub const OtlpModule = struct {
         return ModuleResult.modified(result.data);
     }
 
+    fn processMetrics(
+        self: *OtlpModule,
+        allocator: std.mem.Allocator,
+        body: []const u8,
+        content_type: []const u8,
+    ) !ModuleResult {
+        // Process metrics through filter
+        // FAIL OPEN: If processing fails, pass original through
+        const result = otlp_metrics.processMetrics(
+            allocator,
+            self.registry,
+            self.bus,
+            body,
+            content_type,
+        ) catch |err| {
+            self.bus.warn(MetricsProcessingFailed{ .err = @errorName(err) });
+            return ModuleResult.unchanged();
+        };
+
+        self.bus.debug(MetricsProcessed{
+            .dropped = result.dropped_count,
+            .kept = result.original_count - result.dropped_count,
+        });
+
+        // If all metrics were dropped, return empty response with 200 (OTLP expects this)
+        if (result.allDropped()) {
+            allocator.free(result.data);
+            return ModuleResult.respond(200, "{}");
+        }
+
+        // Check if metrics were actually modified (any dropped)
+        if (!result.wasModified()) {
+            // No changes - free allocated memory and return unchanged
+            allocator.free(result.data);
+            return ModuleResult.unchanged();
+        }
+
+        // Metrics were modified
+        return ModuleResult.modified(result.data);
+    }
+
     fn deinit(_: *anyopaque) void {
         // Nothing to cleanup (stateless)
     }
 };
 
-/// Routes for OTLP logs endpoint
+/// Routes for OTLP endpoints
 pub const routes = [_]RoutePattern{
     RoutePattern.exact("/v1/logs", .{ .post = true }),
+    RoutePattern.exact("/v1/metrics", .{ .post = true }),
 };
 
 // =============================================================================

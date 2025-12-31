@@ -249,6 +249,7 @@ pub fn build(b: *std.Build) void {
                 "proto/tero/policy/v1/policy.proto",
                 "proto/tero/policy/v1/log.proto",
                 "proto/opentelemetry/proto/logs/v1/logs.proto",
+                "proto/opentelemetry/proto/metrics/v1/metrics.proto",
             },
             .include_directories = &.{
                 "proto",
