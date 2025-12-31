@@ -19,6 +19,7 @@ const server_mod = edge.server;
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough_module;
 const otlp_mod = edge.otlp_module;
+const health_mod = edge.health_module;
 const policy = edge.policy;
 
 const o11y = @import("observability/root.zig");
@@ -31,6 +32,7 @@ const ModuleRegistration = proxy_module.ModuleRegistration;
 const PassthroughModule = passthrough_mod.PassthroughModule;
 const OtlpModule = otlp_mod.OtlpModule;
 const OtlpConfig = otlp_mod.OtlpConfig;
+const HealthModule = health_mod.HealthModule;
 
 /// Route std.log through our EventBus adapter
 pub const std_options: std.Options = .{
@@ -244,11 +246,21 @@ pub fn main() !void {
     };
 
     // Create modules
+    var health_module = HealthModule{};
     var otlp_module = OtlpModule{};
     var passthrough_module = PassthroughModule{};
 
     // Register modules (order matters - first match wins)
     const module_registrations = [_]ModuleRegistration{
+        // Health module - reserved /_health endpoint (responds immediately, no upstream)
+        .{
+            .module = health_module.asProxyModule(),
+            .routes = &health_mod.routes,
+            .upstream_url = config.upstream_url,
+            .max_request_body = 0,
+            .max_response_body = 0,
+            .module_data = null,
+        },
         // OTLP module - handles /v1/logs with filtering
         .{
             .module = otlp_module.asProxyModule(),

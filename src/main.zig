@@ -17,6 +17,7 @@ const proxy_module = @import("modules/proxy_module.zig");
 const passthrough_mod = @import("modules/passthrough_module.zig");
 const datadog_mod = @import("modules/datadog_module.zig");
 const otlp_mod = @import("modules/otlp_module.zig");
+const health_mod = @import("modules/health_module.zig");
 const policy = @import("policy/root.zig");
 
 const ProxyServer = server_mod.ProxyServer;
@@ -26,6 +27,7 @@ const DatadogModule = datadog_mod.DatadogModule;
 const DatadogConfig = datadog_mod.DatadogConfig;
 const OtlpModule = otlp_mod.OtlpModule;
 const OtlpConfig = otlp_mod.OtlpConfig;
+const HealthModule = health_mod.HealthModule;
 
 /// Global server instance for signal handler
 var server_instance: ?*ProxyServer = null;
@@ -249,12 +251,22 @@ pub fn main() !void {
     };
 
     // Create modules
+    var health_module = HealthModule{};
     var datadog_module = DatadogModule{};
     var otlp_module = OtlpModule{};
     var passthrough_module = PassthroughModule{};
 
     // Register modules (order matters - first match wins)
     const module_registrations = [_]ModuleRegistration{
+        // Health module - reserved /_health endpoint (responds immediately, no upstream)
+        .{
+            .module = health_module.asProxyModule(),
+            .routes = &health_mod.routes,
+            .upstream_url = config.upstream_url,
+            .max_request_body = 0,
+            .max_response_body = 0,
+            .module_data = null,
+        },
         // Datadog module - handles /api/v2/logs with filtering
         .{
             .module = datadog_module.asProxyModule(),
@@ -264,7 +276,7 @@ pub fn main() !void {
             .max_response_body = config.max_body_size,
             .module_data = @ptrCast(&datadog_config),
         },
-        // OTLP module - handles /api/v2/logs with filtering
+        // OTLP module - handles /v1/logs and /v1/metrics with filtering
         .{
             .module = otlp_module.asProxyModule(),
             .routes = &otlp_mod.routes,

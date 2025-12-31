@@ -20,6 +20,7 @@ pub const proxy_module = @import("modules/proxy_module.zig");
 pub const passthrough_module = @import("modules/passthrough_module.zig");
 pub const datadog_module = @import("modules/datadog_module.zig");
 pub const otlp_module = @import("modules/otlp_module.zig");
+pub const health_module = @import("modules/health_module.zig");
 
 // Hyperscan/Vectorscan bindings
 pub const hyperscan = @import("hyperscan/hyperscan.zig");
@@ -75,5 +76,6 @@ test {
     _ = @import("modules/datadog_logs_v2.zig");
     _ = @import("modules/otlp_module.zig");
     _ = @import("modules/otlp_logs.zig");
+    _ = @import("modules/health_module.zig");
     _ = @import("hyperscan/hyperscan.zig");
 }
