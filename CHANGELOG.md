@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.0](https://github.com/usetero/edge/compare/v1.6.0...v1.7.0) (2025-12-31)
+
+
+### Features
+
+* support metric transforms in the edge ([#61](https://github.com/usetero/edge/issues/61)) ([a419678](https://github.com/usetero/edge/commit/a41967847ebca47b4bc6f57bf986c27f3cfe4fcd))
+
+
+### Bug Fixes
+
+* proxy response was truncated and encoding when not requested ([#59](https://github.com/usetero/edge/issues/59)) ([2728ff6](https://github.com/usetero/edge/commit/2728ff63a79fafe1d29a63ca3b7f470a05f423c0))
+
 ## [1.6.0](https://github.com/usetero/edge/compare/v1.5.1...v1.6.0) (2025-12-24)
 
 
