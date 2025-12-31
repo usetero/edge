@@ -374,9 +374,8 @@ fn filterLogsInPlace(
     logs_data: *LogsData,
     registry: *const PolicyRegistry,
     bus: *EventBus,
-    allocator: std.mem.Allocator,
 ) FilterCounts {
-    const engine = PolicyEngine.init(allocator, bus, @constCast(registry));
+    const engine = PolicyEngine.init(bus, @constCast(registry));
 
     var original_count: usize = 0;
     var dropped_count: usize = 0;
@@ -438,7 +437,7 @@ fn processJsonLogs(
     defer parsed.deinit();
 
     // Filter logs in-place
-    const counts = filterLogsInPlace(&parsed.value, registry, bus, allocator);
+    const counts = filterLogsInPlace(&parsed.value, registry, bus);
 
     // Re-serialize to JSON
     const output = try parsed.value.jsonEncode(.{}, allocator);
@@ -480,7 +479,7 @@ fn processProtobufLogs(
     var logs_data = try LogsData.decode(&reader, arena_alloc);
 
     // Filter logs in-place
-    const counts = filterLogsInPlace(&logs_data, registry, bus, arena_alloc);
+    const counts = filterLogsInPlace(&logs_data, registry, bus);
 
     // Re-serialize to protobuf - use main allocator for output since we return it
     // TODO: we should be passing the IO Writer to these methods to write the response bytes

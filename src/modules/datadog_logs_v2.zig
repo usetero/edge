@@ -352,7 +352,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
         return returnUnchanged(allocator, data, 0);
     };
 
-    const engine = PolicyEngine.init(allocator, bus, @constCast(registry));
+    const engine = PolicyEngine.init(bus, @constCast(registry));
 
     const value_type = document.getType() catch {
         return returnUnchanged(allocator, data, 0);

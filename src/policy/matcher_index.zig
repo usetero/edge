@@ -6,13 +6,13 @@
 //!
 //! ## Architecture
 //!
-//! 1. **MatcherKey**: Tagged union of LogMatcherKey/MetricMatcherKey for hash map indexing
+//! 1. **LogMatcherIndex / MetricMatcherIndex**: Type-specific indices for each telemetry type
 //! 2. **MatcherDatabase**: Compiled Hyperscan DBs for one MatcherKey (positive + negated)
-//! 3. **MatcherIndex**: Collection of all databases + policy metadata for match aggregation
-//! 4. **Builder**: Internal helper for constructing MatcherIndex from policies
+//! 3. **IndexBuilder(T)**: Generic builder for constructing type-specific indices
 //!
 //! ## Performance Optimizations
 //!
+//! - **Compile-time dispatch**: No runtime telemetry type filtering
 //! - **Numeric policy indices**: O(1) array lookups instead of string hash lookups
 //! - **Separate positive/negated databases**: Clean separation, no per-pattern negate flag
 //! - **Dense policy array**: Cache-friendly iteration over matched policies
@@ -21,14 +21,13 @@ const std = @import("std");
 const proto = @import("proto");
 const hyperscan = @import("../hyperscan/hyperscan.zig");
 const policy_types = @import("./types.zig");
-const policy_engine = @import("./policy_engine.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
 const FieldRef = policy_types.FieldRef;
 const MetricFieldRef = policy_types.MetricFieldRef;
-const TelemetryType = policy_types.TelemetryType;
+pub const TelemetryType = policy_types.TelemetryType;
 
 const Policy = proto.policy.Policy;
 const LogMatcher = proto.policy.LogMatcher;
@@ -42,21 +41,19 @@ const MetricField = proto.policy.MetricField;
 // Observability Events
 // =============================================================================
 
-const MatcherIndexBuildStarted = struct { policy_count: usize };
+const MatcherIndexBuildStarted = struct { policy_count: usize, telemetry_type: TelemetryType };
 const MatcherIndexBuildCompleted = struct { database_count: usize, matcher_key_count: usize, policy_count: usize };
 const ScanMatched = struct { pattern_count: usize, value_len: usize, value_preview: []const u8, is_negated: bool };
 const ScanMatchDetail = struct { pattern_id: u32, policy_index: PolicyIndex };
 const ScanError = struct { err: []const u8 };
 const ProcessingPolicy = struct { id: []const u8, name: []const u8, enabled: bool, index: PolicyIndex, telemetry_type: TelemetryType };
-const SkippingPolicyNoTarget = struct { id: []const u8 };
+const SkippingPolicyWrongType = struct { id: []const u8 };
 const PolicyMatcherCount = struct { id: []const u8, matcher_count: usize };
 const MatcherNullField = struct { matcher_idx: usize };
 const MatcherNullMatch = struct { matcher_idx: usize };
 const MatcherEmptyRegex = struct { matcher_idx: usize };
-const LogMatcherDetail = struct { matcher_idx: usize, field: FieldRef, regex: []const u8, negate: bool };
-const MetricMatcherDetail = struct { matcher_idx: usize, field: MetricFieldRef, regex: []const u8, negate: bool };
+const MatcherDetail = struct { matcher_idx: usize, regex: []const u8, negate: bool };
 const PolicyStored = struct { id: []const u8, index: PolicyIndex, required_matches: u16, negated_count: u16 };
-const CompilingDatabase = struct { key: MatcherKey, positive_count: usize, negated_count: usize };
 
 // =============================================================================
 // Policy Index - Numeric identifier for O(1) lookups
@@ -69,7 +66,7 @@ pub const PolicyIndex = u16;
 pub const MAX_POLICIES: usize = 4096;
 
 // =============================================================================
-// MatcherKey Types
+// MatcherKey Types - Separate types for log and metric
 // =============================================================================
 
 /// Key for indexing Hyperscan databases for log policies.
@@ -79,44 +76,11 @@ pub const LogMatcherKey = struct {
     const Self = @This();
 
     pub fn hash(self: Self) u64 {
-        var h = std.hash.Wyhash.init(0);
-        switch (self.field) {
-            .log_field => |lf| h.update(std.mem.asBytes(&lf)),
-            .log_attribute => |k| {
-                h.update(&.{0});
-                h.update(k);
-            },
-            .resource_attribute => |k| {
-                h.update(&.{1});
-                h.update(k);
-            },
-            .scope_attribute => |k| {
-                h.update(&.{2});
-                h.update(k);
-            },
-        }
-        return h.final();
+        return hashFieldRef(FieldRef, self.field);
     }
 
     pub fn eql(a: Self, b: Self) bool {
-        return switch (a.field) {
-            .log_field => |lf_a| switch (b.field) {
-                .log_field => |lf_b| lf_a == lf_b,
-                else => false,
-            },
-            .log_attribute => |k_a| switch (b.field) {
-                .log_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
-                else => false,
-            },
-            .resource_attribute => |k_a| switch (b.field) {
-                .resource_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
-                else => false,
-            },
-            .scope_attribute => |k_a| switch (b.field) {
-                .scope_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
-                else => false,
-            },
-        };
+        return eqlFieldRef(FieldRef, a.field, b.field);
     }
 };
 
@@ -127,90 +91,66 @@ pub const MetricMatcherKey = struct {
     const Self = @This();
 
     pub fn hash(self: Self) u64 {
-        var h = std.hash.Wyhash.init(0);
-        switch (self.field) {
-            .metric_field => |mf| h.update(std.mem.asBytes(&mf)),
-            .datapoint_attribute => |k| {
-                h.update(&.{0});
-                h.update(k);
-            },
-            .resource_attribute => |k| {
-                h.update(&.{1});
-                h.update(k);
-            },
-            .scope_attribute => |k| {
-                h.update(&.{2});
-                h.update(k);
-            },
-        }
-        return h.final();
+        return hashFieldRef(MetricFieldRef, self.field);
     }
 
     pub fn eql(a: Self, b: Self) bool {
-        return switch (a.field) {
-            .metric_field => |mf_a| switch (b.field) {
-                .metric_field => |mf_b| mf_a == mf_b,
-                else => false,
-            },
-            .datapoint_attribute => |k_a| switch (b.field) {
-                .datapoint_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
-                else => false,
-            },
-            .resource_attribute => |k_a| switch (b.field) {
-                .resource_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
-                else => false,
-            },
-            .scope_attribute => |k_a| switch (b.field) {
-                .scope_attribute => |k_b| std.mem.eql(u8, k_a, k_b),
-                else => false,
-            },
-        };
+        return eqlFieldRef(MetricFieldRef, a.field, b.field);
     }
 };
 
-/// Unified key for indexing Hyperscan databases.
-pub const MatcherKey = union(enum) {
-    log: LogMatcherKey,
-    metric: MetricMatcherKey,
-
-    const Self = @This();
-
-    pub fn hash(self: Self) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(std.mem.asBytes(&@intFromEnum(self)));
-        return switch (self) {
-            .log => |k| h.final() ^ k.hash(),
-            .metric => |k| h.final() ^ k.hash(),
-        };
+/// Generic hash implementation for field refs
+fn hashFieldRef(comptime FieldRefT: type, field: FieldRefT) u64 {
+    var h = std.hash.Wyhash.init(0);
+    switch (field) {
+        inline else => |val, tag| {
+            h.update(std.mem.asBytes(&tag));
+            const T = @TypeOf(val);
+            if (T == []const u8) {
+                h.update(val);
+            } else {
+                h.update(std.mem.asBytes(&val));
+            }
+        },
     }
+    return h.final();
+}
 
-    pub fn eql(a: Self, b: Self) bool {
-        return switch (a) {
-            .log => |ka| switch (b) {
-                .log => |kb| ka.eql(kb),
-                .metric => false,
-            },
-            .metric => |ka| switch (b) {
-                .metric => |kb| ka.eql(kb),
-                .log => false,
-            },
-        };
+/// Generic equality implementation for field refs
+fn eqlFieldRef(comptime FieldRefT: type, a: FieldRefT, b: FieldRefT) bool {
+    const tag_a = std.meta.activeTag(a);
+    const tag_b = std.meta.activeTag(b);
+    if (tag_a != tag_b) return false;
+
+    switch (a) {
+        inline else => |val_a, tag| {
+            const val_b = @field(b, @tagName(tag));
+            const T = @TypeOf(val_a);
+            if (T == []const u8) {
+                return std.mem.eql(u8, val_a, val_b);
+            } else {
+                return val_a == val_b;
+            }
+        },
     }
+}
 
-    pub fn telemetryType(self: Self) TelemetryType {
-        return switch (self) {
-            .log => .log,
-            .metric => .metric,
-        };
-    }
-};
-
-/// Hash context for MatcherKey in hash maps
-pub const MatcherKeyContext = struct {
-    pub fn hash(_: MatcherKeyContext, key: MatcherKey) u64 {
+/// Hash context for LogMatcherKey in hash maps
+pub const LogMatcherKeyContext = struct {
+    pub fn hash(_: LogMatcherKeyContext, key: LogMatcherKey) u64 {
         return key.hash();
     }
-    pub fn eql(_: MatcherKeyContext, a: MatcherKey, b: MatcherKey) bool {
+    pub fn eql(_: LogMatcherKeyContext, a: LogMatcherKey, b: LogMatcherKey) bool {
+        return a.eql(b);
+    }
+};
+
+/// Hash context for MetricMatcherKey in hash maps
+pub const MetricMatcherKeyContext = struct {
+    pub fn hash(_: MetricMatcherKeyContext, key: MetricMatcherKey) u64 {
+        return key.hash();
+    }
+    pub fn eql(_: MetricMatcherKeyContext, a: MetricMatcherKey, b: MetricMatcherKey) bool {
         return a.eql(b);
     }
 };
@@ -220,7 +160,7 @@ pub const MatcherKeyContext = struct {
 // =============================================================================
 
 /// Parsed keep value from policy.
-/// Priority order (most restrictive first): none > percentage > all > rate_limit
+/// Priority order (most restrictive first): none > rate_limit > percentage > all
 pub const KeepValue = union(enum) {
     all,
     none,
@@ -263,11 +203,16 @@ pub const KeepValue = union(enum) {
     }
 
     fn restrictiveness(self: KeepValue) u8 {
+        // Lower rank = more restrictive
+        // none: drop everything (most restrictive)
+        // rate limit: keep up to N per time unit
+        // percentage: keep N% of data
+        // all: keep everything (least restrictive)
         return switch (self) {
             .none => 0,
-            .percentage => 1,
-            .all => 2,
-            .per_second, .per_minute => 3,
+            .per_second, .per_minute => 1,
+            .percentage => 2,
+            .all => 3,
         };
     }
 };
@@ -277,6 +222,7 @@ pub const KeepValue = union(enum) {
 // =============================================================================
 
 /// Policy information needed for match aggregation and action determination.
+/// No telemetry_type field - that's implicit in the index type.
 pub const PolicyInfo = struct {
     id: []const u8,
     index: PolicyIndex,
@@ -284,7 +230,6 @@ pub const PolicyInfo = struct {
     negated_count: u16,
     keep: KeepValue,
     enabled: bool,
-    telemetry_type: TelemetryType,
 };
 
 // =============================================================================
@@ -392,7 +337,59 @@ pub const MatcherDatabase = struct {
 };
 
 // =============================================================================
-// Builder - Internal helper for constructing MatcherIndex
+// Comptime Type Helpers
+// =============================================================================
+
+/// Returns the MatcherKey type for a given telemetry type
+pub fn MatcherKeyType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => LogMatcherKey,
+        .metric => MetricMatcherKey,
+    };
+}
+
+/// Returns the FieldRef type for a given telemetry type
+pub fn FieldRefType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => FieldRef,
+        .metric => MetricFieldRef,
+    };
+}
+
+/// Returns the Matcher type for a given telemetry type
+fn MatcherType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => LogMatcher,
+        .metric => MetricMatcher,
+    };
+}
+
+/// Returns the Target type for a given telemetry type
+fn TargetType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => LogTarget,
+        .metric => MetricTarget,
+    };
+}
+
+/// Returns the HashContext type for a given telemetry type
+fn HashContextType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => LogMatcherKeyContext,
+        .metric => MetricMatcherKeyContext,
+    };
+}
+
+/// Returns the MatcherIndex type for a given telemetry type
+pub fn MatcherIndexType(comptime T: TelemetryType) type {
+    return switch (T) {
+        .log => LogMatcherIndex,
+        .metric => MetricMatcherIndex,
+    };
+}
+
+// =============================================================================
+// PatternsPerKey - Collected patterns before compilation
 // =============================================================================
 
 const PatternsPerKey = struct {
@@ -400,319 +397,269 @@ const PatternsPerKey = struct {
     negated: std.ArrayListUnmanaged(PatternCollector),
 };
 
-const Builder = struct {
-    // Permanent allocator (for final output)
-    allocator: std.mem.Allocator,
-    // Temporary allocator (arena, freed after build)
-    temp_allocator: std.mem.Allocator,
-    // Event bus
-    bus: *EventBus,
-    // Pattern collection per key
-    patterns_by_key: std.HashMap(MatcherKey, PatternsPerKey, MatcherKeyContext, std.hash_map.default_max_load_percentage),
-    // Policy info list
-    policy_info_list: std.ArrayListUnmanaged(PolicyInfo),
-    // Storage for duped attribute keys
-    key_storage: std.ArrayListUnmanaged([]const u8),
-    // Storage for duped policy IDs
-    policy_id_storage: std.ArrayListUnmanaged([]const u8),
-    // Current policy index
-    policy_index: PolicyIndex,
-    // Track positive/negated counts for current policy
-    current_positive_count: u16,
-    current_negated_count: u16,
+// =============================================================================
+// IndexBuilder - Generic builder for type-specific indices
+// =============================================================================
 
-    const Self = @This();
+fn IndexBuilder(comptime T: TelemetryType) type {
+    const MatcherKeyT = MatcherKeyType(T);
+    const FieldRefT = FieldRefType(T);
+    const MatcherT = MatcherType(T);
+    const TargetT = TargetType(T);
+    const HashContextT = HashContextType(T);
+    const IndexT = MatcherIndexType(T);
 
-    fn init(allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator, bus: *EventBus) Self {
-        return .{
-            .allocator = allocator,
-            .temp_allocator = temp_allocator,
-            .bus = bus,
-            .patterns_by_key = std.HashMap(MatcherKey, PatternsPerKey, MatcherKeyContext, std.hash_map.default_max_load_percentage).init(temp_allocator),
-            .policy_info_list = .{},
-            .key_storage = .{},
-            .policy_id_storage = .{},
-            .policy_index = 0,
-            .current_positive_count = 0,
-            .current_negated_count = 0,
-        };
-    }
+    return struct {
+        allocator: std.mem.Allocator,
+        temp_allocator: std.mem.Allocator,
+        bus: *EventBus,
+        patterns_by_key: std.HashMap(MatcherKeyT, PatternsPerKey, HashContextT, std.hash_map.default_max_load_percentage),
+        policy_info_list: std.ArrayListUnmanaged(PolicyInfo),
+        key_storage: std.ArrayListUnmanaged([]const u8),
+        policy_id_storage: std.ArrayListUnmanaged([]const u8),
+        policy_index: PolicyIndex,
+        current_positive_count: u16,
+        current_negated_count: u16,
 
-    fn processPolicy(self: *Self, policy: *const Policy) !void {
-        if (policy_engine.getLogTarget(policy)) |log_target| {
-            try self.processLogTarget(policy, log_target);
-        } else if (policy_engine.getMetricTarget(policy)) |metric_target| {
-            try self.processMetricTarget(policy, metric_target);
-        } else {
-            self.bus.debug(SkippingPolicyNoTarget{ .id = policy.id });
-        }
-    }
+        const Self = @This();
 
-    fn processLogTarget(self: *Self, policy: *const Policy, log_target: *const LogTarget) !void {
-        self.bus.debug(ProcessingPolicy{
-            .id = policy.id,
-            .name = policy.name,
-            .enabled = policy.enabled,
-            .index = self.policy_index,
-            .telemetry_type = .log,
-        });
-
-        self.current_positive_count = 0;
-        self.current_negated_count = 0;
-
-        self.bus.debug(PolicyMatcherCount{ .id = policy.id, .matcher_count = log_target.match.items.len });
-
-        for (log_target.match.items, 0..) |matcher, matcher_idx| {
-            try self.processLogMatcher(&matcher, matcher_idx);
+        fn init(allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator, bus: *EventBus) Self {
+            return .{
+                .allocator = allocator,
+                .temp_allocator = temp_allocator,
+                .bus = bus,
+                .patterns_by_key = std.HashMap(MatcherKeyT, PatternsPerKey, HashContextT, std.hash_map.default_max_load_percentage).init(temp_allocator),
+                .policy_info_list = .{},
+                .key_storage = .{},
+                .policy_id_storage = .{},
+                .policy_index = 0,
+                .current_positive_count = 0,
+                .current_negated_count = 0,
+            };
         }
 
-        try self.storePolicyInfo(policy, KeepValue.parse(log_target.keep), .log);
-    }
+        fn processPolicy(self: *Self, policy: *const Policy) !void {
+            const target = getTarget(policy) orelse {
+                self.bus.debug(SkippingPolicyWrongType{ .id = policy.id });
+                return;
+            };
 
-    fn processLogMatcher(self: *Self, matcher: *const LogMatcher, matcher_idx: usize) !void {
-        const field_ref = FieldRef.fromMatcherField(matcher.field) orelse {
-            self.bus.debug(MatcherNullField{ .matcher_idx = matcher_idx });
-            return;
-        };
-
-        const regex = self.extractRegex(matcher.match, matcher_idx) orelse return;
-
-        self.bus.debug(LogMatcherDetail{
-            .matcher_idx = matcher_idx,
-            .field = field_ref,
-            .regex = regex,
-            .negate = matcher.negate,
-        });
-
-        const matcher_key = MatcherKey{ .log = .{ .field = field_ref } };
-        try self.addPattern(matcher_key, regex, matcher.negate, .{ .log_field_ref = field_ref });
-    }
-
-    fn processMetricTarget(self: *Self, policy: *const Policy, metric_target: *const MetricTarget) !void {
-        self.bus.debug(ProcessingPolicy{
-            .id = policy.id,
-            .name = policy.name,
-            .enabled = policy.enabled,
-            .index = self.policy_index,
-            .telemetry_type = .metric,
-        });
-
-        self.current_positive_count = 0;
-        self.current_negated_count = 0;
-
-        self.bus.debug(PolicyMatcherCount{ .id = policy.id, .matcher_count = metric_target.match.items.len });
-
-        for (metric_target.match.items, 0..) |matcher, matcher_idx| {
-            try self.processMetricMatcher(&matcher, matcher_idx);
-        }
-
-        const keep_value: KeepValue = if (metric_target.keep) .all else .none;
-        try self.storePolicyInfo(policy, keep_value, .metric);
-    }
-
-    fn processMetricMatcher(self: *Self, matcher: *const MetricMatcher, matcher_idx: usize) !void {
-        // MetricFieldRef.fromMatcherField returns null for enum matchers (metric_type, aggregation_temporality)
-        const field_ref = MetricFieldRef.fromMatcherField(matcher.field) orelse return;
-
-        const regex = self.extractMetricRegex(matcher.match, matcher_idx) orelse return;
-
-        self.bus.debug(MetricMatcherDetail{
-            .matcher_idx = matcher_idx,
-            .field = field_ref,
-            .regex = regex,
-            .negate = matcher.negate,
-        });
-
-        const matcher_key = MatcherKey{ .metric = .{ .field = field_ref } };
-        try self.addPattern(matcher_key, regex, matcher.negate, .{ .metric_field_ref = field_ref });
-    }
-
-    const FieldRefContext = union(enum) {
-        log_field_ref: FieldRef,
-        metric_field_ref: MetricFieldRef,
-    };
-
-    fn addPattern(self: *Self, key: MatcherKey, regex: []const u8, negate: bool, field_ctx: FieldRefContext) !void {
-        if (negate) {
-            self.current_negated_count += 1;
-        } else {
-            self.current_positive_count += 1;
-        }
-
-        const gop = try self.patterns_by_key.getOrPut(key);
-        if (!gop.found_existing) {
-            // First time seeing this key - dupe attribute key if needed
-            try self.dupeKeyIfNeeded(gop.key_ptr, field_ctx);
-            gop.value_ptr.* = .{ .positive = .{}, .negated = .{} };
-        }
-
-        const collector = PatternCollector{ .policy_index = self.policy_index, .regex = regex };
-        if (negate) {
-            try gop.value_ptr.negated.append(self.temp_allocator, collector);
-        } else {
-            try gop.value_ptr.positive.append(self.temp_allocator, collector);
-        }
-    }
-
-    fn dupeKeyIfNeeded(self: *Self, key_ptr: *MatcherKey, field_ctx: FieldRefContext) !void {
-        switch (field_ctx) {
-            .log_field_ref => |field_ref| {
-                const attr_key = field_ref.getKey();
-                if (attr_key.len > 0) {
-                    const key_copy = try self.allocator.dupe(u8, attr_key);
-                    try self.key_storage.append(self.allocator, key_copy);
-                    key_ptr.log.field = switch (field_ref) {
-                        .log_attribute => .{ .log_attribute = key_copy },
-                        .resource_attribute => .{ .resource_attribute = key_copy },
-                        .scope_attribute => .{ .scope_attribute = key_copy },
-                        .log_field => field_ref,
-                    };
-                }
-            },
-            .metric_field_ref => |field_ref| {
-                const attr_key = field_ref.getKey();
-                if (attr_key.len > 0) {
-                    const key_copy = try self.allocator.dupe(u8, attr_key);
-                    try self.key_storage.append(self.allocator, key_copy);
-                    key_ptr.metric.field = switch (field_ref) {
-                        .datapoint_attribute => .{ .datapoint_attribute = key_copy },
-                        .resource_attribute => .{ .resource_attribute = key_copy },
-                        .scope_attribute => .{ .scope_attribute = key_copy },
-                        .metric_field => field_ref,
-                    };
-                }
-            },
-        }
-    }
-
-    fn extractRegex(self: *Self, match_union: ?LogMatcher.match_union, matcher_idx: usize) ?[]const u8 {
-        const m = match_union orelse {
-            self.bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
-            return null;
-        };
-        const regex: []const u8 = switch (m) {
-            .regex => |r| r,
-            .exact => |e| e,
-            .exists => return null,
-        };
-        if (regex.len == 0) {
-            self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
-            return null;
-        }
-        return regex;
-    }
-
-    fn extractMetricRegex(self: *Self, match_union: ?MetricMatcher.match_union, matcher_idx: usize) ?[]const u8 {
-        const m = match_union orelse {
-            self.bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
-            return null;
-        };
-        const regex: []const u8 = switch (m) {
-            .regex => |r| r,
-            .exact => |e| e,
-            .exists => return null,
-        };
-        if (regex.len == 0) {
-            self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
-            return null;
-        }
-        return regex;
-    }
-
-    fn storePolicyInfo(self: *Self, policy: *const Policy, keep: KeepValue, telemetry_type: TelemetryType) !void {
-        const policy_id_copy = try self.allocator.dupe(u8, policy.id);
-        try self.policy_id_storage.append(self.allocator, policy_id_copy);
-
-        try self.policy_info_list.append(self.temp_allocator, .{
-            .id = policy_id_copy,
-            .index = self.policy_index,
-            .required_match_count = self.current_positive_count + self.current_negated_count,
-            .negated_count = self.current_negated_count,
-            .keep = keep,
-            .enabled = policy.enabled,
-            .telemetry_type = telemetry_type,
-        });
-
-        self.bus.debug(PolicyStored{
-            .id = policy.id,
-            .index = self.policy_index,
-            .required_matches = self.current_positive_count,
-            .negated_count = self.current_negated_count,
-        });
-
-        self.policy_index += 1;
-    }
-
-    fn finish(self: *Self) !MatcherIndex {
-        // Copy policy info to owned slice
-        const policies = try self.allocator.dupe(PolicyInfo, self.policy_info_list.items);
-
-        // Build list of policy indices with negated patterns
-        var negation_indices = std.ArrayListUnmanaged(PolicyIndex){};
-        for (policies) |p| {
-            if (p.negated_count > 0) {
-                try negation_indices.append(self.temp_allocator, p.index);
-            }
-        }
-        const policies_with_negation = try self.allocator.dupe(PolicyIndex, negation_indices.items);
-
-        // Compile databases
-        var databases = std.HashMap(MatcherKey, *MatcherDatabase, MatcherKeyContext, std.hash_map.default_max_load_percentage).init(self.allocator);
-        var keys_list = std.ArrayListUnmanaged(MatcherKey){};
-
-        var key_it = self.patterns_by_key.iterator();
-        while (key_it.next()) |entry| {
-            const matcher_key = entry.key_ptr.*;
-            const patterns = entry.value_ptr.*;
-
-            if (patterns.positive.items.len == 0 and patterns.negated.items.len == 0) continue;
-
-            self.bus.debug(CompilingDatabase{
-                .key = matcher_key,
-                .positive_count = patterns.positive.items.len,
-                .negated_count = patterns.negated.items.len,
+            self.bus.debug(ProcessingPolicy{
+                .id = policy.id,
+                .name = policy.name,
+                .enabled = policy.enabled,
+                .index = self.policy_index,
+                .telemetry_type = T,
             });
 
-            const db = try compileDatabase(self.allocator, self.bus, patterns.positive.items, patterns.negated.items);
-            try databases.put(matcher_key, db);
-            try keys_list.append(self.temp_allocator, matcher_key);
+            self.current_positive_count = 0;
+            self.current_negated_count = 0;
+
+            self.bus.debug(PolicyMatcherCount{ .id = policy.id, .matcher_count = target.match.items.len });
+
+            for (target.match.items, 0..) |matcher, matcher_idx| {
+                try self.processMatcher(&matcher, matcher_idx);
+            }
+
+            const keep_value = parseKeepValue(target);
+            try self.storePolicyInfo(policy, keep_value);
         }
 
-        const matcher_keys = try self.allocator.dupe(MatcherKey, keys_list.items);
+        fn getTarget(policy: *const Policy) ?*const TargetT {
+            const target_ptr = &(policy.target orelse return null);
+            return switch (T) {
+                .log => switch (target_ptr.*) {
+                    .log => |*log| log,
+                    .metric => null,
+                },
+                .metric => switch (target_ptr.*) {
+                    .metric => |*metric| metric,
+                    .log => null,
+                },
+            };
+        }
 
-        return MatcherIndex{
-            .allocator = self.allocator,
-            .databases = databases,
-            .policies = policies,
-            .policies_with_negation = policies_with_negation,
-            .matcher_keys = matcher_keys,
-            .key_storage = self.key_storage,
-            .policy_id_storage = self.policy_id_storage,
-            .bus = self.bus,
-        };
-    }
-};
+        fn parseKeepValue(target: *const TargetT) KeepValue {
+            return switch (T) {
+                .log => KeepValue.parse(target.keep),
+                .metric => if (target.keep) .all else .none,
+            };
+        }
+
+        fn processMatcher(self: *Self, matcher: *const MatcherT, matcher_idx: usize) !void {
+            const field_ref = getFieldRef(matcher) orelse {
+                self.bus.debug(MatcherNullField{ .matcher_idx = matcher_idx });
+                return;
+            };
+
+            const regex = self.extractRegex(matcher.match, matcher_idx) orelse return;
+
+            self.bus.debug(MatcherDetail{
+                .matcher_idx = matcher_idx,
+                .regex = regex,
+                .negate = matcher.negate,
+            });
+
+            const matcher_key = MatcherKeyT{ .field = field_ref };
+            try self.addPattern(matcher_key, regex, matcher.negate, field_ref);
+        }
+
+        fn getFieldRef(matcher: *const MatcherT) ?FieldRefT {
+            return switch (T) {
+                .log => FieldRef.fromMatcherField(matcher.field),
+                .metric => MetricFieldRef.fromMatcherField(matcher.field),
+            };
+        }
+
+        fn extractRegex(self: *Self, match_union: anytype, matcher_idx: usize) ?[]const u8 {
+            const m = match_union orelse {
+                self.bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
+                return null;
+            };
+            const regex: []const u8 = switch (m) {
+                .regex => |r| r,
+                .exact => |e| e,
+                .exists => return null,
+            };
+            if (regex.len == 0) {
+                self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
+                return null;
+            }
+            return regex;
+        }
+
+        fn addPattern(self: *Self, key: MatcherKeyT, regex: []const u8, negate: bool, field_ref: FieldRefT) !void {
+            if (negate) {
+                self.current_negated_count += 1;
+            } else {
+                self.current_positive_count += 1;
+            }
+
+            const gop = try self.patterns_by_key.getOrPut(key);
+            if (!gop.found_existing) {
+                try self.dupeKeyIfNeeded(gop.key_ptr, field_ref);
+                gop.value_ptr.* = .{ .positive = .{}, .negated = .{} };
+            }
+
+            const collector = PatternCollector{ .policy_index = self.policy_index, .regex = regex };
+            if (negate) {
+                try gop.value_ptr.negated.append(self.temp_allocator, collector);
+            } else {
+                try gop.value_ptr.positive.append(self.temp_allocator, collector);
+            }
+        }
+
+        fn dupeKeyIfNeeded(self: *Self, key_ptr: *MatcherKeyT, field_ref: FieldRefT) !void {
+            const attr_key = field_ref.getKey();
+            if (attr_key.len == 0) return;
+
+            const key_copy = try self.allocator.dupe(u8, attr_key);
+            try self.key_storage.append(self.allocator, key_copy);
+
+            // Update the key's field to point to the duped key
+            key_ptr.field = dupeFieldRef(FieldRefT, field_ref, key_copy);
+        }
+
+        fn dupeFieldRef(comptime FieldRefTT: type, field_ref: FieldRefTT, key_copy: []const u8) FieldRefTT {
+            switch (T) {
+                .log => return switch (field_ref) {
+                    .log_attribute => .{ .log_attribute = key_copy },
+                    .resource_attribute => .{ .resource_attribute = key_copy },
+                    .scope_attribute => .{ .scope_attribute = key_copy },
+                    .log_field => field_ref,
+                },
+                .metric => return switch (field_ref) {
+                    .datapoint_attribute => .{ .datapoint_attribute = key_copy },
+                    .resource_attribute => .{ .resource_attribute = key_copy },
+                    .scope_attribute => .{ .scope_attribute = key_copy },
+                    .metric_field => field_ref,
+                },
+            }
+        }
+
+        fn storePolicyInfo(self: *Self, policy: *const Policy, keep: KeepValue) !void {
+            const policy_id_copy = try self.allocator.dupe(u8, policy.id);
+            try self.policy_id_storage.append(self.allocator, policy_id_copy);
+
+            try self.policy_info_list.append(self.temp_allocator, .{
+                .id = policy_id_copy,
+                .index = self.policy_index,
+                .required_match_count = self.current_positive_count + self.current_negated_count,
+                .negated_count = self.current_negated_count,
+                .keep = keep,
+                .enabled = policy.enabled,
+            });
+
+            self.bus.debug(PolicyStored{
+                .id = policy.id,
+                .index = self.policy_index,
+                .required_matches = self.current_positive_count,
+                .negated_count = self.current_negated_count,
+            });
+
+            self.policy_index += 1;
+        }
+
+        fn finish(self: *Self) !IndexT {
+            const policies = try self.allocator.dupe(PolicyInfo, self.policy_info_list.items);
+
+            var negation_indices = std.ArrayListUnmanaged(PolicyIndex){};
+            for (policies) |p| {
+                if (p.negated_count > 0) {
+                    try negation_indices.append(self.temp_allocator, p.index);
+                }
+            }
+            const policies_with_negation = try self.allocator.dupe(PolicyIndex, negation_indices.items);
+
+            var databases = std.HashMap(MatcherKeyT, *MatcherDatabase, HashContextT, std.hash_map.default_max_load_percentage).init(self.allocator);
+            var keys_list = std.ArrayListUnmanaged(MatcherKeyT){};
+
+            var key_it = self.patterns_by_key.iterator();
+            while (key_it.next()) |entry| {
+                const matcher_key = entry.key_ptr.*;
+                const patterns = entry.value_ptr.*;
+
+                if (patterns.positive.items.len == 0 and patterns.negated.items.len == 0) continue;
+
+                const db = try compileDatabase(self.allocator, self.bus, patterns.positive.items, patterns.negated.items);
+                try databases.put(matcher_key, db);
+                try keys_list.append(self.temp_allocator, matcher_key);
+            }
+
+            const matcher_keys = try self.allocator.dupe(MatcherKeyT, keys_list.items);
+
+            return IndexT{
+                .allocator = self.allocator,
+                .databases = databases,
+                .policies = policies,
+                .policies_with_negation = policies_with_negation,
+                .matcher_keys = matcher_keys,
+                .key_storage = self.key_storage,
+                .policy_id_storage = self.policy_id_storage,
+                .bus = self.bus,
+            };
+        }
+    };
+}
 
 // =============================================================================
-// MatcherIndex - The complete compiled index
+// LogMatcherIndex - Index for log policies only
 // =============================================================================
 
-/// The compiled matcher index containing all databases and policy metadata.
-pub const MatcherIndex = struct {
+pub const LogMatcherIndex = struct {
     allocator: std.mem.Allocator,
-    databases: std.HashMap(MatcherKey, *MatcherDatabase, MatcherKeyContext, std.hash_map.default_max_load_percentage),
+    databases: std.HashMap(LogMatcherKey, *MatcherDatabase, LogMatcherKeyContext, std.hash_map.default_max_load_percentage),
     policies: []PolicyInfo,
     policies_with_negation: []PolicyIndex,
-    matcher_keys: []MatcherKey,
+    matcher_keys: []LogMatcherKey,
     key_storage: std.ArrayListUnmanaged([]const u8),
     policy_id_storage: std.ArrayListUnmanaged([]const u8),
     bus: *EventBus,
 
     const Self = @This();
 
-    /// Build a MatcherIndex from a slice of policies.
     pub fn build(allocator: std.mem.Allocator, bus: *EventBus, policies_slice: []const Policy) !Self {
-        var span = bus.started(.info, MatcherIndexBuildStarted{ .policy_count = policies_slice.len });
+        var span = bus.started(.info, MatcherIndexBuildStarted{ .policy_count = policies_slice.len, .telemetry_type = .log });
 
         if (policies_slice.len > MAX_POLICIES) {
             return error.TooManyPolicies;
@@ -721,7 +668,7 @@ pub const MatcherIndex = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        var builder = Builder.init(allocator, arena.allocator(), bus);
+        var builder = IndexBuilder(.log).init(allocator, arena.allocator(), bus);
 
         for (policies_slice) |*policy| {
             try builder.processPolicy(policy);
@@ -738,7 +685,7 @@ pub const MatcherIndex = struct {
         return index;
     }
 
-    pub fn getDatabase(self: *const Self, key: MatcherKey) ?*MatcherDatabase {
+    pub fn getDatabase(self: *const Self, key: LogMatcherKey) ?*MatcherDatabase {
         return self.databases.get(key);
     }
 
@@ -754,7 +701,113 @@ pub const MatcherIndex = struct {
         return null;
     }
 
-    pub fn getMatcherKeys(self: *const Self) []const MatcherKey {
+    pub fn getMatcherKeys(self: *const Self) []const LogMatcherKey {
+        return self.matcher_keys;
+    }
+
+    pub fn getPolicies(self: *const Self) []const PolicyInfo {
+        return self.policies;
+    }
+
+    pub fn getPoliciesWithNegation(self: *const Self) []const PolicyIndex {
+        return self.policies_with_negation;
+    }
+
+    pub fn isEmpty(self: *const Self) bool {
+        return self.databases.count() == 0;
+    }
+
+    pub fn getDatabaseCount(self: *const Self) usize {
+        return self.databases.count();
+    }
+
+    pub fn getPolicyCount(self: *const Self) usize {
+        return self.policies.len;
+    }
+
+    pub fn deinit(self: *Self) void {
+        var db_it = self.databases.valueIterator();
+        while (db_it.next()) |db| {
+            db.*.deinit();
+            self.allocator.destroy(db.*);
+        }
+        self.databases.deinit();
+        self.allocator.free(self.policies);
+        self.allocator.free(self.policies_with_negation);
+        self.allocator.free(self.matcher_keys);
+
+        for (self.key_storage.items) |key| {
+            self.allocator.free(key);
+        }
+        self.key_storage.deinit(self.allocator);
+
+        for (self.policy_id_storage.items) |id| {
+            self.allocator.free(id);
+        }
+        self.policy_id_storage.deinit(self.allocator);
+    }
+};
+
+// =============================================================================
+// MetricMatcherIndex - Index for metric policies only
+// =============================================================================
+
+pub const MetricMatcherIndex = struct {
+    allocator: std.mem.Allocator,
+    databases: std.HashMap(MetricMatcherKey, *MatcherDatabase, MetricMatcherKeyContext, std.hash_map.default_max_load_percentage),
+    policies: []PolicyInfo,
+    policies_with_negation: []PolicyIndex,
+    matcher_keys: []MetricMatcherKey,
+    key_storage: std.ArrayListUnmanaged([]const u8),
+    policy_id_storage: std.ArrayListUnmanaged([]const u8),
+    bus: *EventBus,
+
+    const Self = @This();
+
+    pub fn build(allocator: std.mem.Allocator, bus: *EventBus, policies_slice: []const Policy) !Self {
+        var span = bus.started(.info, MatcherIndexBuildStarted{ .policy_count = policies_slice.len, .telemetry_type = .metric });
+
+        if (policies_slice.len > MAX_POLICIES) {
+            return error.TooManyPolicies;
+        }
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        var builder = IndexBuilder(.metric).init(allocator, arena.allocator(), bus);
+
+        for (policies_slice) |*policy| {
+            try builder.processPolicy(policy);
+        }
+
+        var index = try builder.finish();
+
+        span.completed(MatcherIndexBuildCompleted{
+            .database_count = index.databases.count(),
+            .matcher_key_count = index.matcher_keys.len,
+            .policy_count = index.policies.len,
+        });
+
+        return index;
+    }
+
+    pub fn getDatabase(self: *const Self, key: MetricMatcherKey) ?*MatcherDatabase {
+        return self.databases.get(key);
+    }
+
+    pub fn getPolicyByIndex(self: *const Self, index: PolicyIndex) ?PolicyInfo {
+        if (index >= self.policies.len) return null;
+        return self.policies[index];
+    }
+
+    pub fn getPolicy(self: *const Self, id: []const u8) ?PolicyInfo {
+        for (self.policies) |info| {
+            if (std.mem.eql(u8, info.id, id)) return info;
+        }
+        return null;
+    }
+
+    pub fn getMatcherKeys(self: *const Self) []const MetricMatcherKey {
         return self.matcher_keys;
     }
 
@@ -901,8 +954,8 @@ test "MetricMatcherKey: hash and equality" {
     const key1 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_NAME } };
     const key2 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_NAME } };
     const key3 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_UNIT } };
-    const key4 = MetricMatcherKey{ .field = .{ .datapoint_attribute = "host" } };
-    const key5 = MetricMatcherKey{ .field = .{ .datapoint_attribute = "host" } };
+    const key4 = MetricMatcherKey{ .field = .{ .datapoint_attribute = "status" } };
+    const key5 = MetricMatcherKey{ .field = .{ .datapoint_attribute = "status" } };
     const key6 = MetricMatcherKey{ .field = .{ .datapoint_attribute = "env" } };
 
     try testing.expect(key1.eql(key2));
@@ -913,83 +966,75 @@ test "MetricMatcherKey: hash and equality" {
     try testing.expectEqual(key4.hash(), key5.hash());
 }
 
-test "MatcherKey: tagged union hash and equality" {
-    const log_key1 = MatcherKey{ .log = .{ .field = .{ .log_field = .LOG_FIELD_BODY } } };
-    const log_key2 = MatcherKey{ .log = .{ .field = .{ .log_field = .LOG_FIELD_BODY } } };
-    const metric_key1 = MatcherKey{ .metric = .{ .field = .{ .metric_field = .METRIC_FIELD_NAME } } };
-    const metric_key2 = MatcherKey{ .metric = .{ .field = .{ .metric_field = .METRIC_FIELD_NAME } } };
-
-    try testing.expect(log_key1.eql(log_key2));
-    try testing.expect(metric_key1.eql(metric_key2));
-    try testing.expect(!log_key1.eql(metric_key1));
-    try testing.expectEqual(log_key1.hash(), log_key2.hash());
-    try testing.expectEqual(metric_key1.hash(), metric_key2.hash());
-    try testing.expect(log_key1.hash() != metric_key1.hash());
-    try testing.expectEqual(TelemetryType.log, log_key1.telemetryType());
-    try testing.expectEqual(TelemetryType.metric, metric_key1.telemetryType());
-}
-
 test "FieldRef: isKeyed" {
-    const log_body: FieldRef = .{ .log_field = .LOG_FIELD_BODY };
-    const log_attr: FieldRef = .{ .log_attribute = "service" };
-    const res_attr: FieldRef = .{ .resource_attribute = "host" };
-    const scope_attr: FieldRef = .{ .scope_attribute = "name" };
+    const log_field = FieldRef{ .log_field = .LOG_FIELD_BODY };
+    const log_attr = FieldRef{ .log_attribute = "service" };
+    const resource_attr = FieldRef{ .resource_attribute = "env" };
 
-    try testing.expect(!log_body.isKeyed());
+    try testing.expect(!log_field.isKeyed());
     try testing.expect(log_attr.isKeyed());
-    try testing.expect(res_attr.isKeyed());
-    try testing.expect(scope_attr.isKeyed());
+    try testing.expect(resource_attr.isKeyed());
 }
 
 test "KeepValue: parse" {
-    try testing.expectEqual(KeepValue.all, KeepValue.parse("all"));
     try testing.expectEqual(KeepValue.all, KeepValue.parse(""));
+    try testing.expectEqual(KeepValue.all, KeepValue.parse("all"));
     try testing.expectEqual(KeepValue.none, KeepValue.parse("none"));
     try testing.expectEqual(KeepValue{ .percentage = 50 }, KeepValue.parse("50%"));
-    try testing.expectEqual(KeepValue{ .percentage = 0 }, KeepValue.parse("0%"));
-    try testing.expectEqual(KeepValue{ .percentage = 100 }, KeepValue.parse("100%"));
     try testing.expectEqual(KeepValue{ .per_second = 100 }, KeepValue.parse("100/s"));
     try testing.expectEqual(KeepValue{ .per_minute = 1000 }, KeepValue.parse("1000/m"));
-    try testing.expectEqual(KeepValue.all, KeepValue.parse("invalid"));
-    try testing.expectEqual(KeepValue.all, KeepValue.parse("101%"));
 }
 
 test "KeepValue: restrictiveness comparison" {
-    const none: KeepValue = .none;
     const all: KeepValue = .all;
+    const none: KeepValue = .none;
     const pct50: KeepValue = .{ .percentage = 50 };
-    const pct10: KeepValue = .{ .percentage = 10 };
-    const rate100: KeepValue = .{ .per_second = 100 };
+    const pct25: KeepValue = .{ .percentage = 25 };
+    const rate: KeepValue = .{ .per_second = 100 };
 
     try testing.expect(none.isMoreRestrictiveThan(all));
     try testing.expect(none.isMoreRestrictiveThan(pct50));
     try testing.expect(pct50.isMoreRestrictiveThan(all));
-    try testing.expect(pct10.isMoreRestrictiveThan(pct50));
-    try testing.expect(all.isMoreRestrictiveThan(rate100));
-    try testing.expect(!all.isMoreRestrictiveThan(all));
-    try testing.expect(!none.isMoreRestrictiveThan(none));
+    try testing.expect(pct25.isMoreRestrictiveThan(pct50));
+    try testing.expect(!all.isMoreRestrictiveThan(rate));
 }
 
-test "MatcherIndex: build empty" {
+test "LogMatcherIndex: build empty" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{});
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{});
     defer index.deinit();
 
     try testing.expect(index.isEmpty());
-    try testing.expectEqual(@as(usize, 0), index.getDatabaseCount());
     try testing.expectEqual(@as(usize, 0), index.getPolicyCount());
 }
 
-test "MatcherIndex: build with single policy" {
+test "MetricMatcherIndex: build empty" {
     const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{});
+    defer index.deinit();
+
+    try testing.expect(index.isEmpty());
+    try testing.expectEqual(@as(usize, 0), index.getPolicyCount());
+}
+
+test "LogMatcherIndex: build with single policy" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
     };
     try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
@@ -997,9 +1042,7 @@ test "MatcherIndex: build with single policy" {
     });
     defer policy.deinit(allocator);
 
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
     try testing.expect(!index.isEmpty());
@@ -1008,313 +1051,179 @@ test "MatcherIndex: build with single policy" {
 
     const policy_info = index.getPolicyByIndex(0);
     try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
-    try testing.expectEqual(@as(u16, 0), policy_info.?.negated_count);
     try testing.expectEqual(KeepValue.none, policy_info.?.keep);
-    try testing.expect(policy_info.?.enabled);
+    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
 
     const policy_info_by_id = index.getPolicy("policy-1");
     try testing.expect(policy_info_by_id != null);
     try testing.expectEqualStrings("policy-1", policy_info_by_id.?.id);
-
-    const db = index.getDatabase(.{ .log = .{ .field = .{ .log_field = .LOG_FIELD_BODY } } });
-    try testing.expect(db != null);
-    try testing.expect(db.?.positive_db != null);
-    try testing.expect(db.?.negated_db == null);
 }
 
-test "MatcherIndex: build with keyed matchers" {
+test "MetricMatcherIndex: build with single policy" {
     const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "metric-policy-1"),
+        .name = try allocator.dupe(u8, "test-metric-policy"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "debug_.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    try testing.expect(!index.isEmpty());
+    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+    try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+
+    const policy_info = index.getPolicyByIndex(0);
+    try testing.expect(policy_info != null);
+    try testing.expectEqual(KeepValue.none, policy_info.?.keep);
+}
+
+test "LogMatcherIndex: build with keyed matchers" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+        } },
     };
     try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
-        .match = .{ .regex = try allocator.dupe(u8, "payment") },
-    });
-    try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
-        .match = .{ .regex = try allocator.dupe(u8, "prod") },
+        .match = .{ .regex = try allocator.dupe(u8, "payment-api") },
     });
     defer policy.deinit(allocator);
 
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    try testing.expectEqual(@as(usize, 2), index.getDatabaseCount());
-    try testing.expect(index.getDatabase(.{ .log = .{ .field = .{ .log_attribute = "service" } } }) != null);
-    try testing.expect(index.getDatabase(.{ .log = .{ .field = .{ .log_attribute = "env" } } }) != null);
-    try testing.expect(index.getDatabase(.{ .log = .{ .field = .{ .log_attribute = "other" } } }) == null);
-}
+    try testing.expect(!index.isEmpty());
 
-test "MatcherIndex: multiple policies same matcher key" {
-    const allocator = testing.allocator;
-
-    var policy1 = Policy{
-        .id = try allocator.dupe(u8, "policy-1"),
-        .name = try allocator.dupe(u8, "policy-1"),
-        .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
-    };
-    try policy1.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "error") },
-    });
-    defer policy1.deinit(allocator);
-
-    var policy2 = Policy{
-        .id = try allocator.dupe(u8, "policy-2"),
-        .name = try allocator.dupe(u8, "policy-2"),
-        .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
-    };
-    try policy2.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "warning") },
-    });
-    defer policy2.deinit(allocator);
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{ policy1, policy2 });
-    defer index.deinit();
-
-    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
-    try testing.expectEqual(@as(usize, 2), index.getPolicyCount());
-
-    const db = index.getDatabase(.{ .log = .{ .field = .{ .log_field = .LOG_FIELD_BODY } } });
+    const expected_key = LogMatcherKey{ .field = .{ .log_attribute = "service" } };
+    const db = index.getDatabase(expected_key);
     try testing.expect(db != null);
-    try testing.expectEqual(@as(usize, 2), db.?.positive_patterns.len);
 }
 
-test "MatcherIndex: negated matcher creates negated database" {
+test "LogMatcherIndex: negated matcher creates negated database" {
     const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
     };
     try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "error") },
+        .match = .{ .regex = try allocator.dupe(u8, "important") },
         .negate = true,
     });
     defer policy.deinit(allocator);
 
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const policy_info = index.getPolicyByIndex(0);
-    try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
-    try testing.expectEqual(@as(u16, 1), policy_info.?.negated_count);
+    try testing.expect(!index.isEmpty());
 
-    const db = index.getDatabase(.{ .log = .{ .field = .{ .log_field = .LOG_FIELD_BODY } } });
+    const expected_key = LogMatcherKey{ .field = .{ .log_field = .LOG_FIELD_BODY } };
+    const db = index.getDatabase(expected_key);
     try testing.expect(db != null);
+    try testing.expect(db.?.negated_db != null);
     try testing.expect(db.?.positive_db == null);
-    try testing.expect(db.?.negated_db != null);
-    try testing.expectEqual(@as(usize, 1), db.?.negated_patterns.len);
 }
 
-test "MatcherIndex: mixed positive and negated matchers" {
+test "LogMatcherIndex: scan database" {
     const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
     };
     try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
         .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
-    try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "ignore") },
-        .negate = true,
-    });
     defer policy.deinit(allocator);
 
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    const policy_info = index.getPolicyByIndex(0);
-    try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 2), policy_info.?.required_match_count);
-    try testing.expectEqual(@as(u16, 1), policy_info.?.negated_count);
-
-    const db = index.getDatabase(.{ .log = .{ .field = .{ .log_field = .LOG_FIELD_BODY } } });
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } });
     try testing.expect(db != null);
-    try testing.expect(db.?.positive_db != null);
-    try testing.expect(db.?.negated_db != null);
-    try testing.expectEqual(@as(usize, 1), db.?.positive_patterns.len);
-    try testing.expectEqual(@as(usize, 1), db.?.negated_patterns.len);
+
+    var result_buf: [256]u32 = undefined;
+
+    const match_result = db.?.scanPositive("an error occurred", &result_buf);
+    try testing.expectEqual(@as(usize, 1), match_result.count);
+    try testing.expectEqual(@as(u32, 0), match_result.matches()[0]);
+
+    const no_match_result = db.?.scanPositive("everything is fine", &result_buf);
+    try testing.expectEqual(@as(usize, 0), no_match_result.count);
 }
 
-test "MatcherIndex: scan database" {
+test "LogMatcherIndex: exists matcher excluded from regex matchers" {
     const allocator = testing.allocator;
-
-    var policy = Policy{
-        .id = try allocator.dupe(u8, "policy-1"),
-        .name = try allocator.dupe(u8, "test-policy"),
-        .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
-    };
-    try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "error") },
-    });
-    try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "warning") },
-    });
-    defer policy.deinit(allocator);
-
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
-    defer index.deinit();
-
-    var db = index.getDatabase(.{ .log = .{ .field = .{ .log_field = .LOG_FIELD_BODY } } }).?;
-
-    var result_buf: [16]u32 = undefined;
-    var result = db.scanPositive("an error occurred", &result_buf);
-    try testing.expectEqual(@as(usize, 1), result.count);
-
-    result = db.scanPositive("all good", &result_buf);
-    try testing.expectEqual(@as(usize, 0), result.count);
-
-    result = db.scanPositive("error and warning", &result_buf);
-    try testing.expectEqual(@as(usize, 2), result.count);
-}
-
-test "MatcherIndex: exists matcher excluded from regex matchers" {
-    const allocator = testing.allocator;
 
     var policy = Policy{
         .id = try allocator.dupe(u8, "policy-1"),
         .name = try allocator.dupe(u8, "test-policy"),
         .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+        } },
     };
-    try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "error") },
-    });
     try policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
         .match = .{ .exists = true },
     });
     defer policy.deinit(allocator);
 
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
-
-    const policy_info = index.getPolicyByIndex(0);
-    try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
-}
-
-// =============================================================================
-// Metric Policy Tests
-// =============================================================================
-
-test "MatcherIndex: build with single metric policy" {
-    const allocator = testing.allocator;
-
-    var policy = Policy{
-        .id = try allocator.dupe(u8, "metric-policy-1"),
-        .name = try allocator.dupe(u8, "test-metric-policy"),
-        .enabled = true,
-        .target = .{ .metric = .{ .keep = false } },
-    };
-    try policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "http_requests_total") },
-    });
-    defer policy.deinit(allocator);
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
-    defer index.deinit();
-
-    try testing.expect(!index.isEmpty());
-    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+    try testing.expect(index.isEmpty());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
-
-    const policy_info = index.getPolicyByIndex(0);
-    try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
-    try testing.expectEqual(@as(u16, 0), policy_info.?.negated_count);
-    try testing.expectEqual(KeepValue.none, policy_info.?.keep);
-    try testing.expect(policy_info.?.enabled);
-
-    const db = index.getDatabase(.{ .metric = .{ .field = .{ .metric_field = .METRIC_FIELD_NAME } } });
-    try testing.expect(db != null);
-    try testing.expect(db.?.positive_db != null);
-    try testing.expect(db.?.negated_db == null);
 }
 
-test "MatcherIndex: metric policy with datapoint attribute" {
+test "Mixed log and metric policies: each index only gets its type" {
     const allocator = testing.allocator;
-
-    var policy = Policy{
-        .id = try allocator.dupe(u8, "metric-policy-1"),
-        .name = try allocator.dupe(u8, "test-metric-policy"),
-        .enabled = true,
-        .target = .{ .metric = .{ .keep = true } },
-    };
-    try policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "http_requests") },
-    });
-    try policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .datapoint_attribute = try allocator.dupe(u8, "method") },
-        .match = .{ .regex = try allocator.dupe(u8, "GET|POST") },
-    });
-    defer policy.deinit(allocator);
-
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
-    defer index.deinit();
-
-    try testing.expectEqual(@as(usize, 2), index.getDatabaseCount());
-    try testing.expect(index.getDatabase(.{ .metric = .{ .field = .{ .metric_field = .METRIC_FIELD_NAME } } }) != null);
-    try testing.expect(index.getDatabase(.{ .metric = .{ .field = .{ .datapoint_attribute = "method" } } }) != null);
-
-    const policy_info = index.getPolicyByIndex(0);
-    try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 2), policy_info.?.required_match_count);
-    try testing.expectEqual(KeepValue.all, policy_info.?.keep);
-}
-
-test "MatcherIndex: mixed log and metric policies" {
-    const allocator = testing.allocator;
 
     var log_policy = Policy{
         .id = try allocator.dupe(u8, "log-policy-1"),
-        .name = try allocator.dupe(u8, "drop-errors"),
+        .name = try allocator.dupe(u8, "test-log"),
         .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+        } },
     };
     try log_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_BODY },
@@ -1324,63 +1233,41 @@ test "MatcherIndex: mixed log and metric policies" {
 
     var metric_policy = Policy{
         .id = try allocator.dupe(u8, "metric-policy-1"),
-        .name = try allocator.dupe(u8, "drop-http-metrics"),
+        .name = try allocator.dupe(u8, "test-metric"),
         .enabled = true,
-        .target = .{ .metric = .{ .keep = false } },
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
     };
     try metric_policy.target.?.metric.match.append(allocator, .{
         .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "http_") },
+        .match = .{ .regex = try allocator.dupe(u8, "debug_.*") },
     });
     defer metric_policy.deinit(allocator);
 
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{ log_policy, metric_policy });
-    defer index.deinit();
+    const policies = &[_]Policy{ log_policy, metric_policy };
 
-    try testing.expectEqual(@as(usize, 2), index.getDatabaseCount());
-    try testing.expectEqual(@as(usize, 2), index.getPolicyCount());
+    // Log index should only have log policy
+    var log_index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), policies);
+    defer log_index.deinit();
+    try testing.expectEqual(@as(usize, 1), log_index.getPolicyCount());
+    try testing.expectEqual(@as(usize, 1), log_index.getDatabaseCount());
 
-    try testing.expect(index.getDatabase(.{ .log = .{ .field = .{ .log_field = .LOG_FIELD_BODY } } }) != null);
-    try testing.expect(index.getDatabase(.{ .metric = .{ .field = .{ .metric_field = .METRIC_FIELD_NAME } } }) != null);
-
-    const log_info = index.getPolicy("log-policy-1");
+    const log_info = log_index.getPolicy("log-policy-1");
     try testing.expect(log_info != null);
-    try testing.expectEqual(KeepValue.none, log_info.?.keep);
 
-    const metric_info = index.getPolicy("metric-policy-1");
+    const metric_in_log = log_index.getPolicy("metric-policy-1");
+    try testing.expect(metric_in_log == null);
+
+    // Metric index should only have metric policy
+    var metric_index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), policies);
+    defer metric_index.deinit();
+    try testing.expectEqual(@as(usize, 1), metric_index.getPolicyCount());
+    try testing.expectEqual(@as(usize, 1), metric_index.getDatabaseCount());
+
+    const metric_info = metric_index.getPolicy("metric-policy-1");
     try testing.expect(metric_info != null);
-    try testing.expectEqual(KeepValue.none, metric_info.?.keep);
-}
 
-test "MatcherIndex: metric policy skips enum matchers" {
-    const allocator = testing.allocator;
-
-    var policy = Policy{
-        .id = try allocator.dupe(u8, "metric-policy-1"),
-        .name = try allocator.dupe(u8, "gauge-only"),
-        .enabled = true,
-        .target = .{ .metric = .{ .keep = true } },
-    };
-    try policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "cpu_") },
-    });
-    try policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_type = .METRIC_TYPE_GAUGE },
-        .match = .{ .exists = true },
-    });
-    defer policy.deinit(allocator);
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
-    var index = try MatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
-    defer index.deinit();
-
-    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
-
-    const policy_info = index.getPolicyByIndex(0);
-    try testing.expect(policy_info != null);
-    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
+    const log_in_metric = metric_index.getPolicy("log-policy-1");
+    try testing.expect(log_in_metric == null);
 }

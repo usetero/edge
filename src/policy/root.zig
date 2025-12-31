@@ -81,8 +81,8 @@ pub const TelemetryType = types.TelemetryType;
 // =============================================================================
 
 pub const matcher_index = @import("./matcher_index.zig");
-pub const MatcherIndex = matcher_index.MatcherIndex;
-pub const MatcherKey = matcher_index.MatcherKey;
+pub const LogMatcherIndex = matcher_index.LogMatcherIndex;
+pub const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
 pub const LogMatcherKey = matcher_index.LogMatcherKey;
 pub const MetricMatcherKey = matcher_index.MetricMatcherKey;
 pub const MAX_POLICIES = matcher_index.MAX_POLICIES;

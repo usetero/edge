@@ -43,8 +43,10 @@ const KeepValue = matcher_index.KeepValue;
 const PolicyIndex = matcher_index.PolicyIndex;
 const MAX_POLICIES = matcher_index.MAX_POLICIES;
 
-const MatcherIndex = matcher_index.MatcherIndex;
-const MatcherKey = matcher_index.MatcherKey;
+const LogMatcherIndex = matcher_index.LogMatcherIndex;
+const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
+const LogMatcherKey = matcher_index.LogMatcherKey;
+const MetricMatcherKey = matcher_index.MetricMatcherKey;
 const MatcherDatabase = matcher_index.MatcherDatabase;
 const PolicyInfo = matcher_index.PolicyInfo;
 const PatternMeta = matcher_index.PatternMeta;
@@ -203,8 +205,6 @@ const TransformApplied = struct {
 /// 1. Filter stage: Determines keep/drop decision
 /// 2. Transform stage: Returns matched policies for modification (caller handles)
 pub const PolicyEngine = struct {
-    /// Allocator for temporary match aggregation buffers
-    allocator: std.mem.Allocator,
     /// Event bus for observability
     bus: *EventBus,
     /// Policy registry for getting snapshots and recording stats/errors
@@ -215,9 +215,8 @@ pub const PolicyEngine = struct {
     /// Maximum number of pattern matches to track per scan
     const MAX_MATCHES_PER_SCAN: usize = 256;
 
-    pub fn init(allocator: std.mem.Allocator, bus: *EventBus, registry: *PolicyRegistry) Self {
+    pub fn init(bus: *EventBus, registry: *PolicyRegistry) Self {
         return .{
-            .allocator = allocator,
             .bus = bus,
             .registry = registry,
         };
@@ -289,7 +288,11 @@ pub const PolicyEngine = struct {
             return PolicyResult.unmatched;
         };
 
-        const index = &snapshot.matcher_index;
+        // Select the appropriate index based on telemetry type (compile-time dispatch)
+        const index = switch (T) {
+            .log => &snapshot.log_index,
+            .metric => &snapshot.metric_index,
+        };
 
         if (index.isEmpty()) {
             self.bus.debug(EvaluateEmpty{});
@@ -302,7 +305,7 @@ pub const PolicyEngine = struct {
         var scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
 
         // Phase 2: Find matching policies and determine decision
-        var match_state = self.findMatchingPolicies(index, &scan_state, policy_id_buf);
+        var match_state = self.findMatchingPolicies(T, index, &scan_state, policy_id_buf);
 
         self.bus.debug(EvaluateResult{ .decision = match_state.best_decision, .matched_count = match_state.matched_count });
 
@@ -332,7 +335,7 @@ pub const PolicyEngine = struct {
         comptime T: TelemetryType,
         ctx: *anyopaque,
         field_accessor: FieldAccessorType(T),
-        index: *const MatcherIndex,
+        index: *const matcher_index.MatcherIndexType(T),
     ) ScanState {
         var state = ScanState{
             .match_counts = undefined,
@@ -343,11 +346,10 @@ pub const PolicyEngine = struct {
         @memset(&state.match_counts, 0);
         @memset(&state.is_active, false);
 
-        // Initialize match counts for policies with negated patterns (of matching telemetry type)
+        // Initialize match counts for policies with negated patterns
+        // No telemetry type filtering needed - index only contains policies of type T
         for (index.getPoliciesWithNegation()) |policy_index| {
             const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
-            // Only initialize policies of the matching telemetry type
-            if (policy_info.telemetry_type != T) continue;
             state.match_counts[policy_index] = policy_info.negated_count;
             state.is_active[policy_index] = true;
             state.active_policies[state.active_count] = policy_index;
@@ -356,18 +358,9 @@ pub const PolicyEngine = struct {
 
         var result_buf: [MAX_MATCHES_PER_SCAN]u32 = undefined;
 
+        // Iterate type-specific matcher keys - no runtime type filtering needed
         for (index.getMatcherKeys()) |matcher_key| {
-            // Extract field ref based on telemetry type, skip keys of other types
-            const field_ref: FieldRefType(T) = switch (T) {
-                .log => switch (matcher_key) {
-                    .log => |k| k.field,
-                    .metric => continue,
-                },
-                .metric => switch (matcher_key) {
-                    .metric => |k| k.field,
-                    .log => continue,
-                },
-            };
+            const field_ref = matcher_key.field;
 
             const value = field_accessor(ctx, field_ref) orelse {
                 self.bus.debug(MatcherKeyFieldNotPresent{
@@ -426,7 +419,8 @@ pub const PolicyEngine = struct {
     /// Find all matching policies from active set and determine best decision.
     inline fn findMatchingPolicies(
         self: *const Self,
-        index: *const MatcherIndex,
+        comptime T: TelemetryType,
+        index: *const matcher_index.MatcherIndexType(T),
         scan_state: *const ScanState,
         policy_id_buf: [][]const u8,
     ) MatchState {
@@ -607,7 +601,7 @@ test "PolicyEngine: empty registry returns unset" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var test_log = TestLogContext{ .message = "hello" };
     var policy_id_buf: [16][]const u8 = undefined;
@@ -641,7 +635,7 @@ test "PolicyEngine: single policy drop match" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Matching log should be dropped
     var error_log = TestLogContext{ .message = "an error occurred" };
@@ -681,7 +675,7 @@ test "PolicyEngine: single policy keep match returns policy ID" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Matching log should be kept with policy ID returned
     var error_log = TestLogContext{ .message = "an error occurred" };
@@ -722,7 +716,7 @@ test "PolicyEngine: multiple matchers AND logic" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Both match - dropped
@@ -763,7 +757,7 @@ test "PolicyEngine: negated matcher" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Non-important log should be dropped (negate: pattern NOT found = success)
@@ -806,7 +800,7 @@ test "PolicyEngine: mixed negated and non-negated matchers" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Error from staging - dropped (error matches, prod not found = both conditions satisfied)
@@ -865,7 +859,7 @@ test "PolicyEngine: most restrictive wins - drop beats keep" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ keep_policy, drop_policy }, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Error from payment - both policies match, most restrictive (DROP) wins
@@ -902,7 +896,7 @@ test "PolicyEngine: disabled policies are skipped" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Would match but policy is disabled - unset
@@ -934,7 +928,7 @@ test "PolicyEngine: regex pattern matching" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Various error formats should match
@@ -974,7 +968,7 @@ test "PolicyEngine: missing field with negated matcher succeeds" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // No service attribute = pattern cannot be found = negation succeeds = dropped
@@ -1029,7 +1023,7 @@ test "PolicyEngine: multiple policies with different matcher keys" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Matches policy1
@@ -1068,7 +1062,7 @@ test "PolicyEngine: evaluate with null mutator" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Test evaluate with null mutator returns full PolicyResult
     var error_log = TestLogContext{ .message = "an error occurred" };
@@ -1124,7 +1118,7 @@ test "PolicyEngine: all policies positive only - none start active" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // No match - no policies become active
@@ -1177,7 +1171,7 @@ test "PolicyEngine: all policies negated only - all start active" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ policy1, policy2 }, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Neither "important" nor "critical" - both policies match
@@ -1235,7 +1229,7 @@ test "PolicyEngine: mix of positive-only and negated policies" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ positive_policy, negated_policy }, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // No "error", no "debug" - negated policy matches (drops)
@@ -1284,7 +1278,7 @@ test "PolicyEngine: multiple negated patterns same policy" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Neither word - both negations pass - policy matches
@@ -1333,7 +1327,7 @@ test "PolicyEngine: policy becomes active via positive then fails via negated" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Has "error", no "debug" - positive matches, negation passes - policy matches
@@ -1536,7 +1530,7 @@ test "evaluate: policy with keep=all and no transform" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var ctx = MutableTestLogContext.init(allocator);
     defer ctx.deinit();
@@ -1582,7 +1576,7 @@ test "evaluate: policy with keep=all and remove transform" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var ctx = MutableTestLogContext.init(allocator);
     defer ctx.deinit();
@@ -1630,7 +1624,7 @@ test "evaluate: policy with keep=all and redact transform" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var ctx = MutableTestLogContext.init(allocator);
     defer ctx.deinit();
@@ -1676,7 +1670,7 @@ test "evaluate: policy with keep=all and add transform" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var ctx = MutableTestLogContext.init(allocator);
     defer ctx.deinit();
@@ -1721,7 +1715,7 @@ test "evaluate: policy with no keep (drop) skips transform" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var ctx = MutableTestLogContext.init(allocator);
     defer ctx.deinit();
@@ -1790,7 +1784,7 @@ test "evaluate: multiple policies with different transforms" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ policy1, policy2 }, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Log matches BOTH policies
     var ctx = MutableTestLogContext.init(allocator);
@@ -1843,7 +1837,7 @@ test "evaluate: policy with unset keep applies transform" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var ctx = MutableTestLogContext.init(allocator);
     defer ctx.deinit();
@@ -1887,7 +1881,7 @@ test "evaluate: null mutator skips transforms" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var ctx = MutableTestLogContext.init(allocator);
     defer ctx.deinit();
@@ -1929,7 +1923,7 @@ test "evaluate: policy without transform field" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var ctx = MutableTestLogContext.init(allocator);
     defer ctx.deinit();
@@ -2000,7 +1994,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ drop_policy, keep_policy }, "test", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Test 1: Log matches only drop policy
     {
@@ -2151,7 +2145,7 @@ test "PolicyEngine stats: all DROP policies get hits" {
     try registry.registerProvider(&provider_iface);
     try registry.updatePolicies(&.{ drop_policy1, drop_policy2 }, "stats-tracking-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Log matches both DROP policies
     var test_log = TestLogContext{ .message = "critical error occurred" };
@@ -2212,7 +2206,7 @@ test "PolicyEngine stats: all KEEP policies get hits" {
     try registry.registerProvider(&provider_iface);
     try registry.updatePolicies(&.{ keep_policy1, keep_policy2 }, "stats-tracking-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Log matches both KEEP policies
     var test_log = TestLogContext{ .message = "critical error occurred" };
@@ -2273,7 +2267,7 @@ test "PolicyEngine stats: mixed KEEP and DROP - KEEP gets hits, DROP gets misses
     try registry.registerProvider(&provider_iface);
     try registry.updatePolicies(&.{ keep_policy, drop_policy }, "stats-tracking-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Log matches both policies (KEEP and DROP)
     var test_log = TestLogContext{ .message = "critical error occurred" };
@@ -2324,7 +2318,7 @@ test "PolicyEngine stats: single policy match gets hit" {
     try registry.registerProvider(&provider_iface);
     try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var test_log = TestLogContext{ .message = "an error occurred" };
     var policy_id_buf: [16][]const u8 = undefined;
@@ -2402,7 +2396,7 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - all KEEPs get hits, all DRO
     try registry.registerProvider(&provider_iface);
     try registry.updatePolicies(&.{ keep_policy1, keep_policy2, drop_policy1, drop_policy2 }, "stats-tracking-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Log matches all 4 policies (2 KEEP, 2 DROP)
     var test_log = TestLogContext{ .message = "critical error with warning and debug info" };
@@ -2461,7 +2455,7 @@ test "PolicyEngine stats: no match records no stats" {
     try registry.registerProvider(&provider_iface);
     try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     // Log doesn't match the policy
     var test_log = TestLogContext{ .message = "all good here" };
@@ -2523,7 +2517,7 @@ test "MetricPolicyEngine: empty registry returns unset" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var test_metric = TestMetricContext{ .name = "http_requests_total" };
     var policy_id_buf: [16][]const u8 = undefined;
@@ -2561,13 +2555,13 @@ test "MetricPolicyEngine: single policy drop match" {
     const snapshot = registry.getSnapshot().?;
     try testing.expectEqual(@as(usize, 1), snapshot.policies.len);
 
-    // Verify the index has the matcher key
-    const index = &snapshot.matcher_index;
+    // Verify the metric index has the matcher key
+    const index = &snapshot.metric_index;
     try testing.expect(!index.isEmpty());
     try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
 
     // Verify we can get the database for the metric key
-    const db = index.getDatabase(.{ .metric = .{ .field = .{ .metric_field = .METRIC_FIELD_NAME } } });
+    const db = index.getDatabase(.{ .field = .{ .metric_field = .METRIC_FIELD_NAME } });
     try testing.expect(db != null);
 
     // Test that scanning works directly
@@ -2575,7 +2569,7 @@ test "MetricPolicyEngine: single policy drop match" {
     const scan_result = db.?.scanPositive("debug_memory_usage", &result_buf);
     try testing.expect(scan_result.count > 0); // Pattern should match
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Matching metric should be dropped
@@ -2612,7 +2606,7 @@ test "MetricPolicyEngine: single policy keep match returns policy ID" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
     var test_metric = TestMetricContext{ .name = "http_requests_total" };
     var policy_id_buf: [16][]const u8 = undefined;
@@ -2653,7 +2647,7 @@ test "MetricPolicyEngine: multiple matchers AND logic" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Both match - should drop
@@ -2697,7 +2691,7 @@ test "MetricPolicyEngine: negated matcher" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Internal metric matches pattern, negation fails -> policy doesn't match -> passes
@@ -2734,7 +2728,7 @@ test "MetricPolicyEngine: datapoint attribute matching" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Metric with 500 status should be dropped
@@ -2785,7 +2779,7 @@ test "MetricPolicyEngine: resource attribute matching" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Metric from test environment should be dropped
@@ -2837,7 +2831,7 @@ test "MetricPolicyEngine: log policies don't affect metrics" {
     defer registry.deinit();
     try registry.updatePolicies(&.{log_policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Metric evaluation should not be affected by log policies
@@ -2872,7 +2866,7 @@ test "MetricPolicyEngine: metric policies don't affect logs" {
     defer registry.deinit();
     try registry.updatePolicies(&.{metric_policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Log evaluation should not be affected by metric policies
@@ -2922,7 +2916,7 @@ test "MetricPolicyEngine: most restrictive wins - drop beats keep" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ keep_policy, drop_policy }, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // http_errors matches both policies - drop should win
@@ -2959,7 +2953,7 @@ test "MetricPolicyEngine: disabled policies are skipped" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Even though the pattern matches, the disabled policy should be skipped
@@ -3008,7 +3002,7 @@ test "MetricPolicyEngine: mixed log and metric policies" {
     defer registry.deinit();
     try registry.updatePolicies(&.{ metric_policy, log_policy }, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Debug metric should be dropped by metric policy
@@ -3056,7 +3050,7 @@ test "MetricPolicyEngine: regex pattern matching" {
     defer registry.deinit();
     try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Matches: starts with internal_
@@ -3101,7 +3095,7 @@ test "MetricPolicyEngine: stats recording for matched policies" {
     try registry.registerProvider(&provider_iface);
     try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
 
-    const engine = PolicyEngine.init(allocator, noop_bus.eventBus(), &registry);
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
 
     // Matching metric - should record stats

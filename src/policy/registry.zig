@@ -10,7 +10,8 @@ const NoopEventBus = o11y.NoopEventBus;
 const Policy = proto.policy.Policy;
 const SourceType = policy_source.SourceType;
 const PolicyMetadata = policy_source.PolicyMetadata;
-const MatcherIndex = matcher_index.MatcherIndex;
+const LogMatcherIndex = matcher_index.LogMatcherIndex;
+const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
 
 // =============================================================================
 // Observability Events
@@ -60,14 +61,17 @@ pub const PolicySnapshot = struct {
     metric_target_indices: []const u32,
 
     /// Compiled Hyperscan-based matcher index for efficient log evaluation
-    /// Indexed by (MatchCase, key) for O(k*n) evaluation
-    matcher_index: MatcherIndex,
+    log_index: LogMatcherIndex,
+
+    /// Compiled Hyperscan-based matcher index for efficient metric evaluation
+    metric_index: MetricMatcherIndex,
 
     version: u64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PolicySnapshot) void {
-        self.matcher_index.deinit();
+        self.log_index.deinit();
+        self.metric_index.deinit();
         self.allocator.free(self.policies);
         self.allocator.free(self.log_target_indices);
         self.allocator.free(self.metric_target_indices);
@@ -459,9 +463,12 @@ pub const PolicyRegistry = struct {
             }
         }
 
-        // Build matcher index for Hyperscan-based matching
-        var idx = try MatcherIndex.build(self.allocator, self.bus, policies_slice);
-        errdefer idx.deinit();
+        // Build matcher indices for Hyperscan-based matching
+        var log_idx = try LogMatcherIndex.build(self.allocator, self.bus, policies_slice);
+        errdefer log_idx.deinit();
+
+        var metric_idx = try MetricMatcherIndex.build(self.allocator, self.bus, policies_slice);
+        errdefer metric_idx.deinit();
 
         // Increment version
         const new_version = self.version.load(.monotonic) + 1;
@@ -473,7 +480,8 @@ pub const PolicyRegistry = struct {
             .policies = policies_slice,
             .log_target_indices = log_target_indices,
             .metric_target_indices = metric_target_indices,
-            .matcher_index = idx,
+            .log_index = log_idx,
+            .metric_index = metric_idx,
             .version = new_version,
             .allocator = self.allocator,
         };
