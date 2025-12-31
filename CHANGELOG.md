@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.8.1](https://github.com/usetero/edge/compare/v1.8.0...v1.8.1) (2025-12-31)
+
+
+### Bug Fixes
+
+* add health checks for the edge ([#66](https://github.com/usetero/edge/issues/66)) ([173095a](https://github.com/usetero/edge/commit/173095a52409974fca4c68982f2363396cd573e6))
+* bot signoff work plz ([#68](https://github.com/usetero/edge/issues/68)) ([2a6a90e](https://github.com/usetero/edge/commit/2a6a90e99d8c4bc4d2aa67165ebbcb42ae4532b2))
+* maybe signoff will work ([#69](https://github.com/usetero/edge/issues/69)) ([78b6a51](https://github.com/usetero/edge/commit/78b6a5153680126c32c8624b6f25a6756d15cebe))
+
 ## [1.8.0](https://github.com/usetero/edge/compare/v1.7.0...v1.8.0) (2025-12-31)
 
 
