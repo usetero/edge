@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.8.0](https://github.com/usetero/edge/compare/v1.7.0...v1.8.0) (2025-12-31)
+
+
+### Features
+
+* otlp metrics support ([#62](https://github.com/usetero/edge/issues/62)) ([7068b59](https://github.com/usetero/edge/commit/7068b594a556c618cdf5e7af6b212d43ad824ae3))
+* support more fields in the protos ([#64](https://github.com/usetero/edge/issues/64)) ([ecf9d01](https://github.com/usetero/edge/commit/ecf9d0127c17af5ff4a1aa7ad98c404a8523d15b))
+
 ## [1.7.0](https://github.com/usetero/edge/compare/v1.6.0...v1.7.0) (2025-12-31)
 
 
