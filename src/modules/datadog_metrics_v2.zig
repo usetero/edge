@@ -296,7 +296,7 @@ fn buildResult(
 
     // If everything was dropped, return empty series
     if (state.kept.items.len == 0) {
-        const empty_payload = "{\"series\":[]}";
+        const empty_payload = "{\"errors\":[]}";
         const result = try allocator.alloc(u8, empty_payload.len);
         @memcpy(result, empty_payload);
         return .{
@@ -483,7 +483,7 @@ test "processMetrics - returns 202-compatible response when all metrics dropped"
     const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
     defer allocator.free(result.data);
 
-    try std.testing.expectEqualStrings("{\"series\":[]}", result.data);
+    try std.testing.expectEqualStrings("{\"errors\":[]}", result.data);
     try std.testing.expect(result.allDropped());
 }
 

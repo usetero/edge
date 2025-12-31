@@ -3,55 +3,69 @@
     {
       "id": "drop-echo-logs",
       "name": "drop-echo-logs",
-      "matchers": [
-        { "field": "log_attribute", "key": "ddsource", "pattern": "nginx" }
-      ],
-      "keep": "none"
+      "log": {
+        "match": [{ "log_attribute": "ddsource", "regex": "nginx" }],
+        "keep": "none"
+      }
     },
     {
       "id": "drop-debug-logs",
       "name": "drop-debug-logs",
-      "matchers": [
-        { "field": "log_body", "pattern": "debug" },
-        { "field": "log_body", "pattern": "trace" }
-      ],
-      "keep": "none"
+      "log": {
+        "match": [
+          { "log_field": "body", "regex": "debug" },
+          { "log_field": "body", "regex": "trace" }
+        ],
+        "keep": "none"
+      }
     },
     {
       "id": "drop-no-such-file-or-directory-logs",
       "name": "drop-no-such-file-or-directory-logs",
-      "matchers": [
-        { "field": "log_body", "pattern": "no such file or directory" }
-      ],
-      "keep": "none"
+      "log": {
+        "match": [
+          { "log_field": "body", "regex": "no such file or directory" }
+        ],
+        "keep": "none"
+      }
     },
     {
       "id": "drop-debug-level",
       "name": "drop-debug-level",
-      "matchers": [{ "field": "log_severity_text", "pattern": "DEBUG" }],
-      "keep": "none"
+      "log": {
+        "match": [{ "log_field": "severity_text", "regex": "DEBUG" }],
+        "keep": "none"
+      }
     },
     {
       "id": "drop-edge-logs",
       "name": "drop-edge-logs",
-      "matchers": [
-        {
-          "field": "resource_attribute",
-          "key": "service.name",
-          "pattern": "^.*edge$"
-        }
-      ],
-      "keep": "none"
+      "log": {
+        "match": [
+          { "resource_attribute": "service.name", "regex": "^.*edge$" }
+        ],
+        "keep": "none"
+      }
     },
     {
       "id": "keep-error-logs",
       "name": "keep-error-logs",
-      "matchers": [
-        { "field": "log_severity_text", "pattern": "error" },
-        { "field": "log_severity_text", "pattern": "critical" },
-        { "field": "log_severity_text", "pattern": "fatal" }
-      ],
-      "keep": "all"
+      "log": {
+        "match": [
+          { "log_field": "severity_text", "regex": "error" },
+          { "log_field": "severity_text", "regex": "critical" },
+          { "log_field": "severity_text", "regex": "fatal" }
+        ],
+        "keep": "all"
+      }
+    },
+    {
+      "id": "drop-system-load-metric",
+      "name": "drop-system-load-metric",
+      "metric": {
+        "match": [{ "metric_field": "name", "regex": "^.*system.load.*$" }],
+        "keep": false
+      }
     }
   ]
 }

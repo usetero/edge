@@ -161,7 +161,7 @@ pub const DatadogModule = struct {
         // If all metrics were dropped, return empty series with 202 (Datadog expects this)
         if (result.allDropped()) {
             allocator.free(result.data);
-            return ModuleResult.respond(202, "{\"series\":[]}");
+            return ModuleResult.respond(202, "{\"errors\":[]}");
         }
 
         // Check if metrics were actually modified (any dropped)
