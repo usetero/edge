@@ -55,6 +55,9 @@ pub const FileProvider = @import("./provider_file.zig").FileProvider;
 /// HTTP-based policy provider
 pub const HttpProvider = @import("./provider_http.zig").HttpProvider;
 
+/// Async policy loader for off-hot-path initialization
+pub const Loader = @import("./loader.zig").PolicyLoader;
+
 // =============================================================================
 // Configuration Types
 // =============================================================================
