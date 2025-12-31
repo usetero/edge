@@ -35,6 +35,8 @@ const ConfigJson = struct {
     listen_address: []const u8,
     listen_port: u16,
     upstream_url: []const u8,
+    logs_url: ?[]const u8 = null,
+    metrics_url: ?[]const u8 = null,
     workspace_id: []const u8,
     log_level: []const u8,
     max_body_size: u32,
@@ -76,6 +78,14 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
 
     // Allocate and copy upstream URL
     config.upstream_url = try allocator.dupe(u8, json_config.upstream_url);
+
+    // Allocate and copy optional Datadog-specific URLs
+    if (json_config.logs_url) |logs_url| {
+        config.logs_url = try allocator.dupe(u8, logs_url);
+    }
+    if (json_config.metrics_url) |metrics_url| {
+        config.metrics_url = try allocator.dupe(u8, metrics_url);
+    }
 
     // Allocate and copy workspace ID
     config.workspace_id = try allocator.dupe(u8, json_config.workspace_id);

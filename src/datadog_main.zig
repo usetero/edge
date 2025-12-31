@@ -58,6 +58,8 @@ const ListenAddressConfigured = struct {
     port: u16,
 };
 const UpstreamConfigured = struct { url: []const u8 };
+const LogsUpstreamConfigured = struct { url: []const u8 };
+const MetricsUpstreamConfigured = struct { url: []const u8 };
 const ServiceConfigured = struct {
     namespace: []const u8,
     name: []const u8,
@@ -213,6 +215,8 @@ pub fn main() !void {
     const config = try config_parser.parseConfigFile(allocator, config_path);
     defer {
         allocator.free(config.upstream_url);
+        if (config.logs_url) |logs_url| allocator.free(logs_url);
+        if (config.metrics_url) |metrics_url| allocator.free(metrics_url);
         allocator.free(config.workspace_id);
         for (config.policy_providers) |provider_config| {
             allocator.free(provider_config.id);
@@ -253,6 +257,12 @@ pub fn main() !void {
 
     bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
     bus.info(UpstreamConfigured{ .url = config.upstream_url });
+    if (config.logs_url) |logs_url| {
+        bus.info(LogsUpstreamConfigured{ .url = logs_url });
+    }
+    if (config.metrics_url) |metrics_url| {
+        bus.info(MetricsUpstreamConfigured{ .url = metrics_url });
+    }
     bus.info(ServiceConfigured{
         .namespace = config.service.namespace,
         .name = config.service.name,
@@ -346,17 +356,31 @@ pub fn main() !void {
         .bus = bus,
     };
 
+    // Determine upstream URLs (use specific URLs if configured, otherwise fall back to upstream_url)
+    const logs_upstream = config.logs_url orelse config.upstream_url;
+    const metrics_upstream = config.metrics_url orelse config.upstream_url;
+
     // Create modules
-    var datadog_module = DatadogModule{};
+    var datadog_logs_module = DatadogModule{};
+    var datadog_metrics_module = DatadogModule{};
     var passthrough_module = PassthroughModule{};
 
     // Register modules (order matters - first match wins)
     const module_registrations = [_]ModuleRegistration{
-        // Datadog module - handles /api/v2/logs with filtering
+        // Datadog logs module - handles /api/v2/logs with filtering
         .{
-            .module = datadog_module.asProxyModule(),
-            .routes = &datadog_mod.routes,
-            .upstream_url = config.upstream_url,
+            .module = datadog_logs_module.asProxyModule(),
+            .routes = &datadog_mod.logs_routes,
+            .upstream_url = logs_upstream,
+            .max_request_body = config.max_body_size,
+            .max_response_body = config.max_body_size,
+            .module_data = @ptrCast(&datadog_config),
+        },
+        // Datadog metrics module - handles /api/v2/series with filtering
+        .{
+            .module = datadog_metrics_module.asProxyModule(),
+            .routes = &datadog_mod.metrics_routes,
+            .upstream_url = metrics_upstream,
             .max_request_body = config.max_body_size,
             .max_response_body = config.max_body_size,
             .module_data = @ptrCast(&datadog_config),
