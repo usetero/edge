@@ -51,28 +51,45 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           token: ${{ steps.generate-token.outputs.token }}
-          # Use the merge commit SHA for pull_request events (always valid even if branch deleted)
-          # or the push commit SHA for push events
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.head_ref || github.ref }}
           fetch-depth: 0
           submodules: "true"
+        # For push events to master, this checks out master
+        # For PR events, this checks out the PR branch (with tracking)
+        continue-on-error: true
+        id: checkout
+
+      - name: Exit early if branch was deleted (stale workflow run)
+        if: steps.checkout.outcome == 'failure'
+        run: |
+          echo "::warning::Branch '${{ github.head_ref }}' was deleted (likely a merged release-please PR). Skipping signoff."
+          # Exit successfully - this is expected for merged PRs
+          exit 0
+
       - uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
+        if: steps.checkout.outcome == 'success'
 
       - run: git config --global url.https://x-access-token:${{ steps.generate-token.outputs.token }}@github.com/.insteadOf https://github.com/
+        if: steps.checkout.outcome == 'success'
 
       - run: gh extension install basecamp/gh-signoff
+        if: steps.checkout.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
 
       - run: git config user.name "github-actions[bot]"
+        if: steps.checkout.outcome == 'success'
       - run: git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        if: steps.checkout.outcome == 'success'
 
       - name: Setup CI environment (if task exists)
+        if: steps.checkout.outcome == 'success'
         run: |
           if task --list | grep -q "ci:setup"; then
             task ci:setup
           fi
 
       - run: task signoff
+        if: steps.checkout.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
