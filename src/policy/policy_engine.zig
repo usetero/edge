@@ -43,13 +43,7 @@ const KeepValue = matcher_index.KeepValue;
 const PolicyIndex = matcher_index.PolicyIndex;
 const MAX_POLICIES = matcher_index.MAX_POLICIES;
 
-const LogMatcherIndex = matcher_index.LogMatcherIndex;
-const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
-const LogMatcherKey = matcher_index.LogMatcherKey;
-const MetricMatcherKey = matcher_index.MetricMatcherKey;
 const MatcherDatabase = matcher_index.MatcherDatabase;
-const PolicyInfo = matcher_index.PolicyInfo;
-const PatternMeta = matcher_index.PatternMeta;
 pub const PolicyRegistry = policy_mod.Registry;
 pub const PolicySnapshot = policy_mod.Snapshot;
 
@@ -130,9 +124,6 @@ pub const PolicyResult = struct {
         .matched_policy_ids = &.{},
     };
 };
-
-// Re-export FilterResult for backwards compatibility during migration
-pub const FilterResult = FilterDecision;
 
 // =============================================================================
 // Comptime Type Helpers - Select types based on telemetry type
@@ -222,11 +213,6 @@ pub const PolicyEngine = struct {
         };
     }
 
-    pub fn deinit(self: *Self) void {
-        _ = self;
-        // No resources to free currently
-    }
-
     /// Evaluate telemetry against all policies in the current snapshot.
     ///
     /// Returns a PolicyResult containing:
@@ -309,17 +295,27 @@ pub const PolicyEngine = struct {
 
         self.bus.debug(EvaluateResult{ .decision = match_state.best_decision, .matched_count = match_state.matched_count });
 
-        // Phase 3: Handle drop case (record stats, return early)
+        self.recordMatchedPolicyStats(policy_id_buf, &match_state);
+
         if (match_state.best_decision == .drop) {
-            self.recordMatchStats(policy_id_buf, &match_state);
             return PolicyResult.dropped;
         }
 
-        // Phase 4: Apply transforms and record stats for keep case
+        // Phase 3: Apply transforms (log only) and record stats
         if (T == .log) {
-            self.applyTransformsAndRecordStats(ctx, field_accessor, field_mutator, snapshot, policy_id_buf, &match_state);
-        } else {
-            self.recordMatchStats(policy_id_buf, &match_state);
+            if (field_mutator) |mutator| {
+                for (0..match_state.matched_count) |i| {
+                    const result = self.applyLogTransforms(
+                        ctx,
+                        field_accessor,
+                        mutator,
+                        snapshot,
+                        match_state.matched_indices[i],
+                        policy_id_buf[i],
+                    );
+                    self.registry.recordPolicyStats(policy_id_buf[i], 0, 0, result);
+                }
+            }
         }
 
         return PolicyResult{
@@ -466,79 +462,53 @@ pub const PolicyEngine = struct {
         return state;
     }
 
-    /// Record stats for all matched policies (without transforms).
-    inline fn recordMatchStats(
-        self: *const Self,
-        policy_id_buf: [][]const u8,
-        match_state: *const MatchState,
-    ) void {
-        if (match_state.matched_count == 0) return;
-
-        const empty_transform_result = log_transform.TransformResult{};
-
-        for (0..match_state.matched_count) |i| {
-            const policy_id = policy_id_buf[i];
-            const keep_value = match_state.matched_keep_values[i];
-            const policy_decision = keepToDecision(keep_value);
-
-            if (match_state.hasMixedDecisions()) {
-                if (policy_decision == .keep) {
-                    self.registry.recordPolicyStats(policy_id, 1, 0, empty_transform_result);
-                } else {
-                    self.registry.recordPolicyStats(policy_id, 0, 1, empty_transform_result);
-                }
-            } else {
-                self.registry.recordPolicyStats(policy_id, 1, 0, empty_transform_result);
-            }
-        }
-    }
-
-    /// Apply transforms for each matched policy and record stats.
-    /// Only used for log telemetry.
-    inline fn applyTransformsAndRecordStats(
+    /// Apply transforms to log context for a matched policy.
+    /// Returns the transform result for stats recording.
+    inline fn applyLogTransforms(
         self: *const Self,
         ctx: *anyopaque,
         field_accessor: LogFieldAccessor,
-        field_mutator: ?LogFieldMutator,
+        field_mutator: LogFieldMutator,
         snapshot: *const PolicySnapshot,
+        policy_index: PolicyIndex,
+        policy_id: []const u8,
+    ) log_transform.TransformResult {
+        const policy = snapshot.getPolicy(policy_index) orelse return .{};
+        const log_target = getLogTarget(policy) orelse return .{};
+        const transform = log_target.transform orelse return .{};
+
+        const result = log_transform.applyTransforms(&transform, ctx, field_accessor, field_mutator);
+
+        if (result.totalApplied() > 0) {
+            self.bus.debug(TransformApplied{
+                .policy_id = policy_id,
+                .removes = result.removes_applied,
+                .redacts = result.redacts_applied,
+                .renames = result.renames_applied,
+                .adds = result.adds_applied,
+            });
+        }
+
+        return result;
+    }
+
+    /// Record stats for all matched policies.
+    inline fn recordMatchedPolicyStats(
+        self: *const Self,
         policy_id_buf: [][]const u8,
         match_state: *const MatchState,
     ) void {
+        const has_mixed = match_state.hasMixedDecisions();
+
         for (0..match_state.matched_count) |i| {
             const policy_id = policy_id_buf[i];
-            const policy_index = match_state.matched_indices[i];
             const keep_value = match_state.matched_keep_values[i];
+
             const policy_decision = keepToDecision(keep_value);
-
-            var transform_result = log_transform.TransformResult{};
-            if (field_mutator) |mutator| {
-                if (snapshot.getPolicy(policy_index)) |policy| {
-                    if (getLogTarget(policy)) |log_target| {
-                        if (log_target.transform) |transform| {
-                            transform_result = log_transform.applyTransforms(&transform, ctx, field_accessor, mutator);
-                        }
-                    }
-                }
-            }
-
-            if (transform_result.totalApplied() > 0) {
-                self.bus.debug(TransformApplied{
-                    .policy_id = policy_id,
-                    .removes = transform_result.removes_applied,
-                    .redacts = transform_result.redacts_applied,
-                    .renames = transform_result.renames_applied,
-                    .adds = transform_result.adds_applied,
-                });
-            }
-
-            if (match_state.hasMixedDecisions()) {
-                if (policy_decision == .keep) {
-                    self.registry.recordPolicyStats(policy_id, 1, 0, transform_result);
-                } else {
-                    self.registry.recordPolicyStats(policy_id, 0, 1, transform_result);
-                }
+            if (has_mixed and policy_decision == .drop) {
+                self.registry.recordPolicyStats(policy_id, 0, 1, .{});
             } else {
-                self.registry.recordPolicyStats(policy_id, 1, 0, transform_result);
+                self.registry.recordPolicyStats(policy_id, 1, 0, .{});
             }
         }
     }
@@ -553,9 +523,6 @@ pub const PolicyEngine = struct {
         };
     }
 };
-
-// Backwards compatibility alias
-pub const FilterEngine = PolicyEngine;
 
 // =============================================================================
 // Tests
