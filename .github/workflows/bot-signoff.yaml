@@ -72,3 +72,5 @@ jobs:
           fi
 
       - run: task signoff
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}

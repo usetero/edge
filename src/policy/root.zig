@@ -55,6 +55,9 @@ pub const FileProvider = @import("./provider_file.zig").FileProvider;
 /// HTTP-based policy provider
 pub const HttpProvider = @import("./provider_http.zig").HttpProvider;
 
+/// Async policy loader for off-hot-path initialization
+pub const Loader = @import("./loader.zig").PolicyLoader;
+
 // =============================================================================
 // Configuration Types
 // =============================================================================
@@ -67,9 +70,25 @@ pub const Header = types.Header;
 
 // Field reference types (shared across policy engine and transforms)
 pub const FieldRef = types.FieldRef;
-pub const FieldAccessor = types.FieldAccessor;
-pub const FieldMutator = types.FieldMutator;
+pub const MetricFieldRef = types.MetricFieldRef;
+pub const LogFieldAccessor = types.LogFieldAccessor;
+pub const LogFieldMutator = types.LogFieldMutator;
+pub const MetricFieldAccessor = types.MetricFieldAccessor;
+pub const MetricFieldMutator = types.MetricFieldMutator;
 pub const MutateOp = types.MutateOp;
+pub const MetricMutateOp = types.MetricMutateOp;
+pub const TelemetryType = types.TelemetryType;
+
+// =============================================================================
+// Matcher Index (Hyperscan-based pattern matching)
+// =============================================================================
+
+pub const matcher_index = @import("./matcher_index.zig");
+pub const LogMatcherIndex = matcher_index.LogMatcherIndex;
+pub const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
+pub const LogMatcherKey = matcher_index.LogMatcherKey;
+pub const MetricMatcherKey = matcher_index.MetricMatcherKey;
+pub const MAX_POLICIES = matcher_index.MAX_POLICIES;
 
 // =============================================================================
 // Parsing

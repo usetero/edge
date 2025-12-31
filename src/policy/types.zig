@@ -5,6 +5,18 @@ const provider_http = @import("./provider_http.zig");
 pub const Header = provider_http.Header;
 
 // =============================================================================
+// TelemetryType - Distinguishes between log and metric telemetry
+// =============================================================================
+
+/// Type of telemetry being evaluated
+pub const TelemetryType = enum {
+    /// Log telemetry (OTLP logs, Datadog logs, etc.)
+    log,
+    /// Metric telemetry (Prometheus, OTLP metrics, etc.)
+    metric,
+};
+
+// =============================================================================
 // Service and Provider Configuration
 // =============================================================================
 
@@ -50,6 +62,8 @@ const LogRename = proto.policy.LogRename;
 const LogAdd = proto.policy.LogAdd;
 const LogMatcher = proto.policy.LogMatcher;
 const LogField = proto.policy.LogField;
+const MetricMatcher = proto.policy.MetricMatcher;
+const MetricField = proto.policy.MetricField;
 
 /// Reference to a field for accessor/mutator operations
 pub const FieldRef = union(enum) {
@@ -127,15 +141,75 @@ pub const FieldRef = union(enum) {
     }
 };
 
-/// Field accessor function type - returns the value for a given field
+// =============================================================================
+// Metric Field Reference Types
+// =============================================================================
+
+/// Reference to a metric field for accessor/mutator operations.
+/// Note: metric_type and aggregation_temporality are enum matches, not string/regex,
+/// so they are handled separately and not included here.
+pub const MetricFieldRef = union(enum) {
+    metric_field: MetricField,
+    datapoint_attribute: []const u8,
+    resource_attribute: []const u8,
+    scope_attribute: []const u8,
+
+    pub fn fromMatcherField(field: ?MetricMatcher.field_union) ?MetricFieldRef {
+        const f = field orelse return null;
+        return switch (f) {
+            .metric_field => |v| .{ .metric_field = v },
+            .datapoint_attribute => |v| .{ .datapoint_attribute = v },
+            .resource_attribute => |v| .{ .resource_attribute = v },
+            .scope_attribute => |v| .{ .scope_attribute = v },
+            // Enum fields don't use Hyperscan - handled separately
+            .metric_type, .aggregation_temporality => null,
+        };
+    }
+
+    /// Check if this field ref requires a key (attribute-based fields)
+    pub fn isKeyed(self: MetricFieldRef) bool {
+        return switch (self) {
+            .datapoint_attribute, .resource_attribute, .scope_attribute => true,
+            .metric_field => false,
+        };
+    }
+
+    /// Get the key for attribute-based fields, empty string for metric_field
+    pub fn getKey(self: MetricFieldRef) []const u8 {
+        return switch (self) {
+            .datapoint_attribute => |k| k,
+            .resource_attribute => |k| k,
+            .scope_attribute => |k| k,
+            .metric_field => "",
+        };
+    }
+};
+
+// =============================================================================
+// Log Field Accessor/Mutator Types
+// =============================================================================
+
+/// Log field accessor function type - returns the value for a given log field
 /// Returns null if the field doesn't exist
-pub const FieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
+pub const LogFieldAccessor = *const fn (ctx: *const anyopaque, field: FieldRef) ?[]const u8;
 
-/// Field mutator function type - sets, removes, or renames a field
+/// Log field mutator function type - sets, removes, or renames a log field
 /// Returns true if the operation succeeded
-pub const FieldMutator = *const fn (ctx: *anyopaque, op: MutateOp) bool;
+pub const LogFieldMutator = *const fn (ctx: *anyopaque, op: MutateOp) bool;
 
-/// Mutation operation for field mutator
+// =============================================================================
+// Metric Field Accessor/Mutator Types
+// =============================================================================
+
+/// Metric field accessor function type - returns the value for a given metric field
+/// Returns null if the field doesn't exist
+pub const MetricFieldAccessor = *const fn (ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8;
+
+/// Metric field mutator function type - sets, removes, or renames a metric field
+/// Returns true if the operation succeeded
+pub const MetricFieldMutator = *const fn (ctx: *anyopaque, op: MetricMutateOp) bool;
+
+/// Mutation operation for log field mutator
 pub const MutateOp = union(enum) {
     /// Remove a field entirely
     remove: FieldRef,
@@ -148,6 +222,24 @@ pub const MutateOp = union(enum) {
     /// Rename a field (move value from one field to another)
     rename: struct {
         from: FieldRef,
+        to: []const u8,
+        upsert: bool,
+    },
+};
+
+/// Mutation operation for metric field mutator
+pub const MetricMutateOp = union(enum) {
+    /// Remove a field entirely
+    remove: MetricFieldRef,
+    /// Set a field to a value (upsert controls insert vs update behavior)
+    set: struct {
+        field: MetricFieldRef,
+        value: []const u8,
+        upsert: bool,
+    },
+    /// Rename a field (move value from one field to another)
+    rename: struct {
+        from: MetricFieldRef,
         to: []const u8,
         upsert: bool,
     },

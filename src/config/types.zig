@@ -23,7 +23,11 @@ pub const ProxyConfig = struct {
     // Network config
     listen_address: [4]u8,
     listen_port: u16,
-    upstream_url: []const u8, // Now supports full URLs like "http://example.com:8080"
+    upstream_url: []const u8, // Default upstream URL for passthrough traffic
+
+    // Datadog-specific upstream URLs (optional, fall back to upstream_url if not set)
+    logs_url: ?[]const u8 = null, // e.g., "https://http-intake.logs.datadoghq.com"
+    metrics_url: ?[]const u8 = null, // e.g., "https://api.datadoghq.com"
 
     // Edge metadata
     workspace_id: []const u8,

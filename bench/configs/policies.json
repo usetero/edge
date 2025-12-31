@@ -3,138 +3,133 @@
     {
       "id": "drop-debug-logs",
       "name": "Drop debug level logs",
-      "matchers": [
-        { "field": "log_severity_text", "pattern": "DEBUG" },
-        { "field": "log_severity_text", "pattern": "debug" }
-      ],
-      "keep": "none"
+      "log": {
+        "match": [
+          { "log_field": "severity_text", "regex": "DEBUG" },
+          { "log_field": "severity_text", "regex": "debug" }
+        ],
+        "keep": "none"
+      }
     },
     {
       "id": "drop-health-checks",
       "name": "Drop health check logs",
-      "matchers": [
-        { "field": "log_body", "pattern": "/health" },
-        { "field": "log_body", "pattern": "/ready" },
-        { "field": "log_body", "pattern": "/live" }
-      ],
-      "keep": "none"
+      "log": {
+        "match": [
+          { "log_field": "body", "regex": "/health" },
+          { "log_field": "body", "regex": "/ready" },
+          { "log_field": "body", "regex": "/live" }
+        ],
+        "keep": "none"
+      }
     },
     {
       "id": "keep-errors",
       "name": "Keep error logs",
-      "matchers": [
-        { "field": "log_severity_text", "pattern": "ERROR" },
-        { "field": "log_severity_text", "pattern": "error" },
-        { "field": "log_severity_text", "pattern": "FATAL" }
-      ],
-      "keep": "all"
+      "log": {
+        "match": [
+          { "log_field": "severity_text", "regex": "ERROR" },
+          { "log_field": "severity_text", "regex": "error" },
+          { "log_field": "severity_text", "regex": "FATAL" }
+        ],
+        "keep": "all"
+      }
     },
     {
       "id": "drop-database-queries",
       "name": "Drop database query logs (matches 1 log in large payloads)",
-      "matchers": [
-        { "field": "log_body", "pattern": "Database query executed" }
-      ],
-      "keep": "none"
+      "log": {
+        "match": [{ "log_field": "body", "regex": "Database query executed" }],
+        "keep": "none"
+      }
     },
     {
       "id": "drop-first-entry",
       "name": "Drop first log entry (matches 1 log in 1MB payloads)",
-      "matchers": [{ "field": "log_body", "pattern": "Log entry 0:" }],
-      "keep": "none"
+      "log": {
+        "match": [{ "log_field": "body", "regex": "Log entry 0:" }],
+        "keep": "none"
+      }
     },
     {
       "id": "redact-sensitive-data",
       "name": "Redact sensitive fields from payment logs",
-      "matchers": [{ "field": "log_body", "pattern": "payment" }],
-      "keep": "all",
-      "transform": {
-        "redact": [
-          {
-            "field": "log_attribute",
-            "key": "credit_card",
-            "replacement": "[REDACTED]"
-          },
-          {
-            "field": "log_attribute",
-            "key": "ssn",
-            "replacement": "[REDACTED]"
-          }
-        ]
+      "log": {
+        "match": [{ "log_field": "body", "regex": "payment" }],
+        "keep": "all",
+        "transform": {
+          "redact": [
+            { "log_attribute": "credit_card", "replacement": "[REDACTED]" },
+            { "log_attribute": "ssn", "replacement": "[REDACTED]" }
+          ]
+        }
       }
     },
     {
       "id": "enrich-auth-logs",
       "name": "Add metadata to authentication logs",
-      "matchers": [
-        { "field": "log_body", "pattern": "authentication" },
-        { "field": "log_body", "pattern": "login" }
-      ],
-      "keep": "all",
-      "transform": {
-        "add": [
-          {
-            "field": "log_attribute",
-            "key": "security_category",
-            "value": "auth",
-            "upsert": true
-          },
-          {
-            "field": "log_attribute",
-            "key": "compliance_required",
-            "value": "true",
-            "upsert": true
-          }
-        ]
+      "log": {
+        "match": [
+          { "log_field": "body", "regex": "authentication" },
+          { "log_field": "body", "regex": "login" }
+        ],
+        "keep": "all",
+        "transform": {
+          "add": [
+            {
+              "log_attribute": "security_category",
+              "value": "auth",
+              "upsert": true
+            },
+            {
+              "log_attribute": "compliance_required",
+              "value": "true",
+              "upsert": true
+            }
+          ]
+        }
       }
     },
     {
       "id": "normalize-api-logs",
       "name": "Normalize API request logs",
-      "matchers": [
-        { "field": "log_body", "pattern": "HTTP request" },
-        { "field": "log_body", "pattern": "API call" }
-      ],
-      "keep": "all",
-      "transform": {
-        "rename": [
-          {
-            "from_field": "log_attribute",
-            "from_key": "http_method",
-            "to": "method",
-            "upsert": true
-          },
-          {
-            "from_field": "log_attribute",
-            "from_key": "http_path",
-            "to": "path",
-            "upsert": true
-          }
+      "log": {
+        "match": [
+          { "log_field": "body", "regex": "HTTP request" },
+          { "log_field": "body", "regex": "API call" }
         ],
-        "remove": [{ "field": "log_attribute", "key": "internal_trace_id" }]
+        "keep": "all",
+        "transform": {
+          "rename": [
+            {
+              "from_log_attribute": "http_method",
+              "to": "method",
+              "upsert": true
+            },
+            { "from_log_attribute": "http_path", "to": "path", "upsert": true }
+          ],
+          "remove": [{ "log_attribute": "internal_trace_id" }]
+        }
       }
     },
     {
       "id": "drop-and-transform-cache",
       "name": "Drop verbose cache logs but keep summaries with metadata",
-      "matchers": [
-        { "field": "log_body", "pattern": "cache hit" },
-        { "field": "log_body", "pattern": "cache miss" }
-      ],
-      "keep": "10%",
-      "transform": {
-        "add": [
-          {
-            "field": "log_attribute",
-            "key": "sampled",
-            "value": "true",
-            "upsert": true
-          }
+      "log": {
+        "match": [
+          { "log_field": "body", "regex": "cache hit" },
+          { "log_field": "body", "regex": "cache miss" }
         ],
-        "remove": [
-          { "field": "log_attribute", "key": "cache_key" },
-          { "field": "log_attribute", "key": "cache_ttl" }
-        ]
+        "keep": "10%",
+        "transform": {
+          "add": [
+            { "log_attribute": "sampled", "value": "true", "upsert": true }
+          ],
+          "remove": [
+            { "log_attribute": "cache_key" },
+            { "log_attribute": "cache_ttl" }
+          ]
+        }
       }
     }
   ]

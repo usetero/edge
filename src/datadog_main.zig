@@ -46,11 +46,6 @@ const ShutdownSignalReceived = struct {};
 const SignalHandlersInstalled = struct {};
 const SignalHandlingNotSupported = struct { platform: []const u8 };
 
-const PolicyRegistryUpdated = struct {
-    provider_id: []const u8,
-    policy_count: usize,
-};
-
 const ServerStarting = struct {};
 const ConfigurationLoaded = struct { path: []const u8 };
 const ListenAddressConfigured = struct {
@@ -58,20 +53,14 @@ const ListenAddressConfigured = struct {
     port: u16,
 };
 const UpstreamConfigured = struct { url: []const u8 };
+const LogsUpstreamConfigured = struct { url: []const u8 };
+const MetricsUpstreamConfigured = struct { url: []const u8 };
 const ServiceConfigured = struct {
     namespace: []const u8,
     name: []const u8,
     instance_id: []const u8,
     version: []const u8,
 };
-
-const PolicyProvidersInitializing = struct { count: usize };
-const FileProviderConfigured = struct { path: []const u8 };
-const HttpProviderConfigured = struct {
-    url: []const u8,
-    poll_interval: u64,
-};
-const PolicyCountLoaded = struct { count: usize };
 
 const ServerReady = struct {};
 const ShutdownHint = struct { pid: c_int };
@@ -146,27 +135,6 @@ fn installShutdownHandlers(bus: *EventBus) void {
 }
 
 // =============================================================================
-// Policy callback
-// =============================================================================
-
-const SourceType = policy.SourceType;
-
-const PolicyCallbackContext = struct {
-    registry: *policy.Registry,
-    bus: *EventBus,
-    source_type: SourceType,
-
-    fn handleUpdate(context: *anyopaque, update: policy.PolicyUpdate) !void {
-        const self: *PolicyCallbackContext = @ptrCast(@alignCast(context));
-        try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
-        self.bus.info(PolicyRegistryUpdated{
-            .provider_id = update.provider_id,
-            .policy_count = update.policies.len,
-        });
-    }
-};
-
-// =============================================================================
 // Main entry point
 // =============================================================================
 
@@ -213,6 +181,8 @@ pub fn main() !void {
     const config = try config_parser.parseConfigFile(allocator, config_path);
     defer {
         allocator.free(config.upstream_url);
+        if (config.logs_url) |logs_url| allocator.free(logs_url);
+        if (config.metrics_url) |metrics_url| allocator.free(metrics_url);
         allocator.free(config.workspace_id);
         for (config.policy_providers) |provider_config| {
             allocator.free(provider_config.id);
@@ -253,6 +223,12 @@ pub fn main() !void {
 
     bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
     bus.info(UpstreamConfigured{ .url = config.upstream_url });
+    if (config.logs_url) |logs_url| {
+        bus.info(LogsUpstreamConfigured{ .url = logs_url });
+    }
+    if (config.metrics_url) |metrics_url| {
+        bus.info(MetricsUpstreamConfigured{ .url = metrics_url });
+    }
     bus.info(ServiceConfigured{
         .namespace = config.service.namespace,
         .name = config.service.name,
@@ -264,78 +240,23 @@ pub fn main() !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
-    // Storage for PolicyProvider interfaces
-    var providers: std.ArrayList(policy.Provider) = .empty;
-    defer {
-        for (providers.items) |provider| {
-            provider.deinit();
-        }
-        providers.deinit(allocator);
-    }
+    // Create async policy loader
+    var loader = try policy.Loader.init(
+        allocator,
+        bus,
+        &registry,
+        config.policy_providers,
+        config.workspace_id,
+        config.service,
+    );
+    defer loader.deinit();
 
-    // Storage for callback contexts (need to persist for lifetime of providers)
-    var callback_contexts: std.ArrayList(PolicyCallbackContext) = .empty;
-    defer callback_contexts.deinit(allocator);
+    // Start loading policies asynchronously (non-blocking)
+    // Server can start accepting requests immediately while policies load in background
+    try loader.startAsync();
 
-    bus.info(PolicyProvidersInitializing{ .count = config.policy_providers.len });
-    for (config.policy_providers) |provider_config| {
-        switch (provider_config.type) {
-            .file => {
-                const path = provider_config.path orelse return error.FileProviderRequiresPath;
-                bus.info(FileProviderConfigured{ .path = path });
-
-                const file_provider = try policy.FileProvider.init(allocator, bus, provider_config.id, path);
-                errdefer file_provider.deinit();
-
-                // Create callback context with source type
-                try callback_contexts.append(allocator, .{ .registry = &registry, .bus = bus, .source_type = .file });
-                const callback = policy.PolicyCallback{
-                    .context = @ptrCast(&callback_contexts.items[callback_contexts.items.len - 1]),
-                    .onUpdate = PolicyCallbackContext.handleUpdate,
-                };
-
-                try file_provider.subscribe(callback);
-
-                // Store provider interface for cleanup and registry routing
-                const provider_interface = policy.Provider.init(file_provider);
-                try providers.append(allocator, provider_interface);
-                try registry.registerProvider(&providers.items[providers.items.len - 1]);
-            },
-            .http => {
-                const url = provider_config.url orelse return error.HttpProviderRequiresUrl;
-                const poll_interval = provider_config.poll_interval orelse 60;
-                bus.info(HttpProviderConfigured{ .url = url, .poll_interval = poll_interval });
-
-                const http_provider = try policy.HttpProvider.init(
-                    allocator,
-                    bus,
-                    provider_config.id,
-                    url,
-                    poll_interval,
-                    config.workspace_id,
-                    config.service,
-                    provider_config.headers,
-                );
-                errdefer http_provider.deinit();
-
-                // Create callback context with source type
-                try callback_contexts.append(allocator, .{ .registry = &registry, .bus = bus, .source_type = .http });
-                const callback = policy.PolicyCallback{
-                    .context = @ptrCast(&callback_contexts.items[callback_contexts.items.len - 1]),
-                    .onUpdate = PolicyCallbackContext.handleUpdate,
-                };
-
-                try http_provider.subscribe(callback);
-
-                // Store provider interface for cleanup and registry routing
-                const provider_interface = policy.Provider.init(http_provider);
-                try providers.append(allocator, provider_interface);
-                try registry.registerProvider(&providers.items[providers.items.len - 1]);
-            },
-        }
-    }
-
-    bus.info(PolicyCountLoaded{ .count = registry.getPolicyCount() });
+    // Note: We don't wait for initial load - requests will be processed with
+    // whatever policies are available. The registry handles this gracefully.
 
     // Install signal handlers
     installShutdownHandlers(bus);
@@ -346,17 +267,31 @@ pub fn main() !void {
         .bus = bus,
     };
 
+    // Determine upstream URLs (use specific URLs if configured, otherwise fall back to upstream_url)
+    const logs_upstream = config.logs_url orelse config.upstream_url;
+    const metrics_upstream = config.metrics_url orelse config.upstream_url;
+
     // Create modules
-    var datadog_module = DatadogModule{};
+    var datadog_logs_module = DatadogModule{};
+    var datadog_metrics_module = DatadogModule{};
     var passthrough_module = PassthroughModule{};
 
     // Register modules (order matters - first match wins)
     const module_registrations = [_]ModuleRegistration{
-        // Datadog module - handles /api/v2/logs with filtering
+        // Datadog logs module - handles /api/v2/logs with filtering
         .{
-            .module = datadog_module.asProxyModule(),
-            .routes = &datadog_mod.routes,
-            .upstream_url = config.upstream_url,
+            .module = datadog_logs_module.asProxyModule(),
+            .routes = &datadog_mod.logs_routes,
+            .upstream_url = logs_upstream,
+            .max_request_body = config.max_body_size,
+            .max_response_body = config.max_body_size,
+            .module_data = @ptrCast(&datadog_config),
+        },
+        // Datadog metrics module - handles /api/v2/series with filtering
+        .{
+            .module = datadog_metrics_module.asProxyModule(),
+            .routes = &datadog_mod.metrics_routes,
+            .upstream_url = metrics_upstream,
             .max_request_body = config.max_body_size,
             .max_response_body = config.max_body_size,
             .module_data = @ptrCast(&datadog_config),

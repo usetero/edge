@@ -23,7 +23,7 @@ pub const otlp_module = @import("modules/otlp_module.zig");
 
 // Hyperscan/Vectorscan bindings
 pub const hyperscan = @import("hyperscan/hyperscan.zig");
-pub const matcher_index = @import("hyperscan/matcher_index.zig");
+pub const matcher_index = @import("policy/matcher_index.zig");
 
 // =============================================================================
 // Distribution entry points
@@ -64,7 +64,7 @@ test {
     _ = @import("config/parser.zig");
     _ = @import("policy/root.zig");
     _ = @import("policy/policy_engine.zig");
-    _ = @import("hyperscan/matcher_index.zig");
+    _ = @import("policy/matcher_index.zig");
     _ = @import("modules/proxy_module.zig");
     _ = @import("proxy/compress.zig");
     _ = @import("proxy/router.zig");
