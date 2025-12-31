@@ -145,14 +145,22 @@ pub const FieldRef = union(enum) {
 // Metric Field Reference Types
 // =============================================================================
 
+const MetricType = proto.policy.MetricType;
+const AggregationTemporality = proto.policy.AggregationTemporality;
+
 /// Reference to a metric field for accessor/mutator operations.
-/// Note: metric_type and aggregation_temporality are enum matches, not string/regex,
-/// so they are handled separately and not included here.
+/// Enum fields (metric_type, aggregation_temporality) are matched as strings via Hyperscan.
 pub const MetricFieldRef = union(enum) {
     metric_field: MetricField,
     datapoint_attribute: []const u8,
     resource_attribute: []const u8,
     scope_attribute: []const u8,
+    /// Match on metric type (gauge, sum, histogram, etc.)
+    /// The field accessor returns the type as a string, matched via regex.
+    metric_type: void,
+    /// Match on aggregation temporality (delta, cumulative)
+    /// The field accessor returns the temporality as a string, matched via regex.
+    aggregation_temporality: void,
 
     pub fn fromMatcherField(field: ?MetricMatcher.field_union) ?MetricFieldRef {
         const f = field orelse return null;
@@ -161,8 +169,8 @@ pub const MetricFieldRef = union(enum) {
             .datapoint_attribute => |v| .{ .datapoint_attribute = v },
             .resource_attribute => |v| .{ .resource_attribute = v },
             .scope_attribute => |v| .{ .scope_attribute = v },
-            // Enum fields don't use Hyperscan - handled separately
-            .metric_type, .aggregation_temporality => null,
+            .metric_type => .{ .metric_type = {} },
+            .aggregation_temporality => .{ .aggregation_temporality = {} },
         };
     }
 
@@ -170,17 +178,17 @@ pub const MetricFieldRef = union(enum) {
     pub fn isKeyed(self: MetricFieldRef) bool {
         return switch (self) {
             .datapoint_attribute, .resource_attribute, .scope_attribute => true,
-            .metric_field => false,
+            .metric_field, .metric_type, .aggregation_temporality => false,
         };
     }
 
-    /// Get the key for attribute-based fields, empty string for metric_field
+    /// Get the key for attribute-based fields, empty string for simple fields
     pub fn getKey(self: MetricFieldRef) []const u8 {
         return switch (self) {
             .datapoint_attribute => |k| k,
             .resource_attribute => |k| k,
             .scope_attribute => |k| k,
-            .metric_field => "",
+            .metric_field, .metric_type, .aggregation_temporality => "",
         };
     }
 };

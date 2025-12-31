@@ -511,6 +511,9 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             };
         }
 
+        /// Pattern that matches any non-empty string (used for exists matching)
+        const EXISTS_PATTERN = "^.+$";
+
         fn extractRegex(self: *Self, match_union: anytype, matcher_idx: usize) ?[]const u8 {
             const m = match_union orelse {
                 self.bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
@@ -519,7 +522,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const regex: []const u8 = switch (m) {
                 .regex => |r| r,
                 .exact => |e| e,
-                .exists => return null,
+                .exists => |exists| if (exists) EXISTS_PATTERN else return null,
             };
             if (regex.len == 0) {
                 self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
@@ -572,7 +575,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                     .datapoint_attribute => .{ .datapoint_attribute = key_copy },
                     .resource_attribute => .{ .resource_attribute = key_copy },
                     .scope_attribute => .{ .scope_attribute = key_copy },
-                    .metric_field => field_ref,
+                    .metric_field, .metric_type, .aggregation_temporality => field_ref,
                 },
             }
         }
@@ -1186,7 +1189,7 @@ test "LogMatcherIndex: scan database" {
     try testing.expectEqual(@as(usize, 0), no_match_result.count);
 }
 
-test "LogMatcherIndex: exists matcher excluded from regex matchers" {
+test "LogMatcherIndex: exists=true matcher uses ^.+$ pattern" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
@@ -1208,8 +1211,238 @@ test "LogMatcherIndex: exists matcher excluded from regex matchers" {
     var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
+    // exists=true should create a database with ^.+$ pattern
+    try testing.expect(!index.isEmpty());
+    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+    try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+
+    // The database should match any non-empty string
+    const keys = index.getMatcherKeys();
+    try testing.expectEqual(@as(usize, 1), keys.len);
+
+    const db = index.getDatabase(keys[0]).?;
+    var result_buf: [MAX_POLICIES]u32 = undefined;
+    var result = db.scanPositive("some-trace-id-value", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Empty string should not match
+    result = db.scanPositive("", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "LogMatcherIndex: exists=false matcher is excluded" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "test-policy"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .match = .{ .exists = false },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    // exists=false should not create any database entries
     try testing.expect(index.isEmpty());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+}
+
+test "MetricMatcherIndex: exists=true matcher uses ^.+$ pattern" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "test-policy"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .resource_attribute = try allocator.dupe(u8, "service.name") },
+        .match = .{ .exists = true },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    // exists=true should create a database with ^.+$ pattern
+    try testing.expect(!index.isEmpty());
+    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+    try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+
+    // The database should match any non-empty string
+    const keys = index.getMatcherKeys();
+    try testing.expectEqual(@as(usize, 1), keys.len);
+
+    const db = index.getDatabase(keys[0]).?;
+    var result_buf: [MAX_POLICIES]u32 = undefined;
+    var result = db.scanPositive("my-service", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Empty string should not match
+    result = db.scanPositive("", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "MetricMatcherIndex: metric_type field creates Hyperscan database" {
+    // metric_type is matched as a string via Hyperscan. The field accessor returns
+    // the type as a string (e.g., "gauge", "sum", "histogram") which is then matched
+    // against the regex pattern.
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const MetricType = proto.policy.MetricType;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "match-gauge-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    // Match on metric_type with exists=true (uses ^.+$ pattern)
+    // The proto field uses the enum value, but we only care that it's metric_type
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_type = MetricType.METRIC_TYPE_GAUGE },
+        .match = .{ .exists = true },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    // metric_type field should create a database with ^.+$ pattern
+    try testing.expect(!index.isEmpty());
+    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+    try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+
+    // The policy should have 1 required match
+    const policy_info = index.getPolicy("policy-1");
+    try testing.expect(policy_info != null);
+    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
+
+    // The database should match metric type strings
+    const keys = index.getMatcherKeys();
+    try testing.expectEqual(@as(usize, 1), keys.len);
+
+    const db = index.getDatabase(keys[0]).?;
+    var result_buf: [MAX_POLICIES]u32 = undefined;
+
+    // Should match any non-empty metric type string
+    var result = db.scanPositive("gauge", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("histogram", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Empty string should not match
+    result = db.scanPositive("", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "MetricMatcherIndex: metric_type with regex pattern" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const MetricType = proto.policy.MetricType;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "match-gauge-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    // Match on metric_type with regex pattern for "gauge"
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_type = MetricType.METRIC_TYPE_GAUGE },
+        .match = .{ .exact = try allocator.dupe(u8, "gauge") },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    try testing.expect(!index.isEmpty());
+
+    const keys = index.getMatcherKeys();
+    const db = index.getDatabase(keys[0]).?;
+    var result_buf: [MAX_POLICIES]u32 = undefined;
+
+    // Should match "gauge"
+    var result = db.scanPositive("gauge", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Should NOT match other types
+    result = db.scanPositive("histogram", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+
+    result = db.scanPositive("sum", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "MetricMatcherIndex: aggregation_temporality field creates Hyperscan database" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const AggregationTemporality = proto.policy.AggregationTemporality;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "match-delta-metrics"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    // Match on aggregation_temporality with regex for "delta"
+    try policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .aggregation_temporality = AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA },
+        .match = .{ .exact = try allocator.dupe(u8, "delta") },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try MetricMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
+    defer index.deinit();
+
+    try testing.expect(!index.isEmpty());
+    try testing.expectEqual(@as(usize, 1), index.getDatabaseCount());
+    try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+
+    const policy_info = index.getPolicy("policy-1");
+    try testing.expect(policy_info != null);
+    try testing.expectEqual(@as(u16, 1), policy_info.?.required_match_count);
+
+    const keys = index.getMatcherKeys();
+    const db = index.getDatabase(keys[0]).?;
+    var result_buf: [MAX_POLICIES]u32 = undefined;
+
+    // Should match "delta"
+    var result = db.scanPositive("delta", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Should NOT match "cumulative"
+    result = db.scanPositive("cumulative", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
 }
 
 test "Mixed log and metric policies: each index only gets its type" {

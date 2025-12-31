@@ -2472,6 +2472,8 @@ const TestMetricContext = struct {
                 return null;
             },
             .scope_attribute => null,
+            .metric_type => null, // Test context doesn't track metric type
+            .aggregation_temporality => null, // Test context doesn't track temporality
         };
     }
 };
