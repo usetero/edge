@@ -1,16 +1,15 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
-const policy_engine = @import("../policy/policy_engine.zig");
 const policy = @import("../policy/root.zig");
 const o11y = @import("../observability/root.zig");
 const datadog_log = @import("datadog_log.zig");
 
-const PolicyEngine = policy_engine.PolicyEngine;
-const PolicyResult = policy_engine.PolicyResult;
-const FilterDecision = policy_engine.FilterDecision;
-const FieldRef = policy_engine.FieldRef;
+const PolicyEngine = policy.PolicyEngine;
+const PolicyResult = policy.PolicyResult;
+const FilterDecision = policy.FilterDecision;
+const FieldRef = policy.FieldRef;
 const LogField = @import("proto").policy.LogField;
-const MAX_POLICIES = policy.MAX_POLICIES;
+const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -366,7 +365,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
 
     var state = FilterState{};
     defer state.deinit(allocator);
-    var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
+    var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
 
     switch (value_type) {
         .array => {

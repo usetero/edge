@@ -1,16 +1,15 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
-const policy_engine = @import("../policy/policy_engine.zig");
 const policy = @import("../policy/root.zig");
 const o11y = @import("../observability/root.zig");
 const datadog_metric = @import("datadog_metric.zig");
 
-const PolicyEngine = policy_engine.PolicyEngine;
-const PolicyResult = policy_engine.PolicyResult;
-const FilterDecision = policy_engine.FilterDecision;
-const MetricFieldRef = policy_engine.MetricFieldRef;
+const PolicyEngine = policy.PolicyEngine;
+const PolicyResult = policy.PolicyResult;
+const FilterDecision = policy.FilterDecision;
+const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = @import("proto").policy.MetricField;
-const MAX_POLICIES = policy.MAX_POLICIES;
+const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -376,7 +375,7 @@ fn processJsonMetricsWithFilter(
 
     var state = FilterState{};
     defer state.deinit(allocator);
-    var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
+    var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
 
     for (series_list) |*series| {
         state.original_count += 1;

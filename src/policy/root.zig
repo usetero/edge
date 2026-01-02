@@ -101,6 +101,16 @@ pub const rate_limiter = @import("./rate_limiter.zig");
 pub const RateLimiter = rate_limiter.RateLimiter;
 
 // =============================================================================
+// Policy Engine
+// =============================================================================
+
+pub const policy_engine = @import("./policy_engine.zig");
+pub const PolicyEngine = policy_engine.PolicyEngine;
+pub const PolicyResult = policy_engine.PolicyResult;
+pub const FilterDecision = policy_engine.FilterDecision;
+pub const MAX_MATCHES_PER_SCAN = policy_engine.MAX_MATCHES_PER_SCAN;
+
+// =============================================================================
 // Parsing
 // =============================================================================
 
