@@ -68,6 +68,9 @@ const Policy = proto.policy.Policy;
 const LogTarget = proto.policy.LogTarget;
 const MetricTarget = proto.policy.MetricTarget;
 
+/// Maximum number of pattern matches to track per scan
+pub const MAX_MATCHES_PER_SCAN: usize = 256;
+
 /// Helper to extract the log target from a policy (handles target union)
 pub fn getLogTarget(policy: *const Policy) ?*const LogTarget {
     const target_ptr = &(policy.target orelse return null);
@@ -208,9 +211,6 @@ pub const PolicyEngine = struct {
 
     const Self = @This();
 
-    /// Maximum number of pattern matches to track per scan
-    const MAX_MATCHES_PER_SCAN: usize = 256;
-
     pub fn init(bus: *EventBus, registry: *PolicyRegistry) Self {
         return .{
             .bus = bus,
@@ -245,17 +245,17 @@ pub const PolicyEngine = struct {
     /// If field_mutator is provided, transforms are applied to matched policies.
     /// Result of scanning all matcher keys against field values
     const ScanState = struct {
-        match_counts: [MAX_POLICIES]u16,
-        active_policies: [MAX_POLICIES]PolicyIndex,
-        is_active: [MAX_POLICIES]bool,
+        match_counts: [MAX_MATCHES_PER_SCAN]u16,
+        active_policies: [MAX_MATCHES_PER_SCAN]PolicyIndex,
+        is_active: [MAX_MATCHES_PER_SCAN]bool,
         active_count: usize,
     };
 
     /// Result of finding matching policies from scan state
     const MatchState = struct {
-        matched_indices: [MAX_POLICIES]PolicyIndex,
-        matched_policies: [MAX_POLICIES]PolicyInfo,
-        matched_decisions: [MAX_POLICIES]FilterDecision,
+        matched_indices: [MAX_MATCHES_PER_SCAN]PolicyIndex,
+        matched_policies: [MAX_MATCHES_PER_SCAN]PolicyInfo,
+        matched_decisions: [MAX_MATCHES_PER_SCAN]FilterDecision,
         matched_count: usize,
         decision: FilterDecision,
     };
@@ -3333,4 +3333,54 @@ test "PolicyEngine: sampling does not affect non-matching logs" {
     var test_log = TestLogContext{ .message = "different message" };
     const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
     try testing.expectEqual(FilterDecision.unset, result.decision);
+}
+
+test "PolicyEngine: more matching policies than policy_id_buf capacity" {
+    // When more policies match than fit in policy_id_buf, the engine should:
+    // 1. Still compute the correct final decision (including from policies beyond buffer)
+    // 2. Only return as many policy IDs as fit in the buffer
+    // 3. Not crash or have undefined behavior
+    const allocator = testing.allocator;
+
+    // Create 5 KEEP policies that all match, but we'll only provide a buffer for 2
+    var policies: [5]Policy = undefined;
+    for (&policies, 0..) |*p, i| {
+        var id_buf: [16]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "policy-{d}", .{i}) catch unreachable;
+
+        p.* = Policy{
+            .id = try allocator.dupe(u8, id),
+            .name = try allocator.dupe(u8, id),
+            .enabled = true,
+            .target = .{ .log = .{
+                .keep = try allocator.dupe(u8, "all"),
+            } },
+        };
+        // All policies match on "test" in body
+        try p.target.?.log.match.append(allocator, .{
+            .field = .{ .log_field = .LOG_FIELD_BODY },
+            .match = .{ .regex = try allocator.dupe(u8, "test") },
+        });
+    }
+    defer for (&policies) |*p| p.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&policies, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+
+    // Buffer only fits 2 policy IDs, but 5 policies will match
+    var small_policy_id_buf: [2][]const u8 = undefined;
+
+    var test_log = TestLogContext{ .message = "test message" };
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &small_policy_id_buf);
+
+    // Decision should be KEEP (all 5 policies want to keep)
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+
+    // Only 2 policy IDs returned (buffer capacity), even though 5 matched
+    try testing.expectEqual(@as(usize, 2), result.matched_policy_ids.len);
 }

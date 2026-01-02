@@ -1,6 +1,5 @@
 const std = @import("std");
 const proto = @import("proto");
-const policy_engine = @import("../policy/policy_engine.zig");
 const policy = @import("../policy/root.zig");
 const o11y = @import("../observability/root.zig");
 
@@ -12,12 +11,12 @@ const AnyValue = proto.common.AnyValue;
 const KeyValue = proto.common.KeyValue;
 const InstrumentationScope = proto.common.InstrumentationScope;
 
-const PolicyEngine = policy_engine.PolicyEngine;
-const PolicyResult = policy_engine.PolicyResult;
-const FilterDecision = policy_engine.FilterDecision;
-const FieldRef = policy_engine.FieldRef;
+const PolicyEngine = policy.PolicyEngine;
+const PolicyResult = policy.PolicyResult;
+const FilterDecision = policy.FilterDecision;
+const FieldRef = policy.FieldRef;
 const LogField = proto.policy.LogField;
-const MAX_POLICIES = policy.MAX_POLICIES;
+const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -395,7 +394,7 @@ fn filterLogsInPlace(
     var dropped_count: usize = 0;
 
     // Buffer for matched policy IDs (stack allocated)
-    var policy_id_buf: [MAX_POLICIES][]const u8 = undefined;
+    var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
 
     // Iterate through the nested structure and filter logs in place
     // Structure: LogsData -> ResourceLogs[] -> ScopeLogs[] -> LogRecord[]
