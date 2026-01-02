@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.9.0](https://github.com/usetero/edge/compare/v1.8.1...v1.9.0) (2026-01-02)
+
+
+### Features
+
+* better exports and lower matching policy limit ([#73](https://github.com/usetero/edge/issues/73)) ([a3b3a0d](https://github.com/usetero/edge/commit/a3b3a0d2e5fbde23554423f7f465def30cdc33d5))
+* support for sampling and rate limits ([#71](https://github.com/usetero/edge/issues/71)) ([77aace7](https://github.com/usetero/edge/commit/77aace7adeef021763948b67b941069a09446709))
+
 ## [1.8.1](https://github.com/usetero/edge/compare/v1.8.0...v1.8.1) (2025-12-31)
 
 
