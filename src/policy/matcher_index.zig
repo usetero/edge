@@ -21,9 +21,14 @@ const std = @import("std");
 const proto = @import("proto");
 const hyperscan = @import("../hyperscan/hyperscan.zig");
 const policy_types = @import("./types.zig");
+const sampler_mod = @import("./sampler.zig");
+const rate_limiter_mod = @import("./rate_limiter.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
+
+const Sampler = sampler_mod.Sampler;
+const RateLimiter = rate_limiter_mod.RateLimiter;
 
 const FieldRef = policy_types.FieldRef;
 const MetricFieldRef = policy_types.MetricFieldRef;
@@ -230,6 +235,9 @@ pub const PolicyInfo = struct {
     negated_count: u16,
     keep: KeepValue,
     enabled: bool,
+    /// Rate limiter for per_second/per_minute policies. Null for other keep types.
+    /// Pointer because RateLimiter contains atomics that need stable addresses.
+    rate_limiter: ?*RateLimiter,
 };
 
 // =============================================================================
@@ -584,6 +592,21 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             const policy_id_copy = try self.allocator.dupe(u8, policy.id);
             try self.policy_id_storage.append(self.allocator, policy_id_copy);
 
+            // Create rate limiter for rate limit policies
+            const rate_limiter: ?*RateLimiter = switch (keep) {
+                .per_second => |limit| blk: {
+                    const rl = try self.allocator.create(RateLimiter);
+                    rl.* = RateLimiter.initPerSecond(limit);
+                    break :blk rl;
+                },
+                .per_minute => |limit| blk: {
+                    const rl = try self.allocator.create(RateLimiter);
+                    rl.* = RateLimiter.initPerMinute(limit);
+                    break :blk rl;
+                },
+                else => null,
+            };
+
             try self.policy_info_list.append(self.temp_allocator, .{
                 .id = policy_id_copy,
                 .index = self.policy_index,
@@ -591,6 +614,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .negated_count = self.current_negated_count,
                 .keep = keep,
                 .enabled = policy.enabled,
+                .rate_limiter = rate_limiter,
             });
 
             self.bus.debug(PolicyStored{
@@ -735,6 +759,13 @@ pub const LogMatcherIndex = struct {
             self.allocator.destroy(db.*);
         }
         self.databases.deinit();
+
+        // Free rate limiters
+        for (self.policies) |policy_info| {
+            if (policy_info.rate_limiter) |rl| {
+                self.allocator.destroy(rl);
+            }
+        }
         self.allocator.free(self.policies);
         self.allocator.free(self.policies_with_negation);
         self.allocator.free(self.matcher_keys);
@@ -841,6 +872,13 @@ pub const MetricMatcherIndex = struct {
             self.allocator.destroy(db.*);
         }
         self.databases.deinit();
+
+        // Free rate limiters
+        for (self.policies) |policy_info| {
+            if (policy_info.rate_limiter) |rl| {
+                self.allocator.destroy(rl);
+            }
+        }
         self.allocator.free(self.policies);
         self.allocator.free(self.policies_with_negation);
         self.allocator.free(self.matcher_keys);

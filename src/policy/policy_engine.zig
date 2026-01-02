@@ -32,6 +32,8 @@ const matcher_index = @import("./matcher_index.zig");
 const policy_mod = @import("./root.zig");
 const policy_types = @import("./types.zig");
 const log_transform = @import("./log_transform.zig");
+const sampler_mod = @import("./sampler.zig");
+const rate_limiter_mod = @import("./rate_limiter.zig");
 
 const o11y = @import("../observability/root.zig");
 const NoopEventBus = o11y.NoopEventBus;
@@ -41,7 +43,10 @@ const LogMatcher = proto.policy.LogMatcher;
 
 const KeepValue = matcher_index.KeepValue;
 const PolicyIndex = matcher_index.PolicyIndex;
+const PolicyInfo = matcher_index.PolicyInfo;
 const MAX_POLICIES = matcher_index.MAX_POLICIES;
+const Sampler = sampler_mod.Sampler;
+const RateLimiter = rate_limiter_mod.RateLimiter;
 
 const MatcherDatabase = matcher_index.MatcherDatabase;
 pub const PolicyRegistry = policy_mod.Registry;
@@ -249,15 +254,10 @@ pub const PolicyEngine = struct {
     /// Result of finding matching policies from scan state
     const MatchState = struct {
         matched_indices: [MAX_POLICIES]PolicyIndex,
-        matched_keep_values: [MAX_POLICIES]KeepValue,
+        matched_policies: [MAX_POLICIES]PolicyInfo,
+        matched_decisions: [MAX_POLICIES]FilterDecision,
         matched_count: usize,
-        best_decision: FilterDecision,
-        has_keep_policy: bool,
-        has_drop_policy: bool,
-
-        inline fn hasMixedDecisions(self: *const MatchState) bool {
-            return self.has_keep_policy and self.has_drop_policy;
-        }
+        decision: FilterDecision,
     };
 
     pub fn evaluate(
@@ -291,13 +291,15 @@ pub const PolicyEngine = struct {
         var scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
 
         // Phase 2: Find matching policies and determine decision
-        var match_state = self.findMatchingPolicies(T, index, &scan_state, policy_id_buf);
+        // Use context pointer as hash input for deterministic sampling
+        const hash_input = @intFromPtr(ctx);
+        const match_state = self.findMatchingPolicies(T, index, &scan_state, policy_id_buf, hash_input);
 
-        self.bus.debug(EvaluateResult{ .decision = match_state.best_decision, .matched_count = match_state.matched_count });
+        self.bus.debug(EvaluateResult{ .decision = match_state.decision, .matched_count = match_state.matched_count });
 
         self.recordMatchedPolicyStats(policy_id_buf, &match_state);
 
-        if (match_state.best_decision == .drop) {
+        if (match_state.decision == .drop) {
             return PolicyResult.dropped;
         }
 
@@ -319,7 +321,7 @@ pub const PolicyEngine = struct {
         }
 
         return PolicyResult{
-            .decision = match_state.best_decision,
+            .decision = match_state.decision,
             .matched_policy_ids = policy_id_buf[0..match_state.matched_count],
         };
     }
@@ -412,23 +414,23 @@ pub const PolicyEngine = struct {
         return state;
     }
 
-    /// Find all matching policies from active set and determine best decision.
+    /// Find all matching policies, apply sampling/rate limiting, and determine final decision.
+    /// Drop always beats keep: if any policy returns drop, final decision is drop.
     inline fn findMatchingPolicies(
         self: *const Self,
         comptime T: TelemetryType,
         index: *const matcher_index.MatcherIndexType(T),
         scan_state: *const ScanState,
         policy_id_buf: [][]const u8,
+        hash_input: u64,
     ) MatchState {
         var state = MatchState{
             .matched_indices = undefined,
-            .matched_keep_values = undefined,
+            .matched_policies = undefined,
+            .matched_decisions = undefined,
             .matched_count = 0,
-            .best_decision = .unset,
-            .has_keep_policy = false,
-            .has_drop_policy = false,
+            .decision = .unset,
         };
-        var best_keep: ?KeepValue = null;
 
         for (scan_state.active_policies[0..scan_state.active_count]) |policy_index| {
             const policy_info = index.getPolicyByIndex(policy_index) orelse continue;
@@ -438,23 +440,22 @@ pub const PolicyEngine = struct {
             if (scan_state.match_counts[policy_index] == policy_info.required_match_count) {
                 self.bus.debug(PolicyFullMatch{ .policy_index = policy_info.index, .policy_id = policy_info.id });
 
+                // Apply sampling/rate limiting to get this policy's decision
+                const decision = applyKeepValue(policy_info, hash_input);
+
                 if (state.matched_count < policy_id_buf.len) {
                     policy_id_buf[state.matched_count] = policy_info.id;
                     state.matched_indices[state.matched_count] = policy_index;
-                    state.matched_keep_values[state.matched_count] = policy_info.keep;
+                    state.matched_policies[state.matched_count] = policy_info;
+                    state.matched_decisions[state.matched_count] = decision;
                     state.matched_count += 1;
-
-                    const decision = keepToDecision(policy_info.keep);
-                    if (decision == .keep) {
-                        state.has_keep_policy = true;
-                    } else if (decision == .drop) {
-                        state.has_drop_policy = true;
-                    }
                 }
 
-                if (best_keep == null or policy_info.keep.isMoreRestrictiveThan(best_keep.?)) {
-                    best_keep = policy_info.keep;
-                    state.best_decision = keepToDecision(policy_info.keep);
+                // Update final decision: drop beats keep, keep beats unset
+                if (decision == .drop) {
+                    state.decision = .drop;
+                } else if (decision == .keep and state.decision == .unset) {
+                    state.decision = .keep;
                 }
             }
         }
@@ -493,33 +494,43 @@ pub const PolicyEngine = struct {
     }
 
     /// Record stats for all matched policies.
+    /// Hit if policy's decision matches final decision, miss otherwise.
     inline fn recordMatchedPolicyStats(
         self: *const Self,
         policy_id_buf: [][]const u8,
         match_state: *const MatchState,
     ) void {
-        const has_mixed = match_state.hasMixedDecisions();
-
         for (0..match_state.matched_count) |i| {
             const policy_id = policy_id_buf[i];
-            const keep_value = match_state.matched_keep_values[i];
+            const policy_decision = match_state.matched_decisions[i];
 
-            const policy_decision = keepToDecision(keep_value);
-            if (has_mixed and policy_decision == .drop) {
-                self.registry.recordPolicyStats(policy_id, 0, 1, .{});
+            if (policy_decision == match_state.decision) {
+                self.registry.recordPolicyStats(policy_id, 1, 0, .{}); // hit
             } else {
-                self.registry.recordPolicyStats(policy_id, 1, 0, .{});
+                self.registry.recordPolicyStats(policy_id, 0, 1, .{}); // miss
             }
         }
     }
 
-    /// Convert KeepValue to FilterDecision
-    fn keepToDecision(keep: KeepValue) FilterDecision {
-        return switch (keep) {
+    /// Apply policy's keep value with sampling/rate limiting to get decision.
+    /// - none: always drop
+    /// - all: always keep
+    /// - percentage: hash-based deterministic sampling
+    /// - per_second/per_minute: uses the policy's RateLimiter
+    fn applyKeepValue(policy_info: PolicyInfo, hash_input: u64) FilterDecision {
+        return switch (policy_info.keep) {
             .none => .drop,
             .all => .keep,
-            // For percentage and rate limits, we keep for now (sampling not implemented)
-            .percentage, .per_second, .per_minute => .keep,
+            .percentage => |pct| {
+                const sampler = Sampler{ .percentage = pct };
+                return if (sampler.shouldKeep(hash_input)) .keep else .drop;
+            },
+            .per_second, .per_minute => {
+                if (policy_info.rate_limiter) |rl| {
+                    return if (rl.shouldKeep()) .keep else .drop;
+                }
+                return .keep; // No rate limiter configured, default to keep
+            },
         };
     }
 };
@@ -2194,7 +2205,7 @@ test "PolicyEngine stats: all KEEP policies get hits" {
     try testing.expectEqual(@as(i64, 0), stats2.misses);
 }
 
-test "PolicyEngine stats: mixed KEEP and DROP - KEEP gets hits, DROP gets misses" {
+test "PolicyEngine stats: mixed KEEP and DROP - DROP gets hits, KEEP gets misses" {
     const allocator = testing.allocator;
 
     // One KEEP and one DROP policy that both match
@@ -2247,15 +2258,15 @@ test "PolicyEngine stats: mixed KEEP and DROP - KEEP gets hits, DROP gets misses
     // Both policies should have stats recorded
     try testing.expectEqual(@as(usize, 2), stats_provider.callCount());
 
-    // KEEP policy gets hit (it matched)
+    // KEEP policy gets miss (its decision differs from final decision)
     const keep_stats = stats_provider.getStats("keep-policy").?;
-    try testing.expectEqual(@as(i64, 1), keep_stats.hits);
-    try testing.expectEqual(@as(i64, 0), keep_stats.misses);
+    try testing.expectEqual(@as(i64, 0), keep_stats.hits);
+    try testing.expectEqual(@as(i64, 1), keep_stats.misses);
 
-    // DROP policy gets miss (KEEP was also present)
+    // DROP policy gets hit (its decision matches final decision)
     const drop_stats = stats_provider.getStats("drop-policy").?;
-    try testing.expectEqual(@as(i64, 0), drop_stats.hits);
-    try testing.expectEqual(@as(i64, 1), drop_stats.misses);
+    try testing.expectEqual(@as(i64, 1), drop_stats.hits);
+    try testing.expectEqual(@as(i64, 0), drop_stats.misses);
 }
 
 test "PolicyEngine stats: single policy match gets hit" {
@@ -2298,7 +2309,7 @@ test "PolicyEngine stats: single policy match gets hit" {
     try testing.expectEqual(@as(i64, 0), stats.misses);
 }
 
-test "PolicyEngine stats: multiple KEEPs and DROPs - all KEEPs get hits, all DROPs get misses" {
+test "PolicyEngine stats: multiple KEEPs and DROPs - all DROPs get hits, all KEEPs get misses" {
     const allocator = testing.allocator;
 
     // Two KEEP policies
@@ -2376,23 +2387,23 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - all KEEPs get hits, all DRO
     // All 4 policies should have stats recorded
     try testing.expectEqual(@as(usize, 4), stats_provider.callCount());
 
-    // Both KEEP policies get hits
+    // Both KEEP policies get misses (their decision differs from final decision)
     const keep1_stats = stats_provider.getStats("keep-1").?;
-    try testing.expectEqual(@as(i64, 1), keep1_stats.hits);
-    try testing.expectEqual(@as(i64, 0), keep1_stats.misses);
+    try testing.expectEqual(@as(i64, 0), keep1_stats.hits);
+    try testing.expectEqual(@as(i64, 1), keep1_stats.misses);
 
     const keep2_stats = stats_provider.getStats("keep-2").?;
-    try testing.expectEqual(@as(i64, 1), keep2_stats.hits);
-    try testing.expectEqual(@as(i64, 0), keep2_stats.misses);
+    try testing.expectEqual(@as(i64, 0), keep2_stats.hits);
+    try testing.expectEqual(@as(i64, 1), keep2_stats.misses);
 
-    // Both DROP policies get misses (because KEEP policies were also present)
+    // Both DROP policies get hits (their decision matches final decision)
     const drop1_stats = stats_provider.getStats("drop-1").?;
-    try testing.expectEqual(@as(i64, 0), drop1_stats.hits);
-    try testing.expectEqual(@as(i64, 1), drop1_stats.misses);
+    try testing.expectEqual(@as(i64, 1), drop1_stats.hits);
+    try testing.expectEqual(@as(i64, 0), drop1_stats.misses);
 
     const drop2_stats = stats_provider.getStats("drop-2").?;
-    try testing.expectEqual(@as(i64, 0), drop2_stats.hits);
-    try testing.expectEqual(@as(i64, 1), drop2_stats.misses);
+    try testing.expectEqual(@as(i64, 1), drop2_stats.hits);
+    try testing.expectEqual(@as(i64, 0), drop2_stats.misses);
 }
 
 test "PolicyEngine stats: no match records no stats" {
@@ -3077,4 +3088,249 @@ test "MetricPolicyEngine: stats recording for matched policies" {
     const stats = stats_provider.getStats("metric-stats-test").?;
     try testing.expectEqual(@as(i64, 1), stats.hits);
     try testing.expectEqual(@as(i64, 0), stats.misses);
+}
+
+// =============================================================================
+// Sampling and Rate Limiting Tests
+// =============================================================================
+
+test "PolicyEngine: percentage sampling - 0% drops all" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "sample-0-percent"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "0%"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // 0% sampling should drop all matching logs
+    var test_log = TestLogContext{ .message = "test message" };
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+}
+
+test "PolicyEngine: percentage sampling - 100% keeps all" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "sample-100-percent"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "100%"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // 100% sampling should keep all matching logs
+    var test_log = TestLogContext{ .message = "test message" };
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.keep, result.decision);
+}
+
+test "PolicyEngine: percentage sampling - deterministic per context" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "sample-50-percent"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "50%"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Same context should produce same decision (deterministic)
+    var test_log = TestLogContext{ .message = "test message" };
+    const result1 = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    const result2 = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(result1.decision, result2.decision);
+}
+
+test "PolicyEngine: rate limiting - respects limit" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "rate-limit-5-per-second"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "5/s"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // First 5 should be kept
+    var kept_count: u32 = 0;
+    for (0..10) |_| {
+        var test_log = TestLogContext{ .message = "test message" };
+        const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+        if (result.decision == .keep) {
+            kept_count += 1;
+        }
+    }
+
+    // Should keep exactly 5 (rate limit)
+    try testing.expectEqual(@as(u32, 5), kept_count);
+}
+
+test "PolicyEngine: rate limiting per minute" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "rate-limit-3-per-minute"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "3/m"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // First 3 should be kept
+    var kept_count: u32 = 0;
+    for (0..10) |_| {
+        var test_log = TestLogContext{ .message = "test message" };
+        const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+        if (result.decision == .keep) {
+            kept_count += 1;
+        }
+    }
+
+    // Should keep exactly 3 (rate limit per minute)
+    try testing.expectEqual(@as(u32, 3), kept_count);
+}
+
+test "PolicyEngine: rate limiting with zero limit drops all" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "rate-limit-0"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "0/s"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // 0/s rate limit should drop all
+    var test_log = TestLogContext{ .message = "test message" };
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.drop, result.decision);
+}
+
+test "PolicyEngine: sampling does not affect non-matching logs" {
+    const allocator = testing.allocator;
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "sample-policy"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "50%"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "specific_pattern") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Non-matching log should return unset (not affected by sampling)
+    var test_log = TestLogContext{ .message = "different message" };
+    const result = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
+    try testing.expectEqual(FilterDecision.unset, result.decision);
 }

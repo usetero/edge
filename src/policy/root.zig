@@ -91,6 +91,16 @@ pub const MetricMatcherKey = matcher_index.MetricMatcherKey;
 pub const MAX_POLICIES = matcher_index.MAX_POLICIES;
 
 // =============================================================================
+// Sampling and Rate Limiting
+// =============================================================================
+
+pub const sampler = @import("./sampler.zig");
+pub const Sampler = sampler.Sampler;
+
+pub const rate_limiter = @import("./rate_limiter.zig");
+pub const RateLimiter = rate_limiter.RateLimiter;
+
+// =============================================================================
 // Parsing
 // =============================================================================
 
