@@ -68,17 +68,6 @@ cleanup() {
     wait 2>/dev/null || true
 }
 
-# Find otelcol-contrib binary
-find_otelcol() {
-    if [[ -x "$PROJECT_ROOT/bench/bin/otelcol-contrib" ]]; then
-        echo "$PROJECT_ROOT/bench/bin/otelcol-contrib"
-    elif command -v otelcol-contrib >/dev/null 2>&1; then
-        command -v otelcol-contrib
-    else
-        echo ""
-    fi
-}
-
 trap cleanup EXIT INT TERM
 
 usage() {
@@ -169,44 +158,6 @@ start_edge_proxy() {
     fi
     EDGE_PID=$!
     wait_for_server "$port" "$binary"
-}
-
-start_otelcol() {
-    local config=$1
-    local scenario_name=$2
-    local wait_port=${3:-4318}  # Port to wait for (defaults to OTLP HTTP)
-
-    # Kill existing if running
-    [[ -n "$OTELCOL_PID" ]] && kill "$OTELCOL_PID" 2>/dev/null && sleep 0.3 || true
-    OTELCOL_PID=""
-
-    log_info "Starting otelcol-contrib..."
-
-    if [[ "$DEBUG_MODE" == "true" ]]; then
-        local log_file="$DEBUG_DIR/otelcol-$(echo "$scenario_name" | tr ' ' '-').log"
-        "$OTELCOL_BIN" --config "$config" > "$log_file" 2>&1 &
-    else
-        "$OTELCOL_BIN" --config "$config" >/dev/null 2>&1 &
-    fi
-    OTELCOL_PID=$!
-    # otelcol takes a moment to initialize - wait for specified port
-    sleep 1
-    wait_for_server "$wait_port" "otelcol"
-}
-
-stop_otelcol() {
-    if [[ -n "$OTELCOL_PID" ]]; then
-        kill "$OTELCOL_PID" 2>/dev/null || true
-        # Wait for process to fully exit
-        for _ in {1..10}; do
-            kill -0 "$OTELCOL_PID" 2>/dev/null || break
-            sleep 0.2
-        done
-        # Force kill if still running
-        kill -9 "$OTELCOL_PID" 2>/dev/null || true
-        sleep 0.3
-    fi
-    OTELCOL_PID=""
 }
 
 # Resource monitoring (simplified from bench/run.sh)

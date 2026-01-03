@@ -334,23 +334,9 @@ YAML_HEAD
             fi
             echo "        - 'IsMatch(body, \".*${pattern}.*\")'"
         done
-
-        # Probabilistic sampler (represents sampling policies)
-        # Use 28% which is average of Edge's 10%, 25%, 50% sampling rates
-        echo ""
-        echo "  probabilistic_sampler:"
-        echo "    sampling_percentage: 28"
-        echo "    attribute_source: record"
-        echo "    from_attribute: body"
     fi
 
-    # Determine processor chain based on what's enabled
-    local processors="batch"
-    if [[ $count -gt 0 ]]; then
-        processors="filter, probabilistic_sampler, batch"
-    fi
-
-    cat <<YAML_TAIL
+    cat <<'YAML_TAIL'
 
 exporters:
   otlphttp:

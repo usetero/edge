@@ -20,7 +20,7 @@
         "match": [
           {
             "log_field": "body",
-            "regex": "NOMATCH_BENCH_0001_4f403999"
+            "regex": "NOMATCH_BENCH_0001_c224a13e"
           }
         ],
         "keep": "none"
@@ -106,7 +106,7 @@
         "match": [
           {
             "log_field": "body",
-            "regex": "NOMATCH_BENCH_0006_834bdb90"
+            "regex": "NOMATCH_BENCH_0006_dee5ad22"
           }
         ],
         "keep": "500/s"
@@ -132,7 +132,7 @@
         "match": [
           {
             "metric_field": "name",
-            "regex": "NOMATCH_BENCH_0001_4a35caf6"
+            "regex": "NOMATCH_BENCH_0001_9574eaea"
           }
         ],
         "keep": true
@@ -145,7 +145,7 @@
         "match": [
           {
             "metric_field": "name",
-            "regex": "NOMATCH_BENCH_0002_b7ebb413"
+            "regex": "NOMATCH_BENCH_0002_47f5ad5e"
           }
         ],
         "keep": true

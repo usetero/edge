@@ -1,0 +1,37 @@
+# Vector configuration for policy scaling benchmark
+
+data_dir: "/Users/jea/Code/tero/edge/bench/scaling/data"
+
+sources:
+  otlp_source:
+    type: http_server
+    address: "127.0.0.1:4320"
+    decoding:
+      codec: json
+    path: "/v1/logs"
+
+  datadog_source:
+    type: http_server
+    address: "127.0.0.1:4321"
+    decoding:
+      codec: json
+    path: "/api/v2/logs"
+
+sinks:
+  otlp_out:
+    type: http
+    inputs:
+      - otlp_source
+    uri: "http://127.0.0.1:9999/v1/logs"
+    method: post
+    encoding:
+      codec: json
+
+  datadog_out:
+    type: http
+    inputs:
+      - datadog_source
+    uri: "http://127.0.0.1:9999/api/v2/logs"
+    method: post
+    encoding:
+      codec: json
