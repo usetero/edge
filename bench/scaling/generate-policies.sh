@@ -285,9 +285,9 @@ generate_edge_policies() {
     echo "{\"policies\": $(echo "$log_policies $metric_policies" | jq -s 'add')}"
 }
 
-# Generate otelcol filter conditions (for logs)
-# Note: otelcol filter processor only supports drop semantics
-# We generate IsMatch conditions that drop matching logs
+# Generate otelcol config with filter and sampling processors
+# Note: otelcol does NOT have a rate limiting processor for logs (only traces)
+# We generate the same number of filter rules as Edge policies for fair comparison
 generate_otelcol_config() {
     local count=$1
 
@@ -314,28 +314,43 @@ processors:
 YAML_HEAD
 
     if [[ $count -gt 0 ]]; then
+        # Generate the same number of filter rules as Edge policies
+        # This ensures comparable evaluation overhead
+
+        # Filter processor with N rules
         echo ""
         echo "  filter:"
         echo "    error_mode: ignore"
         echo "    logs:"
         echo "      log_record:"
 
-        # Generate filter conditions - only drop policies (otelcol filter only drops)
-        local drop_count=$((count * 40 / 100))
-        [[ $drop_count -lt 1 ]] && drop_count=1
-
-        for ((i=0; i<drop_count && i<count; i++)); do
+        for ((i=0; i<count; i++)); do
             local pattern
-            if ((i % 3 == 0)) && ((i / 3 < ${#MATCHING_PATTERNS[@]})); then
-                pattern="${MATCHING_PATTERNS[$((i / 3))]}"
+            # Cycle through matching patterns, then use non-matching ones
+            if ((i < ${#MATCHING_PATTERNS[@]})); then
+                pattern="${MATCHING_PATTERNS[$i]}"
             else
                 pattern="NOMATCH_BENCH_$(printf '%04d' $i)"
             fi
             echo "        - 'IsMatch(body, \".*${pattern}.*\")'"
         done
+
+        # Probabilistic sampler (represents sampling policies)
+        # Use 28% which is average of Edge's 10%, 25%, 50% sampling rates
+        echo ""
+        echo "  probabilistic_sampler:"
+        echo "    sampling_percentage: 28"
+        echo "    attribute_source: record"
+        echo "    from_attribute: body"
     fi
 
-    cat <<'YAML_TAIL'
+    # Determine processor chain based on what's enabled
+    local processors="batch"
+    if [[ $count -gt 0 ]]; then
+        processors="filter, probabilistic_sampler, batch"
+    fi
+
+    cat <<YAML_TAIL
 
 exporters:
   otlphttp:
@@ -349,24 +364,13 @@ service:
   pipelines:
     logs/otlp:
       receivers: [otlp]
+      processors: [$processors]
+      exporters: [otlphttp]
+    logs/datadog:
+      receivers: [datadog]
+      processors: [$processors]
+      exporters: [otlphttp]
 YAML_TAIL
-
-    if [[ $count -gt 0 ]]; then
-        echo "      processors: [filter, batch]"
-    else
-        echo "      processors: [batch]"
-    fi
-    echo "      exporters: [otlphttp]"
-
-    # Datadog receiver also exports via otlphttp (converts DD format to OTLP)
-    echo "    logs/datadog:"
-    echo "      receivers: [datadog]"
-    if [[ $count -gt 0 ]]; then
-        echo "      processors: [filter, batch]"
-    else
-        echo "      processors: [batch]"
-    fi
-    echo "      exporters: [otlphttp]"
 }
 
 # Main

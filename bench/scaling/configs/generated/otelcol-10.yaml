@@ -19,15 +19,20 @@ processors:
     logs:
       log_record:
         - 'IsMatch(body, ".*authentication.*")'
-        - 'IsMatch(body, ".*NOMATCH_BENCH_0001.*")'
-        - 'IsMatch(body, ".*NOMATCH_BENCH_0002.*")'
         - 'IsMatch(body, ".*Payment.*")'
-        - 'IsMatch(body, ".*NOMATCH_BENCH_0004.*")'
-        - 'IsMatch(body, ".*NOMATCH_BENCH_0005.*")'
         - 'IsMatch(body, ".*Cache miss.*")'
-        - 'IsMatch(body, ".*NOMATCH_BENCH_0007.*")'
-        - 'IsMatch(body, ".*NOMATCH_BENCH_0008.*")'
         - 'IsMatch(body, ".*Cache hit.*")'
+        - 'IsMatch(body, ".*error.*")'
+        - 'IsMatch(body, ".*ERROR.*")'
+        - 'IsMatch(body, ".*debug.*")'
+        - 'IsMatch(body, ".*DEBUG.*")'
+        - 'IsMatch(body, ".*HTTP request.*")'
+        - 'IsMatch(body, ".*API call.*")'
+
+  probabilistic_sampler:
+    sampling_percentage: 28
+    attribute_source: record
+    from_attribute: body
 
 exporters:
   otlphttp:
@@ -41,9 +46,9 @@ service:
   pipelines:
     logs/otlp:
       receivers: [otlp]
-      processors: [filter, batch]
+      processors: [filter, probabilistic_sampler, batch]
       exporters: [otlphttp]
     logs/datadog:
       receivers: [datadog]
-      processors: [filter, batch]
+      processors: [filter, probabilistic_sampler, batch]
       exporters: [otlphttp]

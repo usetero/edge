@@ -1,2 +1,5 @@
 binary,telemetry_type,policy_count,payload_bytes,rps,p50_ms,p99_ms,success_pct,cpu_pct,mem_mb,echo_requests,echo_bytes
-otelcol,OTLP Logs,0,4081,41601,1.1,2.18,100,70.0,157.6,100,1757000
+otelcol,OTLP Logs,0,4081,43800,1.02,2.03,100,0,0,100,1757000
+otelcol,DD Logs,0,2739,21771,1.63,3.55,100,0,0,100,2170000
+otelcol,OTLP Logs,10,4081,42112,1.04,1.94,100,0,0,100,1757000
+otelcol,DD Logs,10,2739,20594,1.8,3.68,100,0,0,100,2170000
