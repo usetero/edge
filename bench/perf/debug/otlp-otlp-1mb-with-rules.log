@@ -1,0 +1,17 @@
+2025-12-18T22:23:07.701Z [INFO] server.starting
+2025-12-18T22:23:07.701Z [INFO] configuration.loaded path="bench/configs/otlp-with-rules.json"
+2025-12-18T22:23:07.701Z [INFO] listen.address.configured address="127.0.0.1" port=8081
+2025-12-18T22:23:07.701Z [INFO] upstream.configured url="http://127.0.0.1:9999"
+2025-12-18T22:23:07.701Z [INFO] service.configured namespace="tero" name="tero-edge" instance_id="edge-1766096587701-31596697" version="latest"
+2025-12-18T22:23:07.701Z [INFO] policy.providers.initializing count=1
+2025-12-18T22:23:07.701Z [INFO] file.provider.configured path="bench/configs/policies.json"
+2025-12-18T22:23:07.701Z [INFO] policies.loading path="bench/configs/policies.json"
+2025-12-18T22:23:07.701Z [INFO] matcher.index.build.started policy_count=5 span_id=a40ec134ae7ac8f7 elapsed=2µs
+2025-12-18T22:23:07.702Z [INFO] matcher.index.build.completed database_count=2 matcher_key_count=2 span_id=a40ec134ae7ac8f7 elapsed=388µs
+2025-12-18T22:23:07.702Z [INFO] policy.registry.updated provider_id="bench-policies" policy_count=5
+2025-12-18T22:23:07.702Z [INFO] policies.loaded count=5 path="bench/configs/policies.json"
+2025-12-18T22:23:07.702Z [INFO] policy.count.loaded count=5
+2025-12-18T22:23:07.702Z [INFO] server.ready
+2025-12-18T22:23:07.702Z [INFO] shutdown.hint pid=38659
+2025-12-18T22:23:07.702Z [INFO] server.listening address="127.0.0.1" port=8081
+2025-12-18T22:23:07.716Z [INFO] shutdown.signal.received

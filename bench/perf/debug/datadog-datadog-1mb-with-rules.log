@@ -1,0 +1,30 @@
+
+=== SEGFAULT ===
+Faulting address: 0x10c009ac0
+Signal code: 2
+Stack trace:
+???:?:?: 0x19d66b743 in ??? (libsystem_platform.dylib)
+/Users/jea/Library/Caches/hermit/pkg/zig@latest/lib/std/multi_array_list.zig:508:71: 0x102a85f8b in handleCompleteValue__anon_54102 (edge-datadog)
+                    @memcpy(other_slice.items(field), self_slice.items(field));
+                                                                      ^
+/Users/jea/Library/Caches/hermit/pkg/zig@latest/lib/std/json/dynamic.zig:91:51: 0x1029f54a3 in processRequest (edge-datadog)
+                    return try handleCompleteValue(&stack, allocator, source, Value{ .string = s }, options) orelse continue;
+                                                  ^
+/Users/jea/Code/tero/edge/src/modules/proxy_module.zig:272:42: 0x102aa42ef in proxyHandler (edge-datadog)
+        return self.vtable.processRequest(self.ptr, req, allocator);
+                                         ^
+/Users/jea/Code/tero/edge/src/proxy/server.zig:187:21: 0x102a59347 in handleRequest (edge-datadog)
+        proxyHandler(self, req, res, &response_bytes) catch |err| {
+                    ^
+/Users/jea/.cache/zig/p/httpz-0.0.0-PNVzrBgtBwCVkSJyophIX6WHwDR0r8XhBGQr96Kk-1El/src/worker.zig:804:38: 0x1029ddbc3 in entryFn (edge-datadog)
+            self.server.handleRequest(http_conn, thread_buf);
+                                     ^
+???:?:?: 0x19d661c07 in ??? (libsystem_pthread.dylib)
+???:?:?: 0x19d65cba7 in ??? (libsystem_pthread.dylib)
+
+=== SEGFAULT ===
+Faulting address: 0x10bf581b0
+Signal code: 2
+Stack trace:
+et: received shutdown signal
+2025-12-18T22:23:07.721Z [INFO] server.stopped

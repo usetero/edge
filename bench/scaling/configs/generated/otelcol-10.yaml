@@ -1,0 +1,49 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+
+  datadog:
+    endpoint: 127.0.0.1:4319
+    read_timeout: 60s
+
+processors:
+  batch:
+    # Small batch for benchmarking - ensures requests flow through
+    send_batch_size: 100
+    timeout: 100ms
+
+  filter:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'IsMatch(body, ".*authentication.*")'
+        - 'IsMatch(body, ".*NOMATCH_BENCH_0001.*")'
+        - 'IsMatch(body, ".*NOMATCH_BENCH_0002.*")'
+        - 'IsMatch(body, ".*Payment.*")'
+        - 'IsMatch(body, ".*NOMATCH_BENCH_0004.*")'
+        - 'IsMatch(body, ".*NOMATCH_BENCH_0005.*")'
+        - 'IsMatch(body, ".*Cache miss.*")'
+        - 'IsMatch(body, ".*NOMATCH_BENCH_0007.*")'
+        - 'IsMatch(body, ".*NOMATCH_BENCH_0008.*")'
+        - 'IsMatch(body, ".*Cache hit.*")'
+
+exporters:
+  otlphttp:
+    endpoint: http://127.0.0.1:9999
+    compression: none
+
+service:
+  telemetry:
+    logs:
+      level: error
+  pipelines:
+    logs/otlp:
+      receivers: [otlp]
+      processors: [filter, batch]
+      exporters: [otlphttp]
+    logs/datadog:
+      receivers: [datadog]
+      processors: [filter, batch]
+      exporters: [otlphttp]

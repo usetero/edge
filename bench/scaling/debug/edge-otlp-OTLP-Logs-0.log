@@ -1,0 +1,15 @@
+2026-01-03T03:57:09.096Z [INFO] server.starting
+2026-01-03T03:57:09.096Z [INFO] configuration.loaded path="/Users/jea/Code/tero/edge/bench/scaling/configs/generated/edge-otlp-0.json"
+2026-01-03T03:57:09.096Z [INFO] listen.address.configured address="127.0.0.1" port=8081
+2026-01-03T03:57:09.096Z [INFO] upstream.configured url="http://127.0.0.1:9999"
+2026-01-03T03:57:09.096Z [INFO] service.configured namespace="tero" name="tero-edge" instance_id="edge-1767412629096-384609" version="latest"
+2026-01-03T03:57:09.096Z [INFO] policy.loader.starting provider_count=1
+2026-01-03T03:57:09.097Z [INFO] file.provider.configured path="/Users/jea/Code/tero/edge/bench/scaling/configs/generated/policies-0.json"
+2026-01-03T03:57:09.097Z [INFO] policies.loading path="/Users/jea/Code/tero/edge/bench/scaling/configs/generated/policies-0.json"
+2026-01-03T03:57:09.097Z [INFO] server.ready
+2026-01-03T03:57:09.097Z [INFO] shutdown.hint pid=42514
+2026-01-03T03:57:09.097Z [INFO] server.listening address="127.0.0.1" port=8081
+2026-01-03T03:57:09.097Z [INFO] policy.registry.updated provider_id="bench-policies" policy_count=0
+2026-01-03T03:57:09.097Z [INFO] policies.loaded count=0 path="/Users/jea/Code/tero/edge/bench/scaling/configs/generated/policies-0.json"
+2026-01-03T03:57:09.097Z [INFO] policy.loader.ready loaded_count=1 failed_count=0
+2026-01-03T03:57:09.353Z [INFO] shutdown.signal.received

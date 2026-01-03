@@ -1,0 +1,3 @@
+Scenario,Type,Mode,Payload Size,Requests/sec,p50 (ms),p99 (ms),Success %,CPU %,Peak Mem MB,Status Codes
+Datadog 1MB,datadog,with-rules,1473789,490,127.18,1136.9,100,1470.0,308.1,"202:10000"
+OTLP 1MB,otlp,with-rules,1624770,616,112.26,725.51,100,1460.0,274.4,"202:10000"

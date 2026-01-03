@@ -1,0 +1,2 @@
+binary,telemetry_type,policy_count,payload_bytes,rps,p50_ms,p99_ms,success_pct,cpu_pct,mem_mb,echo_requests,echo_bytes
+otelcol,OTLP Logs,0,4081,41601,1.1,2.18,100,70.0,157.6,100,1757000
