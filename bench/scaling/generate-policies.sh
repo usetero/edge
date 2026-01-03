@@ -313,9 +313,12 @@ processors:
     timeout: 100ms
 YAML_HEAD
 
+    local processors="batch"
+
     if [[ $count -gt 0 ]]; then
         # Generate the same number of filter rules as Edge policies
         # This ensures comparable evaluation overhead
+        processors="batch, filter"
 
         # Filter processor with N rules
         echo ""
@@ -336,7 +339,7 @@ YAML_HEAD
         done
     fi
 
-    cat <<'YAML_TAIL'
+    cat <<YAML_TAIL
 
 exporters:
   otlphttp:
@@ -359,6 +362,161 @@ service:
 YAML_TAIL
 }
 
+# Generate Vector config with filter, sample, and throttle transforms
+# Vector uses:
+# - port 4320 for OTLP (http_server source)
+# - port 4321 for Datadog (http_server source)
+generate_vector_config() {
+    local count=$1
+    local data_dir="$SCRIPT_DIR/data"
+
+    # Start with data_dir and sources
+    cat <<YAML_HEAD
+data_dir: "$data_dir"
+
+sources:
+  otlp_source:
+    type: http_server
+    address: "127.0.0.1:4320"
+    decoding:
+      codec: json
+    path: "/v1/logs"
+
+  datadog_source:
+    type: http_server
+    address: "127.0.0.1:4321"
+    decoding:
+      codec: json
+    path: "/api/v2/logs"
+YAML_HEAD
+
+    if [[ $count -gt 0 ]]; then
+        echo ""
+        echo "transforms:"
+
+        # Generate filter transforms (same count as Edge policies)
+        # Each filter is chained to the previous one
+        local prev_otlp="otlp_source"
+        local prev_dd="datadog_source"
+
+        for ((i=0; i<count; i++)); do
+            local pattern
+            # Cycle through matching patterns, then use non-matching ones
+            if ((i < ${#MATCHING_PATTERNS[@]})); then
+                pattern="${MATCHING_PATTERNS[$i]}"
+            else
+                pattern="NOMATCH_BENCH_$(printf '%04d' $i)"
+            fi
+
+            # OTLP filter - use contains() instead of match() for simpler syntax
+            cat <<YAML_FILTER
+  filter_otlp_$i:
+    type: filter
+    inputs:
+      - "$prev_otlp"
+    condition: '!contains(to_string(.message) ?? "", "$pattern")'
+YAML_FILTER
+            prev_otlp="filter_otlp_$i"
+
+            # Datadog filter
+            cat <<YAML_FILTER
+  filter_dd_$i:
+    type: filter
+    inputs:
+      - "$prev_dd"
+    condition: '!contains(to_string(.message) ?? "", "$pattern")'
+YAML_FILTER
+            prev_dd="filter_dd_$i"
+        done
+
+        # Add sample transform (simulating percentage sampling)
+        cat <<YAML_SAMPLE
+  sample_otlp:
+    type: sample
+    inputs:
+      - "$prev_otlp"
+    rate: 4
+
+  sample_dd:
+    type: sample
+    inputs:
+      - "$prev_dd"
+    rate: 4
+YAML_SAMPLE
+
+        # Add throttle transform (simulating rate limiting)
+        cat <<YAML_THROTTLE
+  throttle_otlp:
+    type: throttle
+    inputs:
+      - "sample_otlp"
+    threshold: 10000
+    window_secs: 1
+
+  throttle_dd:
+    type: throttle
+    inputs:
+      - "sample_dd"
+    threshold: 10000
+    window_secs: 1
+YAML_THROTTLE
+
+        # Sinks connect to final transforms
+        cat <<'YAML_SINKS'
+
+sinks:
+  otlp_out:
+    type: http
+    inputs:
+      - "throttle_otlp"
+    uri: "http://127.0.0.1:9999/v1/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  datadog_out:
+    type: http
+    inputs:
+      - "throttle_dd"
+    uri: "http://127.0.0.1:9999/api/v2/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+YAML_SINKS
+    else
+        # No transforms - passthrough mode
+        cat <<'YAML_SINKS'
+
+sinks:
+  otlp_out:
+    type: http
+    inputs:
+      - "otlp_source"
+    uri: "http://127.0.0.1:9999/v1/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  datadog_out:
+    type: http
+    inputs:
+      - "datadog_source"
+    uri: "http://127.0.0.1:9999/api/v2/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+YAML_SINKS
+    fi
+}
+
 # Main
 echo "Generating $COUNT policies..."
 
@@ -368,9 +526,13 @@ generate_edge_policies "$COUNT" | jq '.' > "$OUTPUT_DIR/policies-$COUNT.json"
 # Generate otelcol config
 generate_otelcol_config "$COUNT" > "$OUTPUT_DIR/otelcol-$COUNT.yaml"
 
+# Generate Vector config
+generate_vector_config "$COUNT" > "$OUTPUT_DIR/vector-$COUNT.yaml"
+
 echo "Generated:"
 echo "  - $OUTPUT_DIR/policies-$COUNT.json"
 echo "  - $OUTPUT_DIR/otelcol-$COUNT.yaml"
+echo "  - $OUTPUT_DIR/vector-$COUNT.yaml"
 
 # Show summary
 if command -v jq &> /dev/null; then

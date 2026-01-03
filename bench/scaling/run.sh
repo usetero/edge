@@ -10,6 +10,7 @@
 #   --skip-build          Skip building binaries
 #   --edge-only           Only run Edge benchmarks
 #   --otelcol-only        Only run otelcol benchmarks
+#   --vector-only         Only run Vector benchmarks
 #   --debug               Save server logs
 #   -h, --help            Show this help message
 #
@@ -22,13 +23,18 @@ SKIP_BUILD=false
 DEBUG_MODE=false
 RUN_EDGE=true
 RUN_OTELCOL=true
+RUN_VECTOR=true
 
 # For initial testing, only test 0 and 10 policies
-POLICY_COUNTS=(0 10)
-# Full test: POLICY_COUNTS=(0 1 10 100 500 1000 2000 4000)
+# POLICY_COUNTS=(0 10)
+# Full test:
+# POLICY_COUNTS=(0 1 10 100 500 1000 2000 4000)
+# Quick 1000 test:
+POLICY_COUNTS=(0 1000)
 
-# otelcol binary location
+# otelcol and vector binary locations
 OTELCOL_BIN=""
+VECTOR_BIN=""
 
 # Ports
 ECHO_SERVER_PORT=9999
@@ -45,6 +51,7 @@ CONFIGS_DIR="$SCRIPT_DIR/configs"
 
 # PIDs for cleanup
 ECHO_PID=""
+VECTOR_PID=""
 EDGE_PID=""
 OTELCOL_PID=""
 
@@ -60,12 +67,126 @@ log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
+# Find otelcol-contrib binary
+find_otelcol() {
+    # Check in bench/bin first
+    if [[ -x "$PROJECT_ROOT/bench/bin/otelcol-contrib" ]]; then
+        echo "$PROJECT_ROOT/bench/bin/otelcol-contrib"
+        return
+    fi
+    # Check in PATH
+    if command -v otelcol-contrib >/dev/null 2>&1; then
+        command -v otelcol-contrib
+        return
+    fi
+    # Not found
+    echo ""
+}
+
+# Find vector binary
+find_vector() {
+    # Check in bench/bin first
+    if [[ -x "$PROJECT_ROOT/bench/bin/vector" ]]; then
+        echo "$PROJECT_ROOT/bench/bin/vector"
+        return
+    fi
+    # Check in PATH
+    if command -v vector >/dev/null 2>&1; then
+        command -v vector
+        return
+    fi
+    # Not found
+    echo ""
+}
+
+# Start otelcol
+start_otelcol() {
+    local config=$1
+    local scenario_name=$2
+    local wait_port=$3
+
+    # Kill existing if running
+    [[ -n "$OTELCOL_PID" ]] && kill "$OTELCOL_PID" 2>/dev/null && sleep 0.3 || true
+    OTELCOL_PID=""
+
+    log_info "Starting otelcol-contrib..."
+
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        local log_file="$DEBUG_DIR/otelcol-$(echo "$scenario_name" | tr ' ' '-').log"
+        "$OTELCOL_BIN" --config "$config" > "$log_file" 2>&1 &
+    else
+        "$OTELCOL_BIN" --config "$config" >/dev/null 2>&1 &
+    fi
+    OTELCOL_PID=$!
+    wait_for_server "$wait_port" "otelcol"
+}
+
+# Stop otelcol
+stop_otelcol() {
+    if [[ -n "$OTELCOL_PID" ]]; then
+        kill "$OTELCOL_PID" 2>/dev/null || true
+        wait "$OTELCOL_PID" 2>/dev/null || true
+        OTELCOL_PID=""
+    fi
+}
+
+# Start Vector
+start_vector() {
+    local config=$1
+    local scenario_name=$2
+    local wait_port=$3
+
+    # Stop any existing vector first
+    stop_vector
+
+    # Create data directory for Vector
+    mkdir -p "$SCRIPT_DIR/data"
+
+    log_info "Starting vector..."
+
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        local log_file="$DEBUG_DIR/vector-$(echo "$scenario_name" | tr ' ' '-').log"
+        "$VECTOR_BIN" --config "$config" > "$log_file" 2>&1 &
+    else
+        "$VECTOR_BIN" --config "$config" >/dev/null 2>&1 &
+    fi
+    VECTOR_PID=$!
+    # Vector with many policies may take longer to start
+    wait_for_server "$wait_port" "vector" 120
+}
+
+# Stop Vector
+stop_vector() {
+    if [[ -n "$VECTOR_PID" ]]; then
+        # Give Vector time to flush buffers before stopping
+        sleep 2
+        kill "$VECTOR_PID" 2>/dev/null || true
+        # Wait for graceful shutdown
+        for i in {1..20}; do
+            kill -0 "$VECTOR_PID" 2>/dev/null || break
+            sleep 0.3
+        done
+        # Force kill if still running
+        kill -9 "$VECTOR_PID" 2>/dev/null || true
+        sleep 0.3
+        VECTOR_PID=""
+    fi
+}
+
 cleanup() {
     log_info "Cleaning up..."
-    [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null || true
-    [[ -n "$EDGE_PID" ]] && kill "$EDGE_PID" 2>/dev/null || true
-    [[ -n "$OTELCOL_PID" ]] && kill "$OTELCOL_PID" 2>/dev/null || true
-    wait 2>/dev/null || true
+    # Kill by PID first
+    [[ -n "$ECHO_PID" ]] && kill -9 "$ECHO_PID" 2>/dev/null || true
+    [[ -n "$EDGE_PID" ]] && kill -9 "$EDGE_PID" 2>/dev/null || true
+    [[ -n "$OTELCOL_PID" ]] && kill -9 "$OTELCOL_PID" 2>/dev/null || true
+    [[ -n "$VECTOR_PID" ]] && kill -9 "$VECTOR_PID" 2>/dev/null || true
+    # Then pkill to catch any orphans
+    pkill -9 -f "echo-server" 2>/dev/null || true
+    pkill -9 -f "edge-otlp" 2>/dev/null || true
+    pkill -9 -f "edge-datadog" 2>/dev/null || true
+    pkill -9 -f "otelcol" 2>/dev/null || true
+    pkill -9 -f "vector.*--config" 2>/dev/null || true
+    sleep 0.5
 }
 
 trap cleanup EXIT INT TERM
@@ -99,16 +220,28 @@ check_dependencies() {
         fi
     fi
 
+    # Check for vector if needed
+    if [[ "$RUN_VECTOR" == "true" ]]; then
+        VECTOR_BIN=$(find_vector)
+        if [[ -z "$VECTOR_BIN" ]]; then
+            log_warn "vector not found, skipping Vector benchmarks"
+            log_warn "Install to bench/bin/vector or add to PATH"
+            RUN_VECTOR=false
+        else
+            log_success "Found vector: $VECTOR_BIN"
+        fi
+    fi
+
     log_success "All dependencies found"
 }
 
 wait_for_server() {
     local port=$1
     local name=$2
-    local max_attempts=30
+    local max_attempts=${3:-60}  # Default 60 attempts = 6 seconds
     local attempt=0
 
-    while ! curl -s "http://127.0.0.1:$port" >/dev/null 2>&1; do
+    while ! curl -s --max-time 1 "http://127.0.0.1:$port" >/dev/null 2>&1; do
         attempt=$((attempt + 1))
         if [[ $attempt -ge $max_attempts ]]; then
             log_error "$name failed to start on port $port"
@@ -324,8 +457,9 @@ main() {
             -c|--connections) CONNECTIONS="$2"; shift 2 ;;
             --skip-build) SKIP_BUILD=true; shift ;;
             --debug) DEBUG_MODE=true; shift ;;
-            --edge-only) RUN_EDGE=true; RUN_OTELCOL=false; shift ;;
-            --otelcol-only) RUN_EDGE=false; RUN_OTELCOL=true; shift ;;
+            --edge-only) RUN_EDGE=true; RUN_OTELCOL=false; RUN_VECTOR=false; shift ;;
+            --otelcol-only) RUN_EDGE=false; RUN_OTELCOL=true; RUN_VECTOR=false; shift ;;
+            --vector-only) RUN_EDGE=false; RUN_OTELCOL=false; RUN_VECTOR=true; shift ;;
             -h|--help) usage ;;
             *) log_error "Unknown option: $1"; usage ;;
         esac
@@ -333,13 +467,11 @@ main() {
 
     # Determine what we're running for title
     local run_what=""
-    if [[ "$RUN_EDGE" == "true" ]] && [[ "$RUN_OTELCOL" == "true" ]]; then
-        run_what="Edge + otelcol"
-    elif [[ "$RUN_EDGE" == "true" ]]; then
-        run_what="Edge"
-    else
-        run_what="otelcol"
-    fi
+    local components=()
+    [[ "$RUN_EDGE" == "true" ]] && components+=("Edge")
+    [[ "$RUN_OTELCOL" == "true" ]] && components+=("otelcol")
+    [[ "$RUN_VECTOR" == "true" ]] && components+=("Vector")
+    run_what=$(IFS=" + "; echo "${components[*]}")
 
     echo ""
     echo "=========================================="
@@ -477,6 +609,70 @@ main() {
 
                 # Stop otelcol between tests
                 stop_otelcol
+
+                # Get echo server stats
+                local echo_stats=$(get_echo_stats)
+                local echo_requests=$(echo "$echo_stats" | jq -r '.total_requests')
+                local echo_bytes=$(echo "$echo_stats" | jq -r '.total_bytes')
+
+                # Extract benchmark metrics
+                local metrics=$(extract_metrics "$output_json")
+                IFS=',' read -r rps p50 p99 success <<< "$metrics"
+                IFS=',' read -r cpu_percent peak_mem <<< "$resource_metrics"
+
+                # Verify request count (for passthrough, should be ~100%)
+                if [[ "$count" -eq 0 ]]; then
+                    verify_request_count "$REQUESTS" "$echo_stats" "$name" || true
+                fi
+
+                # Log results
+                local success_color="${GREEN}"
+                [[ "$success" != "100" ]] && success_color="${RED}"
+
+                log_success "$name: ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, echo: ${echo_requests} reqs"
+
+                # Write to CSV
+                echo "$binary,$name,$count,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,$echo_requests,$echo_bytes" >> "$results_file"
+            done
+        fi
+
+        # ========== Vector Benchmarks ==========
+        if [[ "$RUN_VECTOR" == "true" ]]; then
+            local vector_config="$CONFIGS_DIR/generated/vector-${count}.yaml"
+
+            # Vector scenarios:
+            # - OTLP HTTP on port 4320
+            # - Datadog HTTP on port 4321
+            local vector_scenarios=(
+                "vector|OTLP Logs|4320|/v1/logs|$PAYLOADS_DIR/otlp-logs.json"
+                "vector|DD Logs|4321|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json"
+            )
+
+            for scenario in "${vector_scenarios[@]}"; do
+                IFS='|' read -r binary name port endpoint payload <<< "$scenario"
+
+                local payload_size=$(wc -c < "$payload" | tr -d ' ')
+                local output_json="$OUTPUT_DIR/${binary}-${name// /-}-${count}.json"
+                local url="http://127.0.0.1:$port$endpoint"
+
+                # Start vector with this config, wait for the specific port
+                start_vector "$vector_config" "${name}-${count}" "$port"
+
+                # Reset echo server stats
+                reset_echo_stats
+
+                # Start resource monitoring
+                start_resource_monitor "$VECTOR_PID"
+
+                # Run benchmark
+                log_info "Running: $name ($binary, $count policies)..."
+                run_benchmark "$url" "$payload" "$output_json"
+
+                # Stop monitoring
+                local resource_metrics=$(stop_resource_monitor)
+
+                # Stop vector between tests
+                stop_vector
 
                 # Get echo server stats
                 local echo_stats=$(get_echo_stats)
