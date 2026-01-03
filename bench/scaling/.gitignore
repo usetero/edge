@@ -1,0 +1,14 @@
+# Generated configs
+configs/generated/
+
+# Benchmark results
+results/
+
+# Debug logs
+debug/
+
+# Vector data directory
+data/
+
+# macOS
+.DS_Store
