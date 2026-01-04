@@ -28,9 +28,9 @@ RUN_VECTOR=true
 # For initial testing, only test 0 and 10 policies
 # POLICY_COUNTS=(0 10)
 # Full test:
-# POLICY_COUNTS=(0 1 10 100 500 1000 2000 4000)
+POLICY_COUNTS=(0 1 10 100 500 1000 2000 4000)
 # Quick 1000 test:
-POLICY_COUNTS=(0 1000)
+# POLICY_COUNTS=(0 1000)
 
 # otelcol and vector binary locations
 OTELCOL_BIN=""
@@ -363,18 +363,16 @@ run_benchmark() {
     local url=$1
     local payload_file=$2
     local output_file=$3
+    local content_type="${4:-application/json}"
 
-    # oha 1.12.0 has issues with -D, use hyperfine-style approach
-    # Write to temp file and redirect
-    local payload
-    payload=$(cat "$payload_file")
-
-    # Run oha with nohup to prevent SIGHUP issues
+    # Run oha with the payload file
+    # For binary files (protobuf), we use -D to read from file
+    # For JSON, we also use -D for consistency
     oha -n "$REQUESTS" \
         -c "$CONNECTIONS" \
         -m POST \
-        -H "Content-Type: application/json" \
-        -d "$payload" \
+        -H "Content-Type: $content_type" \
+        -D "$payload_file" \
         --output-format json \
         "$url" > "$output_file" 2>/dev/null
 }
@@ -490,6 +488,13 @@ main() {
         log_info "Building release binaries..."
         zig build echo-server datadog otlp -Doptimize=ReleaseFast
         log_success "Build complete"
+    fi
+
+    # Generate protobuf payloads for Vector's native OTLP source
+    if [[ "$RUN_VECTOR" == "true" ]]; then
+        log_info "Generating protobuf OTLP payloads..."
+        python3 "$SCRIPT_DIR/generate-protobuf-payloads.py"
+        log_success "Protobuf payloads generated"
     fi
 
     # Start echo server
@@ -641,15 +646,16 @@ main() {
             local vector_config="$CONFIGS_DIR/generated/vector-${count}.yaml"
 
             # Vector scenarios:
-            # - OTLP HTTP on port 4320
-            # - Datadog HTTP on port 4321
+            # - OTLP HTTP on port 4320 (native opentelemetry source, protobuf)
+            # - Datadog HTTP on port 4321 (http_server source, JSON)
+            # Format: binary|name|port|endpoint|payload|content_type
             local vector_scenarios=(
-                "vector|OTLP Logs|4320|/v1/logs|$PAYLOADS_DIR/otlp-logs.json"
-                "vector|DD Logs|4321|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json"
+                "vector|OTLP Logs|4320|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
+                "vector|DD Logs|4321|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
             )
 
             for scenario in "${vector_scenarios[@]}"; do
-                IFS='|' read -r binary name port endpoint payload <<< "$scenario"
+                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
 
                 local payload_size=$(wc -c < "$payload" | tr -d ' ')
                 local output_json="$OUTPUT_DIR/${binary}-${name// /-}-${count}.json"
@@ -666,7 +672,7 @@ main() {
 
                 # Run benchmark
                 log_info "Running: $name ($binary, $count policies)..."
-                run_benchmark "$url" "$payload" "$output_json"
+                run_benchmark "$url" "$payload" "$output_json" "$content_type"
 
                 # Stop monitoring
                 local resource_metrics=$(stop_resource_monitor)

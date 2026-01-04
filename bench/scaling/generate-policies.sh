@@ -364,23 +364,24 @@ YAML_TAIL
 
 # Generate Vector config with filter, sample, and throttle transforms
 # Vector uses:
-# - port 4320 for OTLP (http_server source)
-# - port 4321 for Datadog (http_server source)
+# - port 4320 for OTLP HTTP (native opentelemetry source, accepts protobuf)
+# - port 4321 for Datadog (http_server source with JSON)
 generate_vector_config() {
     local count=$1
     local data_dir="$SCRIPT_DIR/data"
 
     # Start with data_dir and sources
+    # Using native opentelemetry source for proper OTLP parsing
     cat <<YAML_HEAD
 data_dir: "$data_dir"
 
 sources:
-  otlp_source:
-    type: http_server
-    address: "127.0.0.1:4320"
-    decoding:
-      codec: json
-    path: "/v1/logs"
+  otel_source:
+    type: opentelemetry
+    grpc:
+      address: "127.0.0.1:4317"
+    http:
+      address: "127.0.0.1:4320"
 
   datadog_source:
     type: http_server
@@ -396,7 +397,8 @@ YAML_HEAD
 
         # Generate filter transforms (same count as Edge policies)
         # Each filter is chained to the previous one
-        local prev_otlp="otlp_source"
+        # Note: opentelemetry source outputs to .logs stream
+        local prev_otlp="otel_source.logs"
         local prev_dd="datadog_source"
 
         for ((i=0; i<count; i++)); do
@@ -495,7 +497,7 @@ sinks:
   otlp_out:
     type: http
     inputs:
-      - "otlp_source"
+      - "otel_source.logs"
     uri: "http://127.0.0.1:9999/v1/logs"
     encoding:
       codec: json
