@@ -302,7 +302,8 @@ pub const PolicyEngine = struct {
 
         self.bus.debug(EvaluateResult{ .decision = match_state.decision, .matched_count = match_state.matched_count });
 
-        self.recordMatchedPolicyStats(policy_id_buf, &match_state);
+        // Record hit/miss stats using lock-free atomics
+        self.recordMatchedPolicyStats(snapshot, &match_state);
 
         if (match_state.decision == .drop) {
             return PolicyResult.dropped;
@@ -313,18 +314,22 @@ pub const PolicyEngine = struct {
         if (T == .log) {
             if (field_mutator) |mutator| {
                 for (0..match_state.matched_count) |i| {
+                    const policy_index = match_state.matched_indices[i];
                     const result = self.applyLogTransforms(
                         ctx,
                         field_accessor,
                         mutator,
                         snapshot,
-                        match_state.matched_indices[i],
+                        policy_index,
                         policy_id_buf[i],
                     );
                     if (result.totalApplied() > 0) {
                         was_transformed = true;
+                        // Record transform stats using lock-free atomics
+                        if (snapshot.getStats(policy_index)) |stats| {
+                            stats.addTransform(@intCast(result.totalApplied()));
+                        }
                     }
-                    self.registry.recordPolicyStats(policy_id_buf[i], 0, 0, result);
                 }
             }
         }
@@ -503,21 +508,24 @@ pub const PolicyEngine = struct {
         return result;
     }
 
-    /// Record stats for all matched policies.
+    /// Record stats for all matched policies using lock-free atomics.
     /// Hit if policy's decision matches final decision, miss otherwise.
     inline fn recordMatchedPolicyStats(
         self: *const Self,
-        policy_id_buf: [][]const u8,
+        snapshot: *const PolicySnapshot,
         match_state: *const MatchState,
     ) void {
+        _ = self; // Observability bus not used for stats currently
         for (0..match_state.matched_count) |i| {
-            const policy_id = policy_id_buf[i];
+            const policy_index = match_state.matched_indices[i];
             const policy_decision = match_state.matched_decisions[i];
 
-            if (policy_decision == match_state.decision) {
-                self.registry.recordPolicyStats(policy_id, 1, 0, .{}); // hit
-            } else {
-                self.registry.recordPolicyStats(policy_id, 0, 1, .{}); // miss
+            if (snapshot.getStats(policy_index)) |stats| {
+                if (policy_decision == match_state.decision) {
+                    stats.addHit();
+                } else {
+                    stats.addMiss();
+                }
             }
         }
     }
@@ -2124,14 +2132,9 @@ test "PolicyEngine stats: all DROP policies get hits" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var stats_provider = StatsTrackingProvider.init(allocator);
-    defer stats_provider.deinit();
-    var provider_iface = stats_provider.provider();
-
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.registerProvider(&provider_iface);
-    try registry.updatePolicies(&.{ drop_policy1, drop_policy2 }, "stats-tracking-provider", .file);
+    try registry.updatePolicies(&.{ drop_policy1, drop_policy2 }, "file-provider", .file);
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
@@ -2142,16 +2145,18 @@ test "PolicyEngine stats: all DROP policies get hits" {
 
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
-    // Both policies should get hits (all same action)
-    try testing.expectEqual(@as(usize, 2), stats_provider.callCount());
+    // Both policies should get hits via lock-free atomic stats on snapshot
+    const snapshot = registry.getSnapshot().?;
 
-    const stats1 = stats_provider.getStats("drop-1").?;
-    try testing.expectEqual(@as(i64, 1), stats1.hits);
-    try testing.expectEqual(@as(i64, 0), stats1.misses);
+    // Policy 0 (drop-1) should have 1 hit
+    const stats0 = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 1), stats0.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), stats0.misses.load(.monotonic));
 
-    const stats2 = stats_provider.getStats("drop-2").?;
-    try testing.expectEqual(@as(i64, 1), stats2.hits);
-    try testing.expectEqual(@as(i64, 0), stats2.misses);
+    // Policy 1 (drop-2) should have 1 hit
+    const stats1 = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 1), stats1.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), stats1.misses.load(.monotonic));
 }
 
 test "PolicyEngine stats: all KEEP policies get hits" {
@@ -2185,14 +2190,9 @@ test "PolicyEngine stats: all KEEP policies get hits" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var stats_provider = StatsTrackingProvider.init(allocator);
-    defer stats_provider.deinit();
-    var provider_iface = stats_provider.provider();
-
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.registerProvider(&provider_iface);
-    try registry.updatePolicies(&.{ keep_policy1, keep_policy2 }, "stats-tracking-provider", .file);
+    try registry.updatePolicies(&.{ keep_policy1, keep_policy2 }, "file-provider", .file);
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
@@ -2203,16 +2203,18 @@ test "PolicyEngine stats: all KEEP policies get hits" {
 
     try testing.expectEqual(FilterDecision.keep, result.decision);
 
-    // Both policies should get hits (all same action)
-    try testing.expectEqual(@as(usize, 2), stats_provider.callCount());
+    // Both policies should get hits via lock-free atomic stats on snapshot
+    const snapshot = registry.getSnapshot().?;
 
-    const stats1 = stats_provider.getStats("keep-1").?;
-    try testing.expectEqual(@as(i64, 1), stats1.hits);
-    try testing.expectEqual(@as(i64, 0), stats1.misses);
+    // Policy 0 (keep-1) should have 1 hit
+    const stats0 = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 1), stats0.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), stats0.misses.load(.monotonic));
 
-    const stats2 = stats_provider.getStats("keep-2").?;
-    try testing.expectEqual(@as(i64, 1), stats2.hits);
-    try testing.expectEqual(@as(i64, 0), stats2.misses);
+    // Policy 1 (keep-2) should have 1 hit
+    const stats1 = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 1), stats1.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), stats1.misses.load(.monotonic));
 }
 
 test "PolicyEngine stats: mixed KEEP and DROP - DROP gets hits, KEEP gets misses" {
@@ -2246,14 +2248,9 @@ test "PolicyEngine stats: mixed KEEP and DROP - DROP gets hits, KEEP gets misses
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var stats_provider = StatsTrackingProvider.init(allocator);
-    defer stats_provider.deinit();
-    var provider_iface = stats_provider.provider();
-
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.registerProvider(&provider_iface);
-    try registry.updatePolicies(&.{ keep_policy, drop_policy }, "stats-tracking-provider", .file);
+    try registry.updatePolicies(&.{ keep_policy, drop_policy }, "file-provider", .file);
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
@@ -2265,18 +2262,18 @@ test "PolicyEngine stats: mixed KEEP and DROP - DROP gets hits, KEEP gets misses
     // DROP wins (most restrictive)
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
-    // Both policies should have stats recorded
-    try testing.expectEqual(@as(usize, 2), stats_provider.callCount());
+    // Both policies should have stats recorded via lock-free atomics
+    const snapshot = registry.getSnapshot().?;
 
-    // KEEP policy gets miss (its decision differs from final decision)
-    const keep_stats = stats_provider.getStats("keep-policy").?;
-    try testing.expectEqual(@as(i64, 0), keep_stats.hits);
-    try testing.expectEqual(@as(i64, 1), keep_stats.misses);
+    // KEEP policy (index 0) gets miss (its decision differs from final decision)
+    const keep_stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 0), keep_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), keep_stats.misses.load(.monotonic));
 
-    // DROP policy gets hit (its decision matches final decision)
-    const drop_stats = stats_provider.getStats("drop-policy").?;
-    try testing.expectEqual(@as(i64, 1), drop_stats.hits);
-    try testing.expectEqual(@as(i64, 0), drop_stats.misses);
+    // DROP policy (index 1) gets hit (its decision matches final decision)
+    const drop_stats = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 1), drop_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), drop_stats.misses.load(.monotonic));
 }
 
 test "PolicyEngine stats: single policy match gets hit" {
@@ -2297,14 +2294,9 @@ test "PolicyEngine stats: single policy match gets hit" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var stats_provider = StatsTrackingProvider.init(allocator);
-    defer stats_provider.deinit();
-    var provider_iface = stats_provider.provider();
-
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.registerProvider(&provider_iface);
-    try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
@@ -2312,11 +2304,11 @@ test "PolicyEngine stats: single policy match gets hit" {
     var policy_id_buf: [16][]const u8 = undefined;
     _ = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
 
-    // Single policy should get a hit
-    try testing.expectEqual(@as(usize, 1), stats_provider.callCount());
-    const stats = stats_provider.getStats("single-policy").?;
-    try testing.expectEqual(@as(i64, 1), stats.hits);
-    try testing.expectEqual(@as(i64, 0), stats.misses);
+    // Single policy should get a hit via lock-free atomic stats
+    const snapshot = registry.getSnapshot().?;
+    const stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 1), stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), stats.misses.load(.monotonic));
 }
 
 test "PolicyEngine stats: multiple KEEPs and DROPs - all DROPs get hits, all KEEPs get misses" {
@@ -2375,14 +2367,9 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - all DROPs get hits, all KEE
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var stats_provider = StatsTrackingProvider.init(allocator);
-    defer stats_provider.deinit();
-    var provider_iface = stats_provider.provider();
-
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.registerProvider(&provider_iface);
-    try registry.updatePolicies(&.{ keep_policy1, keep_policy2, drop_policy1, drop_policy2 }, "stats-tracking-provider", .file);
+    try registry.updatePolicies(&.{ keep_policy1, keep_policy2, drop_policy1, drop_policy2 }, "file-provider", .file);
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
@@ -2394,26 +2381,26 @@ test "PolicyEngine stats: multiple KEEPs and DROPs - all DROPs get hits, all KEE
     // DROP wins (most restrictive)
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
-    // All 4 policies should have stats recorded
-    try testing.expectEqual(@as(usize, 4), stats_provider.callCount());
+    // All 4 policies should have stats recorded via lock-free atomics
+    const snapshot = registry.getSnapshot().?;
 
-    // Both KEEP policies get misses (their decision differs from final decision)
-    const keep1_stats = stats_provider.getStats("keep-1").?;
-    try testing.expectEqual(@as(i64, 0), keep1_stats.hits);
-    try testing.expectEqual(@as(i64, 1), keep1_stats.misses);
+    // Both KEEP policies (index 0,1) get misses (their decision differs from final decision)
+    const keep1_stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 0), keep1_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), keep1_stats.misses.load(.monotonic));
 
-    const keep2_stats = stats_provider.getStats("keep-2").?;
-    try testing.expectEqual(@as(i64, 0), keep2_stats.hits);
-    try testing.expectEqual(@as(i64, 1), keep2_stats.misses);
+    const keep2_stats = snapshot.getStats(1).?;
+    try testing.expectEqual(@as(i64, 0), keep2_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), keep2_stats.misses.load(.monotonic));
 
-    // Both DROP policies get hits (their decision matches final decision)
-    const drop1_stats = stats_provider.getStats("drop-1").?;
-    try testing.expectEqual(@as(i64, 1), drop1_stats.hits);
-    try testing.expectEqual(@as(i64, 0), drop1_stats.misses);
+    // Both DROP policies (index 2,3) get hits (their decision matches final decision)
+    const drop1_stats = snapshot.getStats(2).?;
+    try testing.expectEqual(@as(i64, 1), drop1_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), drop1_stats.misses.load(.monotonic));
 
-    const drop2_stats = stats_provider.getStats("drop-2").?;
-    try testing.expectEqual(@as(i64, 1), drop2_stats.hits);
-    try testing.expectEqual(@as(i64, 0), drop2_stats.misses);
+    const drop2_stats = snapshot.getStats(3).?;
+    try testing.expectEqual(@as(i64, 1), drop2_stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), drop2_stats.misses.load(.monotonic));
 }
 
 test "PolicyEngine stats: no match records no stats" {
@@ -2434,14 +2421,9 @@ test "PolicyEngine stats: no match records no stats" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var stats_provider = StatsTrackingProvider.init(allocator);
-    defer stats_provider.deinit();
-    var provider_iface = stats_provider.provider();
-
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.registerProvider(&provider_iface);
-    try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
 
@@ -2450,8 +2432,11 @@ test "PolicyEngine stats: no match records no stats" {
     var policy_id_buf: [16][]const u8 = undefined;
     _ = engine.evaluate(.log, &test_log, TestLogContext.fieldAccessor, null, &policy_id_buf);
 
-    // No stats should be recorded
-    try testing.expectEqual(@as(usize, 0), stats_provider.callCount());
+    // No stats should be recorded - policy should have 0 hits and 0 misses
+    const snapshot = registry.getSnapshot().?;
+    const stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 0), stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), stats.misses.load(.monotonic));
 }
 
 // =============================================================================
@@ -3076,14 +3061,9 @@ test "MetricPolicyEngine: stats recording for matched policies" {
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
 
-    var stats_provider = StatsTrackingProvider.init(allocator);
-    defer stats_provider.deinit();
-    var provider_iface = stats_provider.provider();
-
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
-    try registry.registerProvider(&provider_iface);
-    try registry.updatePolicies(&.{policy}, "stats-tracking-provider", .file);
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
 
     const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
     var policy_id_buf: [16][]const u8 = undefined;
@@ -3093,11 +3073,11 @@ test "MetricPolicyEngine: stats recording for matched policies" {
     const result = engine.evaluate(.metric, &test_metric, TestMetricContext.fieldAccessor, null, &policy_id_buf);
     try testing.expectEqual(FilterDecision.drop, result.decision);
 
-    // Verify stats were recorded
-    try testing.expectEqual(@as(usize, 1), stats_provider.callCount());
-    const stats = stats_provider.getStats("metric-stats-test").?;
-    try testing.expectEqual(@as(i64, 1), stats.hits);
-    try testing.expectEqual(@as(i64, 0), stats.misses);
+    // Verify stats were recorded via lock-free atomics
+    const snapshot = registry.getSnapshot().?;
+    const stats = snapshot.getStats(0).?;
+    try testing.expectEqual(@as(i64, 1), stats.hits.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), stats.misses.load(.monotonic));
 }
 
 // =============================================================================

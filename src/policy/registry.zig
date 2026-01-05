@@ -14,6 +14,42 @@ const LogMatcherIndex = matcher_index.LogMatcherIndex;
 const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
 
 // =============================================================================
+// Lock-free Policy Stats
+// =============================================================================
+
+/// Atomic counters for policy statistics - lock-free updates
+pub const PolicyAtomicStats = struct {
+    hits: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    misses: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    // Transform stats (adds, removes, etc.) - less frequent, can batch
+    transforms_applied: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    /// Atomically increment hits
+    pub inline fn addHit(self: *PolicyAtomicStats) void {
+        _ = self.hits.fetchAdd(1, .monotonic);
+    }
+
+    /// Atomically increment misses
+    pub inline fn addMiss(self: *PolicyAtomicStats) void {
+        _ = self.misses.fetchAdd(1, .monotonic);
+    }
+
+    /// Atomically increment transforms applied
+    pub inline fn addTransform(self: *PolicyAtomicStats, count: i64) void {
+        _ = self.transforms_applied.fetchAdd(count, .monotonic);
+    }
+
+    /// Read and reset stats atomically (for flushing)
+    pub fn readAndReset(self: *PolicyAtomicStats) struct { hits: i64, misses: i64, transforms: i64 } {
+        return .{
+            .hits = self.hits.swap(0, .monotonic),
+            .misses = self.misses.swap(0, .monotonic),
+            .transforms = self.transforms_applied.swap(0, .monotonic),
+        };
+    }
+};
+
+// =============================================================================
 // Observability Events
 // =============================================================================
 
@@ -66,6 +102,10 @@ pub const PolicySnapshot = struct {
     /// Compiled Hyperscan-based matcher index for efficient metric evaluation
     metric_index: MetricMatcherIndex,
 
+    /// Lock-free atomic stats per policy (indexed by policy position)
+    /// Mutable even though snapshot is "immutable" - stats are append-only
+    policy_stats: []PolicyAtomicStats,
+
     version: u64,
     allocator: std.mem.Allocator,
 
@@ -75,6 +115,15 @@ pub const PolicySnapshot = struct {
         self.allocator.free(self.policies);
         self.allocator.free(self.log_target_indices);
         self.allocator.free(self.metric_target_indices);
+        self.allocator.free(self.policy_stats);
+    }
+
+    /// Get atomic stats for a policy by index (for lock-free updates)
+    pub fn getStats(self: *const PolicySnapshot, idx: u32) ?*PolicyAtomicStats {
+        if (idx >= self.policy_stats.len) {
+            return null;
+        }
+        return &self.policy_stats[idx];
     }
 
     /// Get a policy by index
@@ -474,6 +523,14 @@ pub const PolicyRegistry = struct {
         const new_version = self.version.load(.monotonic) + 1;
         self.version.store(new_version, .monotonic);
 
+        // Allocate atomic stats array for lock-free per-policy counters
+        const policy_stats = try self.allocator.alloc(PolicyAtomicStats, policies_slice.len);
+        errdefer self.allocator.free(policy_stats);
+        // Initialize all stats to zero (default init does this)
+        for (policy_stats) |*stat| {
+            stat.* = .{};
+        }
+
         // Create new snapshot with indices
         const snapshot = try self.allocator.create(PolicySnapshot);
         snapshot.* = .{
@@ -482,6 +539,7 @@ pub const PolicyRegistry = struct {
             .metric_target_indices = metric_target_indices,
             .log_index = log_idx,
             .metric_index = metric_idx,
+            .policy_stats = policy_stats,
             .version = new_version,
             .allocator = self.allocator,
         };
