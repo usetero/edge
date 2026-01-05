@@ -490,8 +490,8 @@ main() {
         log_success "Build complete"
     fi
 
-    # Generate protobuf payloads for Vector's native OTLP source
-    if [[ "$RUN_VECTOR" == "true" ]]; then
+    # Generate protobuf payloads for OTLP tests (used by Edge, otelcol, and Vector)
+    if [[ "$RUN_EDGE" == "true" ]] || [[ "$RUN_OTELCOL" == "true" ]] || [[ "$RUN_VECTOR" == "true" ]]; then
         log_info "Generating protobuf OTLP payloads..."
         python3 "$SCRIPT_DIR/generate-protobuf-payloads.py"
         log_success "Protobuf payloads generated"
@@ -518,15 +518,16 @@ main() {
 
         # ========== Edge Benchmarks ==========
         if [[ "$RUN_EDGE" == "true" ]]; then
+            # Format: binary|name|port|endpoint|payload|content_type
             local edge_scenarios=(
-                "edge-otlp|OTLP Logs|$OTLP_PORT|/v1/logs|$PAYLOADS_DIR/otlp-logs.json"
-                "edge-otlp|OTLP Metrics|$OTLP_PORT|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.json"
-                "edge-datadog|DD Logs|$DATADOG_PORT|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json"
-                "edge-datadog|DD Metrics|$DATADOG_PORT|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json"
+                "edge-otlp|OTLP Logs|$OTLP_PORT|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
+                "edge-otlp|OTLP Metrics|$OTLP_PORT|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
+                "edge-datadog|DD Logs|$DATADOG_PORT|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "edge-datadog|DD Metrics|$DATADOG_PORT|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
 
             for scenario in "${edge_scenarios[@]}"; do
-                IFS='|' read -r binary name port endpoint payload <<< "$scenario"
+                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
 
                 local payload_size=$(wc -c < "$payload" | tr -d ' ')
                 local config=$(create_edge_config "$binary" "$count")
@@ -544,7 +545,7 @@ main() {
 
                 # Run benchmark
                 log_info "Running: $name ($binary, $count policies)..."
-                run_benchmark "$url" "$payload" "$output_json"
+                run_benchmark "$url" "$payload" "$output_json" "$content_type"
 
                 # Stop monitoring
                 local resource_metrics=$(stop_resource_monitor)
@@ -582,15 +583,16 @@ main() {
             local otelcol_config="$CONFIGS_DIR/generated/otelcol-${count}.yaml"
 
             # otelcol scenarios:
-            # - OTLP HTTP on port 4318
-            # - Datadog receiver on port 4319
+            # - OTLP HTTP on port 4318 (protobuf)
+            # - Datadog receiver on port 4319 (JSON)
+            # Format: binary|name|port|endpoint|payload|content_type
             local otelcol_scenarios=(
-                "otelcol|OTLP Logs|4318|/v1/logs|$PAYLOADS_DIR/otlp-logs.json"
-                "otelcol|DD Logs|4319|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json"
+                "otelcol|OTLP Logs|4318|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
+                "otelcol|DD Logs|4319|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
             )
 
             for scenario in "${otelcol_scenarios[@]}"; do
-                IFS='|' read -r binary name port endpoint payload <<< "$scenario"
+                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
 
                 local payload_size=$(wc -c < "$payload" | tr -d ' ')
                 local output_json="$OUTPUT_DIR/${binary}-${name// /-}-${count}.json"
@@ -607,7 +609,7 @@ main() {
 
                 # Run benchmark
                 log_info "Running: $name ($binary, $count policies)..."
-                run_benchmark "$url" "$payload" "$output_json"
+                run_benchmark "$url" "$payload" "$output_json" "$content_type"
 
                 # Stop monitoring
                 local resource_metrics=$(stop_resource_monitor)

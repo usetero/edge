@@ -4,11 +4,8 @@
 #
 # Usage: ./generate-policies.sh <count>
 #
-# Generates policies with the following distribution:
-#   - 40% drop policies (mix of matching and non-matching patterns)
-#   - 30% keep policies with transforms
-#   - 15% percentage sampling (10%, 25%, 50%)
-#   - 15% rate limiting (100/s, 500/s, 1000/m)
+# Generates N drop policies for fair comparison across Edge, otelcol, and Vector.
+# All systems get the same number of filter/drop rules with identical patterns.
 #
 set -euo pipefail
 
@@ -38,7 +35,7 @@ random_nomatch() {
     echo "NOMATCH_BENCH_$(printf '%04d' $1)_$(head -c 4 /dev/urandom | xxd -p)"
 }
 
-# Generate Tero Edge log policies
+# Generate Tero Edge log policies - all drop policies for fair comparison
 generate_edge_log_policies() {
     local count=$1
     local policies=()
@@ -48,29 +45,20 @@ generate_edge_log_policies() {
         return
     fi
 
-    # Calculate distribution
-    local drop_count=$((count * 40 / 100))
-    local keep_count=$((count * 30 / 100))
-    local sample_count=$((count * 15 / 100))
-    local rate_count=$((count - drop_count - keep_count - sample_count))
-
-    local idx=0
-
-    # Drop policies (40%) - mix of matching and non-matching
-    for ((i=0; i<drop_count; i++)); do
+    # All drop policies - same patterns as otelcol/vector for fair comparison
+    for ((i=0; i<count; i++)); do
         local pattern
-        if ((i % 3 == 0)) && ((i / 3 < ${#MATCHING_PATTERNS[@]})); then
-            # Use matching pattern (will actually drop some logs)
-            pattern="${MATCHING_PATTERNS[$((i / 3))]}"
+        # Cycle through matching patterns, then use non-matching ones
+        if ((i < ${#MATCHING_PATTERNS[@]})); then
+            pattern="${MATCHING_PATTERNS[$i]}"
         else
-            # Use non-matching pattern (tests evaluation overhead)
-            pattern=$(random_nomatch $idx)
+            pattern=$(random_nomatch $i)
         fi
 
         policies+=("$(cat <<EOF
     {
-      "id": "drop-$(printf '%04d' $idx)",
-      "name": "Drop policy $idx",
+      "id": "drop-$(printf '%04d' $i)",
+      "name": "Drop policy $i",
       "log": {
         "match": [{"log_field": "body", "regex": "$pattern"}],
         "keep": "none"
@@ -78,98 +66,6 @@ generate_edge_log_policies() {
     }
 EOF
 )")
-        ((idx++))
-    done
-
-    # Keep policies with transforms (30%)
-    for ((i=0; i<keep_count; i++)); do
-        local pattern
-        local transform
-
-        case $((i % 4)) in
-            0)
-                pattern="payment"
-                transform='"redact": [{"log_attribute": "credit_card", "replacement": "[REDACTED]"}, {"log_attribute": "ssn", "replacement": "[REDACTED]"}]'
-                ;;
-            1)
-                pattern="authentication|login"
-                transform='"add": [{"log_attribute": "security_category", "value": "auth", "upsert": true}]'
-                ;;
-            2)
-                pattern="HTTP request|API call"
-                transform='"rename": [{"from_log_attribute": "http_method", "to": "method", "upsert": true}], "remove": [{"log_attribute": "internal_trace_id"}]'
-                ;;
-            3)
-                pattern=$(random_nomatch $idx)
-                transform='"add": [{"log_attribute": "processed", "value": "true", "upsert": true}]'
-                ;;
-        esac
-
-        policies+=("$(cat <<EOF
-    {
-      "id": "keep-$(printf '%04d' $idx)",
-      "name": "Keep policy $idx",
-      "log": {
-        "match": [{"log_field": "body", "regex": "$pattern"}],
-        "keep": "all",
-        "transform": {$transform}
-      }
-    }
-EOF
-)")
-        ((idx++))
-    done
-
-    # Percentage sampling policies (15%)
-    local percentages=("10%" "25%" "50%")
-    for ((i=0; i<sample_count; i++)); do
-        local pattern
-        local pct="${percentages[$((i % 3))]}"
-
-        if ((i % 2 == 0)); then
-            pattern="Cache"
-        else
-            pattern=$(random_nomatch $idx)
-        fi
-
-        policies+=("$(cat <<EOF
-    {
-      "id": "sample-$(printf '%04d' $idx)",
-      "name": "Sample policy $idx",
-      "log": {
-        "match": [{"log_field": "body", "regex": "$pattern"}],
-        "keep": "$pct"
-      }
-    }
-EOF
-)")
-        ((idx++))
-    done
-
-    # Rate limiting policies (15%)
-    local rates=("100/s" "500/s" "1000/m")
-    for ((i=0; i<rate_count; i++)); do
-        local pattern
-        local rate="${rates[$((i % 3))]}"
-
-        if ((i % 2 == 0)); then
-            pattern="info|INFO"
-        else
-            pattern=$(random_nomatch $idx)
-        fi
-
-        policies+=("$(cat <<EOF
-    {
-      "id": "rate-$(printf '%04d' $idx)",
-      "name": "Rate limit policy $idx",
-      "log": {
-        "match": [{"log_field": "body", "regex": "$pattern"}],
-        "keep": "$rate"
-      }
-    }
-EOF
-)")
-        ((idx++))
     done
 
     # Output JSON
@@ -186,7 +82,7 @@ EOF
     echo ']}'
 }
 
-# Generate Tero Edge metric policies
+# Generate Tero Edge metric policies - all drop policies for fair comparison
 generate_edge_metric_policies() {
     local count=$1
     local policies=()
@@ -196,28 +92,22 @@ generate_edge_metric_policies() {
         return
     fi
 
-    # For metrics, we use a simpler distribution: 50% drop, 50% keep
-    local drop_count=$((count / 2))
-    local keep_count=$((count - drop_count))
+    # Metric patterns that match our payload (only use app.queue to avoid dropping everything)
+    local metric_patterns=("app.queue")
 
-    local idx=0
-
-    # Matching metric patterns
-    local metric_patterns=("payment" "auth" "cache" "error" "http" "db" "system")
-
-    # Drop policies
-    for ((i=0; i<drop_count; i++)); do
+    # All drop policies - same pattern approach as logs
+    for ((i=0; i<count; i++)); do
         local pattern
         if ((i < ${#metric_patterns[@]})); then
             pattern="${metric_patterns[$i]}"
         else
-            pattern=$(random_nomatch $idx)
+            pattern=$(random_nomatch $i)
         fi
 
         policies+=("$(cat <<EOF
     {
-      "id": "metric-drop-$(printf '%04d' $idx)",
-      "name": "Metric drop policy $idx",
+      "id": "metric-drop-$(printf '%04d' $i)",
+      "name": "Metric drop policy $i",
       "metric": {
         "match": [{"metric_field": "name", "regex": "$pattern"}],
         "keep": false
@@ -225,25 +115,6 @@ generate_edge_metric_policies() {
     }
 EOF
 )")
-        ((idx++))
-    done
-
-    # Keep policies
-    for ((i=0; i<keep_count; i++)); do
-        local pattern=$(random_nomatch $idx)
-
-        policies+=("$(cat <<EOF
-    {
-      "id": "metric-keep-$(printf '%04d' $idx)",
-      "name": "Metric keep policy $idx",
-      "metric": {
-        "match": [{"metric_field": "name", "regex": "$pattern"}],
-        "keep": true
-      }
-    }
-EOF
-)")
-        ((idx++))
     done
 
     # Output JSON
@@ -261,6 +132,8 @@ EOF
 }
 
 # Generate combined policies (logs + metrics)
+# For fair comparison, we generate N log policies and N metric policies
+# This matches otelcol/vector which get N filter rules each
 generate_edge_policies() {
     local count=$1
 
@@ -269,13 +142,9 @@ generate_edge_policies() {
         return
     fi
 
-    # Split count between logs and metrics (70% logs, 30% metrics)
-    local log_count=$((count * 70 / 100))
-    local metric_count=$((count - log_count))
-
-    # Generate log policies
-    local log_json=$(generate_edge_log_policies $log_count)
-    local metric_json=$(generate_edge_metric_policies $metric_count)
+    # Generate same count for both logs and metrics
+    local log_json=$(generate_edge_log_policies $count)
+    local metric_json=$(generate_edge_metric_policies $count)
 
     # Merge the two JSON arrays
     local log_policies=$(echo "$log_json" | jq -c '.policies')
@@ -431,46 +300,14 @@ YAML_FILTER
             prev_dd="filter_dd_$i"
         done
 
-        # Add sample transform (simulating percentage sampling)
-        cat <<YAML_SAMPLE
-  sample_otlp:
-    type: sample
-    inputs:
-      - "$prev_otlp"
-    rate: 4
-
-  sample_dd:
-    type: sample
-    inputs:
-      - "$prev_dd"
-    rate: 4
-YAML_SAMPLE
-
-        # Add throttle transform (simulating rate limiting)
-        cat <<YAML_THROTTLE
-  throttle_otlp:
-    type: throttle
-    inputs:
-      - "sample_otlp"
-    threshold: 10000
-    window_secs: 1
-
-  throttle_dd:
-    type: throttle
-    inputs:
-      - "sample_dd"
-    threshold: 10000
-    window_secs: 1
-YAML_THROTTLE
-
-        # Sinks connect to final transforms
-        cat <<'YAML_SINKS'
+        # Sinks connect to final filter transforms (no sample/throttle for fair comparison)
+        cat <<YAML_SINKS
 
 sinks:
   otlp_out:
     type: http
     inputs:
-      - "throttle_otlp"
+      - "$prev_otlp"
     uri: "http://127.0.0.1:9999/v1/logs"
     encoding:
       codec: json
@@ -481,7 +318,7 @@ sinks:
   datadog_out:
     type: http
     inputs:
-      - "throttle_dd"
+      - "$prev_dd"
     uri: "http://127.0.0.1:9999/api/v2/logs"
     encoding:
       codec: json
@@ -542,11 +379,7 @@ if command -v jq &> /dev/null; then
     echo "Edge policy summary:"
     jq '{
         total: .policies | length,
-        log_policies: [.policies[] | select(.log != null)] | length,
-        metric_policies: [.policies[] | select(.metric != null)] | length,
-        drop_policies: [.policies[] | select(.log.keep == "none" or .metric.keep == false)] | length,
-        keep_policies: [.policies[] | select(.log.keep == "all" or .metric.keep == true)] | length,
-        sample_policies: [.policies[] | select(.log.keep != null and (.log.keep | test("^[0-9]+%$")))] | length,
-        rate_policies: [.policies[] | select(.log.keep != null and (.log.keep | test("/[sm]$")))] | length
+        log_drop_policies: [.policies[] | select(.log.keep == "none")] | length,
+        metric_drop_policies: [.policies[] | select(.metric.keep == false)] | length
     }' "$OUTPUT_DIR/policies-$COUNT.json"
 fi

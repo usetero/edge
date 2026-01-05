@@ -68,7 +68,7 @@ const PolicyStored = struct { id: []const u8, index: PolicyIndex, required_match
 pub const PolicyIndex = u16;
 
 /// Maximum number of policies supported
-pub const MAX_POLICIES: usize = 4096;
+pub const MAX_POLICIES: usize = 8192;
 
 // =============================================================================
 // MatcherKey Types - Separate types for log and metric
