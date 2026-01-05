@@ -119,17 +119,22 @@ pub const PolicyResult = struct {
     /// IDs of policies that matched (for transform stage lookup)
     /// Only populated when decision is keep or unset
     matched_policy_ids: []const []const u8,
+    /// Whether any transformations were applied to the telemetry
+    /// Callers should use this to determine if re-encoding is needed
+    was_transformed: bool = false,
 
     /// Empty result for dropped telemetry
     pub const dropped = PolicyResult{
         .decision = .drop,
         .matched_policy_ids = &.{},
+        .was_transformed = false,
     };
 
     /// Default result when no policies match
     pub const unmatched = PolicyResult{
         .decision = .unset,
         .matched_policy_ids = &.{},
+        .was_transformed = false,
     };
 };
 
@@ -304,6 +309,7 @@ pub const PolicyEngine = struct {
         }
 
         // Phase 3: Apply transforms (log only) and record stats
+        var was_transformed = false;
         if (T == .log) {
             if (field_mutator) |mutator| {
                 for (0..match_state.matched_count) |i| {
@@ -315,6 +321,9 @@ pub const PolicyEngine = struct {
                         match_state.matched_indices[i],
                         policy_id_buf[i],
                     );
+                    if (result.totalApplied() > 0) {
+                        was_transformed = true;
+                    }
                     self.registry.recordPolicyStats(policy_id_buf[i], 0, 0, result);
                 }
             }
@@ -323,6 +332,7 @@ pub const PolicyEngine = struct {
         return PolicyResult{
             .decision = match_state.decision,
             .matched_policy_ids = policy_id_buf[0..match_state.matched_count],
+            .was_transformed = was_transformed,
         };
     }
 

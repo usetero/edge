@@ -21,16 +21,18 @@ const ArrayList = std.ArrayListUnmanaged;
 
 /// Result of processing metrics
 pub const ProcessResult = struct {
-    /// The processed data (caller owns this slice)
-    data: []u8,
+    /// Whether any transformations were applied (not yet supported for metrics)
+    was_transformed: bool = false,
     /// Number of metrics that were dropped by filter policies
     dropped_count: usize,
     /// Original number of metrics before filtering
     original_count: usize,
+    /// The processed data (caller owns this slice)
+    data: []u8,
 
-    /// Returns true if any metrics were dropped
+    /// Returns true if any metrics were dropped or transformed
     pub fn wasModified(self: ProcessResult) bool {
-        return self.dropped_count > 0;
+        return self.dropped_count > 0 or self.was_transformed;
     }
 
     /// Returns true if all metrics were dropped

@@ -4,8 +4,11 @@
 #
 # Usage: ./generate-policies.sh <count>
 #
-# Generates N drop policies for fair comparison across Edge, otelcol, and Vector.
-# All systems get the same number of filter/drop rules with identical patterns.
+# Generates N policies with the following distribution:
+#   - 50% log policies (25% drops, 25% transforms)
+#   - 50% metric policies (25% drops, 25% transforms)
+#
+# All systems (Edge, otelcol, Vector) get equivalent rules for fair comparison.
 #
 set -euo pipefail
 
@@ -15,7 +18,7 @@ OUTPUT_DIR="$SCRIPT_DIR/configs/generated"
 
 mkdir -p "$OUTPUT_DIR"
 
-# Patterns that WILL match our test payloads
+# Patterns that WILL match our test payloads (for logs)
 MATCHING_PATTERNS=(
     "authentication"
     "Payment"
@@ -30,13 +33,39 @@ MATCHING_PATTERNS=(
     "login"
 )
 
-# Generate a random non-matching pattern
-random_nomatch() {
-    echo "NOMATCH_BENCH_$(printf '%04d' $1)_$(head -c 4 /dev/urandom | xxd -p)"
+# Metric patterns that match our payload
+METRIC_MATCHING_PATTERNS=(
+    "app.queue"
+)
+
+# Generate a deterministic non-matching pattern (no random for reproducibility)
+nomatch_pattern() {
+    echo "NOMATCH_BENCH_$(printf '%04d' $1)"
 }
 
-# Generate Tero Edge log policies - all drop policies for fair comparison
-generate_edge_log_policies() {
+# Get a log pattern by index
+get_log_pattern() {
+    local idx=$1
+    if ((idx < ${#MATCHING_PATTERNS[@]})); then
+        echo "${MATCHING_PATTERNS[$idx]}"
+    else
+        nomatch_pattern $idx
+    fi
+}
+
+# Get a metric pattern by index
+get_metric_pattern() {
+    local idx=$1
+    if ((idx < ${#METRIC_MATCHING_PATTERNS[@]})); then
+        echo "${METRIC_MATCHING_PATTERNS[$idx]}"
+    else
+        nomatch_pattern $idx
+    fi
+}
+
+# Generate Tero Edge policies with drops and transforms
+# Distribution: 50% logs (half drop, half transform), 50% metrics (all drops - no transform support yet)
+generate_edge_policies() {
     local count=$1
     local policies=()
 
@@ -45,20 +74,23 @@ generate_edge_log_policies() {
         return
     fi
 
-    # All drop policies - same patterns as otelcol/vector for fair comparison
-    for ((i=0; i<count; i++)); do
-        local pattern
-        # Cycle through matching patterns, then use non-matching ones
-        if ((i < ${#MATCHING_PATTERNS[@]})); then
-            pattern="${MATCHING_PATTERNS[$i]}"
-        else
-            pattern=$(random_nomatch $i)
-        fi
+    # Split: 50% logs, 50% metrics
+    local log_count=$((count / 2))
+    local metric_count=$((count - log_count))
 
+    # Logs: 50% drops, 50% transforms
+    local log_drop_count=$((log_count / 2))
+    local log_transform_count=$((log_count - log_drop_count))
+
+    local idx=0
+
+    # Log drop policies
+    for ((i=0; i<log_drop_count; i++)); do
+        local pattern=$(get_log_pattern $i)
         policies+=("$(cat <<EOF
     {
-      "id": "drop-$(printf '%04d' $i)",
-      "name": "Drop policy $i",
+      "id": "log-drop-$(printf '%04d' $idx)",
+      "name": "Log drop policy $idx",
       "log": {
         "match": [{"log_field": "body", "regex": "$pattern"}],
         "keep": "none"
@@ -66,48 +98,36 @@ generate_edge_log_policies() {
     }
 EOF
 )")
+        ((idx++))
     done
 
-    # Output JSON
-    echo '{"policies": ['
-    local first=true
-    for policy in "${policies[@]}"; do
-        if [[ "$first" == "true" ]]; then
-            first=false
-        else
-            echo ","
-        fi
-        echo "$policy"
-    done
-    echo ']}'
-}
-
-# Generate Tero Edge metric policies - all drop policies for fair comparison
-generate_edge_metric_policies() {
-    local count=$1
-    local policies=()
-
-    if [[ $count -eq 0 ]]; then
-        echo '{"policies": []}'
-        return
-    fi
-
-    # Metric patterns that match our payload (only use app.queue to avoid dropping everything)
-    local metric_patterns=("app.queue")
-
-    # All drop policies - same pattern approach as logs
-    for ((i=0; i<count; i++)); do
-        local pattern
-        if ((i < ${#metric_patterns[@]})); then
-            pattern="${metric_patterns[$i]}"
-        else
-            pattern=$(random_nomatch $i)
-        fi
-
+    # Log transform policies (keep all + add attribute)
+    for ((i=0; i<log_transform_count; i++)); do
+        local pattern=$(nomatch_pattern $((log_drop_count + i)))
         policies+=("$(cat <<EOF
     {
-      "id": "metric-drop-$(printf '%04d' $i)",
-      "name": "Metric drop policy $i",
+      "id": "log-transform-$(printf '%04d' $idx)",
+      "name": "Log transform policy $idx",
+      "log": {
+        "match": [{"log_field": "body", "regex": "$pattern"}],
+        "keep": "all",
+        "transform": {
+          "add": [{"log_attribute": "bench_processed_$i", "value": "true", "upsert": true}]
+        }
+      }
+    }
+EOF
+)")
+        ((idx++))
+    done
+
+    # Metric drop policies (no transform support for metrics yet)
+    for ((i=0; i<metric_count; i++)); do
+        local pattern=$(get_metric_pattern $i)
+        policies+=("$(cat <<EOF
+    {
+      "id": "metric-drop-$(printf '%04d' $idx)",
+      "name": "Metric drop policy $idx",
       "metric": {
         "match": [{"metric_field": "name", "regex": "$pattern"}],
         "keep": false
@@ -115,6 +135,7 @@ generate_edge_metric_policies() {
     }
 EOF
 )")
+        ((idx++))
     done
 
     # Output JSON
@@ -131,32 +152,9 @@ EOF
     echo ']}'
 }
 
-# Generate combined policies (logs + metrics)
-# For fair comparison, we generate N log policies and N metric policies
-# This matches otelcol/vector which get N filter rules each
-generate_edge_policies() {
-    local count=$1
-
-    if [[ $count -eq 0 ]]; then
-        echo '{"policies": []}'
-        return
-    fi
-
-    # Generate same count for both logs and metrics
-    local log_json=$(generate_edge_log_policies $count)
-    local metric_json=$(generate_edge_metric_policies $count)
-
-    # Merge the two JSON arrays
-    local log_policies=$(echo "$log_json" | jq -c '.policies')
-    local metric_policies=$(echo "$metric_json" | jq -c '.policies')
-
-    # Combine
-    echo "{\"policies\": $(echo "$log_policies $metric_policies" | jq -s 'add')}"
-}
-
-# Generate otelcol config with filter and sampling processors
-# Note: otelcol does NOT have a rate limiting processor for logs (only traces)
-# We generate the same number of filter rules as Edge policies for fair comparison
+# Generate otelcol config with filter and transform processors
+# Distribution matches Edge: 50% log rules (half filter, half transform), 50% metric drops
+# Note: otelcol transform processor uses OTTL for attribute manipulation
 generate_otelcol_config() {
     local count=$1
 
@@ -182,30 +180,82 @@ processors:
     timeout: 100ms
 YAML_HEAD
 
-    local processors="batch"
+    local log_processors="batch"
+    local metric_processors="batch"
 
     if [[ $count -gt 0 ]]; then
-        # Generate the same number of filter rules as Edge policies
-        # This ensures comparable evaluation overhead
-        processors="batch, filter"
+        # 50% logs, 50% metrics
+        local log_count=$((count / 2))
+        local metric_count=$((count - log_count))
 
-        # Filter processor with N rules
-        echo ""
-        echo "  filter:"
-        echo "    error_mode: ignore"
-        echo "    logs:"
-        echo "      log_record:"
+        # Logs: half drops, half transforms
+        local log_drop_count=$((log_count / 2))
+        local log_transform_count=$((log_count - log_drop_count))
 
-        for ((i=0; i<count; i++)); do
-            local pattern
-            # Cycle through matching patterns, then use non-matching ones
-            if ((i < ${#MATCHING_PATTERNS[@]})); then
-                pattern="${MATCHING_PATTERNS[$i]}"
-            else
-                pattern="NOMATCH_BENCH_$(printf '%04d' $i)"
-            fi
-            echo "        - 'IsMatch(body, \".*${pattern}.*\")'"
-        done
+        # Build processor lists based on what we actually have
+        local log_proc_list="batch"
+        local metric_proc_list="batch"
+
+        # Filter processor for logs - drop rules (only if we have drops)
+        if [[ $log_drop_count -gt 0 ]]; then
+            log_proc_list="$log_proc_list, filter/logs"
+            echo ""
+            echo "  filter/logs:"
+            echo "    error_mode: ignore"
+            echo "    logs:"
+            echo "      log_record:"
+
+            for ((i=0; i<log_drop_count; i++)); do
+                local pattern
+                if ((i < ${#MATCHING_PATTERNS[@]})); then
+                    pattern="${MATCHING_PATTERNS[$i]}"
+                else
+                    pattern="NOMATCH_BENCH_$(printf '%04d' $i)"
+                fi
+                echo "        - 'IsMatch(body, \".*${pattern}.*\")'"
+            done
+        fi
+
+        # Transform processor for logs - add attributes (only if we have transforms)
+        if [[ $log_transform_count -gt 0 ]]; then
+            log_proc_list="$log_proc_list, transform/logs"
+            echo ""
+            echo "  transform/logs:"
+            echo "    error_mode: ignore"
+            echo "    log_statements:"
+
+            for ((i=0; i<log_transform_count; i++)); do
+                local pattern="NOMATCH_BENCH_$(printf '%04d' $((log_drop_count + i)))"
+                echo "      - context: log"
+                echo "        conditions:"
+                echo "          - 'IsMatch(body, \".*${pattern}.*\")'"
+                echo "        statements:"
+                echo "          - 'set(attributes[\"bench_processed_$i\"], \"true\")'"
+            done
+        fi
+
+        # Filter processor for metrics - drop rules (only if we have metrics)
+        if [[ $metric_count -gt 0 ]]; then
+            metric_proc_list="$metric_proc_list, filter/metrics"
+            echo ""
+            echo "  filter/metrics:"
+            echo "    error_mode: ignore"
+            echo "    metrics:"
+            echo "      metric:"
+
+            for ((i=0; i<metric_count; i++)); do
+                local pattern
+                if ((i < ${#METRIC_MATCHING_PATTERNS[@]})); then
+                    pattern="${METRIC_MATCHING_PATTERNS[$i]}"
+                else
+                    pattern="NOMATCH_BENCH_$(printf '%04d' $i)"
+                fi
+                echo "        - 'IsMatch(name, \".*${pattern}.*\")'"
+            done
+        fi
+
+        log_processors="$log_proc_list"
+        metric_processors="$metric_proc_list"
     fi
 
     cat <<YAML_TAIL
@@ -222,16 +272,21 @@ service:
   pipelines:
     logs/otlp:
       receivers: [otlp]
-      processors: [$processors]
+      processors: [$log_processors]
       exporters: [otlphttp]
     logs/datadog:
       receivers: [datadog]
-      processors: [$processors]
+      processors: [$log_processors]
+      exporters: [otlphttp]
+    metrics:
+      receivers: [otlp]
+      processors: [$metric_processors]
       exporters: [otlphttp]
 YAML_TAIL
 }
 
-# Generate Vector config with filter, sample, and throttle transforms
+# Generate Vector config with filter and remap transforms
+# Distribution matches Edge: 50% log rules (half filter, half remap/transform), 50% metric drops
 # Vector uses:
 # - port 4320 for OTLP HTTP (native opentelemetry source, accepts protobuf)
 # - port 4321 for Datadog (http_server source with JSON)
@@ -261,54 +316,126 @@ sources:
 YAML_HEAD
 
     if [[ $count -gt 0 ]]; then
+        # 50% logs, 50% metrics
+        local log_count=$((count / 2))
+        local metric_count=$((count - log_count))
+
+        # Logs: half drops, half transforms
+        local log_drop_count=$((log_count / 2))
+        local log_transform_count=$((log_count - log_drop_count))
+
         echo ""
         echo "transforms:"
 
-        # Generate filter transforms (same count as Edge policies)
+        # Generate log filter transforms (drops)
         # Each filter is chained to the previous one
         # Note: opentelemetry source outputs to .logs stream
-        local prev_otlp="otel_source.logs"
+        local prev_otlp_logs="otel_source.logs"
         local prev_dd="datadog_source"
 
-        for ((i=0; i<count; i++)); do
+        for ((i=0; i<log_drop_count; i++)); do
             local pattern
-            # Cycle through matching patterns, then use non-matching ones
             if ((i < ${#MATCHING_PATTERNS[@]})); then
                 pattern="${MATCHING_PATTERNS[$i]}"
             else
                 pattern="NOMATCH_BENCH_$(printf '%04d' $i)"
             fi
 
-            # OTLP filter - use contains() instead of match() for simpler syntax
+            # OTLP filter
             cat <<YAML_FILTER
-  filter_otlp_$i:
+  filter_otlp_log_$i:
     type: filter
     inputs:
-      - "$prev_otlp"
+      - "$prev_otlp_logs"
     condition: '!contains(to_string(.message) ?? "", "$pattern")'
 YAML_FILTER
-            prev_otlp="filter_otlp_$i"
+            prev_otlp_logs="filter_otlp_log_$i"
 
             # Datadog filter
             cat <<YAML_FILTER
-  filter_dd_$i:
+  filter_dd_log_$i:
     type: filter
     inputs:
       - "$prev_dd"
     condition: '!contains(to_string(.message) ?? "", "$pattern")'
 YAML_FILTER
-            prev_dd="filter_dd_$i"
+            prev_dd="filter_dd_log_$i"
         done
 
-        # Sinks connect to final filter transforms (no sample/throttle for fair comparison)
+        # Generate log remap transforms (add attributes)
+        for ((i=0; i<log_transform_count; i++)); do
+            local pattern="NOMATCH_BENCH_$(printf '%04d' $((log_drop_count + i)))"
+            local remap_idx=$((log_drop_count + i))
+
+            # OTLP remap
+            cat <<YAML_REMAP
+  remap_otlp_log_$remap_idx:
+    type: remap
+    inputs:
+      - "$prev_otlp_logs"
+    source: |
+      if contains(to_string(.message) ?? "", "$pattern") {
+        .bench_processed_$i = "true"
+      }
+YAML_REMAP
+            prev_otlp_logs="remap_otlp_log_$remap_idx"
+
+            # Datadog remap
+            cat <<YAML_REMAP
+  remap_dd_log_$remap_idx:
+    type: remap
+    inputs:
+      - "$prev_dd"
+    source: |
+      if contains(to_string(.message) ?? "", "$pattern") {
+        .bench_processed_$i = "true"
+      }
+YAML_REMAP
+            prev_dd="remap_dd_log_$remap_idx"
+        done
+
+        # Generate metric filter transforms (drops)
+        # Note: opentelemetry source outputs metrics to .metrics stream
+        local prev_otlp_metrics="otel_source.metrics"
+
+        for ((i=0; i<metric_count; i++)); do
+            local pattern
+            if ((i < ${#METRIC_MATCHING_PATTERNS[@]})); then
+                pattern="${METRIC_MATCHING_PATTERNS[$i]}"
+            else
+                pattern="NOMATCH_BENCH_$(printf '%04d' $i)"
+            fi
+
+            cat <<YAML_FILTER
+  filter_otlp_metric_$i:
+    type: filter
+    inputs:
+      - "$prev_otlp_metrics"
+    condition: '!contains(to_string(.name) ?? "", "$pattern")'
+YAML_FILTER
+            prev_otlp_metrics="filter_otlp_metric_$i"
+        done
+
+        # Sinks connect to final transforms
         cat <<YAML_SINKS
 
 sinks:
-  otlp_out:
+  otlp_logs_out:
     type: http
     inputs:
-      - "$prev_otlp"
+      - "$prev_otlp_logs"
     uri: "http://127.0.0.1:9999/v1/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  otlp_metrics_out:
+    type: http
+    inputs:
+      - "$prev_otlp_metrics"
+    uri: "http://127.0.0.1:9999/v1/metrics"
     encoding:
       codec: json
     batch:
@@ -331,11 +458,22 @@ YAML_SINKS
         cat <<'YAML_SINKS'
 
 sinks:
-  otlp_out:
+  otlp_logs_out:
     type: http
     inputs:
       - "otel_source.logs"
     uri: "http://127.0.0.1:9999/v1/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  otlp_metrics_out:
+    type: http
+    inputs:
+      - "otel_source.metrics"
+    uri: "http://127.0.0.1:9999/v1/metrics"
     encoding:
       codec: json
     batch:
@@ -379,7 +517,8 @@ if command -v jq &> /dev/null; then
     echo "Edge policy summary:"
     jq '{
         total: .policies | length,
-        log_drop_policies: [.policies[] | select(.log.keep == "none")] | length,
-        metric_drop_policies: [.policies[] | select(.metric.keep == false)] | length
+        log_drop: [.policies[] | select(.log.keep == "none")] | length,
+        log_transform: [.policies[] | select(.log.keep == "all" and .log.transform != null)] | length,
+        metric_drop: [.policies[] | select(.metric.keep == false)] | length
     }' "$OUTPUT_DIR/policies-$COUNT.json"
 fi

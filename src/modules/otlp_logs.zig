@@ -25,16 +25,18 @@ const LogsProcessingFailed = struct { err: []const u8, contentType: []const u8 }
 
 /// Result of processing logs
 pub const ProcessResult = struct {
-    /// The processed data (caller owns this slice)
-    data: []u8,
+    /// Whether any transformations were applied
+    was_transformed: bool = false,
     /// Number of logs that were dropped by filter policies
     dropped_count: usize,
     /// Original number of logs before filtering
     original_count: usize,
+    /// The processed data (caller owns this slice)
+    data: []u8,
 
-    /// Returns true if any logs were dropped
+    /// Returns true if any logs were dropped or transformed
     pub fn wasModified(self: ProcessResult) bool {
-        return self.dropped_count > 0;
+        return self.dropped_count > 0 or self.was_transformed;
     }
 
     /// Returns true if all logs were dropped
@@ -374,6 +376,7 @@ fn otlpFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
 
 /// Result of filtering logs in-place
 const FilterCounts = struct {
+    was_transformed: bool,
     original_count: usize,
     dropped_count: usize,
 };
@@ -392,6 +395,7 @@ fn filterLogsInPlace(
 
     var original_count: usize = 0;
     var dropped_count: usize = 0;
+    var was_transformed: bool = false;
 
     // Buffer for matched policy IDs (stack allocated)
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
@@ -414,6 +418,10 @@ fn filterLogsInPlace(
 
                 const result = engine.evaluate(.log, &ctx, otlpFieldAccessor, otlpFieldMutator, &policy_id_buf);
 
+                if (result.was_transformed) {
+                    was_transformed = true;
+                }
+
                 if (result.decision.shouldContinue()) {
                     // Keep this log - move to write position if needed
                     if (write_idx != scope_logs.log_records.items.len - 1) {
@@ -433,6 +441,7 @@ fn filterLogsInPlace(
     return .{
         .original_count = original_count,
         .dropped_count = dropped_count,
+        .was_transformed = was_transformed,
     };
 }
 
@@ -442,6 +451,19 @@ fn processJsonLogs(
     bus: *EventBus,
     data: []const u8,
 ) !ProcessResult {
+    // Fast path: if no policies, skip decode/encode entirely
+    const snapshot = registry.getSnapshot();
+    if (snapshot == null or snapshot.?.log_index.isEmpty()) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = 0,
+            .was_transformed = false,
+        };
+    }
+
     // Parse JSON into LogsData protobuf struct
     proto.protobuf.json.pb_options.emit_oneof_field_name = false;
     var parsed = try LogsData.jsonDecode(data, .{
@@ -452,6 +474,18 @@ fn processJsonLogs(
     // Filter logs in-place
     const counts = filterLogsInPlace(&parsed.value, registry, bus);
 
+    // Fast path: if nothing was modified, return original data without re-encoding
+    if (counts.dropped_count == 0 and !counts.was_transformed) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = counts.original_count,
+            .was_transformed = false,
+        };
+    }
+
     // Re-serialize to JSON
     const output = try parsed.value.jsonEncode(.{}, allocator);
 
@@ -459,6 +493,7 @@ fn processJsonLogs(
         .data = @constCast(output),
         .dropped_count = counts.dropped_count,
         .original_count = counts.original_count,
+        .was_transformed = counts.was_transformed,
     };
 }
 
@@ -479,9 +514,24 @@ fn processProtobufLogs(
         return error.DataLooksLikeJson;
     }
 
+    // Fast path: if no policies, skip decode/encode entirely
+    const snapshot = registry.getSnapshot();
+    if (snapshot == null or snapshot.?.log_index.isEmpty()) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = 0,
+            .was_transformed = false,
+        };
+    }
+
     // Use an arena for the protobuf decode/filter/encode cycle.
     // This ensures all allocations (including dropped log records) are freed together.
     var arena = std.heap.ArenaAllocator.init(allocator);
+    _ = try arena.allocator().alloc(u8, data.len * 10); // Pre-warm
+    _ = arena.reset(.retain_capacity); // Reset but keep capacity
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
@@ -494,8 +544,19 @@ fn processProtobufLogs(
     // Filter logs in-place
     const counts = filterLogsInPlace(&logs_data, registry, bus);
 
+    // Fast path: if nothing was modified, return original data without re-encoding
+    if (counts.dropped_count == 0 and !counts.was_transformed) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = counts.original_count,
+            .was_transformed = false,
+        };
+    }
+
     // Re-serialize to protobuf - use main allocator for output since we return it
-    // TODO: we should be passing the IO Writer to these methods to write the response bytes
     var output_writer = std.Io.Writer.Allocating.init(allocator);
     errdefer output_writer.deinit();
 
@@ -508,6 +569,7 @@ fn processProtobufLogs(
         .data = output,
         .dropped_count = counts.dropped_count,
         .original_count = counts.original_count,
+        .was_transformed = counts.was_transformed,
     };
 }
 
@@ -604,7 +666,8 @@ test "processLogs - no policies keeps all logs" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "msg1") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.data, "msg2") != null);
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    // When no policies exist, we skip decoding entirely so original_count is 0
+    try std.testing.expectEqual(@as(usize, 0), result.original_count);
     try std.testing.expect(!result.wasModified());
 }
 
@@ -812,9 +875,9 @@ test "processLogs - protobuf parses and re-serializes" {
     const result = try processLogs(allocator, &registry, noop_bus.eventBus(), proto_data, "application/x-protobuf");
     defer allocator.free(result.data);
 
-    // With no policies, all logs should be kept
+    // With no policies, we skip decoding entirely so original_count is 0
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    try std.testing.expectEqual(@as(usize, 0), result.original_count);
     try std.testing.expect(!result.wasModified());
 }
 

@@ -22,16 +22,18 @@ const ArrayList = std.ArrayListUnmanaged;
 
 /// Result of processing logs
 pub const ProcessResult = struct {
-    /// The processed data (caller owns this slice)
-    data: []u8,
+    /// Whether any transformations were applied
+    was_transformed: bool = false,
     /// Number of logs that were dropped by filter policies
     dropped_count: usize,
     /// Original number of logs before filtering
     original_count: usize,
+    /// The processed data (caller owns this slice)
+    data: []u8,
 
-    /// Returns true if any logs were dropped
+    /// Returns true if any logs were dropped or transformed
     pub fn wasModified(self: ProcessResult) bool {
-        return self.dropped_count > 0;
+        return self.dropped_count > 0 or self.was_transformed;
     }
 
     /// Returns true if all logs were dropped
@@ -278,7 +280,7 @@ fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, policy_id_buf: [][]c
     const result = engine.evaluate(.log, &field_ctx, datadogFieldAccessor, datadogFieldMutator, policy_id_buf);
     return .{
         .keep = result.decision.shouldContinue(),
-        .mutated = result.matched_policy_ids.len > 0,
+        .mutated = result.was_transformed,
     };
 }
 
@@ -309,6 +311,7 @@ fn buildResult(
             .data = result,
             .dropped_count = 0,
             .original_count = state.original_count,
+            .was_transformed = false,
         };
     }
 
@@ -321,6 +324,7 @@ fn buildResult(
             .data = result,
             .dropped_count = state.dropped_count,
             .original_count = state.original_count,
+            .was_transformed = state.mutated,
         };
     }
 
@@ -332,6 +336,7 @@ fn buildResult(
         .data = try out.toOwnedSlice(),
         .dropped_count = state.dropped_count,
         .original_count = state.original_count,
+        .was_transformed = state.mutated,
     };
 }
 
