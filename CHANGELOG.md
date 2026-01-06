@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.10.0](https://github.com/usetero/edge/compare/v1.9.0...v1.10.0) (2026-01-06)
+
+
+### Features
+
+* attempt releasing binaries too ([#77](https://github.com/usetero/edge/issues/77)) ([f3ab4ab](https://github.com/usetero/edge/commit/f3ab4abd3d912e99294d8f998a44b80e5cd73254))
+* perf improvements and benchmark comparisons ([#74](https://github.com/usetero/edge/issues/74)) ([5bfe030](https://github.com/usetero/edge/commit/5bfe030f3253603962cbc9ee301dcc68114aa253))
+* update docs and releases for catchall ([#76](https://github.com/usetero/edge/issues/76)) ([e940ba6](https://github.com/usetero/edge/commit/e940ba6d498e0747c7601fc0ec1fee577f6d09b7))
+
 ## [1.9.0](https://github.com/usetero/edge/compare/v1.8.1...v1.9.0) (2026-01-02)
 
 
