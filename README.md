@@ -388,7 +388,30 @@ zig build run-datadog
 zig build run-otlp
 ```
 
-## Docker
+## Installation
+
+### Pre-built Binaries
+
+Download the latest release for your platform from the
+[Releases](../../releases) page:
+
+| Platform                    | Binary              |
+| --------------------------- | ------------------- |
+| Linux x86_64                | `edge-linux-amd64`  |
+| Linux ARM64                 | `edge-linux-arm64`  |
+| macOS ARM64 (Apple Silicon) | `edge-darwin-arm64` |
+
+For Datadog-only or OTLP-only distributions, use `edge-datadog-*` or
+`edge-otlp-*` binaries.
+
+```bash
+# Download and run (example for Linux x86_64)
+curl -LO https://github.com/<org>/edge/releases/latest/download/edge-linux-amd64
+chmod +x edge-linux-amd64
+./edge-linux-amd64 config.json
+```
+
+### Docker
 
 Multi-stage Dockerfile for building minimal container images.
 
@@ -404,6 +427,19 @@ docker build --build-arg DISTRIBUTION=otlp -t edge-otlp .
 
 # Run with a config file
 docker run -v $(pwd)/config.json:/app/config.json -p 8080:8080 edge
+```
+
+Pre-built images are available from GitHub Container Registry:
+
+```bash
+# Pull the full distribution
+docker pull ghcr.io/<org>/edge:latest
+
+# Pull Datadog-only distribution
+docker pull ghcr.io/<org>/edge-datadog:latest
+
+# Pull OTLP-only distribution
+docker pull ghcr.io/<org>/edge-otlp:latest
 ```
 
 Available distributions: `edge`, `datadog`, `otlp`
