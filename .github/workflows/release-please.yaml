@@ -18,7 +18,7 @@
 # 4. GitHub release is created automatically
 #
 # DO NOT EDIT: Managed by Terraform at https://github.com/usetero/infrastructure
-name: release-please
+name: Release please
 
 on:
   push:
