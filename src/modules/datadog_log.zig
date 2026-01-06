@@ -1,16 +1,13 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
 
-const StreamParser = zimdjson.ondemand.StreamParser(.default);
+pub const Parser = zimdjson.ondemand.FullParser(.default);
+pub const Value = Parser.Value;
+pub const AnyValue = Parser.AnyValue;
 
 /// Datadog log schema for parsing and serialization
-/// Uses zimdjson schema inference for deserialization
+/// Uses zimdjson ondemand parser for efficient deserialization
 pub const DatadogLog = struct {
-    pub const schema: StreamParser.schema.Infer(@This()) = .{
-        .fields = .{ .extra = .{ .skip = true } },
-        .on_unknown_field = .{ .handle = @This().handleUnknownField },
-    };
-
     message: ?[]const u8 = null,
     status: ?[]const u8 = null,
     level: ?[]const u8 = null,
@@ -22,11 +19,54 @@ pub const DatadogLog = struct {
     environment: ?[]const u8 = null,
     custom_field: ?[]const u8 = null,
 
-    extra: std.StringHashMapUnmanaged(StreamParser.AnyValue) = .empty,
+    extra: std.StringHashMapUnmanaged(AnyValue) = .empty,
 
-    pub fn handleUnknownField(self: *@This(), alloc: ?std.mem.Allocator, key: []const u8, value: StreamParser.Value) StreamParser.schema.Error!void {
-        const gpa = alloc orelse return error.ExpectedAllocator;
-        return self.extra.put(gpa, key, try value.asAny());
+    /// Free extra field keys allocated during parsing
+    pub fn deinit(self: *DatadogLog, allocator: std.mem.Allocator) void {
+        var it = self.extra.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        self.extra.deinit(allocator);
+    }
+
+    /// Parse a DatadogLog from a zimdjson Value (object)
+    pub fn parse(allocator: std.mem.Allocator, value: Value) !DatadogLog {
+        var log = DatadogLog{};
+
+        var obj = try value.asObject();
+        var it = obj.iterator();
+        while (try it.next()) |field| {
+            const key = try field.key.get();
+
+            if (std.mem.eql(u8, key, "message")) {
+                log.message = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "status")) {
+                log.status = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "level")) {
+                log.level = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "service")) {
+                log.service = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "hostname")) {
+                log.hostname = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "ddsource")) {
+                log.ddsource = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "ddtags")) {
+                log.ddtags = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "timestamp")) {
+                log.timestamp = try field.value.asSigned();
+            } else if (std.mem.eql(u8, key, "environment")) {
+                log.environment = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "custom_field")) {
+                log.custom_field = try field.value.asString();
+            } else {
+                // Store unknown fields in extra map - need to dupe the key since it's from the parser buffer
+                const key_copy = try allocator.dupe(u8, key);
+                try log.extra.put(allocator, key_copy, try field.value.asAny());
+            }
+        }
+
+        return log;
     }
 
     /// Custom JSON serialization for known fields only.
@@ -87,7 +127,7 @@ pub const DatadogLog = struct {
     }
 
     /// Write a zimdjson AnyValue to a JSON writer
-    fn writeAnyValue(jws: anytype, value: StreamParser.AnyValue) !void {
+    fn writeAnyValue(jws: anytype, value: AnyValue) !void {
         switch (value) {
             .null => try jws.write(null),
             .bool => |v| try jws.write(v),
@@ -99,16 +139,16 @@ pub const DatadogLog = struct {
             .string => |v| try jws.write(v.get() catch ""),
             .array => |arr| {
                 try jws.beginArray();
-                var it = arr.iterator();
-                while (it.next() catch null) |item| {
+                var arr_it = arr.iterator();
+                while (arr_it.next() catch null) |item| {
                     try writeAnyValue(jws, item.asAny() catch continue);
                 }
                 try jws.endArray();
             },
             .object => |obj| {
                 try jws.beginObject();
-                var it = obj.iterator();
-                while (it.next() catch null) |field| {
+                var obj_it = obj.iterator();
+                while (obj_it.next() catch null) |field| {
                     try jws.objectField(field.key.get() catch continue);
                     try writeAnyValue(jws, field.value.asAny() catch continue);
                 }
@@ -125,19 +165,15 @@ pub const DatadogLog = struct {
 test "DatadogLog - parse basic fields" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"message": "test message", "status": "info", "service": "my-service"}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-    const log = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const log = try DatadogLog.parse(allocator, doc.asValue());
 
     try std.testing.expectEqualStrings("test message", log.message.?);
     try std.testing.expectEqualStrings("info", log.status.?);
@@ -149,19 +185,15 @@ test "DatadogLog - parse basic fields" {
 test "DatadogLog - parse all known fields" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"message": "log body", "status": "error", "level": "ERROR", "service": "api", "hostname": "host1", "ddsource": "nginx", "ddtags": "env:prod", "timestamp": 1703001234, "environment": "production", "custom_field": "custom_value"}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-    const log = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const log = try DatadogLog.parse(allocator, doc.asValue());
 
     try std.testing.expectEqualStrings("log body", log.message.?);
     try std.testing.expectEqualStrings("error", log.status.?);
@@ -178,39 +210,39 @@ test "DatadogLog - parse all known fields" {
 test "DatadogLog - parse with extra fields" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"message": "test", "unknown_field": "value", "another_extra": 123}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer {
+        var it = log.extra.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        log.extra.deinit(allocator);
+    }
 
-    var parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqualStrings("test", parsed.value.message.?);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.extra.count());
-    try std.testing.expect(parsed.value.extra.contains("unknown_field"));
-    try std.testing.expect(parsed.value.extra.contains("another_extra"));
+    try std.testing.expectEqualStrings("test", log.message.?);
+    try std.testing.expectEqual(@as(usize, 2), log.extra.count());
+    try std.testing.expect(log.extra.contains("unknown_field"));
+    try std.testing.expect(log.extra.contains("another_extra"));
 }
 
 test "DatadogLog - parse empty object" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json = "{}";
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-    const log = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const log = try DatadogLog.parse(allocator, doc.asValue());
 
     try std.testing.expect(log.message == null);
     try std.testing.expect(log.status == null);
@@ -373,19 +405,15 @@ test "DatadogLog - field mutation remove all fields" {
 test "DatadogLog - parse and reserialize preserves data" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"message": "test", "status": "info", "service": "api"}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-    const log = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const log = try DatadogLog.parse(allocator, doc.asValue());
 
     // Serialize back
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -404,27 +432,24 @@ test "DatadogLog - parse and reserialize preserves data" {
 test "DatadogLog - parse mutate and reserialize" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"message": "test", "status": "info", "service": "api"}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    var parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
 
     // Mutate - remove service
-    parsed.value.service = null;
+    log.service = null;
 
     // Serialize back
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try std.json.Stringify.value(parsed.value, .{}, &out.writer);
+    try std.json.Stringify.value(log, .{}, &out.writer);
 
     const output = out.written();
 
@@ -437,7 +462,7 @@ test "DatadogLog - parse mutate and reserialize" {
 test "DatadogLog - special characters in strings" {
     const allocator = std.testing.allocator;
 
-    const log = DatadogLog{
+    const log_out = DatadogLog{
         .message = "line1\nline2\ttab\"quote\\backslash",
         .service = "service-with-dash",
     };
@@ -445,26 +470,23 @@ test "DatadogLog - special characters in strings" {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try std.json.Stringify.value(log, .{}, &out.writer);
+    try std.json.Stringify.value(log_out, .{}, &out.writer);
 
     // Parse the output to verify it's valid JSON
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
-    var reader = std.Io.Reader.fixed(out.written());
-    var doc = try parser.parseFromReader(allocator, &reader);
+    const doc = try parser.parseFromSlice(allocator, out.written());
+    const log = try DatadogLog.parse(allocator, doc.asValue());
 
-    const parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqualStrings("line1\nline2\ttab\"quote\\backslash", parsed.value.message.?);
-    try std.testing.expectEqualStrings("service-with-dash", parsed.value.service.?);
+    try std.testing.expectEqualStrings("line1\nline2\ttab\"quote\\backslash", log.message.?);
+    try std.testing.expectEqualStrings("service-with-dash", log.service.?);
 }
 
 test "DatadogLog - unicode in strings" {
     const allocator = std.testing.allocator;
 
-    const log = DatadogLog{
+    const log_out = DatadogLog{
         .message = "Hello 世界 🌍",
         .service = "サービス",
     };
@@ -472,45 +494,39 @@ test "DatadogLog - unicode in strings" {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try std.json.Stringify.value(log, .{}, &out.writer);
+    try std.json.Stringify.value(log_out, .{}, &out.writer);
 
     // Parse the output to verify it's valid JSON
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
-    var reader = std.Io.Reader.fixed(out.written());
-    var doc = try parser.parseFromReader(allocator, &reader);
+    const doc = try parser.parseFromSlice(allocator, out.written());
+    const log = try DatadogLog.parse(allocator, doc.asValue());
 
-    const parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqualStrings("Hello 世界 🌍", parsed.value.message.?);
-    try std.testing.expectEqualStrings("サービス", parsed.value.service.?);
+    try std.testing.expectEqualStrings("Hello 世界 🌍", log.message.?);
+    try std.testing.expectEqualStrings("サービス", log.service.?);
 }
 
 test "DatadogLog - negative timestamp" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"timestamp": -1000}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
+    const doc = try parser.parseFromSlice(allocator, json);
+    const log = try DatadogLog.parse(allocator, doc.asValue());
 
-    const parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(i64, -1000), parsed.value.timestamp.?);
+    try std.testing.expectEqual(@as(i64, -1000), log.timestamp.?);
 }
 
 test "DatadogLog - large timestamp" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     // Timestamp in nanoseconds (common for some logging systems)
@@ -518,11 +534,8 @@ test "DatadogLog - large timestamp" {
         \\{"timestamp": 1703001234567890123}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
+    const doc = try parser.parseFromSlice(allocator, json);
+    const log = try DatadogLog.parse(allocator, doc.asValue());
 
-    const parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(i64, 1703001234567890123), parsed.value.timestamp.?);
+    try std.testing.expectEqual(@as(i64, 1703001234567890123), log.timestamp.?);
 }
