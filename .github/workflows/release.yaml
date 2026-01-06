@@ -13,9 +13,10 @@ on:
       distribution:
         description: "Distribution to build"
         required: true
-        default: "datadog"
+        default: "edge"
         type: choice
         options:
+          - edge
           - datadog
           - otlp
 
@@ -36,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog", "otlp"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp"]') }}
         arch:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -49,7 +50,11 @@ jobs:
         run: |
           platform=${{ matrix.arch.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-          echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}" >> $GITHUB_ENV
+          if [ "${{ matrix.distribution }}" = "edge" ]; then
+            echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> $GITHUB_ENV
+          else
+            echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}" >> $GITHUB_ENV
+          fi
 
       - name: Install Docker (self-hosted only)
         if: matrix.arch.runner == 'arm-4-core'
@@ -117,11 +122,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog", "otlp"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp"]') }}
     steps:
       - name: Prepare
         run: |
-          echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}" >> $GITHUB_ENV
+          if [ "${{ matrix.distribution }}" = "edge" ]; then
+            echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> $GITHUB_ENV
+          else
+            echo "REGISTRY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.distribution }}" >> $GITHUB_ENV
+          fi
 
       - name: Download digests
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
