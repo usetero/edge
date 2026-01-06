@@ -14,7 +14,7 @@
 # Just edit your PR title to match the format. The check will re-run automatically.
 #
 # DO NOT EDIT: Managed by Terraform at https://github.com/usetero/infrastructure
-name: conventional-pr
+name: Conventional PR title
 "on":
   pull_request:
     branches:
