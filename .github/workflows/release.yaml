@@ -13,9 +13,10 @@ on:
       distribution:
         description: "Distribution to build"
         required: true
-        default: "datadog"
+        default: "all"
         type: choice
         options:
+          - all
           - datadog
           - otlp
 
@@ -36,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog", "otlp"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["all", "datadog", "otlp"]') }}
         arch:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -117,7 +118,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["datadog", "otlp"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["all", "datadog", "otlp"]') }}
     steps:
       - name: Prepare
         run: |

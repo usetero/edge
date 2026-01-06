@@ -1,6 +1,11 @@
 # Multi-stage Dockerfile for Tero Edge distributions
 # Build specific distributions with: docker build --build-arg DISTRIBUTION=<name> -t tero-edge-<name> .
-# Available distributions: datadog, otlp
+# Available distributions: all, datadog, otlp
+#
+# Examples:
+#   docker build --build-arg DISTRIBUTION=all -t tero-edge .
+#   docker build --build-arg DISTRIBUTION=datadog -t tero-edge-datadog .
+#   docker build --build-arg DISTRIBUTION=otlp -t tero-edge-otlp .
 #
 # =============================================================================
 # Build stage

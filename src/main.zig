@@ -1,24 +1,33 @@
+//! Full Distribution Entry Point
+//!
+//! A full edge proxy distribution supporting both Datadog and OTLP ingestion with filtering.
+//! Handles /api/v2/logs, /api/v2/series, /v1/logs, and /v1/metrics with policy-based filtering,
+//! passes all other requests through.
+//!
+//! Features:
+//! - Policy-based log filtering (DROP/KEEP actions)
+//! - Fail-open behavior (errors pass logs through unchanged)
+//! - Thread-safe, stateless request processing
+//! - Lock-free policy updates via atomic snapshots
+//! - Graceful shutdown with signal handling
+
 const std = @import("std");
 const builtin = @import("builtin");
-const observability = @import("observability/root.zig");
-const StdLogAdapter = observability.StdLogAdapter;
-const Level = observability.Level;
 
-/// Route std.log through our EventBus adapter
-pub const std_options: std.Options = .{
-    .log_level = .debug, // Allow all levels through, EventBus will filter
-    .logFn = StdLogAdapter.logFn,
-};
+const edge = @import("root.zig");
+const config_parser = edge.config_parser;
+const server_mod = edge.server;
+const proxy_module = edge.proxy_module;
+const passthrough_mod = edge.passthrough_module;
+const datadog_mod = edge.datadog_module;
+const otlp_mod = edge.otlp_module;
+const health_mod = edge.health_module;
+const policy = edge.policy;
 
-const config_types = @import("config/types.zig");
-const config_parser = @import("config/parser.zig");
-const server_mod = @import("proxy/server.zig");
-const proxy_module = @import("modules/proxy_module.zig");
-const passthrough_mod = @import("modules/passthrough_module.zig");
-const datadog_mod = @import("modules/datadog_module.zig");
-const otlp_mod = @import("modules/otlp_module.zig");
-const health_mod = @import("modules/health_module.zig");
-const policy = @import("policy/root.zig");
+const o11y = @import("observability/root.zig");
+const EventBus = o11y.EventBus;
+const StdLogAdapter = o11y.StdLogAdapter;
+const Level = o11y.Level;
 
 const ProxyServer = server_mod.ProxyServer;
 const ModuleRegistration = proxy_module.ModuleRegistration;
@@ -29,13 +38,53 @@ const OtlpModule = otlp_mod.OtlpModule;
 const OtlpConfig = otlp_mod.OtlpConfig;
 const HealthModule = health_mod.HealthModule;
 
-/// Global server instance for signal handler
-var server_instance: ?*ProxyServer = null;
+/// Route std.log through our EventBus adapter
+pub const std_options: std.Options = .{
+    .log_level = .debug, // Allow all levels through, EventBus will filter
+    .logFn = StdLogAdapter.logFn,
+};
 
-/// Signal handler for graceful shutdown
+// =============================================================================
+// Observability Events
+// =============================================================================
+
+const ShutdownSignalReceived = struct {};
+const SignalHandlersInstalled = struct {};
+const SignalHandlingNotSupported = struct { platform: []const u8 };
+
+const ServerStarting = struct {};
+const ConfigurationLoaded = struct { path: []const u8 };
+const ListenAddressConfigured = struct {
+    address: []const u8,
+    port: u16,
+};
+const UpstreamConfigured = struct { url: []const u8 };
+const LogsUpstreamConfigured = struct { url: []const u8 };
+const MetricsUpstreamConfigured = struct { url: []const u8 };
+const ServiceConfigured = struct {
+    namespace: []const u8,
+    name: []const u8,
+    instance_id: []const u8,
+    version: []const u8,
+};
+
+const ServerReady = struct {};
+const ShutdownHint = struct { pid: c_int };
+const ServerStopped = struct {};
+const ServerError = struct { message: anyerror };
+
+// =============================================================================
+// Global state for signal handlers
+// =============================================================================
+
+var server_instance: ?*ProxyServer = null;
+var global_event_bus: ?*EventBus = null;
+
 fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     _ = sig;
-    std.log.info("Shutdown signal received, stopping server...", .{});
+    if (global_event_bus) |bus| {
+        bus.info(ShutdownSignalReceived{});
+    }
 
     // Stop the server - this unblocks the main thread
     // Provider cleanup happens in the defer blocks of main()
@@ -45,10 +94,29 @@ fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     }
 }
 
-/// Install SIGINT and SIGTERM handlers
-fn installShutdownHandlers() void {
+fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
+    _ = sig;
+    _ = ctx_ptr;
+
+    std.debug.print("\n=== SEGFAULT ===\n", .{});
+
+    // Get faulting address - field layout differs between Linux and macOS
+    const fault_addr: usize = switch (builtin.os.tag) {
+        .macos => @intFromPtr(info.addr),
+        .linux => @intFromPtr(info.fields.sigfault.addr),
+        else => 0,
+    };
+    std.debug.print("Faulting address: 0x{x}\n", .{fault_addr});
+    std.debug.print("Signal code: {d}\n", .{info.code});
+    std.debug.print("Stack trace:\n", .{});
+    std.debug.dumpCurrentStackTrace(@returnAddress());
+
+    std.posix.abort();
+}
+
+fn installShutdownHandlers(bus: *EventBus) void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
-        std.log.warn("Signal handling not supported on this platform", .{});
+        bus.warn(SignalHandlingNotSupported{ .platform = @tagName(builtin.os.tag) });
         return;
     }
 
@@ -61,25 +129,20 @@ fn installShutdownHandlers() void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 
-    std.log.debug("Installed signal handlers for SIGINT and SIGTERM", .{});
+    // Install SIGSEGV handler to capture crash info
+    const segv_act = std.posix.Sigaction{
+        .handler = .{ .sigaction = handleSegfault },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.SIGINFO,
+    };
+    std.posix.sigaction(std.posix.SIG.SEGV, &segv_act, null);
+
+    bus.debug(SignalHandlersInstalled{});
 }
 
-const SourceType = policy.SourceType;
-
-/// Context for policy update callback
-const PolicyCallbackContext = struct {
-    registry: *policy.Registry,
-    source_type: SourceType,
-
-    fn handleUpdate(context: *anyopaque, update: policy.PolicyUpdate) !void {
-        const self: *PolicyCallbackContext = @ptrCast(@alignCast(context));
-        try self.registry.updatePolicies(update.policies, update.provider_id, self.source_type);
-        std.log.info("Policy registry updated from provider '{s}' with {} policies", .{
-            update.provider_id,
-            update.policies.len,
-        });
-    }
-};
+// =============================================================================
+// Main entry point
+// =============================================================================
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -87,7 +150,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Initialize observability with log level from environment
-    var stdio_bus: observability.StdioEventBus = undefined;
+    var stdio_bus: o11y.StdioEventBus = undefined;
     stdio_bus.init();
     const bus = stdio_bus.eventBus();
 
@@ -98,23 +161,27 @@ pub fn main() !void {
     StdLogAdapter.init(bus);
     defer StdLogAdapter.deinit();
 
+    // Set global event bus for signal handler
+    global_event_bus = bus;
+    defer global_event_bus = null;
+
     // Parse command line arguments
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
     _ = args.next(); // Skip program name
-
     const config_path = args.next() orelse "config.json";
 
-    std.log.info("Tero Edge HTTP Proxy starting...", .{});
-    std.log.info("Configuration file: {s}", .{config_path});
+    bus.info(ServerStarting{});
+    bus.info(ConfigurationLoaded{ .path = config_path });
 
     // Parse configuration
     const config = try config_parser.parseConfigFile(allocator, config_path);
     defer {
         allocator.free(config.upstream_url);
+        if (config.logs_url) |logs_url| allocator.free(logs_url);
+        if (config.metrics_url) |metrics_url| allocator.free(metrics_url);
         allocator.free(config.workspace_id);
-        // Free policy providers
         for (config.policy_providers) |provider_config| {
             allocator.free(provider_config.id);
             if (provider_config.path) |path| allocator.free(path);
@@ -143,100 +210,54 @@ pub fn main() !void {
     // Set the instance_id in service metadata
     config.service.instance_id = instance_id_copy;
 
-    std.log.info("Listen address: {}.{}.{}.{}:{}", .{
+    // Format listen address for logging
+    var addr_buf: [64]u8 = undefined;
+    const addr_str = try std.fmt.bufPrint(&addr_buf, "{}.{}.{}.{}", .{
         config.listen_address[0],
         config.listen_address[1],
         config.listen_address[2],
         config.listen_address[3],
-        config.listen_port,
     });
-    std.log.info("Upstream URL: {s}", .{config.upstream_url});
-    std.log.info("Service: {s}/{s} (instance: {s}, version: {s})", .{
-        config.service.namespace,
-        config.service.name,
-        config.service.instance_id,
-        config.service.version,
+
+    bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
+    bus.info(UpstreamConfigured{ .url = config.upstream_url });
+    if (config.logs_url) |logs_url| {
+        bus.info(LogsUpstreamConfigured{ .url = logs_url });
+    }
+    if (config.metrics_url) |metrics_url| {
+        bus.info(MetricsUpstreamConfigured{ .url = metrics_url });
+    }
+    bus.info(ServiceConfigured{
+        .namespace = config.service.namespace,
+        .name = config.service.name,
+        .instance_id = config.service.instance_id,
+        .version = config.service.version,
     });
 
     // Create centralized policy registry
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
-    // Storage for PolicyProvider interfaces
-    var providers: std.ArrayList(policy.Provider) = .empty;
-    defer {
-        for (providers.items) |provider| {
-            provider.deinit();
-        }
-        providers.deinit(allocator);
-    }
+    // Create async policy loader
+    var loader = try policy.Loader.init(
+        allocator,
+        bus,
+        &registry,
+        config.policy_providers,
+        config.workspace_id,
+        config.service,
+    );
+    defer loader.deinit();
 
-    // Storage for callback contexts (need to persist for lifetime of providers)
-    var callback_contexts: std.ArrayList(PolicyCallbackContext) = .empty;
-    defer callback_contexts.deinit(allocator);
+    // Start loading policies asynchronously (non-blocking)
+    // Server can start accepting requests immediately while policies load in background
+    try loader.startAsync();
 
-    std.log.info("Initializing {} policy provider(s)...", .{config.policy_providers.len});
-    for (config.policy_providers) |provider_config| {
-        switch (provider_config.type) {
-            .file => {
-                const path = provider_config.path orelse return error.FileProviderRequiresPath;
-                std.log.info("  - File provider '{s}': {s}", .{ provider_config.id, path });
-
-                const file_provider = try policy.FileProvider.init(allocator, bus, provider_config.id, path);
-                errdefer file_provider.deinit();
-
-                // Create callback context with source type
-                try callback_contexts.append(allocator, .{ .registry = &registry, .source_type = .file });
-                const callback = policy.PolicyCallback{
-                    .context = @ptrCast(&callback_contexts.items[callback_contexts.items.len - 1]),
-                    .onUpdate = PolicyCallbackContext.handleUpdate,
-                };
-
-                try file_provider.subscribe(callback);
-
-                // Store provider interface for cleanup and registry routing
-                const provider_interface = policy.Provider.init(file_provider);
-                try providers.append(allocator, provider_interface);
-                try registry.registerProvider(&providers.items[providers.items.len - 1]);
-            },
-            .http => {
-                const url = provider_config.url orelse return error.HttpProviderRequiresUrl;
-                const poll_interval = provider_config.poll_interval orelse 60;
-                std.log.info("  - HTTP provider '{s}': {s} (poll interval: {}s)", .{ provider_config.id, url, poll_interval });
-
-                const http_provider = try policy.HttpProvider.init(
-                    allocator,
-                    bus,
-                    provider_config.id,
-                    url,
-                    poll_interval,
-                    config.workspace_id,
-                    config.service,
-                    provider_config.headers,
-                );
-                errdefer http_provider.deinit();
-
-                // Create callback context with source type
-                try callback_contexts.append(allocator, .{ .registry = &registry, .source_type = .http });
-                const callback = policy.PolicyCallback{
-                    .context = @ptrCast(&callback_contexts.items[callback_contexts.items.len - 1]),
-                    .onUpdate = PolicyCallbackContext.handleUpdate,
-                };
-
-                try http_provider.subscribe(callback);
-
-                // Store provider interface for cleanup and registry routing
-                const provider_interface = policy.Provider.init(http_provider);
-                try providers.append(allocator, provider_interface);
-                try registry.registerProvider(&providers.items[providers.items.len - 1]);
-            },
-        }
-    }
-
-    std.log.info("Policy count: {}", .{registry.getPolicyCount()});
+    // Note: We don't wait for initial load - requests will be processed with
+    // whatever policies are available. The registry handles this gracefully.
 
     // Install signal handlers
-    installShutdownHandlers();
+    installShutdownHandlers(bus);
 
     // Create Datadog module configuration
     var datadog_config = DatadogConfig{
@@ -250,9 +271,14 @@ pub fn main() !void {
         .bus = bus,
     };
 
+    // Determine upstream URLs (use specific URLs if configured, otherwise fall back to upstream_url)
+    const logs_upstream = config.logs_url orelse config.upstream_url;
+    const metrics_upstream = config.metrics_url orelse config.upstream_url;
+
     // Create modules
     var health_module = HealthModule{};
-    var datadog_module = DatadogModule{};
+    var datadog_logs_module = DatadogModule{};
+    var datadog_metrics_module = DatadogModule{};
     var otlp_module = OtlpModule{};
     var passthrough_module = PassthroughModule{};
 
@@ -267,11 +293,20 @@ pub fn main() !void {
             .max_response_body = 0,
             .module_data = null,
         },
-        // Datadog module - handles /api/v2/logs with filtering
+        // Datadog logs module - handles /api/v2/logs with filtering
         .{
-            .module = datadog_module.asProxyModule(),
-            .routes = &datadog_mod.routes,
-            .upstream_url = config.upstream_url,
+            .module = datadog_logs_module.asProxyModule(),
+            .routes = &datadog_mod.logs_routes,
+            .upstream_url = logs_upstream,
+            .max_request_body = config.max_body_size,
+            .max_response_body = config.max_body_size,
+            .module_data = @ptrCast(&datadog_config),
+        },
+        // Datadog metrics module - handles /api/v2/series with filtering
+        .{
+            .module = datadog_metrics_module.asProxyModule(),
+            .routes = &datadog_mod.metrics_routes,
+            .upstream_url = metrics_upstream,
             .max_request_body = config.max_body_size,
             .max_response_body = config.max_body_size,
             .module_data = @ptrCast(&datadog_config),
@@ -312,21 +347,15 @@ pub fn main() !void {
     server_instance = &proxy;
     defer server_instance = null;
 
-    std.log.info("Proxy ready. Waiting for connections...", .{});
+    bus.info(ServerReady{});
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
-        std.log.info("To shutdown: kill -s INT {d}", .{std.c.getpid()});
+        bus.info(ShutdownHint{ .pid = std.c.getpid() });
     }
 
     // Start listening (blocks until server.stop() is called)
-    try proxy.listen();
+    proxy.listen() catch |err| {
+        bus.err(ServerError{ .message = err });
+    };
 
-    std.log.info("Server stopped gracefully.", .{});
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa);
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+    bus.info(ServerStopped{});
 }
