@@ -378,12 +378,12 @@ zig build
 zig build test
 
 # Build specific distribution
-zig build all      # Full distribution (Datadog + OTLP)
+zig build edge     # Full distribution (Datadog + OTLP)
 zig build datadog  # Datadog-only distribution
 zig build otlp     # OTLP-only distribution
 
 # Run specific distribution
-zig build run-all
+zig build run-edge
 zig build run-datadog
 zig build run-otlp
 ```
@@ -393,20 +393,20 @@ zig build run-otlp
 Multi-stage Dockerfile for building minimal container images.
 
 ```bash
-# Build the full distribution (default)
-docker build --build-arg DISTRIBUTION=all -t tero-edge .
+# Build the full distribution
+docker build --build-arg DISTRIBUTION=edge -t edge .
 
 # Build Datadog-only distribution
-docker build --build-arg DISTRIBUTION=datadog -t tero-edge-datadog .
+docker build --build-arg DISTRIBUTION=datadog -t edge-datadog .
 
 # Build OTLP-only distribution
-docker build --build-arg DISTRIBUTION=otlp -t tero-edge-otlp .
+docker build --build-arg DISTRIBUTION=otlp -t edge-otlp .
 
 # Run with a config file
-docker run -v $(pwd)/config.json:/app/config.json -p 8080:8080 tero-edge
+docker run -v $(pwd)/config.json:/app/config.json -p 8080:8080 edge
 ```
 
-Available distributions: `all`, `datadog`, `otlp`
+Available distributions: `edge`, `datadog`, `otlp`
 
 ## Configuration
 
