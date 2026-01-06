@@ -46,31 +46,13 @@ jobs:
       matrix:
         distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp"]') }}
         arch:
-          - runner: ubuntu-latest
-            artifact_suffix: linux-amd64
+          - runner: ubuntu-24.04
+            suffix: linux-amd64
           - runner: ubuntu-24.04-arm
-            artifact_suffix: linux-arm64
+            suffix: linux-arm64
     runs-on: ${{ matrix.arch.runner }}
-    container:
-      image: alpine:edge@sha256:115729ec5cb049ba6359c3ab005ac742012d92bbaa5b8bc1a878f1e8f62c0cb8
     timeout-minutes: 30
     steps:
-      - name: Install dependencies
-        run: |
-          apk add --no-cache \
-            git \
-            zig="0.15.2-r0" \
-            zlib-dev \
-            zlib-static \
-            zstd-dev \
-            zstd-static \
-            musl-dev \
-            g++ \
-            linux-headers \
-            pkgconf \
-            vectorscan-dev \
-            vectorscan-static
-
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
@@ -81,6 +63,19 @@ jobs:
           else
             echo "BINARY_NAME=edge-${{ matrix.distribution }}" >> $GITHUB_ENV
           fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libvectorscan-dev \
+            libzstd-dev \
+            zlib1g-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@fa65c4058643678a4e4a9a60513944a7d8d35440 # v2.1.0
+        with:
+          version: 0.15.2
 
       - name: Fetch Zig dependencies
         run: |
@@ -93,13 +88,13 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir -p artifacts
-          cp zig-out/bin/edge-${{ matrix.distribution }} artifacts/${{ env.BINARY_NAME }}-${{ matrix.arch.artifact_suffix }}
-          chmod +x artifacts/${{ env.BINARY_NAME }}-${{ matrix.arch.artifact_suffix }}
+          cp zig-out/bin/edge-${{ matrix.distribution }} artifacts/${{ env.BINARY_NAME }}-${{ matrix.arch.suffix }}
+          chmod +x artifacts/${{ env.BINARY_NAME }}-${{ matrix.arch.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: binary-${{ matrix.distribution }}-${{ matrix.arch.artifact_suffix }}
+          name: binary-${{ matrix.distribution }}-${{ matrix.arch.suffix }}
           path: artifacts/*
           if-no-files-found: error
           retention-days: 1
