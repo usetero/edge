@@ -46,17 +46,31 @@ jobs:
       matrix:
         distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp"]') }}
         arch:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            zig_target: x86_64-linux-musl
+          - runner: ubuntu-latest
             artifact_suffix: linux-amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            zig_target: aarch64-linux-musl
+          - runner: ubuntu-24.04-arm
             artifact_suffix: linux-arm64
     runs-on: ${{ matrix.arch.runner }}
+    container:
+      image: alpine:edge@sha256:115729ec5cb049ba6359c3ab005ac742012d92bbaa5b8bc1a878f1e8f62c0cb8
     timeout-minutes: 30
     steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache \
+            git \
+            zig="0.15.2-r0" \
+            zlib-dev \
+            zlib-static \
+            zstd-dev \
+            zstd-static \
+            musl-dev \
+            g++ \
+            linux-headers \
+            pkgconf \
+            vectorscan-dev \
+            vectorscan-static
+
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
@@ -68,40 +82,18 @@ jobs:
             echo "BINARY_NAME=edge-${{ matrix.distribution }}" >> $GITHUB_ENV
           fi
 
-      - name: Build binary in Docker
+      - name: Fetch Zig dependencies
         run: |
-          docker build \
-            --build-arg DISTRIBUTION=${{ matrix.distribution }} \
-            --target builder \
-            --output type=local,dest=./output \
-            -f - . <<'EOF'
-          FROM alpine:edge@sha256:115729ec5cb049ba6359c3ab005ac742012d92bbaa5b8bc1a878f1e8f62c0cb8 AS builder
-          RUN apk add --no-cache \
-              zig="0.15.2-r0" \
-              zlib-dev \
-              zlib-static \
-              zstd-dev \
-              zstd-static \
-              musl-dev \
-              g++ \
-              linux-headers \
-              pkgconf \
-              vectorscan-dev \
-              vectorscan-static
-          WORKDIR /build
-          COPY build.zig build.zig.zon ./
-          COPY src/ src/
-          COPY proto/ proto/
-          ARG DISTRIBUTION=edge
-          RUN for i in 1 2 3 4 5; do zig build --fetch && break || sleep 10; done
-          RUN zig build ${DISTRIBUTION} -Dcpu=baseline -Doptimize=ReleaseSafe
-          RUN mkdir -p /output && cp /build/zig-out/bin/edge-${DISTRIBUTION} /output/
-          EOF
+          for i in 1 2 3 4 5; do zig build --fetch && break || sleep 10; done
 
-      - name: Rename and prepare artifact
+      - name: Build
+        run: |
+          zig build ${{ matrix.distribution }} -Dcpu=baseline -Doptimize=ReleaseSafe
+
+      - name: Prepare artifact
         run: |
           mkdir -p artifacts
-          cp output/edge-${{ matrix.distribution }} artifacts/${{ env.BINARY_NAME }}-${{ matrix.arch.artifact_suffix }}
+          cp zig-out/bin/edge-${{ matrix.distribution }} artifacts/${{ env.BINARY_NAME }}-${{ matrix.arch.artifact_suffix }}
           chmod +x artifacts/${{ env.BINARY_NAME }}-${{ matrix.arch.artifact_suffix }}
 
       - name: Upload artifact
