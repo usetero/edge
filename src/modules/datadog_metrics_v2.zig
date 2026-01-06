@@ -16,7 +16,8 @@ const NoopEventBus = o11y.NoopEventBus;
 const MetricSeries = datadog_metric.MetricSeries;
 const MetricPayload = datadog_metric.MetricPayload;
 
-const StreamParser = zimdjson.ondemand.StreamParser(.default);
+const Parser = datadog_metric.Parser;
+const Value = datadog_metric.Value;
 const ArrayList = std.ArrayListUnmanaged;
 
 /// Result of processing metrics
@@ -250,7 +251,7 @@ fn filterMetric(
     const result = engine.evaluate(.metric, &field_ctx, datadogMetricFieldAccessor, datadogMetricFieldMutator, policy_id_buf);
     return .{
         .keep = result.decision.shouldContinue(),
-        .mutated = result.matched_policy_ids.len > 0,
+        .mutated = result.was_transformed,
     };
 }
 
@@ -287,9 +288,20 @@ const FilterState = struct {
     original_count: usize = 0,
     dropped_count: usize = 0,
     mutated: bool = false,
+    arena: std.heap.ArenaAllocator,
 
-    fn deinit(self: *FilterState, allocator: std.mem.Allocator) void {
-        self.kept.deinit(allocator);
+    fn init(backing_allocator: std.mem.Allocator) FilterState {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(backing_allocator),
+        };
+    }
+
+    fn allocator(self: *FilterState) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    fn deinit(self: *FilterState) void {
+        self.arena.deinit();
     }
 };
 
@@ -307,6 +319,7 @@ fn buildResult(
             .data = result,
             .dropped_count = 0,
             .original_count = state.original_count,
+            .was_transformed = false,
         };
     }
 
@@ -319,6 +332,7 @@ fn buildResult(
             .data = result,
             .dropped_count = state.dropped_count,
             .original_count = state.original_count,
+            .was_transformed = state.mutated,
         };
     }
 
@@ -334,6 +348,7 @@ fn buildResult(
         .data = try out.toOwnedSlice(),
         .dropped_count = state.dropped_count,
         .original_count = state.original_count,
+        .was_transformed = state.mutated,
     };
 }
 
@@ -348,43 +363,42 @@ fn returnUnchanged(allocator: std.mem.Allocator, data: []const u8, original_coun
     };
 }
 
-/// Process JSON metrics with filter evaluation using zimdjson streaming parser
+/// Process JSON metrics with filter evaluation using zimdjson ondemand parser
 fn processJsonMetricsWithFilter(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
     bus: *EventBus,
     data: []const u8,
 ) !ProcessResult {
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
-    var reader = std.Io.Reader.fixed(data);
-    const document = parser.parseFromReader(allocator, &reader) catch {
+    const document = parser.parseFromSlice(allocator, data) catch {
         return returnUnchanged(allocator, data, 0);
     };
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
 
-    // Parse as MetricPayload
-    var payload: std.json.Parsed(MetricPayload) = document.as(MetricPayload, allocator, .{}) catch {
-        return returnUnchanged(allocator, data, 0);
-    };
-    defer payload.deinit();
-
-    const series_list = payload.value.series orelse {
-        return returnUnchanged(allocator, data, 0);
-    };
-
-    var state = FilterState{};
-    defer state.deinit(allocator);
+    var state = FilterState.init(allocator);
+    defer state.deinit();
+    const arena = state.allocator();
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
+
+    // Parse as MetricPayload
+    const payload = MetricPayload.parse(arena, document.asValue()) catch {
+        return returnUnchanged(allocator, data, 0);
+    };
+
+    const series_list = payload.series orelse {
+        return returnUnchanged(allocator, data, 0);
+    };
 
     for (series_list) |*series| {
         state.original_count += 1;
         const filter_result = filterMetric(allocator, &engine, @constCast(series), &policy_id_buf);
         if (filter_result.mutated) state.mutated = true;
         if (filter_result.keep) {
-            try state.kept.append(allocator, series.*);
+            try state.kept.append(arena, series.*);
         } else {
             state.dropped_count += 1;
         }
@@ -398,6 +412,46 @@ fn processJsonMetricsWithFilter(
 // =============================================================================
 
 const proto = @import("proto");
+
+test "datadogMetricFieldAccessor - extra field lookup" {
+    // Unit test to verify the field accessor can retrieve fields
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"metric": "system.load.1", "type": 3, "tags": ["env:prod", "service:web"]}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.tags.?);
+
+    // Build tags cache for matching
+    const tags_cache = try buildTagsCache(allocator, series.tags);
+    defer if (tags_cache) |tc| allocator.free(tc);
+
+    var field_ctx = FieldAccessorContext{
+        .series = &series,
+        .tags_cache = tags_cache,
+    };
+
+    // Test known field
+    const metric_val = datadogMetricFieldAccessor(&field_ctx, .{ .metric_field = .METRIC_FIELD_NAME });
+    try std.testing.expect(metric_val != null);
+    try std.testing.expectEqualStrings("system.load.1", metric_val.?);
+
+    // Test tags field
+    const tags_val = datadogMetricFieldAccessor(&field_ctx, .{ .datapoint_attribute = "tags" });
+    try std.testing.expect(tags_val != null);
+    try std.testing.expectEqualStrings("env:prod,service:web", tags_val.?);
+
+    // Test metric type
+    const type_val = datadogMetricFieldAccessor(&field_ctx, .metric_type);
+    try std.testing.expect(type_val != null);
+    try std.testing.expectEqualStrings("gauge", type_val.?);
+}
 
 test "processMetrics - no policies keeps all metrics" {
     const allocator = std.testing.allocator;
@@ -604,6 +658,77 @@ test "processMetrics - preserves all fields when no metrics dropped" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "resources") != null);
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 1), result.original_count);
+}
+
+test "processMetrics - extra fields are preserved when no metrics dropped" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // No policies - all metrics kept, original data returned unchanged
+
+    // Metrics with extra fields not in the MetricSeries schema
+    const metrics =
+        \\{"series": [{"metric": "test", "type": 3, "points": [], "extra_field": "should_be_preserved", "nested": {"key": "value"}}]}
+    ;
+
+    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    defer allocator.free(result.data);
+
+    // When nothing is dropped, original data is returned unchanged - extra fields preserved
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "extra_field") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "should_be_preserved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "nested") != null);
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+}
+
+test "processMetrics - filter on metric type" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy that matches on metric type "count"
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-count-metrics"),
+        .name = try allocator.dupe(u8, "drop-count-metrics"),
+        .enabled = true,
+        .target = .{
+            .metric = .{
+                .keep = false, // drop matching metrics
+            },
+        },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_type = .METRIC_TYPE_UNSPECIFIED }, // The actual enum value doesn't matter for regex match
+        .match = .{ .regex = try allocator.dupe(u8, "^count$") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    const metrics =
+        \\{"series": [
+        \\  {"metric": "requests.total", "type": 1, "points": [{"timestamp": 1, "value": 100}]},
+        \\  {"metric": "cpu.usage", "type": 3, "points": [{"timestamp": 1, "value": 0.5}]}
+        \\]}
+    ;
+
+    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    defer allocator.free(result.data);
+
+    // count metric (type=1) should be dropped, gauge metric (type=3) should remain
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "requests.total") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "cpu.usage") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
 }
 
 test "buildTagsCache - concatenates tags with comma separator" {

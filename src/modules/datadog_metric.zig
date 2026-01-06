@@ -1,7 +1,9 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
 
-const StreamParser = zimdjson.ondemand.StreamParser(.default);
+pub const Parser = zimdjson.ondemand.FullParser(.default);
+pub const Value = Parser.Value;
+pub const AnyValue = Parser.AnyValue;
 
 /// Datadog metric intake type enum values
 /// See: https://docs.datadoghq.com/api/v2/metrics/#submit-metrics
@@ -23,6 +25,24 @@ pub const MetricPoint = struct {
     /// 64-bit float gauge-type value
     value: ?f64 = null,
 
+    pub fn parse(value: Value) !MetricPoint {
+        var point = MetricPoint{};
+
+        var obj = try value.asObject();
+        var it = obj.iterator();
+        while (try it.next()) |field| {
+            const key = try field.key.get();
+
+            if (std.mem.eql(u8, key, "timestamp")) {
+                point.timestamp = try field.value.asSigned();
+            } else if (std.mem.eql(u8, key, "value")) {
+                point.value = try field.value.asDouble();
+            }
+        }
+
+        return point;
+    }
+
     pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
         try jws.beginObject();
         if (self.timestamp) |v| {
@@ -43,6 +63,24 @@ pub const MetricResource = struct {
     name: ?[]const u8 = null,
     /// The type of the resource
     type: ?[]const u8 = null,
+
+    pub fn parse(value: Value) !MetricResource {
+        var resource = MetricResource{};
+
+        var obj = try value.asObject();
+        var it = obj.iterator();
+        while (try it.next()) |field| {
+            const key = try field.key.get();
+
+            if (std.mem.eql(u8, key, "name")) {
+                resource.name = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "type")) {
+                resource.type = try field.value.asString();
+            }
+        }
+
+        return resource;
+    }
 
     pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
         try jws.beginObject();
@@ -67,6 +105,26 @@ pub const MetricOrigin = struct {
     /// The origin service code
     service: ?i32 = null,
 
+    pub fn parse(value: Value) !MetricOrigin {
+        var origin = MetricOrigin{};
+
+        var obj = try value.asObject();
+        var it = obj.iterator();
+        while (try it.next()) |field| {
+            const key = try field.key.get();
+
+            if (std.mem.eql(u8, key, "metric_type")) {
+                origin.metric_type = @intCast(try field.value.asSigned());
+            } else if (std.mem.eql(u8, key, "product")) {
+                origin.product = @intCast(try field.value.asSigned());
+            } else if (std.mem.eql(u8, key, "service")) {
+                origin.service = @intCast(try field.value.asSigned());
+            }
+        }
+
+        return origin;
+    }
+
     pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
         try jws.beginObject();
         if (self.metric_type) |v| {
@@ -90,6 +148,22 @@ pub const MetricMetadata = struct {
     /// Metric origin information
     origin: ?MetricOrigin = null,
 
+    pub fn parse(value: Value) !MetricMetadata {
+        var metadata = MetricMetadata{};
+
+        var obj = try value.asObject();
+        var it = obj.iterator();
+        while (try it.next()) |field| {
+            const key = try field.key.get();
+
+            if (std.mem.eql(u8, key, "origin")) {
+                metadata.origin = try MetricOrigin.parse(field.value);
+            }
+        }
+
+        return metadata;
+    }
+
     pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
         try jws.beginObject();
         if (self.origin) |v| {
@@ -102,11 +176,6 @@ pub const MetricMetadata = struct {
 
 /// A single metric series
 pub const MetricSeries = struct {
-    pub const schema: StreamParser.schema.Infer(@This()) = .{
-        .fields = .{ .extra = .{ .skip = true } },
-        .on_unknown_field = .{ .handle = @This().handleUnknownField },
-    };
-
     /// The name of the timeseries (required)
     metric: ?[]const u8 = null,
     /// Points relating to a metric (required)
@@ -126,11 +195,70 @@ pub const MetricSeries = struct {
     /// A list of tags associated with the metric
     tags: ?[][]const u8 = null,
 
-    extra: std.StringHashMapUnmanaged(StreamParser.AnyValue) = .empty,
+    extra: std.StringHashMapUnmanaged(AnyValue) = .empty,
 
-    pub fn handleUnknownField(self: *@This(), alloc: ?std.mem.Allocator, key: []const u8, value: StreamParser.Value) StreamParser.schema.Error!void {
-        const gpa = alloc orelse return error.ExpectedAllocator;
-        return self.extra.put(gpa, key, try value.asAny());
+    /// Free extra field keys allocated during parsing
+    pub fn deinit(self: *MetricSeries, allocator: std.mem.Allocator) void {
+        var it = self.extra.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        self.extra.deinit(allocator);
+    }
+
+    /// Parse a MetricSeries from a zimdjson Value (object)
+    pub fn parse(allocator: std.mem.Allocator, value: Value) !MetricSeries {
+        var series = MetricSeries{};
+
+        var obj = try value.asObject();
+        var it = obj.iterator();
+        while (try it.next()) |field| {
+            const key = try field.key.get();
+
+            if (std.mem.eql(u8, key, "metric")) {
+                series.metric = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "type")) {
+                series.type = @intCast(try field.value.asSigned());
+            } else if (std.mem.eql(u8, key, "interval")) {
+                series.interval = try field.value.asSigned();
+            } else if (std.mem.eql(u8, key, "unit")) {
+                series.unit = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "source_type_name")) {
+                series.source_type_name = try field.value.asString();
+            } else if (std.mem.eql(u8, key, "metadata")) {
+                series.metadata = try MetricMetadata.parse(field.value);
+            } else if (std.mem.eql(u8, key, "points")) {
+                var points_arr = try field.value.asArray();
+                var points_list: std.ArrayListUnmanaged(MetricPoint) = .empty;
+                var points_it = points_arr.iterator();
+                while (try points_it.next()) |point_val| {
+                    try points_list.append(allocator, try MetricPoint.parse(point_val));
+                }
+                series.points = try points_list.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, key, "resources")) {
+                var res_arr = try field.value.asArray();
+                var res_list: std.ArrayListUnmanaged(MetricResource) = .empty;
+                var res_it = res_arr.iterator();
+                while (try res_it.next()) |res_val| {
+                    try res_list.append(allocator, try MetricResource.parse(res_val));
+                }
+                series.resources = try res_list.toOwnedSlice(allocator);
+            } else if (std.mem.eql(u8, key, "tags")) {
+                var tags_arr = try field.value.asArray();
+                var tags_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                var tags_it = tags_arr.iterator();
+                while (try tags_it.next()) |tag_val| {
+                    try tags_list.append(allocator, try tag_val.asString());
+                }
+                series.tags = try tags_list.toOwnedSlice(allocator);
+            } else {
+                // Store unknown fields in extra map - need to dupe the key since it's from the parser buffer
+                const key_copy = try allocator.dupe(u8, key);
+                try series.extra.put(allocator, key_copy, try field.value.asAny());
+            }
+        }
+
+        return series;
     }
 
     /// Custom JSON serialization for known fields only
@@ -197,7 +325,7 @@ pub const MetricSeries = struct {
     }
 
     /// Write a zimdjson AnyValue to a JSON writer
-    fn writeAnyValue(jws: anytype, value: StreamParser.AnyValue) !void {
+    fn writeAnyValue(jws: anytype, value: AnyValue) !void {
         switch (value) {
             .null => try jws.write(null),
             .bool => |v| try jws.write(v),
@@ -230,10 +358,31 @@ pub const MetricSeries = struct {
 
 /// The payload for submitting metrics to Datadog
 pub const MetricPayload = struct {
-    pub const schema: StreamParser.schema.Infer(@This()) = .{};
-
     /// A list of timeseries to submit to Datadog
     series: ?[]MetricSeries = null,
+
+    /// Parse a MetricPayload from a zimdjson Value (object)
+    pub fn parse(allocator: std.mem.Allocator, value: Value) !MetricPayload {
+        var payload = MetricPayload{};
+
+        var obj = try value.asObject();
+        var it = obj.iterator();
+        while (try it.next()) |field| {
+            const key = try field.key.get();
+
+            if (std.mem.eql(u8, key, "series")) {
+                var series_arr = try field.value.asArray();
+                var series_list: std.ArrayListUnmanaged(MetricSeries) = .empty;
+                var series_it = series_arr.iterator();
+                while (try series_it.next()) |series_val| {
+                    try series_list.append(allocator, try MetricSeries.parse(allocator, series_val));
+                }
+                payload.series = try series_list.toOwnedSlice(allocator);
+            }
+        }
+
+        return payload;
+    }
 
     pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
         try jws.beginObject();
@@ -256,19 +405,15 @@ pub const MetricPayload = struct {
 test "MetricPoint - parse and serialize" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"timestamp": 1636629071, "value": 0.7}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(MetricPoint, allocator, .{});
-    defer parsed.deinit();
-    const point = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const point = try MetricPoint.parse(doc.asValue());
 
     try std.testing.expectEqual(@as(i64, 1636629071), point.timestamp.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.7), point.value.?, 0.001);
@@ -283,19 +428,15 @@ test "MetricPoint - parse and serialize" {
 test "MetricResource - parse and serialize" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"name": "demobox", "type": "host"}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(MetricResource, allocator, .{});
-    defer parsed.deinit();
-    const resource = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const resource = try MetricResource.parse(doc.asValue());
 
     try std.testing.expectEqualStrings("demobox", resource.name.?);
     try std.testing.expectEqualStrings("host", resource.type.?);
@@ -304,19 +445,17 @@ test "MetricResource - parse and serialize" {
 test "MetricSeries - parse basic fields" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"metric": "system.load.1", "type": 3, "points": [{"timestamp": 1636629071, "value": 0.7}], "tags": ["env:prod", "service:web"]}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(MetricSeries, allocator, .{});
-    defer parsed.deinit();
-    const series = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.points.?);
+    defer allocator.free(series.tags.?);
 
     try std.testing.expectEqualStrings("system.load.1", series.metric.?);
     try std.testing.expectEqual(@as(i32, 3), series.type.?);
@@ -328,7 +467,7 @@ test "MetricSeries - parse basic fields" {
 test "MetricSeries - parse all known fields" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
@@ -345,12 +484,11 @@ test "MetricSeries - parse all known fields" {
         \\}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(MetricSeries, allocator, .{});
-    defer parsed.deinit();
-    const series = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.points.?);
+    defer allocator.free(series.resources.?);
+    defer allocator.free(series.tags.?);
 
     try std.testing.expectEqualStrings("system.load.1", series.metric.?);
     try std.testing.expectEqual(@as(i32, 3), series.type.?);
@@ -366,29 +504,34 @@ test "MetricSeries - parse all known fields" {
 test "MetricSeries - parse with extra fields" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"metric": "test", "points": [], "unknown_field": "value", "another_extra": 123}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.points.?);
+    defer {
+        var it = series.extra.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        series.extra.deinit(allocator);
+    }
 
-    var parsed = try doc.as(MetricSeries, allocator, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqualStrings("test", parsed.value.metric.?);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.extra.count());
-    try std.testing.expect(parsed.value.extra.contains("unknown_field"));
-    try std.testing.expect(parsed.value.extra.contains("another_extra"));
+    try std.testing.expectEqualStrings("test", series.metric.?);
+    try std.testing.expectEqual(@as(usize, 2), series.extra.count());
+    try std.testing.expect(series.extra.contains("unknown_field"));
+    try std.testing.expect(series.extra.contains("another_extra"));
 }
 
 test "MetricPayload - parse series array" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
@@ -400,12 +543,14 @@ test "MetricPayload - parse series array" {
         \\}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(MetricPayload, allocator, .{});
-    defer parsed.deinit();
-    const payload = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const payload = try MetricPayload.parse(allocator, doc.asValue());
+    defer {
+        for (payload.series.?) |*s| {
+            allocator.free(s.points.?);
+        }
+        allocator.free(payload.series.?);
+    }
 
     try std.testing.expectEqual(@as(usize, 2), payload.series.?.len);
     try std.testing.expectEqualStrings("system.load.1", payload.series.?[0].metric.?);
@@ -526,19 +671,16 @@ test "MetricSeries - field mutation set tags" {
 test "MetricSeries - parse and reserialize preserves data" {
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"metric": "test", "type": 3, "points": [{"timestamp": 1636629071, "value": 0.7}]}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    const parsed = try doc.as(MetricSeries, allocator, .{});
-    defer parsed.deinit();
-    const series = parsed.value;
+    const doc = try parser.parseFromSlice(allocator, json);
+    const series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.points.?);
 
     // Serialize back
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -552,4 +694,36 @@ test "MetricSeries - parse and reserialize preserves data" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"metric\":\"test\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"type\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "1636629071") != null);
+}
+
+test "MetricSeries - parse empty object" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json = "{}";
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    const series = try MetricSeries.parse(allocator, doc.asValue());
+
+    try std.testing.expect(series.metric == null);
+    try std.testing.expect(series.type == null);
+    try std.testing.expect(series.points == null);
+    try std.testing.expect(series.tags == null);
+    try std.testing.expectEqual(@as(usize, 0), series.extra.count());
+}
+
+test "MetricPayload - parse empty object" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json = "{}";
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    const payload = try MetricPayload.parse(allocator, doc.asValue());
+
+    try std.testing.expect(payload.series == null);
 }
