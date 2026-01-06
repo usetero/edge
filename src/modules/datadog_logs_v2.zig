@@ -15,9 +15,8 @@ const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 const DatadogLog = datadog_log.DatadogLog;
 
-const StreamParser = zimdjson.ondemand.StreamParser(.default);
-const Object = StreamParser.Object;
-const Document = StreamParser.Document;
+const Parser = datadog_log.Parser;
+const Value = datadog_log.Value;
 const ArrayList = std.ArrayListUnmanaged;
 
 /// Result of processing logs
@@ -290,9 +289,20 @@ const FilterState = struct {
     original_count: usize = 0,
     dropped_count: usize = 0,
     mutated: bool = false,
+    arena: std.heap.ArenaAllocator,
 
-    fn deinit(self: *FilterState, allocator: std.mem.Allocator) void {
-        self.kept.deinit(allocator);
+    fn init(backing_allocator: std.mem.Allocator) FilterState {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(backing_allocator),
+        };
+    }
+
+    fn allocator(self: *FilterState) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    fn deinit(self: *FilterState) void {
+        self.arena.deinit();
     }
 };
 
@@ -351,40 +361,44 @@ fn returnUnchanged(allocator: std.mem.Allocator, data: []const u8, original_coun
     };
 }
 
-/// Process JSON logs with filter evaluation using zimdjson streaming parser
+/// Process JSON logs with filter evaluation using zimdjson ondemand parser
 /// Detects if input is an array or single object, applies filter to each log
 fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const PolicyRegistry, bus: *EventBus, data: []const u8) !ProcessResult {
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
-    var reader = std.Io.Reader.fixed(data);
-    const document: Document = parser.parseFromReader(allocator, &reader) catch {
+    const document = parser.parseFromSlice(allocator, data) catch {
         return returnUnchanged(allocator, data, 0);
     };
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
 
-    const value_type = document.getType() catch {
+    const value_type = document.asValue().getType() catch {
         return returnUnchanged(allocator, data, 0);
     };
 
-    var state = FilterState{};
-    defer state.deinit(allocator);
+    var state = FilterState.init(allocator);
+    defer state.deinit();
+    const arena = state.allocator();
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
 
     switch (value_type) {
         .array => {
-            var array: std.json.Parsed([]DatadogLog) = document.as([]DatadogLog, allocator, .{}) catch {
+            var array = document.asValue().asArray() catch {
                 return returnUnchanged(allocator, data, 0);
             };
-            defer array.deinit();
+            var it = array.iterator();
 
-            for (array.value) |*log_obj| {
+            while (it.next() catch null) |item| {
+                var log_obj = DatadogLog.parse(arena, item) catch {
+                    return returnUnchanged(allocator, data, state.original_count);
+                };
+
                 state.original_count += 1;
-                const filter_result = filterLog(&engine, log_obj, &policy_id_buf);
+                const filter_result = filterLog(&engine, &log_obj, &policy_id_buf);
                 if (filter_result.mutated) state.mutated = true;
                 if (filter_result.keep) {
-                    try state.kept.append(allocator, log_obj.*);
+                    try state.kept.append(arena, log_obj);
                 } else {
                     state.dropped_count += 1;
                 }
@@ -393,16 +407,15 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             return buildResult(allocator, &state, data);
         },
         .object => {
-            var log_obj: std.json.Parsed(DatadogLog) = document.as(DatadogLog, allocator, .{}) catch {
+            var log_obj = DatadogLog.parse(arena, document.asValue()) catch {
                 return returnUnchanged(allocator, data, 1);
             };
-            defer log_obj.deinit();
 
             state.original_count = 1;
-            const filter_result = filterLog(&engine, &log_obj.value, &policy_id_buf);
+            const filter_result = filterLog(&engine, &log_obj, &policy_id_buf);
             if (filter_result.mutated) state.mutated = true;
             if (filter_result.keep) {
-                try state.kept.append(allocator, log_obj.value);
+                try state.kept.append(arena, log_obj);
             } else {
                 state.dropped_count = 1;
             }
@@ -423,25 +436,29 @@ test "datadogFieldAccessor - extra field lookup" {
     // Unit test to verify the field accessor can retrieve extra fields
     const allocator = std.testing.allocator;
 
-    var parser: StreamParser = .init;
+    var parser: Parser = .init;
     defer parser.deinit(allocator);
 
     const json =
         \\{"message": "test", "trace_id": "abc123-def456"}
     ;
 
-    var reader = std.Io.Reader.fixed(json);
-    var doc = try parser.parseFromReader(allocator, &reader);
-
-    var parsed = try doc.as(DatadogLog, allocator, .{});
-    defer parsed.deinit();
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer {
+        var it = log.extra.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
+        log.extra.deinit(allocator);
+    }
 
     // Verify the extra field was parsed
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.extra.count());
-    try std.testing.expect(parsed.value.extra.contains("trace_id"));
+    try std.testing.expectEqual(@as(usize, 1), log.extra.count());
+    try std.testing.expect(log.extra.contains("trace_id"));
 
     // Test the accessor directly
-    var field_ctx = FieldAccessorContext{ .log = &parsed.value };
+    var field_ctx = FieldAccessorContext{ .log = &log };
 
     // Test known field
     const message_val = datadogFieldAccessor(&field_ctx, .{ .log_field = .LOG_FIELD_BODY });

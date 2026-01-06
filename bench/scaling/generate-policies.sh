@@ -174,10 +174,7 @@ receivers:
     read_timeout: 60s
 
 processors:
-  batch:
-    # Small batch for benchmarking - ensures requests flow through
-    send_batch_size: 100
-    timeout: 100ms
+  batch: {}
 YAML_HEAD
 
     local log_processors="batch"
@@ -261,9 +258,23 @@ YAML_HEAD
     cat <<YAML_TAIL
 
 exporters:
-  otlphttp:
+  # Use otlphttp with protobuf encoding to match input format
+  otlphttp/logs:
     endpoint: http://127.0.0.1:9999
     compression: none
+    encoding: proto
+
+  otlphttp/metrics:
+    endpoint: http://127.0.0.1:9999
+    compression: none
+    encoding: proto
+
+  # For Datadog input, convert to OTLP protobuf for consistent output format
+  # Note: otelcol's datadog exporter requires an API key, so we use otlphttp
+  otlphttp/datadog:
+    endpoint: http://127.0.0.1:9999
+    compression: none
+    encoding: proto
 
 service:
   telemetry:
@@ -273,15 +284,15 @@ service:
     logs/otlp:
       receivers: [otlp]
       processors: [$log_processors]
-      exporters: [otlphttp]
+      exporters: [otlphttp/logs]
     logs/datadog:
       receivers: [datadog]
       processors: [$log_processors]
-      exporters: [otlphttp]
+      exporters: [otlphttp/datadog]
     metrics:
       receivers: [otlp]
       processors: [$metric_processors]
-      exporters: [otlphttp]
+      exporters: [otlphttp/metrics]
 YAML_TAIL
 }
 
@@ -417,6 +428,11 @@ YAML_FILTER
         done
 
         # Sinks connect to final transforms
+        # Note: Vector's opentelemetry sink cannot re-encode to OTLP protobuf because
+        # the opentelemetry source converts OTLP into Vector's internal event format,
+        # losing the original protobuf structure. The sink's codec: otlp expects
+        # resourceLogs/resourceMetrics fields that no longer exist.
+        # We must use http sink with JSON for all outputs.
         cat <<YAML_SINKS
 
 sinks:
@@ -455,6 +471,7 @@ sinks:
 YAML_SINKS
     else
         # No transforms - passthrough mode
+        # Vector cannot do OTLP passthrough - must use JSON output
         cat <<'YAML_SINKS'
 
 sinks:
