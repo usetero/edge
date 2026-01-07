@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1](https://github.com/usetero/edge/compare/v1.10.0...v1.10.1) (2026-01-07)
+
+
+### Bug Fixes
+
+* support exists false ([#78](https://github.com/usetero/edge/issues/78)) ([35a8ae8](https://github.com/usetero/edge/commit/35a8ae8e1fd6d89be2b7394fe2eebb0da9d77833))
+
 ## [1.10.0](https://github.com/usetero/edge/compare/v1.9.0...v1.10.0) (2026-01-06)
 
 
