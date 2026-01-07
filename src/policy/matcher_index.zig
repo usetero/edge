@@ -500,16 +500,20 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 return;
             };
 
-            const regex = self.extractRegex(matcher.match, matcher_idx) orelse return;
+            const extract = self.extractRegex(matcher.match, matcher_idx) orelse return;
+
+            // XOR: flip_negate inverts the matcher's negate flag
+            // exists: false sets flip_negate=true, so negate becomes !negate
+            const effective_negate = matcher.negate != extract.flip_negate;
 
             self.bus.debug(MatcherDetail{
                 .matcher_idx = matcher_idx,
-                .regex = regex,
-                .negate = matcher.negate,
+                .regex = extract.regex,
+                .negate = effective_negate,
             });
 
             const matcher_key = MatcherKeyT{ .field = field_ref };
-            try self.addPattern(matcher_key, regex, matcher.negate, field_ref);
+            try self.addPattern(matcher_key, extract.regex, effective_negate, field_ref);
         }
 
         fn getFieldRef(matcher: *const MatcherT) ?FieldRefT {
@@ -522,21 +526,28 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         /// Pattern that matches any non-empty string (used for exists matching)
         const EXISTS_PATTERN = "^.+$";
 
-        fn extractRegex(self: *Self, match_union: anytype, matcher_idx: usize) ?[]const u8 {
+        const ExtractResult = struct {
+            regex: []const u8,
+            flip_negate: bool,
+        };
+
+        fn extractRegex(self: *Self, match_union: anytype, matcher_idx: usize) ?ExtractResult {
             const m = match_union orelse {
                 self.bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
                 return null;
             };
-            const regex: []const u8 = switch (m) {
-                .regex => |r| r,
-                .exact => |e| e,
-                .exists => |exists| if (exists) EXISTS_PATTERN else return null,
+            const result: ExtractResult = switch (m) {
+                .regex => |r| .{ .regex = r, .flip_negate = false },
+                .exact => |e| .{ .regex = e, .flip_negate = false },
+                // exists: true  -> match ^.+$ (field has value)
+                // exists: false -> match ^.+$ negated (field is empty/missing)
+                .exists => |exists| .{ .regex = EXISTS_PATTERN, .flip_negate = !exists },
             };
-            if (regex.len == 0) {
+            if (result.regex.len == 0) {
                 self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
                 return null;
             }
-            return regex;
+            return result;
         }
 
         fn addPattern(self: *Self, key: MatcherKeyT, regex: []const u8, negate: bool, field_ref: FieldRefT) !void {
@@ -1268,7 +1279,7 @@ test "LogMatcherIndex: exists=true matcher uses ^.+$ pattern" {
     try testing.expectEqual(@as(usize, 0), result.count);
 }
 
-test "LogMatcherIndex: exists=false matcher is excluded" {
+test "LogMatcherIndex: exists=false matcher creates negated pattern" {
     const allocator = testing.allocator;
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
@@ -1290,9 +1301,16 @@ test "LogMatcherIndex: exists=false matcher is excluded" {
     var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &.{policy});
     defer index.deinit();
 
-    // exists=false should not create any database entries
-    try testing.expect(index.isEmpty());
+    // exists=false should create a negated pattern entry
+    try testing.expect(!index.isEmpty());
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
+
+    // Verify the pattern is in the negated database
+    const key = LogMatcherKey{ .field = .{ .log_attribute = "trace_id" } };
+    const db = index.getDatabase(key);
+    try testing.expect(db != null);
+    try testing.expectEqual(@as(usize, 1), db.?.negated_patterns.len);
+    try testing.expectEqual(@as(usize, 0), db.?.positive_patterns.len);
 }
 
 test "MetricMatcherIndex: exists=true matcher uses ^.+$ pattern" {
