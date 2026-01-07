@@ -25,3 +25,4 @@ bench/bin
 zig-cache/
 
 .DS_Store
+bench/scaling/proto_gen
