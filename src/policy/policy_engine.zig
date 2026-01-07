@@ -568,6 +568,7 @@ const TestLogContext = struct {
     service: ?[]const u8 = null,
     ddtags: ?[]const u8 = null,
     env: ?[]const u8 = null,
+    trace_id: ?[]const u8 = null,
 
     pub fn fieldAccessor(ctx_ptr: *const anyopaque, field: FieldRef) ?[]const u8 {
         const self: *const TestLogContext = @ptrCast(@alignCast(ctx_ptr));
@@ -582,6 +583,7 @@ const TestLogContext = struct {
                 if (std.mem.eql(u8, key, "ddtags")) return self.ddtags;
                 if (std.mem.eql(u8, key, "message")) return self.message;
                 if (std.mem.eql(u8, key, "env")) return self.env;
+                if (std.mem.eql(u8, key, "trace_id")) return self.trace_id;
                 return null;
             },
             .resource_attribute, .scope_attribute => null,
@@ -3373,4 +3375,77 @@ test "PolicyEngine: more matching policies than policy_id_buf capacity" {
 
     // Only 2 policy IDs returned (buffer capacity), even though 5 matched
     try testing.expectEqual(@as(usize, 2), result.matched_policy_ids.len);
+}
+
+test "PolicyEngine: exists=false matches when field is missing or empty" {
+    const allocator = testing.allocator;
+
+    // Drop logs where trace_id does NOT exist (exists: false)
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "drop-missing-trace"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .match = .{ .exists = false },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // No trace_id attribute = field missing = exists:false matches = dropped
+    var no_trace = TestLogContext{ .message = "log without trace" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &no_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+
+    // Has trace_id = field exists = exists:false does NOT match = unset
+    var with_trace = TestLogContext{ .message = "log with trace", .trace_id = "abc123" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &with_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+}
+
+test "PolicyEngine: exists=false with negate=true matches when field exists" {
+    const allocator = testing.allocator;
+
+    // Drop logs where trace_id DOES exist (exists: false + negate: true = double negation)
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "policy-1"),
+        .name = try allocator.dupe(u8, "drop-with-trace"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .match = .{ .exists = false },
+        .negate = true,
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Has trace_id = field exists = exists:false+negate:true matches = dropped
+    var with_trace = TestLogContext{ .message = "log with trace", .trace_id = "abc123" };
+    try testing.expectEqual(FilterDecision.drop, engine.evaluate(.log, &with_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+
+    // No trace_id = field missing = exists:false+negate:true does NOT match = unset
+    var no_trace = TestLogContext{ .message = "log without trace" };
+    try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &no_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
 }
