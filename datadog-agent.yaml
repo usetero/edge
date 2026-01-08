@@ -28,32 +28,42 @@ data:
         {
           "id": "drop-echo-logs",
           "name": "drop-echo-logs",
-          "matchers": [{ "match_type": "log_attribute", "key": "ddsource", "regex": "nginx" }],
-          "action": "drop"
+          "enabled": true,
+          "log": {
+            "match": [{ "log_attribute": "ddsource", "regex": "nginx" }],
+            "keep": "none"
+          }
         },
         {
           "id": "drop-no-such-file-or-directory-logs",
           "name": "drop-no-such-file-or-directory-logs",
-          "matchers": [
-            { "match_type": "log_body", "regex": "no such file or directory" }
-          ],
-          "action": "drop"
+          "enabled": true,
+          "log": {
+            "match": [{ "log_field": "body", "regex": "no such file or directory" }],
+            "keep": "none"
+          }
         },
         {
           "id": "drop-debug-level",
           "name": "drop-debug-level",
-          "matchers": [{ "match_type": "log_severity_text", "regex": "DEBUG" }],
-          "action": "drop"
+          "enabled": true,
+          "log": {
+            "match": [{ "log_field": "severity_text", "regex": "DEBUG" }],
+            "keep": "none"
+          }
         },
         {
           "id": "keep-error-logs",
           "name": "keep-error-logs",
-          "matchers": [
-            { "match_type": "log_severity_text", "regex": "error" },
-            { "match_type": "log_severity_text", "regex": "critical" },
-            { "match_type": "log_severity_text", "regex": "fatal" }
-          ],
-          "action": "keep"
+          "enabled": true,
+          "log": {
+            "match": [
+              { "log_field": "severity_text", "regex": "error" },
+              { "log_field": "severity_text", "regex": "critical" },
+              { "log_field": "severity_text", "regex": "fatal" }
+            ],
+            "keep": "all"
+          }
         }
       ]
     }
@@ -77,7 +87,7 @@ spec:
     spec:
       containers:
         - name: tero-edge
-          image: edge-datadog:v02
+          image: ghcr.io/usetero/edge:1.10.1
           imagePullPolicy: IfNotPresent
           args:
             - /etc/tero/config.json
