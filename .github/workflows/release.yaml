@@ -107,7 +107,7 @@ jobs:
       fail-fast: false
       matrix:
         distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp"]') }}
-    runs-on: macos-14 # Apple Silicon runner
+    runs-on: macos-15 # Apple Silicon runner
     timeout-minutes: 45
     steps:
       - name: Checkout
