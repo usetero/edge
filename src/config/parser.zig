@@ -77,12 +77,12 @@ pub fn parseConfigFile(allocator: std.mem.Allocator, path: []const u8) !*ProxyCo
 
 /// Parse configuration from JSON bytes
 pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*ProxyConfig {
-    // Parse JSON
+    // Parse JSON, ignoring unknown fields for forward compatibility
     const parsed = try std.json.parseFromSlice(
         ConfigJson,
         allocator,
         json_bytes,
-        .{ .allocate = .alloc_always },
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
     );
     defer parsed.deinit();
 
