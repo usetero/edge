@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.11.0](https://github.com/usetero/edge/compare/v1.10.1...v1.11.0) (2026-01-13)
+
+
+### Features
+
+* support environment variable substitution ([#84](https://github.com/usetero/edge/issues/84)) ([6987f16](https://github.com/usetero/edge/commit/6987f16cec57c2d8456ae15fb5ba6e944e37ade0))
+
+
+### Bug Fixes
+
+* add ignore unknown ([#87](https://github.com/usetero/edge/issues/87)) ([2532b27](https://github.com/usetero/edge/commit/2532b2772dd21a5f24c63c5cf9d23bab1683282a))
+
 ## [1.10.1](https://github.com/usetero/edge/compare/v1.10.0...v1.10.1) (2026-01-07)
 
 
