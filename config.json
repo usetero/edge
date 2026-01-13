@@ -1,9 +1,9 @@
 {
   "listen_address": "127.0.0.1",
   "listen_port": 8080,
-  "upstream_url": "https://agent-http-intake.logs.us5.datadoghq.com",
-  "metrics_url": "https://api.us5.datadoghq.com",
-  "workspace_id": "90A6EFC2-27B8-41BC-9343-43BFB1DF0732",
+  "upstream_url": "https://agent-http-intake.logs.${TERO_DD_REGION}.datadoghq.com",
+  "metrics_url": "https://api.${TERO_DD_REGION}.datadoghq.com",
+  "workspace_id": "${TERO_WORKSPACE_ID}",
   "log_level": "info",
   "max_body_size": 1048576,
   "policy_providers": [
@@ -15,11 +15,11 @@
     {
       "id": "http",
       "type": "http",
-      "url": "http://control-plane-sync.orb.local:8090/v1/policy/sync",
+      "url": "${TERO_CONTROL_PLANE_URL}/v1/policy/sync",
       "headers": [
         {
           "name": "Authorization",
-          "value": "Bearer tero_sk_bk2M1oiJsXJuIm6gSNHeJRNrvq2RER_hsLlnIHnqKL8="
+          "value": "Bearer ${TERO_API_TOKEN}"
         }
       ]
     }
