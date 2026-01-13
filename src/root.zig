@@ -11,6 +11,7 @@ pub const policy = @import("policy/root.zig");
 // Config modules (non-policy configuration)
 pub const config_types = @import("config/types.zig");
 pub const config_parser = @import("config/parser.zig");
+pub const config_env_subst = @import("config/env_subst.zig");
 
 // Proxy modules
 pub const server = @import("proxy/server.zig");
@@ -63,6 +64,7 @@ test "basic add functionality" {
 test {
     _ = @import("config/types.zig");
     _ = @import("config/parser.zig");
+    _ = @import("config/env_subst.zig");
     _ = @import("policy/root.zig");
     _ = @import("policy/policy_engine.zig");
     _ = @import("policy/matcher_index.zig");
