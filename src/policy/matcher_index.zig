@@ -32,6 +32,7 @@ const RateLimiter = rate_limiter_mod.RateLimiter;
 
 const FieldRef = policy_types.FieldRef;
 const MetricFieldRef = policy_types.MetricFieldRef;
+const TraceFieldRef = policy_types.TraceFieldRef;
 pub const TelemetryType = policy_types.TelemetryType;
 
 const Policy = proto.policy.Policy;
@@ -41,6 +42,9 @@ const LogField = proto.policy.LogField;
 const MetricMatcher = proto.policy.MetricMatcher;
 const MetricTarget = proto.policy.MetricTarget;
 const MetricField = proto.policy.MetricField;
+const TraceMatcher = proto.policy.TraceMatcher;
+const TraceTarget = proto.policy.TraceTarget;
+const TraceField = proto.policy.TraceField;
 
 // =============================================================================
 // Observability Events
@@ -156,6 +160,31 @@ pub const MetricMatcherKeyContext = struct {
         return key.hash();
     }
     pub fn eql(_: MetricMatcherKeyContext, a: MetricMatcherKey, b: MetricMatcherKey) bool {
+        return a.eql(b);
+    }
+};
+
+/// Key for indexing Hyperscan databases for trace policies.
+pub const TraceMatcherKey = struct {
+    field: TraceFieldRef,
+
+    const Self = @This();
+
+    pub fn hash(self: Self) u64 {
+        return hashFieldRef(TraceFieldRef, self.field);
+    }
+
+    pub fn eql(a: Self, b: Self) bool {
+        return eqlFieldRef(TraceFieldRef, a.field, b.field);
+    }
+};
+
+/// Hash context for TraceMatcherKey in hash maps
+pub const TraceMatcherKeyContext = struct {
+    pub fn hash(_: TraceMatcherKeyContext, key: TraceMatcherKey) u64 {
+        return key.hash();
+    }
+    pub fn eql(_: TraceMatcherKeyContext, a: TraceMatcherKey, b: TraceMatcherKey) bool {
         return a.eql(b);
     }
 };
@@ -353,6 +382,7 @@ pub fn MatcherKeyType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => LogMatcherKey,
         .metric => MetricMatcherKey,
+        .trace => TraceMatcherKey,
     };
 }
 
@@ -361,6 +391,7 @@ pub fn FieldRefType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => FieldRef,
         .metric => MetricFieldRef,
+        .trace => TraceFieldRef,
     };
 }
 
@@ -369,6 +400,7 @@ fn MatcherType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => LogMatcher,
         .metric => MetricMatcher,
+        .trace => TraceMatcher,
     };
 }
 
@@ -377,6 +409,7 @@ fn TargetType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => LogTarget,
         .metric => MetricTarget,
+        .trace => TraceTarget,
     };
 }
 
@@ -385,6 +418,7 @@ fn HashContextType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => LogMatcherKeyContext,
         .metric => MetricMatcherKeyContext,
+        .trace => TraceMatcherKeyContext,
     };
 }
 
@@ -393,6 +427,7 @@ pub fn MatcherIndexType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => LogMatcherIndex,
         .metric => MetricMatcherIndex,
+        .trace => TraceMatcherIndex,
     };
 }
 
@@ -478,11 +513,15 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             return switch (T) {
                 .log => switch (target_ptr.*) {
                     .log => |*log| log,
-                    .metric => null,
+                    .metric, .trace => null,
                 },
                 .metric => switch (target_ptr.*) {
                     .metric => |*metric| metric,
-                    .log => null,
+                    .log, .trace => null,
+                },
+                .trace => switch (target_ptr.*) {
+                    .trace => |*trace| trace,
+                    .log, .metric => null,
                 },
             };
         }
@@ -491,6 +530,14 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             return switch (T) {
                 .log => KeepValue.parse(target.keep),
                 .metric => if (target.keep) .all else .none,
+                .trace => blk: {
+                    // Trace uses TraceSamplingConfig with percentage (0-100)
+                    const keep_config = target.keep orelse break :blk .all;
+                    const percentage = keep_config.percentage;
+                    if (percentage >= 100.0) break :blk .all;
+                    if (percentage <= 0.0) break :blk .none;
+                    break :blk .{ .percentage = @intFromFloat(@min(100.0, @max(0.0, percentage))) };
+                },
             };
         }
 
@@ -520,6 +567,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             return switch (T) {
                 .log => FieldRef.fromMatcherField(matcher.field),
                 .metric => MetricFieldRef.fromMatcherField(matcher.field),
+                .trace => TraceFieldRef.fromMatcherField(matcher.field),
             };
         }
 
@@ -595,6 +643,15 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                     .resource_attribute => .{ .resource_attribute = key_copy },
                     .scope_attribute => .{ .scope_attribute = key_copy },
                     .metric_field, .metric_type, .aggregation_temporality => field_ref,
+                },
+                .trace => return switch (field_ref) {
+                    .span_attribute => .{ .span_attribute = key_copy },
+                    .resource_attribute => .{ .resource_attribute = key_copy },
+                    .scope_attribute => .{ .scope_attribute = key_copy },
+                    .event_name => .{ .event_name = key_copy },
+                    .event_attribute => .{ .event_attribute = key_copy },
+                    .link_trace_id => .{ .link_trace_id = key_copy },
+                    .trace_field, .span_kind, .span_status => field_ref,
                 },
             }
         }
@@ -853,6 +910,119 @@ pub const MetricMatcherIndex = struct {
     }
 
     pub fn getMatcherKeys(self: *const Self) []const MetricMatcherKey {
+        return self.matcher_keys;
+    }
+
+    pub fn getPolicies(self: *const Self) []const PolicyInfo {
+        return self.policies;
+    }
+
+    pub fn getPoliciesWithNegation(self: *const Self) []const PolicyIndex {
+        return self.policies_with_negation;
+    }
+
+    pub fn isEmpty(self: *const Self) bool {
+        return self.databases.count() == 0;
+    }
+
+    pub fn getDatabaseCount(self: *const Self) usize {
+        return self.databases.count();
+    }
+
+    pub fn getPolicyCount(self: *const Self) usize {
+        return self.policies.len;
+    }
+
+    pub fn deinit(self: *Self) void {
+        var db_it = self.databases.valueIterator();
+        while (db_it.next()) |db| {
+            db.*.deinit();
+            self.allocator.destroy(db.*);
+        }
+        self.databases.deinit();
+
+        // Free rate limiters
+        for (self.policies) |policy_info| {
+            if (policy_info.rate_limiter) |rl| {
+                self.allocator.destroy(rl);
+            }
+        }
+        self.allocator.free(self.policies);
+        self.allocator.free(self.policies_with_negation);
+        self.allocator.free(self.matcher_keys);
+
+        for (self.key_storage.items) |key| {
+            self.allocator.free(key);
+        }
+        self.key_storage.deinit(self.allocator);
+
+        for (self.policy_id_storage.items) |id| {
+            self.allocator.free(id);
+        }
+        self.policy_id_storage.deinit(self.allocator);
+    }
+};
+
+// =============================================================================
+// TraceMatcherIndex - Index for trace policies only (OTLP traces)
+// =============================================================================
+
+pub const TraceMatcherIndex = struct {
+    allocator: std.mem.Allocator,
+    databases: std.HashMap(TraceMatcherKey, *MatcherDatabase, TraceMatcherKeyContext, std.hash_map.default_max_load_percentage),
+    policies: []PolicyInfo,
+    policies_with_negation: []PolicyIndex,
+    matcher_keys: []TraceMatcherKey,
+    key_storage: std.ArrayListUnmanaged([]const u8),
+    policy_id_storage: std.ArrayListUnmanaged([]const u8),
+    bus: *EventBus,
+
+    const Self = @This();
+
+    pub fn build(allocator: std.mem.Allocator, bus: *EventBus, policies_slice: []const Policy) !Self {
+        var span = bus.started(.info, MatcherIndexBuildStarted{ .policy_count = policies_slice.len, .telemetry_type = .trace });
+
+        if (policies_slice.len > MAX_POLICIES) {
+            return error.TooManyPolicies;
+        }
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        var builder = IndexBuilder(.trace).init(allocator, arena.allocator(), bus);
+
+        for (policies_slice) |*policy| {
+            try builder.processPolicy(policy);
+        }
+
+        var index = try builder.finish();
+
+        span.completed(MatcherIndexBuildCompleted{
+            .database_count = index.databases.count(),
+            .matcher_key_count = index.matcher_keys.len,
+            .policy_count = index.policies.len,
+        });
+
+        return index;
+    }
+
+    pub fn getDatabase(self: *const Self, key: TraceMatcherKey) ?*MatcherDatabase {
+        return self.databases.get(key);
+    }
+
+    pub fn getPolicyByIndex(self: *const Self, index: PolicyIndex) ?PolicyInfo {
+        if (index >= self.policies.len) return null;
+        return self.policies[index];
+    }
+
+    pub fn getPolicy(self: *const Self, id: []const u8) ?PolicyInfo {
+        for (self.policies) |info| {
+            if (std.mem.eql(u8, info.id, id)) return info;
+        }
+        return null;
+    }
+
+    pub fn getMatcherKeys(self: *const Self) []const TraceMatcherKey {
         return self.matcher_keys;
     }
 

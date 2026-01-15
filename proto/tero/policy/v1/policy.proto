@@ -6,6 +6,7 @@ import "google/api/annotations.proto";
 import "opentelemetry/proto/common/v1/common.proto";
 import "tero/policy/v1/log.proto";
 import "tero/policy/v1/metric.proto";
+import "tero/policy/v1/trace.proto";
 
 option go_package = "github.com/usetero/policy/gen/go/tero/policy/v1";
 
@@ -46,6 +47,7 @@ message Policy {
   oneof target {
     LogTarget log = 10;
     MetricTarget metric = 11;
+    TraceTarget trace = 12;
   }
 }
 
@@ -58,6 +60,8 @@ enum PolicyStage {
   POLICY_STAGE_UNSPECIFIED = 0;
   POLICY_STAGE_LOG_FILTER = 1; // Log filtering stage (keep/drop decisions)
   POLICY_STAGE_LOG_TRANSFORM = 2; // Log transformation stage (field modifications)
+  POLICY_STAGE_METRIC_FILTER = 3; // Metric filtering stage (keep/drop decisions)
+  POLICY_STAGE_TRACE_SAMPLING = 4; // Trace probabilistic sampling stage
 }
 
 // =============================================================================
@@ -70,8 +74,6 @@ message ClientMetadata {
   repeated PolicyStage supported_policy_stages = 1;
 
   // Additional metadata labels
-  // NOTE FOR TERO:
-  // * workspace.id is required for usage.
   repeated opentelemetry.proto.common.v1.KeyValue labels = 2;
 
   // Resource attributes describing this client's identity

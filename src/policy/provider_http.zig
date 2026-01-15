@@ -414,7 +414,13 @@ pub const HttpProvider = struct {
         };
 
         // Build supported_policy_stages
-        const supported_policy_stages = [_]PolicyStage{.POLICY_STAGE_LOG_FILTER};
+        // Note: OTLP supports logs, metrics, and traces. Datadog only supports logs and metrics (no traces).
+        const supported_policy_stages = [_]PolicyStage{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+            .POLICY_STAGE_TRACE_SAMPLING, // OTLP only - Datadog traces are NOT supported
+        };
 
         // Build policy_statuses from our tracked state
         var policy_statuses_list = std.ArrayListUnmanaged(PolicySyncStatus){};
