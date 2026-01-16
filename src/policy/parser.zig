@@ -13,6 +13,13 @@ const LogAdd = proto.policy.LogAdd;
 const MetricTarget = proto.policy.MetricTarget;
 const MetricMatcher = proto.policy.MetricMatcher;
 const MetricField = proto.policy.MetricField;
+const TraceTarget = proto.policy.TraceTarget;
+const TraceMatcher = proto.policy.TraceMatcher;
+const TraceField = proto.policy.TraceField;
+const TraceSamplingConfig = proto.policy.TraceSamplingConfig;
+const SamplingMode = proto.policy.SamplingMode;
+const SpanKind = proto.policy.SpanKind;
+const SpanStatusCode = proto.policy.SpanStatusCode;
 
 // =============================================================================
 // New JSON Schema - matches YAML format closely
@@ -125,6 +132,51 @@ const MetricTargetJson = struct {
     keep: bool = true,
 };
 
+/// JSON schema for a trace matcher
+/// Example: { "trace_field": "TRACE_FIELD_NAME", "regex": "^ping$" }
+/// Example: { "span_attribute": "peer.service", "exists": true }
+/// Example: { "span_kind": "SPAN_KIND_INTERNAL", "exists": true }
+const TraceMatcherJson = struct {
+    // Field selectors (one of these should be set)
+    trace_field: ?[]const u8 = null, // "TRACE_FIELD_NAME", "TRACE_FIELD_TRACE_ID", etc.
+    span_attribute: ?[]const u8 = null, // span attribute key
+    resource_attribute: ?[]const u8 = null, // resource attribute key
+    scope_attribute: ?[]const u8 = null, // scope attribute key
+    span_kind: ?[]const u8 = null, // "SPAN_KIND_INTERNAL", "SPAN_KIND_SERVER", etc.
+    span_status: ?[]const u8 = null, // "SPAN_STATUS_CODE_OK", "SPAN_STATUS_CODE_ERROR"
+    event_name: ?[]const u8 = null, // event name to match
+    event_attribute: ?[]const u8 = null, // event attribute key
+    link_trace_id: ?[]const u8 = null, // link trace_id matcher
+
+    // Match type (one of these should be set)
+    regex: ?[]const u8 = null,
+    exact: ?[]const u8 = null,
+    exists: ?bool = null,
+
+    // Optional negation
+    negate: bool = false,
+};
+
+/// JSON schema for trace sampling config
+const TraceSamplingConfigJson = struct {
+    percentage: f32 = 100.0,
+    mode: ?[]const u8 = null, // "SAMPLING_MODE_HASH_SEED", "SAMPLING_MODE_PROPORTIONAL", etc.
+    sampling_precision: ?u32 = null,
+    hash_seed: ?u32 = null,
+    fail_closed: ?bool = null,
+};
+
+/// JSON schema for trace target
+/// Example:
+/// "trace": {
+///   "match": [{ "trace_field": "TRACE_FIELD_NAME", "regex": "^ping$" }],
+///   "keep": { "percentage": 50.0, "mode": "SAMPLING_MODE_HASH_SEED" }
+/// }
+const TraceTargetJson = struct {
+    match: ?[]TraceMatcherJson = null,
+    keep: ?TraceSamplingConfigJson = null,
+};
+
 /// JSON schema for a policy
 /// Example:
 /// {
@@ -147,6 +199,7 @@ const PolicyJson = struct {
     // Target type (one of these should be set)
     log: ?LogTargetJson = null,
     metric: ?MetricTargetJson = null,
+    trace: ?TraceTargetJson = null,
 };
 
 /// JSON schema for a policies file
@@ -207,6 +260,8 @@ fn parsePolicy(allocator: std.mem.Allocator, json_policy: PolicyJson) !Policy {
         target = .{ .log = try parseLogTarget(allocator, log_json) };
     } else if (json_policy.metric) |metric_json| {
         target = .{ .metric = try parseMetricTarget(allocator, metric_json) };
+    } else if (json_policy.trace) |trace_json| {
+        target = .{ .trace = try parseTraceTarget(allocator, trace_json) };
     }
 
     return Policy{
@@ -479,6 +534,132 @@ fn parseMetricFieldName(name: []const u8) !MetricField {
     if (std.mem.eql(u8, name, "scope_name")) return .METRIC_FIELD_SCOPE_NAME;
     if (std.mem.eql(u8, name, "scope_version")) return .METRIC_FIELD_SCOPE_VERSION;
     return error.InvalidMetricField;
+}
+
+// =============================================================================
+// Trace Target Parsing
+// =============================================================================
+
+fn parseTraceTarget(allocator: std.mem.Allocator, json: TraceTargetJson) !TraceTarget {
+    var matchers = std.ArrayListUnmanaged(TraceMatcher){};
+
+    if (json.match) |json_matchers| {
+        try matchers.ensureTotalCapacity(allocator, json_matchers.len);
+        for (json_matchers) |jm| {
+            const matcher = try parseTraceMatcher(allocator, jm);
+            matchers.appendAssumeCapacity(matcher);
+        }
+    }
+
+    var sampling_config: ?TraceSamplingConfig = null;
+    if (json.keep) |jk| {
+        sampling_config = try parseTraceSamplingConfig(jk);
+    }
+
+    return TraceTarget{
+        .match = matchers,
+        .keep = sampling_config,
+    };
+}
+
+fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceMatcher {
+    // Parse field
+    const field: TraceMatcher.field_union = blk: {
+        if (jm.trace_field) |field_name| {
+            break :blk .{ .trace_field = try parseTraceFieldName(field_name) };
+        } else if (jm.span_attribute) |key| {
+            break :blk .{ .span_attribute = try allocator.dupe(u8, key) };
+        } else if (jm.resource_attribute) |key| {
+            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
+        } else if (jm.scope_attribute) |key| {
+            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+        } else if (jm.span_kind) |kind_name| {
+            break :blk .{ .span_kind = try parseSpanKind(kind_name) };
+        } else if (jm.span_status) |status_name| {
+            break :blk .{ .span_status = try parseSpanStatusCode(status_name) };
+        } else if (jm.event_name) |name| {
+            break :blk .{ .event_name = try allocator.dupe(u8, name) };
+        } else if (jm.event_attribute) |key| {
+            break :blk .{ .event_attribute = try allocator.dupe(u8, key) };
+        } else if (jm.link_trace_id) |id| {
+            break :blk .{ .link_trace_id = try allocator.dupe(u8, id) };
+        } else {
+            return error.MissingField;
+        }
+    };
+
+    // Parse match
+    const match: TraceMatcher.match_union = blk: {
+        if (jm.regex) |pattern| {
+            break :blk .{ .regex = try allocator.dupe(u8, pattern) };
+        } else if (jm.exact) |pattern| {
+            break :blk .{ .exact = try allocator.dupe(u8, pattern) };
+        } else if (jm.exists) |exists| {
+            break :blk .{ .exists = exists };
+        } else {
+            return error.MissingMatch;
+        }
+    };
+
+    return TraceMatcher{
+        .negate = jm.negate,
+        .field = field,
+        .match = match,
+    };
+}
+
+fn parseTraceFieldName(name: []const u8) !TraceField {
+    if (std.mem.eql(u8, name, "TRACE_FIELD_NAME")) return .TRACE_FIELD_NAME;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_TRACE_ID")) return .TRACE_FIELD_TRACE_ID;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_SPAN_ID")) return .TRACE_FIELD_SPAN_ID;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_PARENT_SPAN_ID")) return .TRACE_FIELD_PARENT_SPAN_ID;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_TRACE_STATE")) return .TRACE_FIELD_TRACE_STATE;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_RESOURCE_SCHEMA_URL")) return .TRACE_FIELD_RESOURCE_SCHEMA_URL;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_SCHEMA_URL")) return .TRACE_FIELD_SCOPE_SCHEMA_URL;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_NAME")) return .TRACE_FIELD_SCOPE_NAME;
+    if (std.mem.eql(u8, name, "TRACE_FIELD_SCOPE_VERSION")) return .TRACE_FIELD_SCOPE_VERSION;
+    return error.InvalidTraceField;
+}
+
+fn parseSpanKind(name: []const u8) !SpanKind {
+    if (std.mem.eql(u8, name, "SPAN_KIND_UNSPECIFIED")) return .SPAN_KIND_UNSPECIFIED;
+    if (std.mem.eql(u8, name, "SPAN_KIND_INTERNAL")) return .SPAN_KIND_INTERNAL;
+    if (std.mem.eql(u8, name, "SPAN_KIND_SERVER")) return .SPAN_KIND_SERVER;
+    if (std.mem.eql(u8, name, "SPAN_KIND_CLIENT")) return .SPAN_KIND_CLIENT;
+    if (std.mem.eql(u8, name, "SPAN_KIND_PRODUCER")) return .SPAN_KIND_PRODUCER;
+    if (std.mem.eql(u8, name, "SPAN_KIND_CONSUMER")) return .SPAN_KIND_CONSUMER;
+    return error.InvalidSpanKind;
+}
+
+fn parseSpanStatusCode(name: []const u8) !SpanStatusCode {
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_UNSPECIFIED")) return .SPAN_STATUS_CODE_UNSPECIFIED;
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_OK")) return .SPAN_STATUS_CODE_OK;
+    if (std.mem.eql(u8, name, "SPAN_STATUS_CODE_ERROR")) return .SPAN_STATUS_CODE_ERROR;
+    return error.InvalidSpanStatusCode;
+}
+
+fn parseSamplingMode(name: []const u8) !SamplingMode {
+    if (std.mem.eql(u8, name, "SAMPLING_MODE_UNSPECIFIED")) return .SAMPLING_MODE_UNSPECIFIED;
+    if (std.mem.eql(u8, name, "SAMPLING_MODE_HASH_SEED")) return .SAMPLING_MODE_HASH_SEED;
+    if (std.mem.eql(u8, name, "SAMPLING_MODE_PROPORTIONAL")) return .SAMPLING_MODE_PROPORTIONAL;
+    if (std.mem.eql(u8, name, "SAMPLING_MODE_EQUALIZING")) return .SAMPLING_MODE_EQUALIZING;
+    return error.InvalidSamplingMode;
+}
+
+fn parseTraceSamplingConfig(jk: TraceSamplingConfigJson) !TraceSamplingConfig {
+    var config = TraceSamplingConfig{
+        .percentage = jk.percentage,
+    };
+
+    if (jk.mode) |mode_name| {
+        config.mode = try parseSamplingMode(mode_name);
+    }
+
+    config.sampling_precision = jk.sampling_precision;
+    config.hash_seed = jk.hash_seed;
+    config.fail_closed = jk.fail_closed;
+
+    return config;
 }
 
 // =============================================================================
@@ -920,4 +1101,242 @@ test "parsePoliciesBytes: disabled policy" {
 
     try std.testing.expectEqual(@as(usize, 1), policies.len);
     try std.testing.expect(!policies[0].enabled);
+}
+
+test "parsePoliciesBytes: trace policy with span name matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "sample-ping-spans",
+        \\      "name": "Sample ping spans at 50%",
+        \\      "trace": {
+        \\        "match": [
+        \\          { "trace_field": "TRACE_FIELD_NAME", "regex": "^ping$" }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 50.0,
+        \\          "mode": "SAMPLING_MODE_HASH_SEED",
+        \\          "sampling_precision": 4
+        \\        }
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+    try std.testing.expectEqualStrings("sample-ping-spans", policies[0].id);
+
+    // Verify it's a trace target
+    try std.testing.expect(policies[0].target != null);
+    try std.testing.expect(policies[0].target.? == .trace);
+
+    const trace_target = policies[0].target.?.trace;
+    try std.testing.expectEqual(@as(usize, 1), trace_target.match.items.len);
+
+    // Check matcher
+    const matcher = trace_target.match.items[0];
+    try std.testing.expect(matcher.field != null);
+    try std.testing.expect(matcher.field.? == .trace_field);
+    try std.testing.expectEqual(TraceField.TRACE_FIELD_NAME, matcher.field.?.trace_field);
+    try std.testing.expect(matcher.match != null);
+    try std.testing.expect(matcher.match.? == .regex);
+    try std.testing.expectEqualStrings("^ping$", matcher.match.?.regex);
+
+    // Check sampling config
+    try std.testing.expect(trace_target.keep != null);
+    const sampling = trace_target.keep.?;
+    try std.testing.expectEqual(@as(f32, 50.0), sampling.percentage);
+    try std.testing.expect(sampling.mode != null);
+    try std.testing.expectEqual(SamplingMode.SAMPLING_MODE_HASH_SEED, sampling.mode.?);
+    try std.testing.expect(sampling.sampling_precision != null);
+    try std.testing.expectEqual(@as(u32, 4), sampling.sampling_precision.?);
+}
+
+test "parsePoliciesBytes: trace policy with span kind matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "sample-internal-spans",
+        \\      "name": "Sample internal spans",
+        \\      "trace": {
+        \\        "match": [
+        \\          { "span_kind": "SPAN_KIND_INTERNAL", "exists": true }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 75.0,
+        \\          "mode": "SAMPLING_MODE_EQUALIZING"
+        \\        }
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const trace_target = policies[0].target.?.trace;
+    const matcher = trace_target.match.items[0];
+    try std.testing.expect(matcher.field.? == .span_kind);
+    try std.testing.expectEqual(SpanKind.SPAN_KIND_INTERNAL, matcher.field.?.span_kind);
+    try std.testing.expect(matcher.match.? == .exists);
+    try std.testing.expectEqual(true, matcher.match.?.exists);
+
+    const sampling = trace_target.keep.?;
+    try std.testing.expectEqual(@as(f32, 75.0), sampling.percentage);
+    try std.testing.expectEqual(SamplingMode.SAMPLING_MODE_EQUALIZING, sampling.mode.?);
+}
+
+test "parsePoliciesBytes: trace policy with span attribute" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "sample-peer-service",
+        \\      "name": "Sample spans with peer.service",
+        \\      "trace": {
+        \\        "match": [
+        \\          { "span_attribute": "peer.service", "exists": true }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 10.0,
+        \\          "hash_seed": 12345
+        \\        }
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const trace_target = policies[0].target.?.trace;
+    const matcher = trace_target.match.items[0];
+    try std.testing.expect(matcher.field.? == .span_attribute);
+    try std.testing.expectEqualStrings("peer.service", matcher.field.?.span_attribute);
+
+    const sampling = trace_target.keep.?;
+    try std.testing.expectEqual(@as(f32, 10.0), sampling.percentage);
+    try std.testing.expect(sampling.hash_seed != null);
+    try std.testing.expectEqual(@as(u32, 12345), sampling.hash_seed.?);
+}
+
+test "parsePoliciesBytes: trace policy with resource attribute and exact match" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "sample-test-service",
+        \\      "name": "Sample test-service spans",
+        \\      "trace": {
+        \\        "match": [
+        \\          { "resource_attribute": "service.name", "exact": "test-service" }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 25.0,
+        \\          "mode": "SAMPLING_MODE_PROPORTIONAL",
+        \\          "sampling_precision": 6
+        \\        }
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const trace_target = policies[0].target.?.trace;
+    const matcher = trace_target.match.items[0];
+    try std.testing.expect(matcher.field.? == .resource_attribute);
+    try std.testing.expectEqualStrings("service.name", matcher.field.?.resource_attribute);
+    try std.testing.expect(matcher.match.? == .exact);
+    try std.testing.expectEqualStrings("test-service", matcher.match.?.exact);
+
+    const sampling = trace_target.keep.?;
+    try std.testing.expectEqual(@as(f32, 25.0), sampling.percentage);
+    try std.testing.expectEqual(SamplingMode.SAMPLING_MODE_PROPORTIONAL, sampling.mode.?);
+    try std.testing.expectEqual(@as(u32, 6), sampling.sampling_precision.?);
+}
+
+test "parsePoliciesBytes: trace policy with span status matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "keep-error-spans",
+        \\      "name": "Keep all error spans",
+        \\      "trace": {
+        \\        "match": [
+        \\          { "span_status": "SPAN_STATUS_CODE_ERROR", "exists": true }
+        \\        ],
+        \\        "keep": {
+        \\          "percentage": 100.0
+        \\        }
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const trace_target = policies[0].target.?.trace;
+    const matcher = trace_target.match.items[0];
+    try std.testing.expect(matcher.field.? == .span_status);
+    try std.testing.expectEqual(SpanStatusCode.SPAN_STATUS_CODE_ERROR, matcher.field.?.span_status);
+
+    const sampling = trace_target.keep.?;
+    try std.testing.expectEqual(@as(f32, 100.0), sampling.percentage);
 }

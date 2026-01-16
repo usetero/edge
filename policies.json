@@ -74,6 +74,75 @@
         "match": [{ "metric_field": "name", "regex": "^.*otelgen.*$" }],
         "keep": false
       }
+    },
+    {
+      "id": "sample-ping-spans-by-name",
+      "name": "Sample ping spans at 50% by span name",
+      "trace": {
+        "match": [{ "trace_field": "TRACE_FIELD_NAME", "regex": "^ping$" }],
+        "keep": {
+          "percentage": 50.0,
+          "mode": "SAMPLING_MODE_HASH_SEED",
+          "sampling_precision": 4
+        }
+      }
+    },
+    {
+      "id": "sample-pong-spans-by-resource",
+      "name": "Sample pong spans from test-service at 25%",
+      "trace": {
+        "match": [
+          { "trace_field": "TRACE_FIELD_NAME", "regex": "^pong$" },
+          { "resource_attribute": "service.name", "regex": "^test-service$" }
+        ],
+        "keep": {
+          "percentage": 25.0,
+          "mode": "SAMPLING_MODE_PROPORTIONAL",
+          "sampling_precision": 6
+        }
+      }
+    },
+    {
+      "id": "sample-internal-spans-by-kind",
+      "name": "Sample internal spans at 75%",
+      "trace": {
+        "match": [{ "span_kind": "SPAN_KIND_INTERNAL", "exists": true }],
+        "keep": {
+          "percentage": 75.0,
+          "mode": "SAMPLING_MODE_EQUALIZING"
+        }
+      }
+    },
+    {
+      "id": "sample-spans-with-peer-service",
+      "name": "Sample spans with peer.service attribute at 10%",
+      "trace": {
+        "match": [{ "span_attribute": "peer.service", "exists": true }],
+        "keep": {
+          "percentage": 10.0,
+          "hash_seed": 12345
+        }
+      }
+    },
+    {
+      "id": "drop-basic-spans",
+      "name": "Drop all basic spans (0% sampling)",
+      "trace": {
+        "match": [{ "trace_field": "TRACE_FIELD_NAME", "exact": "basic" }],
+        "keep": {
+          "percentage": 0.0
+        }
+      }
+    },
+    {
+      "id": "keep-error-spans",
+      "name": "Keep all error spans (100% sampling)",
+      "trace": {
+        "match": [{ "span_status": "SPAN_STATUS_CODE_ERROR", "exists": true }],
+        "keep": {
+          "percentage": 100.0
+        }
+      }
     }
   ]
 }

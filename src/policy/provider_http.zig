@@ -31,6 +31,7 @@ pub const Header = struct {
 const PolicyErrorRecordFailed = struct { policy_id: []const u8 };
 const HttpInitialFetchFailed = struct { err: []const u8 };
 const HttpFetchFailed = struct { url: []const u8, err: []const u8 };
+const HttpJsonDecodeFailed = struct { err: []const u8, body_preview: []const u8 };
 const HttpPoliciesUnchanged = struct { reason: []const u8 };
 const HttpPolicyHashUpdated = struct { hash: []const u8 };
 const HttpPoliciesLoaded = struct { count: usize, url: []const u8, sync_timestamp: u64 };
@@ -545,7 +546,15 @@ pub const HttpProvider = struct {
         errdefer self.allocator.free(response_body);
 
         // Decode SyncResponse from JSON
-        const parsed = try SyncResponse.jsonDecode(response_body, .{}, self.allocator);
+        const parsed = SyncResponse.jsonDecode(response_body, .{}, self.allocator) catch |err| {
+            // Log the error with a preview of the response body for debugging
+            const preview_len = @min(response_body.len, 200);
+            self.bus.err(HttpJsonDecodeFailed{
+                .err = @errorName(err),
+                .body_preview = response_body[0..preview_len],
+            });
+            return err;
+        };
 
         return .{
             .parsed = parsed,
