@@ -315,8 +315,18 @@ pub const PolicyEngine = struct {
         var scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
 
         // Phase 2: Find matching policies and determine decision
-        // Use context pointer as hash input for deterministic sampling
-        const hash_input = @intFromPtr(ctx);
+        // For traces, use trace_id for deterministic sampling so all spans in a trace
+        // get the same sampling decision. For other telemetry types, use context pointer.
+        const hash_input = if (T == .trace) blk: {
+            // Try to get trace_id field for deterministic trace sampling
+            const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
+            if (field_accessor(ctx, trace_id_ref)) |trace_id_hex| {
+                // Hash the trace_id hex string for sampling
+                break :blk hashTraceId(trace_id_hex);
+            }
+            // Fallback to context pointer if no trace_id
+            break :blk @intFromPtr(ctx);
+        } else @intFromPtr(ctx);
         const match_state = self.findMatchingPolicies(T, index, &scan_state, policy_id_buf, hash_input);
 
         self.bus.debug(EvaluateResult{ .decision = match_state.decision, .matched_count = match_state.matched_count });
@@ -579,6 +589,34 @@ pub const PolicyEngine = struct {
         };
     }
 };
+
+/// Hash a trace ID hex string to u64 for deterministic sampling.
+/// This ensures all spans with the same trace_id get the same sampling decision.
+///
+/// Following OTel probability sampling spec, we use the rightmost 56 bits
+/// of the trace ID for randomness. For a 32-char hex string (16 bytes),
+/// we use the last 14 hex chars (56 bits).
+fn hashTraceId(trace_id_hex: []const u8) u64 {
+    if (trace_id_hex.len == 0) return 0;
+
+    var hash: u64 = 0;
+
+    // Use the last 14 hex characters (56 bits) if available
+    // This follows OTel spec which uses rightmost bits for randomness
+    const start = if (trace_id_hex.len > 14) trace_id_hex.len - 14 else 0;
+
+    for (trace_id_hex[start..]) |c| {
+        const nibble: u64 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => 0,
+        };
+        hash = (hash << 4) | nibble;
+    }
+
+    return hash;
+}
 
 // =============================================================================
 // Tests

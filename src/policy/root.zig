@@ -101,6 +101,9 @@ pub const MAX_POLICIES = matcher_index.MAX_POLICIES;
 pub const sampler = @import("./sampler.zig");
 pub const Sampler = sampler.Sampler;
 
+pub const trace_sampler = @import("./trace_sampler.zig");
+pub const TraceSampler = trace_sampler.TraceSampler;
+
 pub const rate_limiter = @import("./rate_limiter.zig");
 pub const RateLimiter = rate_limiter.RateLimiter;
 

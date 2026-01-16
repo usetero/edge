@@ -45,6 +45,8 @@ const PolicySpanKind = proto.policy.SpanKind;
 const SpanStatusCode = proto.policy.SpanStatusCode;
 const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
 const PolicyRegistry = policy.Registry;
+const PolicySnapshot = policy.Snapshot;
+const trace_sampler = policy.trace_sampler;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
@@ -308,12 +310,17 @@ const FilterCounts = struct {
 
 /// Filter spans in-place within the TracesData structure
 /// This is the shared filtering logic used by both JSON and protobuf processing
+///
+/// When sampling is applied (percentage < 100), updates the span's tracestate
+/// with the sampling threshold following OTel probability sampling spec.
 fn filterSpansInPlace(
+    allocator: std.mem.Allocator,
     traces_data: *TracesData,
     registry: *const PolicyRegistry,
     bus: *EventBus,
 ) FilterCounts {
     const engine = PolicyEngine.init(bus, @constCast(registry));
+    const snapshot = registry.getSnapshot();
 
     var original_count: usize = 0;
     var dropped_count: usize = 0;
@@ -344,6 +351,13 @@ fn filterSpansInPlace(
                     if (write_idx != scope_spans.spans.items.len - 1) {
                         scope_spans.spans.items[write_idx] = span.*;
                     }
+
+                    // Update tracestate if sampling was applied
+                    // Look up the matched policy to get sampling config
+                    if (result.matched_policy_ids.len > 0 and snapshot != null) {
+                        updateSpanTracestate(allocator, span, result.matched_policy_ids, snapshot.?);
+                    }
+
                     write_idx += 1;
                 } else {
                     dropped_count += 1;
@@ -361,6 +375,63 @@ fn filterSpansInPlace(
     };
 }
 
+/// Thread-local buffer for tracestate updates (avoids allocation)
+const TracestateBuffer = struct {
+    threadlocal var buf: [trace_sampler.MAX_TRACESTATE_LEN]u8 = undefined;
+};
+
+/// Update span's tracestate with sampling threshold from matched policies.
+/// Per OTel spec, we record the sampling threshold so downstream samplers can respect it.
+///
+/// Note: This uses a thread-local buffer to avoid allocation. The result is copied
+/// into the arena allocator that owns the span data.
+fn updateSpanTracestate(
+    arena_alloc: std.mem.Allocator,
+    span: *Span,
+    matched_policy_ids: []const []const u8,
+    snapshot: *const PolicySnapshot,
+) void {
+    // Find the first matched trace policy with sampling config
+    for (snapshot.policies) |*pol| {
+        // Check if this policy matches any of our matched IDs
+        for (matched_policy_ids) |matched_id| {
+            if (std.mem.eql(u8, pol.id, matched_id)) {
+                // Found a matching policy - check if it's a trace policy with sampling
+                if (pol.target) |target| {
+                    switch (target) {
+                        .trace => |trace_target| {
+                            if (trace_target.keep) |sampling_config| {
+                                // Only update tracestate if percentage < 100 (actual sampling)
+                                if (sampling_config.percentage < 100.0) {
+                                    const precision = sampling_config.sampling_precision orelse 4;
+                                    const threshold_hex = trace_sampler.thresholdHexFromPercentage(
+                                        sampling_config.percentage,
+                                        precision,
+                                    );
+
+                                    // Update tracestate using thread-local buffer (no allocation)
+                                    if (trace_sampler.updateTracestateInPlace(
+                                        &TracestateBuffer.buf,
+                                        span.trace_state,
+                                        threshold_hex,
+                                    )) |new_tracestate| {
+                                        // Copy the result into the arena so it persists
+                                        // with the span data through serialization
+                                        const owned = arena_alloc.dupe(u8, new_tracestate) catch return;
+                                        span.trace_state = owned;
+                                    }
+                                }
+                            }
+                            return; // Done after finding first trace policy
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn processJsonTraces(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
@@ -374,8 +445,8 @@ fn processJsonTraces(
     }, allocator);
     defer parsed.deinit();
 
-    // Filter spans in-place
-    const counts = filterSpansInPlace(&parsed.value, registry, bus);
+    // Filter spans in-place (allocator used for tracestate updates)
+    const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus);
 
     // Re-serialize to JSON
     const output = try parsed.value.jsonEncode(.{}, allocator);
@@ -414,8 +485,8 @@ fn processProtobufTraces(
     // Decode protobuf into TracesData struct using arena
     var traces_data = try TracesData.decode(&reader, arena_alloc);
 
-    // Filter spans in-place
-    const counts = filterSpansInPlace(&traces_data, registry, bus);
+    // Filter spans in-place (arena_alloc used for tracestate updates)
+    const counts = filterSpansInPlace(arena_alloc, &traces_data, registry, bus);
 
     // Re-serialize to protobuf - use main allocator for output since we return it
     var output_writer = std.Io.Writer.Allocating.init(allocator);
