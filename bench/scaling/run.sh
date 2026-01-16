@@ -522,6 +522,7 @@ main() {
             local edge_scenarios=(
                 "edge-otlp|OTLP Logs|$OTLP_PORT|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "edge-otlp|OTLP Metrics|$OTLP_PORT|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
+                "edge-otlp|OTLP Traces|$OTLP_PORT|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
                 "edge-datadog|DD Logs|$DATADOG_PORT|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
                 "edge-datadog|DD Metrics|$DATADOG_PORT|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
@@ -578,8 +579,8 @@ main() {
 
         # ========== otelcol Benchmarks ==========
         if [[ "$RUN_OTELCOL" == "true" ]]; then
-            # otelcol scenarios: OTLP Logs, DD Logs (uses filter processor for policies)
-            # Note: otelcol filter processor only supports drop semantics, not sampling/rate limiting
+            # otelcol scenarios: OTLP Logs, Metrics, Traces, DD Logs
+            # Uses filter processor for logs/metrics and probabilistic_sampler for traces
             local otelcol_config="$CONFIGS_DIR/generated/otelcol-${count}.yaml"
 
             # otelcol scenarios:
@@ -588,7 +589,10 @@ main() {
             # Format: binary|name|port|endpoint|payload|content_type
             local otelcol_scenarios=(
                 "otelcol|OTLP Logs|4318|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
+                "otelcol|OTLP Metrics|4318|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
+                "otelcol|OTLP Traces|4318|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
                 "otelcol|DD Logs|4319|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                # DD Metrics disabled - otelcol datadog receiver has issues with /api/v1/series format
             )
 
             for scenario in "${otelcol_scenarios[@]}"; do
@@ -650,10 +654,14 @@ main() {
             # Vector scenarios:
             # - OTLP HTTP on port 4320 (native opentelemetry source, protobuf)
             # - Datadog HTTP on port 4321 (http_server source, JSON)
+            # Uses filter transform for logs/metrics and sample transform for traces
             # Format: binary|name|port|endpoint|payload|content_type
             local vector_scenarios=(
                 "vector|OTLP Logs|4320|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
+                "vector|OTLP Metrics|4320|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
+                "vector|OTLP Traces|4320|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
                 "vector|DD Logs|4321|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "vector|DD Metrics|4322|/api/v1/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
 
             for scenario in "${vector_scenarios[@]}"; do

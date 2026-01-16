@@ -7,18 +7,20 @@ used in the scaling benchmarks, enabling proper testing with Vector's
 native opentelemetry source.
 """
 
-import sys
 import os
+import sys
 
 # Add the generated proto directory to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'proto_gen'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "proto_gen"))
 
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2
-from opentelemetry.proto.logs.v1 import logs_pb2
-from opentelemetry.proto.common.v1 import common_pb2
-from opentelemetry.proto.resource.v1 import resource_pb2
 from opentelemetry.proto.collector.metrics.v1 import metrics_service_pb2
+from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
+from opentelemetry.proto.common.v1 import common_pb2
+from opentelemetry.proto.logs.v1 import logs_pb2
 from opentelemetry.proto.metrics.v1 import metrics_pb2
+from opentelemetry.proto.resource.v1 import resource_pb2
+from opentelemetry.proto.trace.v1 import trace_pb2
 
 
 def create_logs_payload():
@@ -31,16 +33,14 @@ def create_logs_payload():
 
     # Set resource attributes
     resource_logs.resource.attributes.add(
-        key="service.name",
-        value=common_pb2.AnyValue(string_value="bench-service")
+        key="service.name", value=common_pb2.AnyValue(string_value="bench-service")
     )
     resource_logs.resource.attributes.add(
-        key="service.version",
-        value=common_pb2.AnyValue(string_value="1.0.0")
+        key="service.version", value=common_pb2.AnyValue(string_value="1.0.0")
     )
     resource_logs.resource.attributes.add(
         key="deployment.environment",
-        value=common_pb2.AnyValue(string_value="production")
+        value=common_pb2.AnyValue(string_value="production"),
     )
 
     # Create scope logs
@@ -208,16 +208,14 @@ def create_metrics_payload():
 
     # Set resource attributes
     resource_metrics.resource.attributes.add(
-        key="service.name",
-        value=common_pb2.AnyValue(string_value="bench-service")
+        key="service.name", value=common_pb2.AnyValue(string_value="bench-service")
     )
     resource_metrics.resource.attributes.add(
-        key="service.version",
-        value=common_pb2.AnyValue(string_value="1.0.0")
+        key="service.version", value=common_pb2.AnyValue(string_value="1.0.0")
     )
     resource_metrics.resource.attributes.add(
         key="deployment.environment",
-        value=common_pb2.AnyValue(string_value="production")
+        value=common_pb2.AnyValue(string_value="production"),
     )
 
     # Create scope metrics
@@ -235,11 +233,20 @@ def create_metrics_payload():
                 "is_monotonic": True,
                 "aggregation_temporality": 2,  # CUMULATIVE
                 "data_points": [
-                    {"value": 12345, "attributes": [("method", "GET"), ("status", "200")]},
-                    {"value": 5432, "attributes": [("method", "POST"), ("status", "201")]},
-                    {"value": 123, "attributes": [("method", "GET"), ("status", "404")]},
-                ]
-            }
+                    {
+                        "value": 12345,
+                        "attributes": [("method", "GET"), ("status", "200")],
+                    },
+                    {
+                        "value": 5432,
+                        "attributes": [("method", "POST"), ("status", "201")],
+                    },
+                    {
+                        "value": 123,
+                        "attributes": [("method", "GET"), ("status", "404")],
+                    },
+                ],
+            },
         },
         {
             "name": "http_request_duration_seconds",
@@ -255,8 +262,8 @@ def create_metrics_payload():
                         "explicit_bounds": [0.01, 0.05, 0.1, 0.5, 1.0],
                         "attributes": [("endpoint", "/api/users")],
                     }
-                ]
-            }
+                ],
+            },
         },
         {
             "name": "system_memory_usage_bytes",
@@ -267,7 +274,7 @@ def create_metrics_payload():
                     {"value": 1073741824, "attributes": [("host", "web-01")]},
                     {"value": 2147483648, "attributes": [("host", "web-02")]},
                 ]
-            }
+            },
         },
         {
             "name": "cache_hit_ratio",
@@ -278,7 +285,7 @@ def create_metrics_payload():
                     {"value": 0.85, "attributes": [("cache", "redis")]},
                     {"value": 0.92, "attributes": [("cache", "memcached")]},
                 ]
-            }
+            },
         },
         {
             "name": "payment_amount_dollars",
@@ -290,8 +297,8 @@ def create_metrics_payload():
                 "data_points": [
                     {"value": 99999.99, "attributes": [("currency", "USD")]},
                     {"value": 45678.50, "attributes": [("currency", "EUR")]},
-                ]
-            }
+                ],
+            },
         },
     ]
 
@@ -340,7 +347,9 @@ def create_metrics_payload():
 
         elif "histogram" in metric_def:
             hist_data = metric_def["histogram"]
-            metric.histogram.aggregation_temporality = hist_data["aggregation_temporality"]
+            metric.histogram.aggregation_temporality = hist_data[
+                "aggregation_temporality"
+            ]
 
             for dp_def in hist_data["data_points"]:
                 dp = metric.histogram.data_points.add()
@@ -355,6 +364,204 @@ def create_metrics_payload():
                     attr = dp.attributes.add()
                     attr.key = attr_key
                     attr.value.string_value = str(attr_val)
+
+    return request.SerializeToString()
+
+
+def create_traces_payload():
+    """Create an OTLP traces payload for benchmarking"""
+
+    request = trace_service_pb2.ExportTraceServiceRequest()
+
+    # Create resource spans
+    resource_spans = request.resource_spans.add()
+
+    # Set resource attributes
+    resource_spans.resource.attributes.add(
+        key="service.name", value=common_pb2.AnyValue(string_value="bench-service")
+    )
+    resource_spans.resource.attributes.add(
+        key="service.version", value=common_pb2.AnyValue(string_value="1.0.0")
+    )
+    resource_spans.resource.attributes.add(
+        key="deployment.environment",
+        value=common_pb2.AnyValue(string_value="production"),
+    )
+
+    # Create scope spans
+    scope_spans = resource_spans.scope_spans.add()
+    scope_spans.scope.name = "bench-tracer"
+    scope_spans.scope.version = "1.0.0"
+
+    # Base trace ID (16 bytes)
+    base_trace_id = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
+
+    # Span definitions - varied span names and kinds for policy matching
+    span_entries = [
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("0102030405060708"),
+            "parent_span_id": b"",
+            "name": "HTTP GET /api/users",
+            "kind": trace_pb2.Span.SPAN_KIND_SERVER,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("http.method", "GET"),
+                ("http.url", "/api/users"),
+                ("http.status_code", 200),
+                ("peer.service", "api-gateway"),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("0102030405060709"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "database query",
+            "kind": trace_pb2.Span.SPAN_KIND_CLIENT,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("db.system", "postgresql"),
+                ("db.statement", "SELECT * FROM users WHERE id = $1"),
+                ("db.name", "users_db"),
+                ("peer.service", "postgres"),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("010203040506070a"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "cache lookup",
+            "kind": trace_pb2.Span.SPAN_KIND_INTERNAL,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("cache.type", "redis"),
+                ("cache.hit", True),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("010203040506070b"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "HTTP POST /api/orders",
+            "kind": trace_pb2.Span.SPAN_KIND_SERVER,
+            "status_code": trace_pb2.Status.STATUS_CODE_ERROR,
+            "status_message": "Order validation failed",
+            "attributes": [
+                ("http.method", "POST"),
+                ("http.url", "/api/orders"),
+                ("http.status_code", 400),
+                ("error", True),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("010203040506070c"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "message publish",
+            "kind": trace_pb2.Span.SPAN_KIND_PRODUCER,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("messaging.system", "kafka"),
+                ("messaging.destination", "orders-topic"),
+                ("messaging.operation", "publish"),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("010203040506070d"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "message consume",
+            "kind": trace_pb2.Span.SPAN_KIND_CONSUMER,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("messaging.system", "kafka"),
+                ("messaging.destination", "orders-topic"),
+                ("messaging.operation", "receive"),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("010203040506070e"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "authentication check",
+            "kind": trace_pb2.Span.SPAN_KIND_INTERNAL,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("auth.method", "jwt"),
+                ("auth.success", True),
+                ("user.id", "12345"),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("010203040506070f"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "external API call",
+            "kind": trace_pb2.Span.SPAN_KIND_CLIENT,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("http.method", "GET"),
+                ("http.url", "https://external-api.example.com/data"),
+                ("http.status_code", 200),
+                ("peer.service", "external-api"),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("0102030405060710"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "data processing",
+            "kind": trace_pb2.Span.SPAN_KIND_INTERNAL,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("processing.type", "transform"),
+                ("processing.items", 100),
+            ],
+        },
+        {
+            "trace_id": base_trace_id,
+            "span_id": bytes.fromhex("0102030405060711"),
+            "parent_span_id": bytes.fromhex("0102030405060708"),
+            "name": "response serialization",
+            "kind": trace_pb2.Span.SPAN_KIND_INTERNAL,
+            "status_code": trace_pb2.Status.STATUS_CODE_OK,
+            "attributes": [
+                ("serialization.format", "json"),
+                ("serialization.bytes", 2048),
+            ],
+        },
+    ]
+
+    base_time = 1700000000000000000
+
+    for i, entry in enumerate(span_entries):
+        span = scope_spans.spans.add()
+        span.trace_id = entry["trace_id"]
+        span.span_id = entry["span_id"]
+        if entry["parent_span_id"]:
+            span.parent_span_id = entry["parent_span_id"]
+        span.name = entry["name"]
+        span.kind = entry["kind"]
+        span.start_time_unix_nano = base_time + (i * 1000000)  # 1ms apart
+        span.end_time_unix_nano = base_time + (i * 1000000) + 500000  # 0.5ms duration
+
+        # Status
+        span.status.code = entry["status_code"]
+        if "status_message" in entry:
+            span.status.message = entry["status_message"]
+
+        # Attributes
+        for attr_key, attr_val in entry["attributes"]:
+            attr = span.attributes.add()
+            attr.key = attr_key
+            if isinstance(attr_val, str):
+                attr.value.string_value = attr_val
+            elif isinstance(attr_val, bool):
+                attr.value.bool_value = attr_val
+            elif isinstance(attr_val, int):
+                attr.value.int_value = attr_val
+            elif isinstance(attr_val, float):
+                attr.value.double_value = attr_val
 
     return request.SerializeToString()
 
@@ -376,6 +583,13 @@ def main():
     with open(metrics_path, "wb") as f:
         f.write(metrics_pb)
     print(f"Generated {metrics_path} ({len(metrics_pb)} bytes)")
+
+    # Generate traces payload
+    traces_pb = create_traces_payload()
+    traces_path = os.path.join(payloads_dir, "otlp-traces.pb")
+    with open(traces_path, "wb") as f:
+        f.write(traces_pb)
+    print(f"Generated {traces_path} ({len(traces_pb)} bytes)")
 
 
 if __name__ == "__main__":
