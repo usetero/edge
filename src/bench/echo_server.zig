@@ -6,6 +6,12 @@ const EndpointStats = struct {
     bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
+const CapturedPayload = struct {
+    path: []const u8,
+    content_type: []const u8,
+    data: []const u8,
+};
+
 const ServerContext = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
@@ -13,10 +19,18 @@ const ServerContext = struct {
     total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    pub fn init(allocator: std.mem.Allocator) ServerContext {
+    // Capture mode state
+    capture_mutex: std.Thread.Mutex = .{},
+    capture_enabled: bool = false,
+    capture_name: ?[]const u8 = null,
+    captured_payloads: std.ArrayListUnmanaged(CapturedPayload) = .empty,
+    output_dir: []const u8 = ".",
+
+    pub fn init(allocator: std.mem.Allocator, output_dir: []const u8) ServerContext {
         return .{
             .allocator = allocator,
             .endpoint_stats = std.StringHashMap(EndpointStats).init(allocator),
+            .output_dir = output_dir,
         };
     }
 
@@ -26,6 +40,94 @@ const ServerContext = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.endpoint_stats.deinit();
+        self.clearCaptures();
+        if (self.capture_name) |name| {
+            self.allocator.free(name);
+        }
+    }
+
+    fn clearCaptures(self: *ServerContext) void {
+        for (self.captured_payloads.items) |payload| {
+            self.allocator.free(payload.path);
+            self.allocator.free(payload.content_type);
+            self.allocator.free(payload.data);
+        }
+        self.captured_payloads.clearRetainingCapacity();
+    }
+
+    pub fn startCapture(self: *ServerContext, name: []const u8) !void {
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+
+        self.clearCaptures();
+        if (self.capture_name) |old_name| {
+            self.allocator.free(old_name);
+        }
+        self.capture_name = try self.allocator.dupe(u8, name);
+        self.capture_enabled = true;
+    }
+
+    pub fn stopCapture(self: *ServerContext) !usize {
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+
+        self.capture_enabled = false;
+        const count = self.captured_payloads.items.len;
+
+        // Save captures to file if we have a name
+        if (self.capture_name) |name| {
+            try self.saveCaptures(name);
+        }
+
+        return count;
+    }
+
+    fn saveCaptures(self: *ServerContext, name: []const u8) !void {
+        // Create output file path
+        var path_buf: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.jsonl", .{ self.output_dir, name });
+
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+
+        var buf: [4096]u8 = undefined;
+        var file_writer = file.writer(&buf);
+        const writer = &file_writer.interface;
+
+        for (self.captured_payloads.items) |payload| {
+            // Write as JSON lines: {"path": "...", "content_type": "...", "data_base64": "..."}
+            try writer.writeAll("{\"path\":\"");
+            try writer.writeAll(payload.path);
+            try writer.writeAll("\",\"content_type\":\"");
+            try writer.writeAll(payload.content_type);
+            try writer.writeAll("\",\"data_base64\":\"");
+
+            // Base64 encode the data
+            const encoder = std.base64.standard.Encoder;
+            const encoded_len = encoder.calcSize(payload.data.len);
+            const encoded = try self.allocator.alloc(u8, encoded_len);
+            defer self.allocator.free(encoded);
+            _ = encoder.encode(encoded, payload.data);
+            try writer.writeAll(encoded);
+
+            try writer.writeAll("\"}\n");
+        }
+
+        try writer.flush();
+    }
+
+    pub fn capturePayload(self: *ServerContext, path: []const u8, content_type: []const u8, data: []const u8) void {
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+
+        if (!self.capture_enabled) return;
+
+        const payload = CapturedPayload{
+            .path = self.allocator.dupe(u8, path) catch return,
+            .content_type = self.allocator.dupe(u8, content_type) catch return,
+            .data = self.allocator.dupe(u8, data) catch return,
+        };
+        self.captured_payloads.append(self.allocator, payload) catch return;
     }
 
     pub fn recordRequest(self: *ServerContext, path: []const u8, body_len: usize) void {
@@ -64,6 +166,12 @@ const ServerContext = struct {
             entry.value_ptr.requests.store(0, .monotonic);
             entry.value_ptr.bytes.store(0, .monotonic);
         }
+
+        // Also clear captures
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+        self.clearCaptures();
+        self.capture_enabled = false;
     }
 
     pub fn writeStats(self: *ServerContext, writer: anytype) !void {
@@ -85,9 +193,14 @@ const ServerContext = struct {
             });
         }
 
-        try writer.print("}},\"total_requests\":{d},\"total_bytes\":{d}}}", .{
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+
+        try writer.print("}},\"total_requests\":{d},\"total_bytes\":{d},\"capture_enabled\":{},\"captured_count\":{d}}}", .{
             self.total_requests.load(.monotonic),
             self.total_bytes.load(.monotonic),
+            self.capture_enabled,
+            self.captured_payloads.items.len,
         });
     }
 };
@@ -125,9 +238,57 @@ fn handleRequest(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response)
         return;
     }
 
+    // Handle capture start endpoint: /capture/start?name=<name>
+    if (std.mem.eql(u8, path, "/capture/start")) {
+        const query = req.url.query;
+        // Parse name from query string (format: name=value or just value)
+        const capture_name = if (query.len == 0)
+            "capture"
+        else if (std.mem.indexOf(u8, query, "name=")) |idx|
+            query[idx + 5 ..]
+        else
+            query;
+
+        ctx.startCapture(capture_name) catch |err| {
+            res.status = 500;
+            res.body = @errorName(err);
+            return;
+        };
+        res.status = 200;
+        res.content_type = .JSON;
+        res.body = "{\"status\":\"capture_started\"}";
+        return;
+    }
+
+    // Handle capture stop endpoint
+    if (std.mem.eql(u8, path, "/capture/stop")) {
+        const count = ctx.stopCapture() catch |err| {
+            res.status = 500;
+            res.body = @errorName(err);
+            return;
+        };
+        res.status = 200;
+        res.content_type = .JSON;
+
+        var buf: [128]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"status\":\"capture_stopped\",\"count\":{d}}}", .{count}) catch {
+            res.body = "{\"status\":\"capture_stopped\"}";
+            return;
+        };
+        res.body = try ctx.allocator.dupe(u8, json);
+        return;
+    }
+
     // Record stats for all other requests
-    const body_len = if (req.body()) |body| body.len else 0;
+    const body = req.body();
+    const body_len = if (body) |b| b.len else 0;
     ctx.recordRequest(path, body_len);
+
+    // Capture payload if capture mode is enabled
+    if (body) |b| {
+        const content_type = req.header("content-type") orelse "application/octet-stream";
+        ctx.capturePayload(path, content_type, b);
+    }
 
     res.status = 202;
     res.body = "{}";
@@ -145,7 +306,12 @@ pub fn main() !void {
     else
         9999;
 
-    var ctx = ServerContext.init(allocator);
+    const output_dir: []const u8 = if (args.len > 2)
+        args[2]
+    else
+        ".";
+
+    var ctx = ServerContext.init(allocator, output_dir);
     defer ctx.deinit();
     server_context = &ctx;
 
@@ -166,10 +332,20 @@ pub fn main() !void {
     var router = try server.router(.{});
     router.get("/stats", handleRequest, .{});
     router.post("/reset", handleRequest, .{});
+    router.get("/capture/start", handleRequest, .{});
+    router.post("/capture/start", handleRequest, .{});
+    router.get("/capture/stop", handleRequest, .{});
+    router.post("/capture/stop", handleRequest, .{});
     router.post("/*", handleRequest, .{});
 
     std.debug.print("Echo server listening on http://127.0.0.1:{d}\n", .{port});
-    std.debug.print("Endpoints: POST /* (echo), GET /stats, POST /reset\n", .{});
+    std.debug.print("Output directory: {s}\n", .{output_dir});
+    std.debug.print("Endpoints:\n", .{});
+    std.debug.print("  POST /*           - Echo and record request\n", .{});
+    std.debug.print("  GET  /stats       - Get statistics\n", .{});
+    std.debug.print("  POST /reset       - Reset statistics\n", .{});
+    std.debug.print("  GET  /capture/start?name=<name> - Start capturing payloads\n", .{});
+    std.debug.print("  GET  /capture/stop - Stop capturing and save to file\n", .{});
     std.debug.print("Press Ctrl+C to stop\n", .{});
 
     try server.listen();

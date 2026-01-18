@@ -28,7 +28,7 @@ RUN_VECTOR=true
 # For initial testing, only test 0 and 10 policies
 # POLICY_COUNTS=(0 10)
 # Full test:
-POLICY_COUNTS=(0 1 10 100 500 1000 2000 4000)
+POLICY_COUNTS=(0 1 5 10 50 100 500 1000 2000 4000)
 # Quick 1000 test:
 # POLICY_COUNTS=(0 1000)
 
@@ -522,7 +522,7 @@ main() {
             local edge_scenarios=(
                 "edge-otlp|OTLP Logs|$OTLP_PORT|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "edge-otlp|OTLP Metrics|$OTLP_PORT|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
-                "edge-otlp|OTLP Traces|$OTLP_PORT|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
+                # "edge-otlp|OTLP Traces|$OTLP_PORT|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
                 "edge-datadog|DD Logs|$DATADOG_PORT|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
                 "edge-datadog|DD Metrics|$DATADOG_PORT|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
@@ -590,7 +590,7 @@ main() {
             local otelcol_scenarios=(
                 "otelcol|OTLP Logs|4318|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "otelcol|OTLP Metrics|4318|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
-                "otelcol|OTLP Traces|4318|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
+                # "otelcol|OTLP Traces|4318|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
                 "otelcol|DD Logs|4319|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
                 # DD Metrics disabled - otelcol datadog receiver has issues with /api/v1/series format
             )
@@ -659,9 +659,9 @@ main() {
             local vector_scenarios=(
                 "vector|OTLP Logs|4320|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "vector|OTLP Metrics|4320|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
-                "vector|OTLP Traces|4320|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
+                # "vector|OTLP Traces|4320|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
                 "vector|DD Logs|4321|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
-                "vector|DD Metrics|4322|/api/v1/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
+                "vector|DD Metrics|4322|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
 
             for scenario in "${vector_scenarios[@]}"; do
