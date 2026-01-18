@@ -903,11 +903,358 @@ pub const MetricMatcher = struct {
     }
 };
 
+/// TraceField identifies simple span fields (non-keyed).
+pub const TraceField = enum(i32) {
+    TRACE_FIELD_UNSPECIFIED = 0,
+    TRACE_FIELD_NAME = 1,
+    TRACE_FIELD_TRACE_ID = 2,
+    TRACE_FIELD_SPAN_ID = 3,
+    TRACE_FIELD_PARENT_SPAN_ID = 4,
+    TRACE_FIELD_TRACE_STATE = 5,
+    TRACE_FIELD_RESOURCE_SCHEMA_URL = 10,
+    TRACE_FIELD_SCOPE_SCHEMA_URL = 11,
+    TRACE_FIELD_SCOPE_NAME = 12,
+    TRACE_FIELD_SCOPE_VERSION = 13,
+    _,
+};
+
+/// SpanKind identifies the type of span for matching.
+/// Mirrors opentelemetry.proto.trace.v1.Span.SpanKind.
+pub const SpanKind = enum(i32) {
+    SPAN_KIND_UNSPECIFIED = 0,
+    SPAN_KIND_INTERNAL = 1,
+    SPAN_KIND_SERVER = 2,
+    SPAN_KIND_CLIENT = 3,
+    SPAN_KIND_PRODUCER = 4,
+    SPAN_KIND_CONSUMER = 5,
+    _,
+};
+
+/// SpanStatusCode identifies the span status for matching.
+/// Mirrors opentelemetry.proto.trace.v1.Status.StatusCode.
+pub const SpanStatusCode = enum(i32) {
+    SPAN_STATUS_CODE_UNSPECIFIED = 0,
+    SPAN_STATUS_CODE_OK = 1,
+    SPAN_STATUS_CODE_ERROR = 2,
+    _,
+};
+
+/// SamplingMode determines how the sampling decision is made.
+pub const SamplingMode = enum(i32) {
+    SAMPLING_MODE_UNSPECIFIED = 0,
+    SAMPLING_MODE_HASH_SEED = 1,
+    SAMPLING_MODE_PROPORTIONAL = 2,
+    SAMPLING_MODE_EQUALIZING = 3,
+    _,
+};
+
+/// TraceTarget defines matching and sampling actions for traces/spans.
+pub const TraceTarget = struct {
+    match: std.ArrayListUnmanaged(TraceMatcher) = .empty,
+    keep: ?TraceSamplingConfig = null,
+
+    pub const _desc_table = .{
+        .match = fd(1, .{ .repeated = .submessage }),
+        .keep = fd(2, .submessage),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
+/// TraceMatcher provides a way to match against trace/span telemetry data using known fields.
+///
+/// IMPORTANT CONSTRAINTS:
+/// - Multiple matchers are ANDed together: all matchers must match for the
+/// overall match to succeed.
+/// - The list of matchers should uniquely identify a specific pattern of telemetry
+/// for that policy. Matchers should NOT be used as a catch-all; they should be
+/// specific enough to target the intended telemetry precisely.
+///
+/// All regex fields use RE2 syntax for consistency across implementations.
+pub const TraceMatcher = struct {
+    negate: bool = false,
+    field: ?field_union = null,
+    match: ?match_union = null,
+
+    pub const _field_case = enum {
+        trace_field,
+        span_attribute,
+        resource_attribute,
+        scope_attribute,
+        span_kind,
+        span_status,
+        event_name,
+        event_attribute,
+        link_trace_id,
+    };
+    pub const field_union = union(_field_case) {
+        trace_field: TraceField,
+        span_attribute: []const u8,
+        resource_attribute: []const u8,
+        scope_attribute: []const u8,
+        span_kind: SpanKind,
+        span_status: SpanStatusCode,
+        event_name: []const u8,
+        event_attribute: []const u8,
+        link_trace_id: []const u8,
+        pub const _desc_table = .{
+            .trace_field = fd(1, .@"enum"),
+            .span_attribute = fd(2, .{ .scalar = .string }),
+            .resource_attribute = fd(3, .{ .scalar = .string }),
+            .scope_attribute = fd(4, .{ .scalar = .string }),
+            .span_kind = fd(5, .@"enum"),
+            .span_status = fd(6, .@"enum"),
+            .event_name = fd(7, .{ .scalar = .string }),
+            .event_attribute = fd(8, .{ .scalar = .string }),
+            .link_trace_id = fd(9, .{ .scalar = .string }),
+        };
+    };
+
+    pub const _match_case = enum {
+        exact,
+        regex,
+        exists,
+    };
+    pub const match_union = union(_match_case) {
+        exact: []const u8,
+        regex: []const u8,
+        exists: bool,
+        pub const _desc_table = .{
+            .exact = fd(10, .{ .scalar = .string }),
+            .regex = fd(11, .{ .scalar = .string }),
+            .exists = fd(12, .{ .scalar = .bool }),
+        };
+    };
+
+    pub const _desc_table = .{
+        .negate = fd(20, .{ .scalar = .bool }),
+        .field = fd(null, .{ .oneof = field_union }),
+        .match = fd(null, .{ .oneof = match_union }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
+/// TraceSamplingConfig configures probabilistic sampling for traces.
+///
+/// This configuration follows the OpenTelemetry probability sampling specification:
+/// https://opentelemetry.io/docs/specs/otel/trace/tracestate-probability-sampling/
+///
+/// Implementations MUST follow tracestate standards to allow multi-stage sampling:
+/// https://opentelemetry.io/docs/specs/otel/trace/tracestate-handling/#sampling-threshold-value-th
+///
+/// The sampling decision is based on comparing a 56-bit randomness value (R) against
+/// a rejection threshold (T). If R >= T, the span is kept; otherwise it is dropped.
+/// The threshold is derived from the configured percentage:
+/// T = (1 - percentage/100) * 2^56
+pub const TraceSamplingConfig = struct {
+    percentage: f32 = 0,
+    mode: ?SamplingMode = null,
+    sampling_precision: ?u32 = null,
+    hash_seed: ?u32 = null,
+    fail_closed: ?bool = null,
+
+    pub const _desc_table = .{
+        .percentage = fd(1, .{ .scalar = .float }),
+        .mode = fd(2, .@"enum"),
+        .sampling_precision = fd(3, .{ .scalar = .uint32 }),
+        .hash_seed = fd(4, .{ .scalar = .uint32 }),
+        .fail_closed = fd(5, .{ .scalar = .bool }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
 /// PolicyStage identifies the execution stage for a policy.
 pub const PolicyStage = enum(i32) {
     POLICY_STAGE_UNSPECIFIED = 0,
     POLICY_STAGE_LOG_FILTER = 1,
     POLICY_STAGE_LOG_TRANSFORM = 2,
+    POLICY_STAGE_METRIC_FILTER = 3,
+    POLICY_STAGE_TRACE_SAMPLING = 4,
     _,
 };
 
@@ -937,13 +1284,16 @@ pub const Policy = struct {
     pub const _target_case = enum {
         log,
         metric,
+        trace,
     };
     pub const target_union = union(_target_case) {
         log: LogTarget,
         metric: MetricTarget,
+        trace: TraceTarget,
         pub const _desc_table = .{
             .log = fd(10, .submessage),
             .metric = fd(11, .submessage),
+            .trace = fd(12, .submessage),
         };
     };
 

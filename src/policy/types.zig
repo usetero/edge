@@ -14,6 +14,8 @@ pub const TelemetryType = enum {
     log,
     /// Metric telemetry (Prometheus, OTLP metrics, etc.)
     metric,
+    /// Trace telemetry (OTLP traces only - Datadog traces not supported)
+    trace,
 };
 
 // =============================================================================
@@ -248,6 +250,104 @@ pub const MetricMutateOp = union(enum) {
     /// Rename a field (move value from one field to another)
     rename: struct {
         from: MetricFieldRef,
+        to: []const u8,
+        upsert: bool,
+    },
+};
+
+// =============================================================================
+// Trace Field Reference Types
+// =============================================================================
+
+const TraceMatcher = proto.policy.TraceMatcher;
+const TraceField = proto.policy.TraceField;
+const SpanKind = proto.policy.SpanKind;
+const SpanStatusCode = proto.policy.SpanStatusCode;
+
+/// Reference to a trace/span field for accessor/mutator operations.
+/// Supports all field types from TraceMatcher for comprehensive span matching.
+pub const TraceFieldRef = union(enum) {
+    /// Simple trace fields (name, trace_id, span_id, etc.)
+    trace_field: TraceField,
+    /// Span attribute by key
+    span_attribute: []const u8,
+    /// Resource attribute by key
+    resource_attribute: []const u8,
+    /// Scope attribute by key
+    scope_attribute: []const u8,
+    /// Match on span kind (enum value)
+    span_kind: SpanKind,
+    /// Match on span status code (enum value)
+    span_status: SpanStatusCode,
+    /// Event name matcher (matches if span contains an event with this name)
+    event_name: []const u8,
+    /// Event attribute matcher (matches if span contains an event with this attribute)
+    event_attribute: []const u8,
+    /// Link trace ID matcher (matches if span has a link to this trace)
+    link_trace_id: []const u8,
+
+    pub fn fromMatcherField(field: ?TraceMatcher.field_union) ?TraceFieldRef {
+        const f = field orelse return null;
+        return switch (f) {
+            .trace_field => |v| .{ .trace_field = v },
+            .span_attribute => |v| .{ .span_attribute = v },
+            .resource_attribute => |v| .{ .resource_attribute = v },
+            .scope_attribute => |v| .{ .scope_attribute = v },
+            .span_kind => |v| .{ .span_kind = v },
+            .span_status => |v| .{ .span_status = v },
+            .event_name => |v| .{ .event_name = v },
+            .event_attribute => |v| .{ .event_attribute = v },
+            .link_trace_id => |v| .{ .link_trace_id = v },
+        };
+    }
+
+    /// Check if this field ref requires a key (attribute-based fields)
+    pub fn isKeyed(self: TraceFieldRef) bool {
+        return switch (self) {
+            .span_attribute, .resource_attribute, .scope_attribute, .event_name, .event_attribute, .link_trace_id => true,
+            .trace_field, .span_kind, .span_status => false,
+        };
+    }
+
+    /// Get the key for attribute-based fields, empty string for simple fields
+    pub fn getKey(self: TraceFieldRef) []const u8 {
+        return switch (self) {
+            .span_attribute => |k| k,
+            .resource_attribute => |k| k,
+            .scope_attribute => |k| k,
+            .event_name => |k| k,
+            .event_attribute => |k| k,
+            .link_trace_id => |k| k,
+            .trace_field, .span_kind, .span_status => "",
+        };
+    }
+};
+
+// =============================================================================
+// Trace Field Accessor/Mutator Types
+// =============================================================================
+
+/// Trace field accessor function type - returns the value for a given trace/span field
+/// Returns null if the field doesn't exist
+pub const TraceFieldAccessor = *const fn (ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8;
+
+/// Trace field mutator function type - sets, removes, or renames a trace/span field
+/// Returns true if the operation succeeded
+pub const TraceFieldMutator = *const fn (ctx: *anyopaque, op: TraceMutateOp) bool;
+
+/// Mutation operation for trace field mutator
+pub const TraceMutateOp = union(enum) {
+    /// Remove a field entirely
+    remove: TraceFieldRef,
+    /// Set a field to a value (upsert controls insert vs update behavior)
+    set: struct {
+        field: TraceFieldRef,
+        value: []const u8,
+        upsert: bool,
+    },
+    /// Rename a field (move value from one field to another)
+    rename: struct {
+        from: TraceFieldRef,
         to: []const u8,
         upsert: bool,
     },

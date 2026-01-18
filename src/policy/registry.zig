@@ -12,6 +12,7 @@ const SourceType = policy_source.SourceType;
 const PolicyMetadata = policy_source.PolicyMetadata;
 const LogMatcherIndex = matcher_index.LogMatcherIndex;
 const MetricMatcherIndex = matcher_index.MetricMatcherIndex;
+const TraceMatcherIndex = matcher_index.TraceMatcherIndex;
 
 // =============================================================================
 // Lock-free Policy Stats
@@ -71,6 +72,8 @@ pub const PolicyConfigType = enum {
     log_target,
     /// Policy has a MetricTarget (target.metric)
     metric_target,
+    /// Policy has a TraceTarget (target.trace)
+    trace_target,
     /// Policy has no config set
     none,
 
@@ -80,6 +83,7 @@ pub const PolicyConfigType = enum {
         return switch (target) {
             .log => .log_target,
             .metric => .metric_target,
+            .trace => .trace_target,
         };
     }
 };
@@ -96,11 +100,17 @@ pub const PolicySnapshot = struct {
     /// Indices into policies array for metric target policies
     metric_target_indices: []const u32,
 
+    /// Indices into policies array for trace target policies
+    trace_target_indices: []const u32,
+
     /// Compiled Hyperscan-based matcher index for efficient log evaluation
     log_index: LogMatcherIndex,
 
     /// Compiled Hyperscan-based matcher index for efficient metric evaluation
     metric_index: MetricMatcherIndex,
+
+    /// Compiled Hyperscan-based matcher index for efficient trace evaluation (OTLP only)
+    trace_index: TraceMatcherIndex,
 
     /// Lock-free atomic stats per policy (indexed by policy position)
     /// Mutable even though snapshot is "immutable" - stats are append-only
@@ -112,9 +122,11 @@ pub const PolicySnapshot = struct {
     pub fn deinit(self: *PolicySnapshot) void {
         self.log_index.deinit();
         self.metric_index.deinit();
+        self.trace_index.deinit();
         self.allocator.free(self.policies);
         self.allocator.free(self.log_target_indices);
         self.allocator.free(self.metric_target_indices);
+        self.allocator.free(self.trace_target_indices);
         self.allocator.free(self.policy_stats);
     }
 
@@ -478,11 +490,13 @@ pub const PolicyRegistry = struct {
         // First pass: count policies of each type
         var log_target_count: usize = 0;
         var metric_target_count: usize = 0;
+        var trace_target_count: usize = 0;
         for (policies_slice) |*policy| {
             const config_type = PolicyConfigType.fromPolicy(policy);
             switch (config_type) {
                 .log_target => log_target_count += 1,
                 .metric_target => metric_target_count += 1,
+                .trace_target => trace_target_count += 1,
                 .none => {},
             }
         }
@@ -494,9 +508,13 @@ pub const PolicyRegistry = struct {
         const metric_target_indices = try self.allocator.alloc(u32, metric_target_count);
         errdefer self.allocator.free(metric_target_indices);
 
+        const trace_target_indices = try self.allocator.alloc(u32, trace_target_count);
+        errdefer self.allocator.free(trace_target_indices);
+
         // Second pass: populate indices
         var log_target_idx: usize = 0;
         var metric_target_idx: usize = 0;
+        var trace_target_idx: usize = 0;
         for (policies_slice, 0..) |*policy, i| {
             const config_type = PolicyConfigType.fromPolicy(policy);
             switch (config_type) {
@@ -508,6 +526,10 @@ pub const PolicyRegistry = struct {
                     metric_target_indices[metric_target_idx] = @intCast(i);
                     metric_target_idx += 1;
                 },
+                .trace_target => {
+                    trace_target_indices[trace_target_idx] = @intCast(i);
+                    trace_target_idx += 1;
+                },
                 .none => {},
             }
         }
@@ -518,6 +540,9 @@ pub const PolicyRegistry = struct {
 
         var metric_idx = try MetricMatcherIndex.build(self.allocator, self.bus, policies_slice);
         errdefer metric_idx.deinit();
+
+        var trace_idx = try TraceMatcherIndex.build(self.allocator, self.bus, policies_slice);
+        errdefer trace_idx.deinit();
 
         // Increment version
         const new_version = self.version.load(.monotonic) + 1;
@@ -537,8 +562,10 @@ pub const PolicyRegistry = struct {
             .policies = policies_slice,
             .log_target_indices = log_target_indices,
             .metric_target_indices = metric_target_indices,
+            .trace_target_indices = trace_target_indices,
             .log_index = log_idx,
             .metric_index = metric_idx,
+            .trace_index = trace_idx,
             .policy_stats = policy_stats,
             .version = new_version,
             .allocator = self.allocator,

@@ -38,6 +38,20 @@ METRIC_MATCHING_PATTERNS=(
     "app.queue"
 )
 
+# Trace span name patterns that match our payload
+TRACE_MATCHING_PATTERNS=(
+    "HTTP GET"
+    "HTTP POST"
+    "database query"
+    "cache lookup"
+    "message publish"
+    "message consume"
+    "authentication"
+    "external API"
+    "data processing"
+    "serialization"
+)
+
 # Generate a deterministic non-matching pattern (no random for reproducibility)
 nomatch_pattern() {
     echo "NOMATCH_BENCH_$(printf '%04d' $1)"
@@ -63,8 +77,18 @@ get_metric_pattern() {
     fi
 }
 
+# Get a trace pattern by index
+get_trace_pattern() {
+    local idx=$1
+    if ((idx < ${#TRACE_MATCHING_PATTERNS[@]})); then
+        echo "${TRACE_MATCHING_PATTERNS[$idx]}"
+    else
+        nomatch_pattern $idx
+    fi
+}
+
 # Generate Tero Edge policies with drops and transforms
-# Distribution: 50% logs (half drop, half transform), 50% metrics (all drops - no transform support yet)
+# Distribution: 34% logs (half drop, half transform), 33% metrics (all drops), 33% traces (sampling)
 generate_edge_policies() {
     local count=$1
     local policies=()
@@ -74,9 +98,10 @@ generate_edge_policies() {
         return
     fi
 
-    # Split: 50% logs, 50% metrics
-    local log_count=$((count / 2))
-    local metric_count=$((count - log_count))
+    # Split: ~34% logs, ~33% metrics, ~33% traces
+    local log_count=$((count / 3))
+    local metric_count=$((count / 3))
+    local trace_count=$((count - log_count - metric_count))
 
     # Logs: 50% drops, 50% transforms
     local log_drop_count=$((log_count / 2))
@@ -138,6 +163,30 @@ EOF
         ((idx++))
     done
 
+    # Trace sampling policies - vary sampling percentages
+    for ((i=0; i<trace_count; i++)); do
+        local pattern=$(get_trace_pattern $i)
+        # Cycle through different sampling percentages: 10%, 25%, 50%, 75%, 100%
+        local percentages=(10.0 25.0 50.0 75.0 100.0)
+        local pct=${percentages[$((i % 5))]}
+        policies+=("$(cat <<EOF
+    {
+      "id": "trace-sample-$(printf '%04d' $idx)",
+      "name": "Trace sampling policy $idx",
+      "trace": {
+        "match": [{"trace_field": "TRACE_FIELD_NAME", "regex": "$pattern"}],
+        "keep": {
+          "percentage": $pct,
+          "mode": "SAMPLING_MODE_HASH_SEED",
+          "sampling_precision": 4
+        }
+      }
+    }
+EOF
+)")
+        ((idx++))
+    done
+
     # Output JSON
     echo '{"policies": ['
     local first=true
@@ -153,8 +202,9 @@ EOF
 }
 
 # Generate otelcol config with filter and transform processors
-# Distribution matches Edge: 50% log rules (half filter, half transform), 50% metric drops
+# Distribution matches Edge: ~34% log rules (half filter, half transform), ~33% metric drops, ~33% trace sampling
 # Note: otelcol transform processor uses OTTL for attribute manipulation
+# Note: otelcol uses probabilistic_sampler processor for trace sampling
 generate_otelcol_config() {
     local count=$1
 
@@ -179,11 +229,13 @@ YAML_HEAD
 
     local log_processors="batch"
     local metric_processors="batch"
+    local trace_processors="batch"
 
     if [[ $count -gt 0 ]]; then
-        # 50% logs, 50% metrics
-        local log_count=$((count / 2))
-        local metric_count=$((count - log_count))
+        # Split: ~34% logs, ~33% metrics, ~33% traces
+        local log_count=$((count / 3))
+        local metric_count=$((count / 3))
+        local trace_count=$((count - log_count - metric_count))
 
         # Logs: half drops, half transforms
         local log_drop_count=$((log_count / 2))
@@ -192,6 +244,7 @@ YAML_HEAD
         # Build processor lists based on what we actually have
         local log_proc_list="batch"
         local metric_proc_list="batch"
+        local trace_proc_list="batch"
 
         # Filter processor for logs - drop rules (only if we have drops)
         if [[ $log_drop_count -gt 0 ]]; then
@@ -251,8 +304,20 @@ YAML_HEAD
             done
         fi
 
+        # Probabilistic sampler for traces (only if we have trace policies)
+        # otelcol's probabilistic_sampler applies a single sampling rate to all traces
+        # We use the average of our sampling percentages for comparison
+        if [[ $trace_count -gt 0 ]]; then
+            trace_proc_list="$trace_proc_list, probabilistic_sampler"
+            # Use 50% as average sampling rate (matches our 10/25/50/75/100 distribution)
+            echo ""
+            echo "  probabilistic_sampler:"
+            echo "    sampling_percentage: 50"
+        fi
+
         log_processors="$log_proc_list"
         metric_processors="$metric_proc_list"
+        trace_processors="$trace_proc_list"
     fi
 
     cat <<YAML_TAIL
@@ -265,6 +330,11 @@ exporters:
     encoding: proto
 
   otlphttp/metrics:
+    endpoint: http://127.0.0.1:9999
+    compression: none
+    encoding: proto
+
+  otlphttp/traces:
     endpoint: http://127.0.0.1:9999
     compression: none
     encoding: proto
@@ -289,18 +359,28 @@ service:
       receivers: [datadog]
       processors: [$log_processors]
       exporters: [otlphttp/datadog]
-    metrics:
+    metrics/otlp:
       receivers: [otlp]
       processors: [$metric_processors]
       exporters: [otlphttp/metrics]
+    metrics/datadog:
+      receivers: [datadog]
+      processors: [$metric_processors]
+      exporters: [otlphttp/datadog]
+    traces:
+      receivers: [otlp]
+      processors: [$trace_processors]
+      exporters: [otlphttp/traces]
 YAML_TAIL
 }
 
 # Generate Vector config with filter and remap transforms
-# Distribution matches Edge: 50% log rules (half filter, half remap/transform), 50% metric drops
+# Distribution matches Edge: ~34% log rules (half filter, half remap/transform), ~33% metric drops, ~33% trace sampling
 # Vector uses:
 # - port 4320 for OTLP HTTP (native opentelemetry source, accepts protobuf)
-# - port 4321 for Datadog (http_server source with JSON)
+# - port 4321 for Datadog logs (http_server source with JSON)
+# - port 4322 for Datadog metrics (http_server source with JSON)
+# Note: Vector uses sample transform for trace sampling (probabilistic sampling)
 generate_vector_config() {
     local count=$1
     local data_dir="$SCRIPT_DIR/data"
@@ -318,18 +398,26 @@ sources:
     http:
       address: "127.0.0.1:4320"
 
-  datadog_source:
+  datadog_logs_source:
     type: http_server
     address: "127.0.0.1:4321"
     decoding:
       codec: json
     path: "/api/v2/logs"
+
+  datadog_metrics_source:
+    type: http_server
+    address: "127.0.0.1:4322"
+    decoding:
+      codec: json
+    path: "/api/v2/series"
 YAML_HEAD
 
     if [[ $count -gt 0 ]]; then
-        # 50% logs, 50% metrics
-        local log_count=$((count / 2))
-        local metric_count=$((count - log_count))
+        # Split: ~34% logs, ~33% metrics, ~33% traces
+        local log_count=$((count / 3))
+        local metric_count=$((count / 3))
+        local trace_count=$((count - log_count - metric_count))
 
         # Logs: half drops, half transforms
         local log_drop_count=$((log_count / 2))
@@ -342,7 +430,7 @@ YAML_HEAD
         # Each filter is chained to the previous one
         # Note: opentelemetry source outputs to .logs stream
         local prev_otlp_logs="otel_source.logs"
-        local prev_dd="datadog_source"
+        local prev_dd_logs="datadog_logs_source"
 
         for ((i=0; i<log_drop_count; i++)); do
             local pattern
@@ -362,15 +450,15 @@ YAML_HEAD
 YAML_FILTER
             prev_otlp_logs="filter_otlp_log_$i"
 
-            # Datadog filter
+            # Datadog logs filter
             cat <<YAML_FILTER
   filter_dd_log_$i:
     type: filter
     inputs:
-      - "$prev_dd"
+      - "$prev_dd_logs"
     condition: '!contains(to_string(.message) ?? "", "$pattern")'
 YAML_FILTER
-            prev_dd="filter_dd_log_$i"
+            prev_dd_logs="filter_dd_log_$i"
         done
 
         # Generate log remap transforms (add attributes)
@@ -391,23 +479,24 @@ YAML_FILTER
 YAML_REMAP
             prev_otlp_logs="remap_otlp_log_$remap_idx"
 
-            # Datadog remap
+            # Datadog logs remap
             cat <<YAML_REMAP
   remap_dd_log_$remap_idx:
     type: remap
     inputs:
-      - "$prev_dd"
+      - "$prev_dd_logs"
     source: |
       if contains(to_string(.message) ?? "", "$pattern") {
         .bench_processed_$i = "true"
       }
 YAML_REMAP
-            prev_dd="remap_dd_log_$remap_idx"
+            prev_dd_logs="remap_dd_log_$remap_idx"
         done
 
         # Generate metric filter transforms (drops)
         # Note: opentelemetry source outputs metrics to .metrics stream
         local prev_otlp_metrics="otel_source.metrics"
+        local prev_dd_metrics="datadog_metrics_source"
 
         for ((i=0; i<metric_count; i++)); do
             local pattern
@@ -417,6 +506,7 @@ YAML_REMAP
                 pattern="NOMATCH_BENCH_$(printf '%04d' $i)"
             fi
 
+            # OTLP metrics filter
             cat <<YAML_FILTER
   filter_otlp_metric_$i:
     type: filter
@@ -425,7 +515,35 @@ YAML_REMAP
     condition: '!contains(to_string(.name) ?? "", "$pattern")'
 YAML_FILTER
             prev_otlp_metrics="filter_otlp_metric_$i"
+
+            # Datadog metrics filter (uses .metric field for metric name)
+            cat <<YAML_FILTER
+  filter_dd_metric_$i:
+    type: filter
+    inputs:
+      - "$prev_dd_metrics"
+    condition: '!contains(to_string(.metric) ?? "", "$pattern")'
+YAML_FILTER
+            prev_dd_metrics="filter_dd_metric_$i"
         done
+
+        # Generate trace sampling transforms
+        # Note: opentelemetry source outputs traces to .traces stream
+        # Vector uses "sample" transform for probabilistic sampling
+        local prev_otlp_traces="otel_source.traces"
+
+        if [[ $trace_count -gt 0 ]]; then
+            # Vector's sample transform uses a rate (keep 1 in N events)
+            # To match our 50% average sampling, use rate: 2 (keep 1 in 2 = 50%)
+            cat <<YAML_SAMPLE
+  sample_traces:
+    type: sample
+    inputs:
+      - "$prev_otlp_traces"
+    rate: 2
+YAML_SAMPLE
+            prev_otlp_traces="sample_traces"
+        fi
 
         # Sinks connect to final transforms
         # Note: Vector's opentelemetry sink cannot re-encode to OTLP protobuf because
@@ -458,11 +576,33 @@ sinks:
       max_bytes: 1048576
       timeout_secs: 1
 
-  datadog_out:
+  otlp_traces_out:
     type: http
     inputs:
-      - "$prev_dd"
+      - "$prev_otlp_traces"
+    uri: "http://127.0.0.1:9999/v1/traces"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  datadog_logs_out:
+    type: http
+    inputs:
+      - "$prev_dd_logs"
     uri: "http://127.0.0.1:9999/api/v2/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  datadog_metrics_out:
+    type: http
+    inputs:
+      - "$prev_dd_metrics"
+    uri: "http://127.0.0.1:9999/api/v2/series"
     encoding:
       codec: json
     batch:
@@ -497,11 +637,33 @@ sinks:
       max_bytes: 1048576
       timeout_secs: 1
 
-  datadog_out:
+  otlp_traces_out:
     type: http
     inputs:
-      - "datadog_source"
+      - "otel_source.traces"
+    uri: "http://127.0.0.1:9999/v1/traces"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  datadog_logs_out:
+    type: http
+    inputs:
+      - "datadog_logs_source"
     uri: "http://127.0.0.1:9999/api/v2/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  datadog_metrics_out:
+    type: http
+    inputs:
+      - "datadog_metrics_source"
+    uri: "http://127.0.0.1:9999/api/v2/series"
     encoding:
       codec: json
     batch:
@@ -536,6 +698,7 @@ if command -v jq &> /dev/null; then
         total: .policies | length,
         log_drop: [.policies[] | select(.log.keep == "none")] | length,
         log_transform: [.policies[] | select(.log.keep == "all" and .log.transform != null)] | length,
-        metric_drop: [.policies[] | select(.metric.keep == false)] | length
+        metric_drop: [.policies[] | select(.metric.keep == false)] | length,
+        trace_sample: [.policies[] | select(.trace != null)] | length
     }' "$OUTPUT_DIR/policies-$COUNT.json"
 fi

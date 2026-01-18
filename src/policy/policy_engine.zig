@@ -59,14 +59,19 @@ pub const LogFieldAccessor = policy_types.LogFieldAccessor;
 pub const LogFieldMutator = policy_types.LogFieldMutator;
 pub const MetricFieldAccessor = policy_types.MetricFieldAccessor;
 pub const MetricFieldMutator = policy_types.MetricFieldMutator;
+pub const TraceFieldRef = policy_types.TraceFieldRef;
+pub const TraceFieldAccessor = policy_types.TraceFieldAccessor;
+pub const TraceFieldMutator = policy_types.TraceFieldMutator;
 pub const MutateOp = policy_types.MutateOp;
 pub const MetricMutateOp = policy_types.MetricMutateOp;
+pub const TraceMutateOp = policy_types.TraceMutateOp;
 pub const TelemetryType = policy_types.TelemetryType;
 
 // Proto types
 const Policy = proto.policy.Policy;
 const LogTarget = proto.policy.LogTarget;
 const MetricTarget = proto.policy.MetricTarget;
+const TraceTarget = proto.policy.TraceTarget;
 
 /// Maximum number of pattern matches to track per scan
 pub const MAX_MATCHES_PER_SCAN: usize = 256;
@@ -76,7 +81,7 @@ pub fn getLogTarget(policy: *const Policy) ?*const LogTarget {
     const target_ptr = &(policy.target orelse return null);
     return switch (target_ptr.*) {
         .log => |*log| log,
-        .metric => null,
+        .metric, .trace => null,
     };
 }
 
@@ -84,8 +89,17 @@ pub fn getLogTarget(policy: *const Policy) ?*const LogTarget {
 pub fn getMetricTarget(policy: *const Policy) ?*const MetricTarget {
     const target_ptr = &(policy.target orelse return null);
     return switch (target_ptr.*) {
-        .log => null,
         .metric => |*metric| metric,
+        .log, .trace => null,
+    };
+}
+
+/// Helper to extract the trace target from a policy (handles target union)
+pub fn getTraceTarget(policy: *const Policy) ?*const TraceTarget {
+    const target_ptr = &(policy.target orelse return null);
+    return switch (target_ptr.*) {
+        .trace => |*trace| trace,
+        .log, .metric => null,
     };
 }
 
@@ -147,6 +161,7 @@ fn FieldRefType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => FieldRef,
         .metric => MetricFieldRef,
+        .trace => TraceFieldRef,
     };
 }
 
@@ -155,6 +170,7 @@ fn FieldAccessorType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => LogFieldAccessor,
         .metric => MetricFieldAccessor,
+        .trace => TraceFieldAccessor,
     };
 }
 
@@ -163,6 +179,7 @@ fn FieldMutatorType(comptime T: TelemetryType) type {
     return switch (T) {
         .log => LogFieldMutator,
         .metric => MetricFieldMutator,
+        .trace => TraceFieldMutator,
     };
 }
 
@@ -184,6 +201,7 @@ const MatcherKeyFieldValue = struct {
 const MatcherFieldRef = union(TelemetryType) {
     log: FieldRef,
     metric: MetricFieldRef,
+    trace: TraceFieldRef,
 };
 const MatcherKeyNoDatabase = struct {};
 const ScanResult = struct { positive_count: usize, negated_count: usize };
@@ -283,6 +301,7 @@ pub const PolicyEngine = struct {
         const index = switch (T) {
             .log => &snapshot.log_index,
             .metric => &snapshot.metric_index,
+            .trace => &snapshot.trace_index,
         };
 
         if (index.isEmpty()) {
@@ -296,8 +315,18 @@ pub const PolicyEngine = struct {
         var scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
 
         // Phase 2: Find matching policies and determine decision
-        // Use context pointer as hash input for deterministic sampling
-        const hash_input = @intFromPtr(ctx);
+        // For traces, use trace_id for deterministic sampling so all spans in a trace
+        // get the same sampling decision. For other telemetry types, use context pointer.
+        const hash_input = if (T == .trace) blk: {
+            // Try to get trace_id field for deterministic trace sampling
+            const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
+            if (field_accessor(ctx, trace_id_ref)) |trace_id_hex| {
+                // Hash the trace_id hex string for sampling
+                break :blk hashTraceId(trace_id_hex);
+            }
+            // Fallback to context pointer if no trace_id
+            break :blk @intFromPtr(ctx);
+        } else @intFromPtr(ctx);
         const match_state = self.findMatchingPolicies(T, index, &scan_state, policy_id_buf, hash_input);
 
         self.bus.debug(EvaluateResult{ .decision = match_state.decision, .matched_count = match_state.matched_count });
@@ -378,14 +407,22 @@ pub const PolicyEngine = struct {
             const value = field_accessor(ctx, field_ref) orelse {
                 self.bus.debug(MatcherKeyFieldNotPresent{
                     .telemetry_type = T,
-                    .field = if (T == .log) .{ .log = field_ref } else .{ .metric = field_ref },
+                    .field = switch (T) {
+                        .log => .{ .log = field_ref },
+                        .metric => .{ .metric = field_ref },
+                        .trace => .{ .trace = field_ref },
+                    },
                 });
                 continue;
             };
 
             self.bus.debug(MatcherKeyFieldValue{
                 .telemetry_type = T,
-                .field = if (T == .log) .{ .log = field_ref } else .{ .metric = field_ref },
+                .field = switch (T) {
+                    .log => .{ .log = field_ref },
+                    .metric => .{ .metric = field_ref },
+                    .trace => .{ .trace = field_ref },
+                },
                 .value = if (value.len > 100) value[0..100] else value,
             });
 
@@ -552,6 +589,34 @@ pub const PolicyEngine = struct {
         };
     }
 };
+
+/// Hash a trace ID hex string to u64 for deterministic sampling.
+/// This ensures all spans with the same trace_id get the same sampling decision.
+///
+/// Following OTel probability sampling spec, we use the rightmost 56 bits
+/// of the trace ID for randomness. For a 32-char hex string (16 bytes),
+/// we use the last 14 hex chars (56 bits).
+fn hashTraceId(trace_id_hex: []const u8) u64 {
+    if (trace_id_hex.len == 0) return 0;
+
+    var hash: u64 = 0;
+
+    // Use the last 14 hex characters (56 bits) if available
+    // This follows OTel spec which uses rightmost bits for randomness
+    const start = if (trace_id_hex.len > 14) trace_id_hex.len - 14 else 0;
+
+    for (trace_id_hex[start..]) |c| {
+        const nibble: u64 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => 0,
+        };
+        hash = (hash << 4) | nibble;
+    }
+
+    return hash;
+}
 
 // =============================================================================
 // Tests

@@ -71,12 +71,16 @@ pub const Header = types.Header;
 // Field reference types (shared across policy engine and transforms)
 pub const FieldRef = types.FieldRef;
 pub const MetricFieldRef = types.MetricFieldRef;
+pub const TraceFieldRef = types.TraceFieldRef;
 pub const LogFieldAccessor = types.LogFieldAccessor;
 pub const LogFieldMutator = types.LogFieldMutator;
 pub const MetricFieldAccessor = types.MetricFieldAccessor;
 pub const MetricFieldMutator = types.MetricFieldMutator;
+pub const TraceFieldAccessor = types.TraceFieldAccessor;
+pub const TraceFieldMutator = types.TraceFieldMutator;
 pub const MutateOp = types.MutateOp;
 pub const MetricMutateOp = types.MetricMutateOp;
+pub const TraceMutateOp = types.TraceMutateOp;
 pub const TelemetryType = types.TelemetryType;
 
 // =============================================================================
@@ -96,6 +100,9 @@ pub const MAX_POLICIES = matcher_index.MAX_POLICIES;
 
 pub const sampler = @import("./sampler.zig");
 pub const Sampler = sampler.Sampler;
+
+pub const trace_sampler = @import("./trace_sampler.zig");
+pub const TraceSampler = trace_sampler.TraceSampler;
 
 pub const rate_limiter = @import("./rate_limiter.zig");
 pub const RateLimiter = rate_limiter.RateLimiter;

@@ -3,6 +3,7 @@ const proxy_module = @import("./proxy_module.zig");
 const policy = @import("../policy/root.zig");
 const otlp_logs = @import("./otlp_logs.zig");
 const otlp_metrics = @import("./otlp_metrics.zig");
+const otlp_traces = @import("./otlp_traces.zig");
 const o11y = @import("../observability/root.zig");
 
 const ProxyModule = proxy_module.ProxyModule;
@@ -23,6 +24,8 @@ const LogsProcessed = struct { dropped: usize, kept: usize };
 const LogsProcessingFailed = struct { err: []const u8 };
 const MetricsProcessed = struct { dropped: usize, kept: usize };
 const MetricsProcessingFailed = struct { err: []const u8 };
+const TracesProcessed = struct { dropped: usize, kept: usize };
+const TracesProcessingFailed = struct { err: []const u8 };
 
 /// OTLP module configuration
 pub const OtlpConfig = struct {
@@ -93,6 +96,8 @@ pub const OtlpModule = struct {
             return self.processLogs(allocator, req.body, content_type);
         } else if (std.mem.endsWith(u8, req.path, "/v1/metrics")) {
             return self.processMetrics(allocator, req.body, content_type);
+        } else if (std.mem.endsWith(u8, req.path, "/v1/traces")) {
+            return self.processTraces(allocator, req.body, content_type);
         }
 
         return ModuleResult.unchanged();
@@ -180,6 +185,47 @@ pub const OtlpModule = struct {
         return ModuleResult.modified(result.data);
     }
 
+    fn processTraces(
+        self: *OtlpModule,
+        allocator: std.mem.Allocator,
+        body: []const u8,
+        content_type: []const u8,
+    ) !ModuleResult {
+        // Process traces through filter
+        // FAIL OPEN: If processing fails, pass original through
+        const result = otlp_traces.processTraces(
+            allocator,
+            self.registry,
+            self.bus,
+            body,
+            content_type,
+        ) catch |err| {
+            self.bus.warn(TracesProcessingFailed{ .err = @errorName(err) });
+            return ModuleResult.unchanged();
+        };
+
+        self.bus.debug(TracesProcessed{
+            .dropped = result.dropped_count,
+            .kept = result.original_count - result.dropped_count,
+        });
+
+        // If all traces were dropped, return empty response with 200 (OTLP expects this)
+        if (result.allDropped()) {
+            allocator.free(result.data);
+            return ModuleResult.respond(200, "{}");
+        }
+
+        // Check if traces were actually modified (any dropped)
+        if (!result.wasModified()) {
+            // No changes - free allocated memory and return unchanged
+            allocator.free(result.data);
+            return ModuleResult.unchanged();
+        }
+
+        // Traces were modified
+        return ModuleResult.modified(result.data);
+    }
+
     fn deinit(_: *anyopaque) void {
         // Nothing to cleanup (stateless)
     }
@@ -189,6 +235,7 @@ pub const OtlpModule = struct {
 pub const routes = [_]RoutePattern{
     RoutePattern.exact("/v1/logs", .{ .post = true }),
     RoutePattern.exact("/v1/metrics", .{ .post = true }),
+    RoutePattern.exact("/v1/traces", .{ .post = true }),
 };
 
 // =============================================================================
