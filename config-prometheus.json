@@ -1,0 +1,30 @@
+{
+  "listen_address": "127.0.0.1",
+  "listen_port": 8080,
+  "upstream_url": "http://localhost:8888",
+  "workspace_id": "${TERO_WORKSPACE_ID}",
+  "log_level": "info",
+  "max_body_size": 52428800,
+  "global_memory_limit": 1073741824,
+  "prometheus": {
+    "max_bytes_per_scrape": 52428800
+  },
+  "policy_providers": [
+    {
+      "id": "file",
+      "type": "file",
+      "path": "policies.json"
+    },
+    {
+      "id": "http",
+      "type": "http",
+      "url": "${TERO_CONTROL_PLANE_URL}/v1/policy/sync",
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer ${TERO_API_TOKEN}"
+        }
+      ]
+    }
+  ]
+}

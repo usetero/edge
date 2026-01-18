@@ -19,6 +19,13 @@ pub const LogLevel = enum(u8) {
     }
 };
 
+/// Prometheus module configuration
+pub const PrometheusModuleConfig = struct {
+    /// Maximum bytes to process per scrape (data throughput limit)
+    /// Default: 10MB
+    max_bytes_per_scrape: usize = 10 * 1024 * 1024,
+};
+
 pub const ProxyConfig = struct {
     // Network config
     listen_address: [4]u8,
@@ -45,6 +52,12 @@ pub const ProxyConfig = struct {
 
     // Policy providers
     policy_providers: []ProviderConfig,
+
+    // Global memory limit (optional) - if set, uses bounded allocator
+    global_memory_limit: ?usize = null,
+
+    // Module-specific configuration
+    prometheus: PrometheusModuleConfig = .{},
 
     pub fn default() ProxyConfig {
         return .{

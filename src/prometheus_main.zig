@@ -1,12 +1,13 @@
-//! Full Distribution Entry Point
+//! Prometheus Distribution Entry Point
 //!
-//! A full edge proxy distribution supporting both Datadog and OTLP ingestion with filtering.
-//! Handles /api/v2/logs, /api/v2/series, /v1/logs, and /v1/metrics with policy-based filtering,
+//! A focused edge proxy distribution for Prometheus metrics scraping with filtering.
+//! Proxies /metrics endpoints with policy-based metric filtering,
 //! passes all other requests through.
 //!
 //! Features:
-//! - Policy-based log filtering (DROP/KEEP actions)
-//! - Fail-open behavior (errors pass logs through unchanged)
+//! - Policy-based metric filtering (DROP/KEEP actions)
+//! - Streaming response processing (bounded memory)
+//! - Fail-open behavior (errors pass metrics through unchanged)
 //! - Thread-safe, stateless request processing
 //! - Lock-free policy updates via atomic snapshots
 //! - Graceful shutdown with signal handling
@@ -19,8 +20,6 @@ const config_parser = edge.config_parser;
 const server_mod = edge.server;
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough_module;
-const datadog_mod = edge.datadog_module;
-const otlp_mod = edge.otlp_module;
 const prometheus_mod = edge.prometheus_module;
 const health_mod = edge.health_module;
 const policy = edge.policy;
@@ -34,10 +33,6 @@ const Level = o11y.Level;
 const ProxyServer = server_mod.ProxyServer;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const PassthroughModule = passthrough_mod.PassthroughModule;
-const DatadogModule = datadog_mod.DatadogModule;
-const DatadogConfig = datadog_mod.DatadogConfig;
-const OtlpModule = otlp_mod.OtlpModule;
-const OtlpConfig = otlp_mod.OtlpConfig;
 const PrometheusModule = prometheus_mod.PrometheusModule;
 const PrometheusConfig = prometheus_mod.PrometheusConfig;
 const HealthModule = health_mod.HealthModule;
@@ -63,7 +58,6 @@ const ListenAddressConfigured = struct {
     port: u16,
 };
 const UpstreamConfigured = struct { url: []const u8 };
-const LogsUpstreamConfigured = struct { url: []const u8 };
 const MetricsUpstreamConfigured = struct { url: []const u8 };
 const ServiceConfigured = struct {
     namespace: []const u8,
@@ -226,9 +220,6 @@ pub fn main() !void {
 
     bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
     bus.info(UpstreamConfigured{ .url = config.upstream_url });
-    if (config.logs_url) |logs_url| {
-        bus.info(LogsUpstreamConfigured{ .url = logs_url });
-    }
     if (config.metrics_url) |metrics_url| {
         bus.info(MetricsUpstreamConfigured{ .url = metrics_url });
     }
@@ -278,18 +269,6 @@ pub fn main() !void {
     else
         std.heap.page_allocator;
 
-    // Create Datadog module configuration
-    var datadog_config = DatadogConfig{
-        .registry = &registry,
-        .bus = bus,
-    };
-
-    // Create OTLP module configuration
-    var otlp_config = OtlpConfig{
-        .registry = &registry,
-        .bus = bus,
-    };
-
     // Create Prometheus module configuration (use values from config file)
     var prometheus_config = PrometheusConfig{
         .registry = &registry,
@@ -297,15 +276,11 @@ pub fn main() !void {
         .max_bytes_per_scrape = config.prometheus.max_bytes_per_scrape,
     };
 
-    // Determine upstream URLs (use specific URLs if configured, otherwise fall back to upstream_url)
-    const logs_upstream = config.logs_url orelse config.upstream_url;
+    // Determine upstream URL for metrics (use metrics_url if configured, otherwise upstream_url)
     const metrics_upstream = config.metrics_url orelse config.upstream_url;
 
     // Create modules
     var health_module = HealthModule{};
-    var datadog_logs_module = DatadogModule{};
-    var datadog_metrics_module = DatadogModule{};
-    var otlp_module = OtlpModule{};
     var prometheus_module = PrometheusModule{};
     var passthrough_module = PassthroughModule{};
 
@@ -319,33 +294,6 @@ pub fn main() !void {
             .max_request_body = 0,
             .max_response_body = 0,
             .module_data = null,
-        },
-        // Datadog logs module - handles /api/v2/logs with filtering
-        .{
-            .module = datadog_logs_module.asProxyModule(),
-            .routes = &datadog_mod.logs_routes,
-            .upstream_url = logs_upstream,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = @ptrCast(&datadog_config),
-        },
-        // Datadog metrics module - handles /api/v2/series with filtering
-        .{
-            .module = datadog_metrics_module.asProxyModule(),
-            .routes = &datadog_mod.metrics_routes,
-            .upstream_url = metrics_upstream,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = @ptrCast(&datadog_config),
-        },
-        // OTLP module - handles /v1/logs and /v1/metrics with filtering
-        .{
-            .module = otlp_module.asProxyModule(),
-            .routes = &otlp_mod.routes,
-            .upstream_url = config.upstream_url,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = @ptrCast(&otlp_config),
         },
         // Prometheus module - handles /metrics with filtering
         .{

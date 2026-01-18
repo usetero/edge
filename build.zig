@@ -134,7 +134,8 @@ pub fn build(b: *std.Build) void {
     const distributions = .{
         .{ "datadog", "src/datadog_main.zig", "Datadog ingestion" },
         .{ "otlp", "src/otlp_main.zig", "OpenTelemetry (OTLP) ingestion" },
-        .{ "edge", "src/main.zig", "Full distribution (OTLP & Datadog)" },
+        .{ "prometheus", "src/prometheus_main.zig", "Prometheus metrics scraping" },
+        .{ "edge", "src/main.zig", "Full distribution (OTLP, Datadog & Prometheus)" },
     };
 
     inline for (distributions) |dist| {
