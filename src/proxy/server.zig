@@ -13,6 +13,7 @@ const ModuleRequest = proxy_module.ModuleRequest;
 const ModuleResult = proxy_module.ModuleResult;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const ProxyModule = proxy_module.ProxyModule;
+const ResponseFilter = proxy_module.ResponseFilter;
 const HttpMethod = proxy_module.HttpMethod;
 const Router = router_mod.Router;
 const UpstreamClientManager = upstream_client.UpstreamClientManager;
@@ -510,7 +511,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
 
         .proxy_unchanged => {
             // Proxy original (potentially compressed) body to upstream
-            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, original_body);
+            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, module_entry.instance, original_body);
         },
 
         .proxy_modified => {
@@ -528,7 +529,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
             }
             defer if (compressed_allocated) req.arena.free(body_to_send);
 
-            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, body_to_send);
+            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, module_entry.instance, body_to_send);
         },
     }
 }
@@ -548,6 +549,7 @@ fn proxyToUpstream(
     req: *httpz.Request,
     res: *httpz.Response,
     module_id: ModuleId,
+    module: ProxyModule,
     body_to_send: []const u8,
 ) !usize {
     const max_retries = ctx.max_upstream_retries;
@@ -556,7 +558,7 @@ fn proxyToUpstream(
     // https://codeberg.org/ziglang/zig/issues/30165
     // TODO: Once the above is fixed, we should re-evaluate this logic.
     while (attempt < max_retries) : (attempt += 1) {
-        const result = proxyToUpstreamOnce(ctx, req, res, module_id, body_to_send);
+        const result = proxyToUpstreamOnce(ctx, req, res, module_id, module, body_to_send);
         if (result) |bytes| {
             return bytes;
         } else |err| {
@@ -590,6 +592,7 @@ fn proxyToUpstreamOnce(
     req: *httpz.Request,
     res: *httpz.Response,
     module_id: ModuleId,
+    module: ProxyModule,
     body_to_send: []const u8,
 ) !usize {
     // Build upstream URI using pre-allocated buffer
@@ -698,10 +701,20 @@ fn proxyToUpstreamOnce(
     var upstream_body_reader = upstream_res.reader(&read_buffer);
     const response_writer = res.writer();
 
+    // Check if module has a response filter
+    var response_filter = module.createResponseFilter(response_writer, req.arena) catch |err| blk: {
+        ctx.bus.warn(ModuleError{ .err = @errorName(err) });
+        break :blk null;
+    };
+    defer if (response_filter) |*filter| filter.destroy();
+
+    // Use filter writer if available, otherwise direct response writer
+    const target_writer = if (response_filter) |*filter| filter.writer() else response_writer;
+
     var total_bytes: usize = 0;
     while (total_bytes < max_size) {
         const bytes = upstream_body_reader.stream(
-            response_writer,
+            target_writer,
             std.Io.Limit.limited(max_size - total_bytes),
         ) catch |err| switch (err) {
             error.EndOfStream => break,
@@ -721,16 +734,25 @@ fn proxyToUpstreamOnce(
         ctx.bus.warn(ResponseTruncated{ .max_size = max_size });
     }
 
+    // Finish filter if used (this flushes filtered data to response writer)
+    var bytes_forwarded: usize = total_bytes;
+    if (response_filter) |*filter| {
+        bytes_forwarded = filter.finish() catch |err| blk: {
+            ctx.bus.err(ModuleError{ .err = @errorName(err) });
+            break :blk total_bytes;
+        };
+    }
+
     // Flush the response writer to ensure all data is sent to client
     response_writer.flush() catch |err| {
         ctx.bus.err(ResponseFlushError{
             .err = @errorName(err),
-            .bytes_written = total_bytes,
+            .bytes_written = bytes_forwarded,
         });
         return err;
     };
 
-    return total_bytes;
+    return bytes_forwarded;
 }
 
 // =============================================================================

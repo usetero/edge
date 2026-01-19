@@ -6,7 +6,7 @@
   "log_level": "info",
   "max_body_size": 52428800,
   "prometheus": {
-    "max_bytes_per_scrape": 52428800
+    "max_bytes_per_scrape": 10000
   },
   "policy_providers": [
     {

@@ -14,7 +14,9 @@ pub const Label = line_parser.Label;
 pub const MetricType = line_parser.MetricType;
 pub const parseLine = line_parser.parseLine;
 
+pub const StreamingPrometheusFilter = streaming_filter.StreamingPrometheusFilter;
 pub const PolicyStreamingFilter = streaming_filter.PolicyStreamingFilter;
+pub const FilteringWriter = streaming_filter.FilteringWriter;
 pub const FilterStats = streaming_filter.FilterStats;
 pub const ProcessResult = streaming_filter.ProcessResult;
 
