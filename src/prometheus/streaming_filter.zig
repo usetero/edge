@@ -14,8 +14,11 @@ const std = @import("std");
 const line_parser = @import("line_parser.zig");
 const field_accessor = @import("field_accessor.zig");
 const policy = @import("../policy/root.zig");
+const o11y = @import("../observability/root.zig");
 
 const PolicyEngine = policy.PolicyEngine;
+const PolicyRegistry = policy.Registry;
+const EventBus = o11y.EventBus;
 const PrometheusFieldContext = field_accessor.PrometheusFieldContext;
 const prometheusFieldAccessor = field_accessor.prometheusFieldAccessor;
 
@@ -45,7 +48,8 @@ pub const FilterStats = struct {
 
 /// Streaming filter for Prometheus exposition format.
 /// Processes data line-by-line, forwarding to an output writer.
-pub const StreamingPrometheusFilter = struct {
+/// Internal implementation - use PolicyStreamingFilter for public API.
+const StreamingPrometheusFilter = struct {
     // Configuration
     max_scrape_bytes: usize,
 
@@ -200,8 +204,9 @@ pub const PolicyStreamingFilter = struct {
     // Base filter (handles streaming mechanics)
     base: StreamingPrometheusFilter,
 
-    // Policy engine reference
-    engine: *const PolicyEngine,
+    // Policy registry and event bus for creating engine on demand
+    registry: *PolicyRegistry,
+    bus: *EventBus,
 
     // Allocator for labels cache
     allocator: std.mem.Allocator,
@@ -212,6 +217,9 @@ pub const PolicyStreamingFilter = struct {
     current_metric_name: []const u8,
     current_help_line: []const u8,
     current_type_line: []const u8,
+    // Parsed metadata values for policy evaluation
+    current_description: []const u8,
+    current_type_str: []const u8,
     metadata_written: bool,
 
     // Policy ID buffer for evaluate()
@@ -221,7 +229,8 @@ pub const PolicyStreamingFilter = struct {
         line_buffer: []u8,
         metadata_buffer: []u8,
         max_scrape_bytes: usize,
-        engine: *const PolicyEngine,
+        registry: *PolicyRegistry,
+        bus: *EventBus,
         allocator: std.mem.Allocator,
     };
 
@@ -232,11 +241,14 @@ pub const PolicyStreamingFilter = struct {
                 .metadata_buffer = config.metadata_buffer,
                 .max_scrape_bytes = config.max_scrape_bytes,
             }),
-            .engine = config.engine,
+            .registry = config.registry,
+            .bus = config.bus,
             .allocator = config.allocator,
             .current_metric_name = "",
             .current_help_line = "",
             .current_type_line = "",
+            .current_description = "",
+            .current_type_str = "",
             .metadata_written = false,
             .policy_id_buf = undefined,
         };
@@ -302,11 +314,17 @@ pub const PolicyStreamingFilter = struct {
             },
             .help => |h| {
                 // Store HELP metadata for potential later output
-                self.updateMetadata(h.metric_name, line, null);
+                self.updateMetadata(h.metric_name, .{
+                    .line = line,
+                    .description = h.description,
+                }, null);
             },
             .type_info => |t| {
                 // Store TYPE metadata for potential later output
-                self.updateMetadata(t.metric_name, null, line);
+                self.updateMetadata(t.metric_name, null, .{
+                    .line = line,
+                    .type_str = @tagName(t.metric_type),
+                });
             },
             .sample => |s| {
                 // Evaluate sample against policy engine
@@ -332,15 +350,31 @@ pub const PolicyStreamingFilter = struct {
     // [0..256): metric name
     // [256..640): HELP line (384 bytes)
     // [640..1024): TYPE line (384 bytes)
+    // [1024..1280): description text (256 bytes)
+    // [1280..1296): type string (16 bytes - e.g., "counter", "histogram")
     const METRIC_NAME_OFFSET: usize = 0;
     const METRIC_NAME_SIZE: usize = 256;
     const HELP_LINE_OFFSET: usize = 256;
     const HELP_LINE_SIZE: usize = 384;
     const TYPE_LINE_OFFSET: usize = 640;
     const TYPE_LINE_SIZE: usize = 384;
+    const DESCRIPTION_OFFSET: usize = 1024;
+    const DESCRIPTION_SIZE: usize = 256;
+    const TYPE_STR_OFFSET: usize = 1280;
+    const TYPE_STR_SIZE: usize = 16;
+
+    const HelpMetadata = struct {
+        line: []const u8,
+        description: []const u8,
+    };
+
+    const TypeMetadata = struct {
+        line: []const u8,
+        type_str: []const u8,
+    };
 
     /// Update stored metadata for a metric
-    fn updateMetadata(self: *PolicyStreamingFilter, metric_name: []const u8, help_line: ?[]const u8, type_line: ?[]const u8) void {
+    fn updateMetadata(self: *PolicyStreamingFilter, metric_name: []const u8, help: ?HelpMetadata, type_meta: ?TypeMetadata) void {
         // Check if this is a new metric (compare against stored name in buffer)
         if (!std.mem.eql(u8, self.current_metric_name, metric_name)) {
             // New metric - copy name to stable buffer and reset state
@@ -349,21 +383,31 @@ pub const PolicyStreamingFilter = struct {
             self.current_metric_name = self.base.metadata_buffer[METRIC_NAME_OFFSET..][0..name_len];
             self.current_help_line = "";
             self.current_type_line = "";
+            self.current_description = "";
+            self.current_type_str = "";
             self.metadata_written = false;
         }
 
-        // Store HELP line in metadata buffer
-        if (help_line) |h| {
-            const len = @min(h.len, HELP_LINE_SIZE);
-            @memcpy(self.base.metadata_buffer[HELP_LINE_OFFSET..][0..len], h[0..len]);
-            self.current_help_line = self.base.metadata_buffer[HELP_LINE_OFFSET..][0..len];
+        // Store HELP line and description in metadata buffer
+        if (help) |h| {
+            const line_len = @min(h.line.len, HELP_LINE_SIZE);
+            @memcpy(self.base.metadata_buffer[HELP_LINE_OFFSET..][0..line_len], h.line[0..line_len]);
+            self.current_help_line = self.base.metadata_buffer[HELP_LINE_OFFSET..][0..line_len];
+
+            const desc_len = @min(h.description.len, DESCRIPTION_SIZE);
+            @memcpy(self.base.metadata_buffer[DESCRIPTION_OFFSET..][0..desc_len], h.description[0..desc_len]);
+            self.current_description = self.base.metadata_buffer[DESCRIPTION_OFFSET..][0..desc_len];
         }
 
-        // Store TYPE line in metadata buffer
-        if (type_line) |t| {
-            const len = @min(t.len, TYPE_LINE_SIZE);
-            @memcpy(self.base.metadata_buffer[TYPE_LINE_OFFSET..][0..len], t[0..len]);
-            self.current_type_line = self.base.metadata_buffer[TYPE_LINE_OFFSET..][0..len];
+        // Store TYPE line and type string in metadata buffer
+        if (type_meta) |t| {
+            const line_len = @min(t.line.len, TYPE_LINE_SIZE);
+            @memcpy(self.base.metadata_buffer[TYPE_LINE_OFFSET..][0..line_len], t.line[0..line_len]);
+            self.current_type_line = self.base.metadata_buffer[TYPE_LINE_OFFSET..][0..line_len];
+
+            const type_len = @min(t.type_str.len, TYPE_STR_SIZE);
+            @memcpy(self.base.metadata_buffer[TYPE_STR_OFFSET..][0..type_len], t.type_str[0..type_len]);
+            self.current_type_str = self.base.metadata_buffer[TYPE_STR_OFFSET..][0..type_len];
         }
     }
 
@@ -393,11 +437,13 @@ pub const PolicyStreamingFilter = struct {
 
     /// Evaluate whether to keep a metric sample based on policy
     fn shouldKeepMetric(self: *PolicyStreamingFilter, sample: Sample, line: []const u8) bool {
-        // Build the field context
+        // Build the field context with metadata from HELP/TYPE lines
         var ctx = PrometheusFieldContext{
             .parsed = .{ .sample = sample },
             .line_buffer = line,
             .labels_cache = null,
+            .description = if (self.current_description.len > 0) self.current_description else null,
+            .metric_type = if (self.current_type_str.len > 0) self.current_type_str else null,
         };
 
         // Build labels cache for pattern matching (if needed)
@@ -405,9 +451,12 @@ pub const PolicyStreamingFilter = struct {
         defer if (labels_cache) |lc| self.allocator.free(lc);
         ctx.labels_cache = labels_cache;
 
+        // Create engine on demand (same pattern as other modules)
+        const engine = PolicyEngine.init(self.bus, self.registry);
+
         // Evaluate against policy engine
         // Note: We pass null for mutator since Prometheus metrics are immutable in exposition format
-        const result = self.engine.evaluate(
+        const result = engine.evaluate(
             .metric,
             @ptrCast(&ctx),
             prometheusFieldAccessor,

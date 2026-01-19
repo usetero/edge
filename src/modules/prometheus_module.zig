@@ -42,7 +42,8 @@ const EventBus = o11y.EventBus;
 const LINE_BUFFER_SIZE: usize = 8192;
 
 /// Size of metadata buffer for HELP/TYPE tracking
-const METADATA_BUFFER_SIZE: usize = 1024;
+/// Layout: metric name (256) + HELP line (384) + TYPE line (384) + description (256) + type string (16) = 1296
+const METADATA_BUFFER_SIZE: usize = 1296;
 
 /// Size of output buffer per request
 const OUTPUT_BUFFER_SIZE: usize = 8192;
@@ -99,49 +100,87 @@ pub const PrometheusConfig = struct {
 // Intercept Context
 // =============================================================================
 
-/// Per-request context for filtering Prometheus metrics
+/// Per-request context for filtering Prometheus metrics.
+/// Minimal state needed for streaming filter operation.
 pub const PrometheusInterceptContext = struct {
-    /// The streaming filter
     filter: PolicyStreamingFilter,
-
-    /// Output buffer for filtered data
     output_buffer: []u8,
-
-    /// Current position in output buffer
     output_pos: usize,
-
-    /// Allocator used for this context (for cleanup)
     allocator: std.mem.Allocator,
-
-    /// Reference to config for stats emission
     config: *const PrometheusConfig,
 
-    /// Line buffer (stored for cleanup)
-    line_buffer: []u8,
+    /// Allocate and initialize a new context.
+    /// Returns null on allocation failure.
+    pub fn create(allocator: std.mem.Allocator, config: *const PrometheusConfig) ?*PrometheusInterceptContext {
+        const line_buffer = allocator.alloc(u8, LINE_BUFFER_SIZE) catch return null;
 
-    /// Metadata buffer (stored for cleanup)
-    metadata_buffer: []u8,
+        const metadata_buffer = allocator.alloc(u8, METADATA_BUFFER_SIZE) catch {
+            allocator.free(line_buffer);
+            return null;
+        };
 
-    /// PolicyEngine (stored for cleanup)
-    engine: *PolicyEngine,
+        const output_buffer = allocator.alloc(u8, OUTPUT_BUFFER_SIZE) catch {
+            allocator.free(metadata_buffer);
+            allocator.free(line_buffer);
+            return null;
+        };
+
+        const ctx = allocator.create(PrometheusInterceptContext) catch {
+            allocator.free(output_buffer);
+            allocator.free(metadata_buffer);
+            allocator.free(line_buffer);
+            return null;
+        };
+
+        ctx.filter = PolicyStreamingFilter.init(.{
+            .line_buffer = line_buffer,
+            .metadata_buffer = metadata_buffer,
+            .max_scrape_bytes = config.max_bytes_per_scrape,
+            .registry = @constCast(config.registry),
+            .bus = config.bus,
+            .allocator = allocator,
+        });
+        ctx.output_buffer = output_buffer;
+        ctx.output_pos = 0;
+        ctx.allocator = allocator;
+        ctx.config = config;
+
+        return ctx;
+    }
+
+    /// Clean up context and emit stats.
+    pub fn destroy(self: *PrometheusInterceptContext) void {
+        // Emit scrape completion stats
+        const stats = self.filter.getStats();
+        if (stats.lines_processed > 0) {
+            self.config.bus.info(PrometheusScrapeCompleted{
+                .bytes_processed = stats.bytes_processed,
+                .bytes_forwarded = stats.bytes_forwarded,
+                .lines_processed = stats.lines_processed,
+                .lines_dropped = stats.lines_dropped,
+                .lines_kept = stats.lines_kept,
+                .scrape_truncated = stats.scrape_truncated,
+            });
+        }
+
+        // Free allocations - filter holds references to line/metadata buffers
+        const allocator = self.allocator;
+        allocator.free(self.output_buffer);
+        allocator.free(self.filter.base.metadata_buffer);
+        allocator.free(self.filter.base.line_buffer);
+        allocator.destroy(self);
+    }
 };
 
 /// Create intercept context for a request.
-/// Called by the server for each request that needs response interception.
-///
 /// Uses BoundedAllocator if configured (returns null on memory exhaustion).
 /// Falls back to request arena if no bounded allocator configured.
 pub fn createInterceptContext(arena: std.mem.Allocator, module_data: ?*const anyopaque) ?*anyopaque {
     const config: *const PrometheusConfig = @ptrCast(@alignCast(module_data orelse return null));
 
-    // Use bounded allocator if available, otherwise use arena
-    const allocator = if (config.bounded_allocator) |ba|
-        ba.allocator()
-    else
-        arena;
+    const allocator = if (config.bounded_allocator) |ba| ba.allocator() else arena;
 
-    // Allocate context struct
-    const ctx = allocator.create(PrometheusInterceptContext) catch |err| {
+    const ctx: PrometheusInterceptContext = .create(allocator, config) orelse {
         if (config.bounded_allocator) |ba| {
             const stats = ba.getStats();
             config.bus.warn(PrometheusMemoryExhausted{
@@ -150,106 +189,16 @@ pub fn createInterceptContext(arena: std.mem.Allocator, module_data: ?*const any
                 .active_allocations = stats.active_allocations,
             });
         }
-        config.bus.warn(PrometheusScrapeError{
-            .err = @errorName(err),
-            .phase = "alloc_context",
-        });
         return null;
-    };
-
-    // Allocate line buffer
-    const line_buffer = allocator.alloc(u8, LINE_BUFFER_SIZE) catch |err| {
-        allocator.destroy(ctx);
-        config.bus.warn(PrometheusScrapeError{
-            .err = @errorName(err),
-            .phase = "alloc_line_buffer",
-        });
-        return null;
-    };
-
-    // Allocate metadata buffer
-    const metadata_buffer = allocator.alloc(u8, METADATA_BUFFER_SIZE) catch |err| {
-        allocator.free(line_buffer);
-        allocator.destroy(ctx);
-        config.bus.warn(PrometheusScrapeError{
-            .err = @errorName(err),
-            .phase = "alloc_metadata_buffer",
-        });
-        return null;
-    };
-
-    // Allocate output buffer
-    const output_buffer = allocator.alloc(u8, OUTPUT_BUFFER_SIZE) catch |err| {
-        allocator.free(metadata_buffer);
-        allocator.free(line_buffer);
-        allocator.destroy(ctx);
-        config.bus.warn(PrometheusScrapeError{
-            .err = @errorName(err),
-            .phase = "alloc_output_buffer",
-        });
-        return null;
-    };
-
-    // Allocate policy engine
-    const engine = allocator.create(PolicyEngine) catch |err| {
-        allocator.free(output_buffer);
-        allocator.free(metadata_buffer);
-        allocator.free(line_buffer);
-        allocator.destroy(ctx);
-        config.bus.warn(PrometheusScrapeError{
-            .err = @errorName(err),
-            .phase = "alloc_engine",
-        });
-        return null;
-    };
-    engine.* = PolicyEngine.init(config.bus, @constCast(config.registry));
-
-    // Initialize context
-    ctx.* = .{
-        .filter = PolicyStreamingFilter.init(.{
-            .line_buffer = line_buffer,
-            .metadata_buffer = metadata_buffer,
-            .max_scrape_bytes = config.max_bytes_per_scrape,
-            .engine = engine,
-            .allocator = allocator,
-        }),
-        .output_buffer = output_buffer,
-        .output_pos = 0,
-        .allocator = allocator,
-        .config = config,
-        .line_buffer = line_buffer,
-        .metadata_buffer = metadata_buffer,
-        .engine = engine,
     };
 
     return @ptrCast(ctx);
 }
 
-/// Destroy intercept context and emit stats.
-/// Called by the server after request completes.
+/// Destroy intercept context.
 pub fn destroyInterceptContext(context: ?*anyopaque) void {
     const ctx: *PrometheusInterceptContext = @ptrCast(@alignCast(context orelse return));
-
-    // Emit scrape completion stats
-    const stats = ctx.filter.getStats();
-    if (stats.lines_processed > 0) {
-        ctx.config.bus.info(PrometheusScrapeCompleted{
-            .bytes_processed = stats.bytes_processed,
-            .bytes_forwarded = stats.bytes_forwarded,
-            .lines_processed = stats.lines_processed,
-            .lines_dropped = stats.lines_dropped,
-            .lines_kept = stats.lines_kept,
-            .scrape_truncated = stats.scrape_truncated,
-        });
-    }
-
-    // Free allocations
-    const allocator = ctx.allocator;
-    allocator.destroy(ctx.engine);
-    allocator.free(ctx.output_buffer);
-    allocator.free(ctx.metadata_buffer);
-    allocator.free(ctx.line_buffer);
-    allocator.destroy(ctx);
+    ctx.destroy();
 }
 
 // =============================================================================

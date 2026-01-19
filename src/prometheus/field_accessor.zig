@@ -26,6 +26,10 @@ pub const PrometheusFieldContext = struct {
     /// Cached concatenated labels for pattern matching (optional)
     /// Format: "key1=value1,key2=value2,..."
     labels_cache: ?[]const u8 = null,
+    /// Description from HELP metadata (if available)
+    description: ?[]const u8 = null,
+    /// Metric type from TYPE metadata (if available)
+    metric_type: ?[]const u8 = null,
 
     /// Create a context from a parsed sample line
     pub fn fromSample(parsed: line_parser.ParsedLine, line_buffer: []const u8) ?PrometheusFieldContext {
@@ -90,8 +94,8 @@ pub fn prometheusFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]
     return switch (field) {
         .metric_field => |mf| switch (mf) {
             .METRIC_FIELD_NAME => prom_ctx.getMetricName(),
+            .METRIC_FIELD_DESCRIPTION => prom_ctx.description,
             // Prometheus doesn't have these fields directly
-            .METRIC_FIELD_DESCRIPTION,
             .METRIC_FIELD_UNIT,
             .METRIC_FIELD_RESOURCE_SCHEMA_URL,
             .METRIC_FIELD_SCOPE_SCHEMA_URL,
@@ -122,9 +126,8 @@ pub fn prometheusFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]
         // Prometheus doesn't have resource/scope attributes
         .resource_attribute => null,
         .scope_attribute => null,
-        // Prometheus doesn't have metric type or aggregation temporality in the sample
-        // (TYPE lines are metadata, not attached to individual samples)
-        .metric_type => null,
+        // Metric type from TYPE metadata (if provided via context)
+        .metric_type => prom_ctx.metric_type,
         .aggregation_temporality => null,
     };
 }
@@ -240,7 +243,7 @@ test "prometheusFieldAccessor - unsupported fields return null" {
 
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
 
-    // Description not available in Prometheus
+    // Description null when not provided
     const desc = prometheusFieldAccessor(&ctx, .{ .metric_field = .METRIC_FIELD_DESCRIPTION });
     try std.testing.expect(desc == null);
 
@@ -248,9 +251,33 @@ test "prometheusFieldAccessor - unsupported fields return null" {
     const res = prometheusFieldAccessor(&ctx, .{ .resource_attribute = "service.name" });
     try std.testing.expect(res == null);
 
-    // Metric type not available on sample lines
+    // Metric type null when not provided
     const mt = prometheusFieldAccessor(&ctx, .metric_type);
     try std.testing.expect(mt == null);
+}
+
+test "prometheusFieldAccessor - description from metadata" {
+    const line = "http_requests_total{method=\"get\"} 100";
+    const parsed = line_parser.parseLine(line);
+
+    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    ctx.description = "Total number of HTTP requests";
+
+    const desc = prometheusFieldAccessor(&ctx, .{ .metric_field = .METRIC_FIELD_DESCRIPTION });
+    try std.testing.expect(desc != null);
+    try std.testing.expectEqualStrings("Total number of HTTP requests", desc.?);
+}
+
+test "prometheusFieldAccessor - metric type from metadata" {
+    const line = "http_requests_total{method=\"get\"} 100";
+    const parsed = line_parser.parseLine(line);
+
+    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    ctx.metric_type = "counter";
+
+    const mt = prometheusFieldAccessor(&ctx, .metric_type);
+    try std.testing.expect(mt != null);
+    try std.testing.expectEqualStrings("counter", mt.?);
 }
 
 test "prometheusFieldAccessor - labels cache" {
