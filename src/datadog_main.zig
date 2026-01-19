@@ -213,6 +213,13 @@ pub fn main() !void {
     // Set the instance_id in service metadata
     config.service.instance_id = instance_id_copy;
 
+    // Set supported policy stages for this binary (Datadog: logs and metrics only, no traces)
+    config.service.supported_stages = &.{
+        .POLICY_STAGE_LOG_FILTER,
+        .POLICY_STAGE_LOG_TRANSFORM,
+        .POLICY_STAGE_METRIC_FILTER,
+    };
+
     // Format listen address for logging
     var addr_buf: [64]u8 = undefined;
     const addr_str = try std.fmt.bufPrint(&addr_buf, "{}.{}.{}.{}", .{

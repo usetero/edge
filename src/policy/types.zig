@@ -3,6 +3,7 @@ const proto = @import("proto");
 const provider_http = @import("./provider_http.zig");
 
 pub const Header = provider_http.Header;
+pub const PolicyStage = proto.policy.PolicyStage;
 
 // =============================================================================
 // TelemetryType - Distinguishes between log and metric telemetry
@@ -33,6 +34,9 @@ pub const ServiceMetadata = struct {
     /// Service instance ID - generated at startup, not configurable
     /// This field is set by the runtime, not from config
     instance_id: []const u8 = "",
+    /// Supported policy stages for this service.
+    /// Different binaries support different stages (e.g., OTLP supports traces, Datadog does not).
+    supported_stages: []const PolicyStage = &.{},
 };
 
 /// Provider type enumeration
