@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.12.1](https://github.com/usetero/edge/compare/v1.12.0...v1.12.1) (2026-01-19)
+
+
+### Bug Fixes
+
+* patch const cast issue and build safe in signoff ([#94](https://github.com/usetero/edge/issues/94)) ([ff24d43](https://github.com/usetero/edge/commit/ff24d436f01c8d6cff8f7ae9d563c0787e851382))
+
 ## [1.12.0](https://github.com/usetero/edge/compare/v1.11.0...v1.12.0) (2026-01-19)
 
 
