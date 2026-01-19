@@ -270,9 +270,11 @@ pub fn main() !void {
         std.heap.page_allocator;
 
     // Create Prometheus module configuration (use values from config file)
+    // Pass bounded allocator if configured for memory limit enforcement
     var prometheus_config = PrometheusConfig{
         .registry = &registry,
         .bus = bus,
+        .bounded_allocator = if (bounded_allocator) |*ba| ba else null,
         .max_bytes_per_scrape = config.prometheus.max_bytes_per_scrape,
     };
 
@@ -303,6 +305,9 @@ pub fn main() !void {
             .max_request_body = 1024, // Small - GET requests only
             .max_response_body = config.max_body_size,
             .module_data = @ptrCast(&prometheus_config),
+            .response_intercept_fn = &prometheus_mod.prometheusInterceptCallback,
+            .create_intercept_context_fn = &prometheus_mod.createInterceptContext,
+            .destroy_intercept_context_fn = &prometheus_mod.destroyInterceptContext,
         },
         // Passthrough module - handles all other requests
         .{

@@ -328,40 +328,54 @@ pub const PolicyStreamingFilter = struct {
         }
     }
 
+    // Metadata buffer layout:
+    // [0..256): metric name
+    // [256..640): HELP line (384 bytes)
+    // [640..1024): TYPE line (384 bytes)
+    const METRIC_NAME_OFFSET: usize = 0;
+    const METRIC_NAME_SIZE: usize = 256;
+    const HELP_LINE_OFFSET: usize = 256;
+    const HELP_LINE_SIZE: usize = 384;
+    const TYPE_LINE_OFFSET: usize = 640;
+    const TYPE_LINE_SIZE: usize = 384;
+
     /// Update stored metadata for a metric
     fn updateMetadata(self: *PolicyStreamingFilter, metric_name: []const u8, help_line: ?[]const u8, type_line: ?[]const u8) void {
-        // Check if this is a new metric
+        // Check if this is a new metric (compare against stored name in buffer)
         if (!std.mem.eql(u8, self.current_metric_name, metric_name)) {
-            // New metric - reset state
-            self.current_metric_name = metric_name;
+            // New metric - copy name to stable buffer and reset state
+            const name_len = @min(metric_name.len, METRIC_NAME_SIZE);
+            @memcpy(self.base.metadata_buffer[METRIC_NAME_OFFSET..][0..name_len], metric_name[0..name_len]);
+            self.current_metric_name = self.base.metadata_buffer[METRIC_NAME_OFFSET..][0..name_len];
             self.current_help_line = "";
             self.current_type_line = "";
             self.metadata_written = false;
         }
 
-        // Store the metadata lines (they point into line_buffer, which is
-        // stable for the duration of this line's processing)
-        // Note: For proper metadata tracking across multiple lines, we'd need
-        // to copy into metadata_buffer. For now, we rely on HELP/TYPE appearing
-        // immediately before samples (which is the convention).
+        // Store HELP line in metadata buffer
         if (help_line) |h| {
-            // Copy to metadata buffer
-            const end = @min(h.len, self.base.metadata_buffer.len / 2);
-            @memcpy(self.base.metadata_buffer[0..end], h[0..end]);
-            self.current_help_line = self.base.metadata_buffer[0..end];
+            const len = @min(h.len, HELP_LINE_SIZE);
+            @memcpy(self.base.metadata_buffer[HELP_LINE_OFFSET..][0..len], h[0..len]);
+            self.current_help_line = self.base.metadata_buffer[HELP_LINE_OFFSET..][0..len];
         }
+
+        // Store TYPE line in metadata buffer
         if (type_line) |t| {
-            const start = self.base.metadata_buffer.len / 2;
-            const end = @min(t.len, self.base.metadata_buffer.len - start);
-            @memcpy(self.base.metadata_buffer[start..][0..end], t[0..end]);
-            self.current_type_line = self.base.metadata_buffer[start..][0..end];
+            const len = @min(t.len, TYPE_LINE_SIZE);
+            @memcpy(self.base.metadata_buffer[TYPE_LINE_OFFSET..][0..len], t[0..len]);
+            self.current_type_line = self.base.metadata_buffer[TYPE_LINE_OFFSET..][0..len];
         }
     }
 
     /// Write metadata lines if not already written for current metric
     fn maybeWriteMetadata(self: *PolicyStreamingFilter, metric_name: []const u8, writer: *std.Io.Writer) !void {
         // Only write metadata if it matches the current metric and hasn't been written
-        if (std.mem.eql(u8, self.current_metric_name, metric_name) and !self.metadata_written) {
+        // For histograms/summaries, sample names have suffixes like _bucket, _sum, _count
+        // so we check if sample name starts with the metadata metric name
+        const matches = self.current_metric_name.len > 0 and
+            std.mem.startsWith(u8, metric_name, self.current_metric_name);
+
+        if (matches and !self.metadata_written) {
             if (self.current_help_line.len > 0) {
                 try self.writeLine(self.current_help_line, writer);
                 self.base.lines_kept += 1;
@@ -374,8 +388,11 @@ pub const PolicyStreamingFilter = struct {
         }
     }
 
+    /// Sample type from ParsedLine union
+    const Sample = std.meta.TagPayload(line_parser.ParsedLine, .sample);
+
     /// Evaluate whether to keep a metric sample based on policy
-    fn shouldKeepMetric(self: *PolicyStreamingFilter, sample: line_parser.ParsedLine.Sample, line: []const u8) bool {
+    fn shouldKeepMetric(self: *PolicyStreamingFilter, sample: Sample, line: []const u8) bool {
         // Build the field context
         var ctx = PrometheusFieldContext{
             .parsed = .{ .sample = sample },

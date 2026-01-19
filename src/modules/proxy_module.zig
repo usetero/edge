@@ -117,6 +117,21 @@ pub const RoutePattern = struct {
     }
 };
 
+/// Response intercept function type.
+/// Called with each chunk of response data as it streams through.
+/// Return values:
+/// - `null`: Remove/filter this chunk (don't write to client)
+/// - `data`: Pass through unchanged (return the input slice)
+/// - Other slice: Replace with modified content
+pub const ResponseInterceptFn = *const fn (data: []const u8, context: ?*anyopaque) ?[]const u8;
+
+/// Factory function to create intercept context for each request.
+/// Receives allocator (request arena) and module_data (module-specific config).
+pub const CreateInterceptContextFn = *const fn (allocator: std.mem.Allocator, module_data: ?*const anyopaque) ?*anyopaque;
+
+/// Cleanup function for intercept context
+pub const DestroyInterceptContextFn = *const fn (context: ?*anyopaque) void;
+
 /// Upstream configuration with pre-allocated resources
 pub const UpstreamConfig = struct {
     /// Pre-parsed upstream URL components
@@ -143,6 +158,18 @@ pub const ModuleConfig = struct {
 
     /// Module-specific configuration (opaque, read-only)
     module_data: ?*const anyopaque,
+
+    /// Optional response intercept function for transforming/filtering response body
+    /// If null, response is streamed through unchanged
+    response_intercept_fn: ?ResponseInterceptFn = null,
+
+    /// Factory function to create intercept context for each request
+    /// Called once per request, context is passed to response_intercept_fn
+    /// Returns opaque pointer to context (managed by caller)
+    create_intercept_context_fn: ?CreateInterceptContextFn = null,
+
+    /// Cleanup function for intercept context
+    destroy_intercept_context_fn: ?DestroyInterceptContextFn = null,
 };
 
 /// Module request context - passed to handlers
@@ -262,17 +289,6 @@ pub const ProxyModule = struct {
         /// Cleanup module resources (called once at shutdown)
         /// NOT thread-safe (called after server stops)
         deinit: *const fn (ptr: *anyopaque) void,
-
-        /// Process a chunk of response data (optional)
-        /// If present, module wants to process response chunks.
-        /// Returns the processed chunk to forward to client (may be same, modified, or empty)
-        /// MUST be thread-safe
-        processResponseChunk: ?*const fn (
-            ptr: *anyopaque,
-            chunk: []const u8,
-            is_last: bool,
-            allocator: std.mem.Allocator,
-        ) anyerror![]const u8 = null,
     };
 
     pub fn init(self: ProxyModule, allocator: std.mem.Allocator, config: ModuleConfig) !void {
@@ -285,24 +301,6 @@ pub const ProxyModule = struct {
 
     pub fn deinit(self: ProxyModule) void {
         self.vtable.deinit(self.ptr);
-    }
-
-    /// Check if this module wants to process response chunks
-    pub fn wantsResponseProcessing(self: ProxyModule) bool {
-        return self.vtable.processResponseChunk != null;
-    }
-
-    /// Process a response chunk (only call if wantsResponseProcessing returns true)
-    pub fn processResponseChunk(
-        self: ProxyModule,
-        chunk: []const u8,
-        is_last: bool,
-        allocator: std.mem.Allocator,
-    ) ![]const u8 {
-        if (self.vtable.processResponseChunk) |fn_ptr| {
-            return fn_ptr(self.ptr, chunk, is_last, allocator);
-        }
-        return chunk;
     }
 };
 
@@ -328,6 +326,15 @@ pub const ModuleRegistration = struct {
 
     /// Module-specific configuration data (opaque)
     module_data: ?*const anyopaque = null,
+
+    /// Optional response intercept function for transforming/filtering response body
+    response_intercept_fn: ?ResponseInterceptFn = null,
+
+    /// Factory function to create intercept context for each request
+    create_intercept_context_fn: ?CreateInterceptContextFn = null,
+
+    /// Cleanup function for intercept context
+    destroy_intercept_context_fn: ?DestroyInterceptContextFn = null,
 };
 
 // =============================================================================
