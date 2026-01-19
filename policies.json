@@ -68,6 +68,14 @@
       }
     },
     {
+      "id": "drop-promhttp",
+      "name": "drop-promhttp",
+      "metric": {
+        "match": [{ "metric_field": "name", "regex": "^promhttp.*$" }],
+        "keep": false
+      }
+    },
+    {
       "id": "drop-otelgen-metric",
       "name": "drop-otelgen-metric",
       "metric": {
