@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.12.0](https://github.com/usetero/edge/compare/v1.11.0...v1.12.0) (2026-01-19)
+
+
+### Features
+
+* add in prometheus distro ([#91](https://github.com/usetero/edge/issues/91)) ([88d209e](https://github.com/usetero/edge/commit/88d209e63d5da68f4a5a7d80afd379e9859eecb9))
+* implement span policies in edge ([#89](https://github.com/usetero/edge/issues/89)) ([b6af192](https://github.com/usetero/edge/commit/b6af1925d2be8dd618c47dab587a21825e738074))
+* support policy stages ([#93](https://github.com/usetero/edge/issues/93)) ([3d98eed](https://github.com/usetero/edge/commit/3d98eed280778da1b68dc6d64441d5f4d5096eaf))
+
+
+### Bug Fixes
+
+* clean up workspace id requirement and a compression issue ([#92](https://github.com/usetero/edge/issues/92)) ([44b2775](https://github.com/usetero/edge/commit/44b277531dfdde354d608ce8890cf7485a8e6e5c))
+
 ## [1.11.0](https://github.com/usetero/edge/compare/v1.10.1...v1.11.0) (2026-01-13)
 
 
