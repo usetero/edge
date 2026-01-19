@@ -35,6 +35,7 @@ tasks:
     aliases: [bs]
     cmds:
       - zig build -Doptimize=ReleaseSafe
+      - echo "✅ Built safe"
 
   build:small:
     desc: "Build the project in ReleaseSmall mode"
@@ -237,7 +238,6 @@ tasks:
     deps:
       - task: do
       - task: build:safe
-      - echo "✅ Built safe"
     cmds:
       - gh signoff
 
