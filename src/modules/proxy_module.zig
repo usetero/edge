@@ -233,32 +233,6 @@ pub const ModuleResult = struct {
     }
 };
 
-/// Response context - passed to processResponse handlers
-pub const ModuleResponse = struct {
-    /// HTTP status code from upstream
-    status: u16,
-
-    /// Response body from upstream (decompressed)
-    body: []const u8,
-
-    /// Original request context (for access to path, method, etc.)
-    request: *const ModuleRequest,
-
-    /// Opaque context for header access
-    headers_ctx: ?*const anyopaque,
-
-    /// Function to get header value
-    get_header_fn: ?*const fn (ctx: ?*const anyopaque, name: []const u8) ?[]const u8,
-
-    /// Get a response header value by name
-    pub fn getHeader(self: *const ModuleResponse, name: []const u8) ?[]const u8 {
-        if (self.get_header_fn) |get_fn| {
-            return get_fn(self.headers_ctx, name);
-        }
-        return null;
-    }
-};
-
 /// Module interface - vtable pattern for zero-cost abstraction
 /// THREAD SAFETY: All methods MUST be thread-safe (stateless processing only)
 pub const ProxyModule = struct {
@@ -285,18 +259,6 @@ pub const ProxyModule = struct {
             allocator: std.mem.Allocator,
         ) anyerror!ModuleResult,
 
-        /// Process response from upstream
-        /// MUST be thread-safe and stateless
-        /// - Receives decompressed response body
-        /// - Can return modified body or signal to drop
-        /// - Any error = fail-open (response passes unchanged)
-        /// - If null, response passes through unchanged
-        processResponse: ?*const fn (
-            ptr: *anyopaque,
-            resp: *const ModuleResponse,
-            allocator: std.mem.Allocator,
-        ) anyerror!ModuleResult = null,
-
         /// Cleanup module resources (called once at shutdown)
         /// NOT thread-safe (called after server stops)
         deinit: *const fn (ptr: *anyopaque) void,
@@ -308,13 +270,6 @@ pub const ProxyModule = struct {
 
     pub fn processRequest(self: ProxyModule, req: *const ModuleRequest, allocator: std.mem.Allocator) !ModuleResult {
         return self.vtable.processRequest(self.ptr, req, allocator);
-    }
-
-    pub fn processResponse(self: ProxyModule, resp: *const ModuleResponse, allocator: std.mem.Allocator) !ModuleResult {
-        if (self.vtable.processResponse) |process_fn| {
-            return process_fn(self.ptr, resp, allocator);
-        }
-        return ModuleResult.unchanged();
     }
 
     pub fn deinit(self: ProxyModule) void {

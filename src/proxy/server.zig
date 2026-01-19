@@ -10,7 +10,6 @@ const EventBus = o11y.EventBus;
 const ModuleId = proxy_module.ModuleId;
 const ModuleConfig = proxy_module.ModuleConfig;
 const ModuleRequest = proxy_module.ModuleRequest;
-const ModuleResponse = proxy_module.ModuleResponse;
 const ModuleResult = proxy_module.ModuleResult;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const ProxyModule = proxy_module.ProxyModule;
@@ -511,7 +510,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
 
         .proxy_unchanged => {
             // Proxy original (potentially compressed) body to upstream
-            response_bytes.* = try proxyToUpstream(ctx, req, res, &module_entry.config, original_body);
+            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, original_body);
         },
 
         .proxy_modified => {
@@ -529,7 +528,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
             }
             defer if (compressed_allocated) req.arena.free(body_to_send);
 
-            response_bytes.* = try proxyToUpstream(ctx, req, res, &module_entry.config, body_to_send);
+            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, body_to_send);
         },
     }
 }
@@ -548,7 +547,7 @@ fn proxyToUpstream(
     ctx: *ServerContext,
     req: *httpz.Request,
     res: *httpz.Response,
-    module_config: *const ModuleConfig,
+    module_id: ModuleId,
     body_to_send: []const u8,
 ) !usize {
     const max_retries = ctx.max_upstream_retries;
@@ -557,7 +556,7 @@ fn proxyToUpstream(
     // https://codeberg.org/ziglang/zig/issues/30165
     // TODO: Once the above is fixed, we should re-evaluate this logic.
     while (attempt < max_retries) : (attempt += 1) {
-        const result = proxyToUpstreamOnce(ctx, req, res, module_config, body_to_send);
+        const result = proxyToUpstreamOnce(ctx, req, res, module_id, body_to_send);
         if (result) |bytes| {
             return bytes;
         } else |err| {
@@ -590,11 +589,9 @@ fn proxyToUpstreamOnce(
     ctx: *ServerContext,
     req: *httpz.Request,
     res: *httpz.Response,
-    module_config: *const ModuleConfig,
+    module_id: ModuleId,
     body_to_send: []const u8,
 ) !usize {
-    const module_id = module_config.id;
-
     // Build upstream URI using pre-allocated buffer
     const upstream_uri_str = try ctx.upstreams.buildUpstreamUri(
         module_id,
@@ -695,82 +692,43 @@ fn proxyToUpstreamOnce(
         res.header(header_name, header_value);
     }
 
-    // Read response body into buffer
+    // Stream response body
     const max_size = ctx.upstreams.getMaxResponseBody(module_id);
     var read_buffer: [8192]u8 = undefined;
     var upstream_body_reader = upstream_res.reader(&read_buffer);
+    const response_writer = res.writer();
 
-    // Wrap with a limited reader to respect max_size
-    var limited_buffer: [8192]u8 = undefined;
-    var limited_reader = upstream_body_reader.limited(
-        std.Io.Limit.limited(max_size),
-        &limited_buffer,
-    );
-
-    // Read entire body into arena-allocated buffer
-    var body_writer: std.Io.Writer.Allocating = .init(req.arena);
-
-    const total_bytes = limited_reader.interface.streamRemaining(&body_writer.writer) catch |err| {
-        ctx.bus.err(UpstreamStreamError{
-            .err = @errorName(err),
-            .bytes_streamed = 0,
-        });
-        return err;
-    };
+    var total_bytes: usize = 0;
+    while (total_bytes < max_size) {
+        const bytes = upstream_body_reader.stream(
+            response_writer,
+            std.Io.Limit.limited(max_size - total_bytes),
+        ) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => {
+                ctx.bus.err(UpstreamStreamError{
+                    .err = @errorName(err),
+                    .bytes_streamed = total_bytes,
+                });
+                return err;
+            },
+        };
+        if (bytes == 0) break;
+        total_bytes += bytes;
+    }
 
     if (total_bytes >= max_size) {
         ctx.bus.warn(ResponseTruncated{ .max_size = max_size });
     }
 
-    const response_body = body_writer.written();
-
-    // Look up module and call processResponse
-    const module_entry = ctx.modules.get(module_id);
-    if (module_entry) |entry| {
-        // Build ModuleRequest for context
-        const module_req = ModuleRequest{
-            .method = toHttpMethod(req.method),
-            .path = req.url.path,
-            .query = req.url.query,
-            .upstream = &entry.config.upstream,
-            .module_ctx = null,
-            .body = body_to_send,
-            .headers_ctx = req,
-            .get_header_fn = getHeaderFromHttpz,
-        };
-
-        // Build ModuleResponse
-        const module_resp = ModuleResponse{
-            .status = res.status,
-            .body = response_body,
-            .request = &module_req,
-            .headers_ctx = null, // TODO: pass upstream response headers if needed
-            .get_header_fn = null,
-        };
-
-        // Process response through module
-        const result = entry.instance.processResponse(&module_resp, req.arena) catch {
-            // On error, fail open - send original response
-            res.body = response_body;
-            return total_bytes;
-        };
-
-        switch (result.action) {
-            .proxy_unchanged => {
-                res.body = response_body;
-            },
-            .proxy_modified => {
-                res.body = result.modified_body;
-            },
-            .respond_immediately => {
-                res.status = result.status;
-                res.body = result.response_body;
-            },
-        }
-    } else {
-        // No module found, pass through unchanged
-        res.body = response_body;
-    }
+    // Flush the response writer to ensure all data is sent to client
+    response_writer.flush() catch |err| {
+        ctx.bus.err(ResponseFlushError{
+            .err = @errorName(err),
+            .bytes_written = total_bytes,
+        });
+        return err;
+    };
 
     return total_bytes;
 }

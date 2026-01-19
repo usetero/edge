@@ -27,10 +27,6 @@ pub const prometheus_module = @import("modules/prometheus_module.zig");
 // Prometheus module
 pub const prometheus = @import("prometheus/root.zig");
 
-// Utilities
-pub const bounded_allocator = @import("bounded_allocator.zig");
-pub const BoundedAllocator = bounded_allocator.BoundedAllocator;
-
 // Hyperscan/Vectorscan bindings
 pub const hyperscan = @import("hyperscan/hyperscan.zig");
 pub const matcher_index = @import("policy/matcher_index.zig");
@@ -92,6 +88,5 @@ test {
     _ = @import("modules/health_module.zig");
     _ = @import("hyperscan/hyperscan.zig");
     _ = @import("prometheus/root.zig");
-    _ = @import("bounded_allocator.zig");
     _ = @import("modules/prometheus_module.zig");
 }

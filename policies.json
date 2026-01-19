@@ -84,6 +84,14 @@
       }
     },
     {
+      "id": "drop-logs-datatype-metric",
+      "name": "drop-logs-datatype-metric",
+      "metric": {
+        "match": [{ "datapoint_attribute": "data_type", "exact": "logs" }],
+        "keep": false
+      }
+    },
+    {
       "id": "sample-ping-spans-by-name",
       "name": "Sample ping spans at 50% by span name",
       "trace": {

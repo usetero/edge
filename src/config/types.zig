@@ -53,9 +53,6 @@ pub const ProxyConfig = struct {
     // Policy providers
     policy_providers: []ProviderConfig,
 
-    // Global memory limit (optional) - if set, uses bounded allocator
-    global_memory_limit: ?usize = null,
-
     // Module-specific configuration
     prometheus: PrometheusModuleConfig = .{},
 

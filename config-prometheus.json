@@ -5,7 +5,6 @@
   "workspace_id": "${TERO_WORKSPACE_ID}",
   "log_level": "info",
   "max_body_size": 52428800,
-  "global_memory_limit": 1073741824,
   "prometheus": {
     "max_bytes_per_scrape": 52428800
   },

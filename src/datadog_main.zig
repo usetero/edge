@@ -21,7 +21,6 @@ const passthrough_mod = edge.passthrough_module;
 const datadog_mod = edge.datadog_module;
 const health_mod = edge.health_module;
 const policy = edge.policy;
-const BoundedAllocator = edge.BoundedAllocator;
 
 const o11y = @import("observability/root.zig");
 const EventBus = o11y.EventBus;
@@ -65,7 +64,6 @@ const ServiceConfigured = struct {
     version: []const u8,
 };
 
-const GlobalMemoryLimitConfigured = struct { limit_bytes: usize };
 const ServerReady = struct {};
 const ShutdownHint = struct { pid: c_int };
 const ServerStopped = struct {};
@@ -265,19 +263,9 @@ pub fn main() !void {
     // Install signal handlers
     installShutdownHandlers(bus);
 
-    // Initialize bounded allocator if global_memory_limit is configured
-    var bounded_allocator: ?BoundedAllocator = null;
-    if (config.global_memory_limit) |limit| {
-        bounded_allocator = try BoundedAllocator.init(limit);
-        bus.info(GlobalMemoryLimitConfigured{ .limit_bytes = limit });
-    }
-    defer if (bounded_allocator) |*ba| ba.deinit();
-
-    // Use bounded allocator if configured, otherwise use page allocator
-    const server_allocator = if (bounded_allocator) |*ba|
-        ba.allocator()
-    else
-        std.heap.page_allocator;
+    // Use GPA for server allocator - it's thread-safe.
+    // For memory limits, use OS-level limits (ulimit, cgroups) instead.
+    const server_allocator = allocator;
 
     // Create Datadog module configuration
     var datadog_config = DatadogConfig{

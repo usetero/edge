@@ -67,7 +67,6 @@ const ConfigJson = struct {
     max_upstream_retries: ?u8 = null,
     policy_providers: ?[]ProviderJson = null,
     service: ?ServiceJson = null,
-    global_memory_limit: ?usize = null,
     prometheus: ?PrometheusJson = null,
 };
 
@@ -145,9 +144,6 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
             config.service.version = try substituteAndDupe(allocator, version);
         }
     }
-
-    // Parse global memory limit if present
-    config.global_memory_limit = json_config.global_memory_limit;
 
     // Parse Prometheus module configuration if present
     if (json_config.prometheus) |prometheus_json| {
@@ -609,53 +605,6 @@ test "parseConfigBytes: multiple variables in same field" {
     }
 
     try std.testing.expectEqualStrings("https://:@/api", config.upstream_url);
-}
-
-test "parseConfigBytes: global_memory_limit configuration" {
-    const json_content =
-        \\{
-        \\  "listen_address": "127.0.0.1",
-        \\  "listen_port": 8080,
-        \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "test",
-        \\  "log_level": "info",
-        \\  "max_body_size": 1048576,
-        \\  "global_memory_limit": 104857600
-        \\}
-    ;
-
-    const config = try parseConfigBytes(std.testing.allocator, json_content);
-    defer {
-        std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
-        std.testing.allocator.destroy(config);
-    }
-
-    // 100MB global memory limit
-    try std.testing.expectEqual(@as(usize, 104857600), config.global_memory_limit.?);
-}
-
-test "parseConfigBytes: global_memory_limit defaults to null" {
-    const json_content =
-        \\{
-        \\  "listen_address": "127.0.0.1",
-        \\  "listen_port": 8080,
-        \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "test",
-        \\  "log_level": "info",
-        \\  "max_body_size": 1048576
-        \\}
-    ;
-
-    const config = try parseConfigBytes(std.testing.allocator, json_content);
-    defer {
-        std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
-        std.testing.allocator.destroy(config);
-    }
-
-    // Default: null (no memory limit)
-    try std.testing.expect(config.global_memory_limit == null);
 }
 
 test "parseConfigBytes: prometheus module configuration" {
