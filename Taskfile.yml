@@ -58,7 +58,7 @@ tasks:
     desc: "Run all tests"
     aliases: [t]
     cmds:
-      - zig build test
+      - zig build test -Doptimize=ReleaseSafe
 
   test:file:
     desc: "Run tests for a specific file"
@@ -236,6 +236,7 @@ tasks:
     aliases: ["sign", "s"]
     deps:
       - task: do
+      - task: build:safe
     cmds:
       - gh signoff
 
