@@ -469,7 +469,7 @@ pub const HttpProvider = struct {
         // Create SyncRequest with the new structure
         const sync_request = SyncRequest{
             .client_metadata = ClientMetadata{
-                .supported_policy_stages = .{ .items = @constCast(supported_policy_stages.ptr), .capacity = supported_policy_stages.len },
+                .supported_policy_stages = .{ .items = @constCast(supported_policy_stages), .capacity = supported_policy_stages.len },
                 .resource_attributes = .{ .items = @constCast(&resource_attributes), .capacity = resource_attributes.len },
                 .labels = .{ .items = @constCast(&labels), .capacity = labels.len },
             },
