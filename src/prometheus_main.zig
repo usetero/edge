@@ -305,9 +305,6 @@ pub fn main() !void {
             .max_request_body = 1024, // Small - GET requests only
             .max_response_body = config.max_body_size,
             .module_data = @ptrCast(&prometheus_config),
-            .response_intercept_fn = &prometheus_mod.prometheusInterceptCallback,
-            .create_intercept_context_fn = &prometheus_mod.createInterceptContext,
-            .destroy_intercept_context_fn = &prometheus_mod.destroyInterceptContext,
         },
         // Passthrough module - handles all other requests
         .{

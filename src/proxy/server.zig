@@ -1,23 +1,20 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const compress = @import("compress.zig");
-const intercepting_writer = @import("intercepting_writer.zig");
 const proxy_module = @import("../modules/proxy_module.zig");
 const router_mod = @import("router.zig");
 const upstream_client = @import("upstream_client.zig");
 const o11y = @import("../observability/root.zig");
 const EventBus = o11y.EventBus;
 
-const InterceptingWriter = intercepting_writer.InterceptingWriter;
-
 const ModuleId = proxy_module.ModuleId;
 const ModuleConfig = proxy_module.ModuleConfig;
 const ModuleRequest = proxy_module.ModuleRequest;
+const ModuleResponse = proxy_module.ModuleResponse;
 const ModuleResult = proxy_module.ModuleResult;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const ProxyModule = proxy_module.ProxyModule;
 const HttpMethod = proxy_module.HttpMethod;
-const ResponseInterceptFn = proxy_module.ResponseInterceptFn;
 const Router = router_mod.Router;
 const UpstreamClientManager = upstream_client.UpstreamClientManager;
 
@@ -282,9 +279,6 @@ pub const ProxyServer = struct {
                 .routes = reg.routes,
                 .upstream = upstream_config,
                 .module_data = reg.module_data,
-                .response_intercept_fn = reg.response_intercept_fn,
-                .create_intercept_context_fn = reg.create_intercept_context_fn,
-                .destroy_intercept_context_fn = reg.destroy_intercept_context_fn,
             };
 
             // Initialize the module
@@ -701,7 +695,7 @@ fn proxyToUpstreamOnce(
         res.header(header_name, header_value);
     }
 
-    // Stream response body (with optional interception)
+    // Read response body into buffer
     const max_size = ctx.upstreams.getMaxResponseBody(module_id);
     var read_buffer: [8192]u8 = undefined;
     var upstream_body_reader = upstream_res.reader(&read_buffer);
@@ -713,28 +707,10 @@ fn proxyToUpstreamOnce(
         &limited_buffer,
     );
 
-    // Create intercept context if module provides a factory
-    var intercept_context: ?*anyopaque = null;
-    if (module_config.create_intercept_context_fn) |create_fn| {
-        intercept_context = create_fn(req.arena, module_config.module_data);
-    }
-    defer if (module_config.destroy_intercept_context_fn) |destroy_fn| {
-        destroy_fn(intercept_context);
-    };
+    // Read entire body into arena-allocated buffer
+    var body_writer: std.Io.Writer.Allocating = .init(req.arena);
 
-    // Set up writer - use intercepting writer if module has intercept function
-    var intercept_buffer: [8192]u8 = undefined;
-    var intercepting = InterceptingWriter.init(
-        res.writer(),
-        &intercept_buffer,
-        module_config.response_intercept_fn,
-        intercept_context,
-    );
-    const writer = intercepting.writer();
-
-    // Stream from limited reader to writer
-    // streamRemaining handles EndOfStream as success, not an error
-    const total_bytes = limited_reader.interface.streamRemaining(writer) catch |err| {
+    const total_bytes = limited_reader.interface.streamRemaining(&body_writer.writer) catch |err| {
         ctx.bus.err(UpstreamStreamError{
             .err = @errorName(err),
             .bytes_streamed = 0,
@@ -746,14 +722,55 @@ fn proxyToUpstreamOnce(
         ctx.bus.warn(ResponseTruncated{ .max_size = max_size });
     }
 
-    // Flush the writer
-    writer.flush() catch |err| {
-        ctx.bus.err(ResponseFlushError{
-            .err = @errorName(err),
-            .bytes_written = total_bytes,
-        });
-        return err;
-    };
+    const response_body = body_writer.written();
+
+    // Look up module and call processResponse
+    const module_entry = ctx.modules.get(module_id);
+    if (module_entry) |entry| {
+        // Build ModuleRequest for context
+        const module_req = ModuleRequest{
+            .method = toHttpMethod(req.method),
+            .path = req.url.path,
+            .query = req.url.query,
+            .upstream = &entry.config.upstream,
+            .module_ctx = null,
+            .body = body_to_send,
+            .headers_ctx = req,
+            .get_header_fn = getHeaderFromHttpz,
+        };
+
+        // Build ModuleResponse
+        const module_resp = ModuleResponse{
+            .status = res.status,
+            .body = response_body,
+            .request = &module_req,
+            .headers_ctx = null, // TODO: pass upstream response headers if needed
+            .get_header_fn = null,
+        };
+
+        // Process response through module
+        const result = entry.instance.processResponse(&module_resp, req.arena) catch {
+            // On error, fail open - send original response
+            res.body = response_body;
+            return total_bytes;
+        };
+
+        switch (result.action) {
+            .proxy_unchanged => {
+                res.body = response_body;
+            },
+            .proxy_modified => {
+                res.body = result.modified_body;
+            },
+            .respond_immediately => {
+                res.status = result.status;
+                res.body = result.response_body;
+            },
+        }
+    } else {
+        // No module found, pass through unchanged
+        res.body = response_body;
+    }
 
     return total_bytes;
 }
