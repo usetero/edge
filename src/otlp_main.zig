@@ -167,7 +167,6 @@ pub fn main() !void {
     const config = try config_parser.parseConfigFile(allocator, config_path);
     defer {
         allocator.free(config.upstream_url);
-        allocator.free(config.workspace_id);
         for (config.policy_providers) |provider_config| {
             allocator.free(provider_config.id);
             if (provider_config.path) |path| allocator.free(path);
@@ -224,7 +223,6 @@ pub fn main() !void {
         bus,
         &registry,
         config.policy_providers,
-        config.workspace_id,
         config.service,
     );
     defer loader.deinit();

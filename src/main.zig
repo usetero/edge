@@ -184,7 +184,6 @@ pub fn main() !void {
         allocator.free(config.upstream_url);
         if (config.logs_url) |logs_url| allocator.free(logs_url);
         if (config.metrics_url) |metrics_url| allocator.free(metrics_url);
-        allocator.free(config.workspace_id);
         for (config.policy_providers) |provider_config| {
             allocator.free(provider_config.id);
             if (provider_config.path) |path| allocator.free(path);
@@ -247,7 +246,6 @@ pub fn main() !void {
         bus,
         &registry,
         config.policy_providers,
-        config.workspace_id,
         config.service,
     );
     defer loader.deinit();

@@ -3,7 +3,6 @@
   "listen_port": 8080,
   "upstream_url": "https://agent-http-intake.logs.${TERO_DD_REGION}.datadoghq.com",
   "metrics_url": "https://api.${TERO_DD_REGION}.datadoghq.com",
-  "workspace_id": "${TERO_WORKSPACE_ID}",
   "log_level": "info",
   "max_body_size": 1048576,
   "policy_providers": [

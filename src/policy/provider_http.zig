@@ -80,7 +80,6 @@ pub const HttpProvider = struct {
 
     // Service metadata for sync requests (not owned, references config)
     service: ServiceMetadata,
-    workspace_id: []const u8,
     last_sync_timestamp: u64,
     last_successful_hash: ?[]u8,
 
@@ -103,7 +102,6 @@ pub const HttpProvider = struct {
         id: []const u8,
         config_url: []const u8,
         poll_interval_seconds: u64,
-        workspace_id: []const u8,
         service: ServiceMetadata,
         headers: []const Header,
     ) !*HttpProvider {
@@ -146,7 +144,6 @@ pub const HttpProvider = struct {
             .poll_thread = null,
             .shutdown_flag = std.atomic.Value(bool).init(false),
             .service = service,
-            .workspace_id = workspace_id,
             .last_sync_timestamp = 0,
             .last_successful_hash = null,
             .policy_statuses = .{},
@@ -408,11 +405,8 @@ pub const HttpProvider = struct {
             .{ .key = "service.namespace", .value = .{ .value = .{ .string_value = self.service.namespace } } },
         };
 
-        // Build labels with required fields:
-        // - workspace.id
-        const labels = [_]KeyValue{
-            .{ .key = "workspace.id", .value = .{ .value = .{ .string_value = self.workspace_id } } },
-        };
+        // Labels (empty - workspace.id is no longer required)
+        const labels = [_]KeyValue{};
 
         // Build supported_policy_stages
         // Note: OTLP supports logs, metrics, and traces. Datadog only supports logs and metrics (no traces).

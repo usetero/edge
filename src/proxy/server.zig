@@ -254,7 +254,9 @@ pub const ProxyServer = struct {
         ctx.bus = bus;
         ctx.max_upstream_retries = max_upstream_retries;
         ctx.upstreams = UpstreamClientManager.init(allocator);
+        errdefer ctx.upstreams.deinit();
         ctx.modules = .{ .modules = .{} };
+        errdefer ctx.modules.deinit(allocator);
 
         // Build module configs for router
         var module_configs = std.ArrayListUnmanaged(ModuleConfig){};
@@ -297,13 +299,16 @@ pub const ProxyServer = struct {
 
         // Build router from module configs
         ctx.router = try Router.init(allocator, module_configs.items);
+        errdefer ctx.router.deinit();
 
         // Format listen address
         ctx.listen_address = try formatAddress(allocator, listen_address);
+        errdefer allocator.free(ctx.listen_address);
         ctx.listen_port = listen_port;
 
         // Create httpz server - using handle() for direct request handling
         const server = try allocator.create(httpz.Server(*ServerContext));
+        errdefer allocator.destroy(server);
         server.* = try httpz.Server(*ServerContext).init(allocator, .{
             .address = ctx.listen_address,
             .port = listen_port,
@@ -382,6 +387,7 @@ fn getHeaderFromHttpz(ctx: ?*const anyopaque, name: []const u8) ?[]const u8 {
 }
 
 /// Decompress body if encoding is present
+/// Uses default max decompressed size to prevent compression bombs
 fn decompressIfNeeded(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -389,8 +395,8 @@ fn decompressIfNeeded(
 ) ![]const u8 {
     return switch (encoding) {
         .none => body, // Return original, no allocation
-        .gzip => try compress.decompressGzip(allocator, body),
-        .zstd => try compress.decompressZstd(allocator, body),
+        .gzip => try compress.decompressGzip(allocator, body, 0), // 0 = use default max
+        .zstd => try compress.decompressZstd(allocator, body, 0), // 0 = use default max
     };
 }
 
