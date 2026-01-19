@@ -264,7 +264,8 @@ pub fn main() !void {
     var prometheus_config = PrometheusConfig{
         .registry = &registry,
         .bus = bus,
-        .max_bytes_per_scrape = config.prometheus.max_bytes_per_scrape,
+        .max_input_bytes_per_scrape = config.prometheus.max_input_bytes_per_scrape,
+        .max_output_bytes_per_scrape = config.prometheus.max_output_bytes_per_scrape,
     };
 
     // Determine upstream URL for metrics (use metrics_url if configured, otherwise upstream_url)

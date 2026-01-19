@@ -51,7 +51,8 @@ pub const FilterStats = struct {
 /// Internal implementation - use PolicyStreamingFilter for public API.
 const StreamingPrometheusFilter = struct {
     // Configuration
-    max_scrape_bytes: usize,
+    max_input_bytes: usize,
+    max_output_bytes: usize,
 
     // Buffers (caller-provided)
     line_buffer: []u8,
@@ -67,19 +68,28 @@ const StreamingPrometheusFilter = struct {
     lines_dropped: usize,
     lines_kept: usize,
     scrape_truncated: bool,
+    truncation_reason: TruncationReason,
 
     // State
     stopped: bool,
 
+    pub const TruncationReason = enum {
+        none,
+        input_limit,
+        output_limit,
+    };
+
     pub const Config = struct {
         line_buffer: []u8,
         metadata_buffer: []u8,
-        max_scrape_bytes: usize,
+        max_input_bytes: usize,
+        max_output_bytes: usize = std.math.maxInt(usize),
     };
 
     pub fn init(config: Config) StreamingPrometheusFilter {
         return .{
-            .max_scrape_bytes = config.max_scrape_bytes,
+            .max_input_bytes = config.max_input_bytes,
+            .max_output_bytes = config.max_output_bytes,
             .line_buffer = config.line_buffer,
             .line_len = 0,
             .metadata_buffer = config.metadata_buffer,
@@ -89,6 +99,7 @@ const StreamingPrometheusFilter = struct {
             .lines_dropped = 0,
             .lines_kept = 0,
             .scrape_truncated = false,
+            .truncation_reason = .none,
             .stopped = false,
         };
     }
@@ -105,16 +116,25 @@ const StreamingPrometheusFilter = struct {
         chunk: []const u8,
         writer: *std.Io.Writer,
     ) !ProcessResult {
-        // Check data limit before processing
-        const remaining = self.max_scrape_bytes -| self.bytes_processed;
-        if (remaining == 0) {
+        // Check input limit before processing
+        const remaining_input = self.max_input_bytes -| self.bytes_processed;
+        if (remaining_input == 0) {
             self.scrape_truncated = true;
+            self.truncation_reason = .input_limit;
             self.stopped = true;
             return .{ .consumed = 0, .should_stop = true };
         }
 
-        // Only process up to remaining budget
-        const to_process = @min(chunk.len, remaining);
+        // Check output limit
+        if (self.bytes_forwarded >= self.max_output_bytes) {
+            self.scrape_truncated = true;
+            self.truncation_reason = .output_limit;
+            self.stopped = true;
+            return .{ .consumed = 0, .should_stop = true };
+        }
+
+        // Only process up to remaining input budget
+        const to_process = @min(chunk.len, remaining_input);
         var consumed: usize = 0;
 
         for (chunk[0..to_process]) |byte| {
@@ -125,6 +145,14 @@ const StreamingPrometheusFilter = struct {
                 // Process the complete line
                 try self.processLine(writer);
                 self.line_len = 0;
+
+                // Check output limit after each line
+                if (self.bytes_forwarded >= self.max_output_bytes) {
+                    self.scrape_truncated = true;
+                    self.truncation_reason = .output_limit;
+                    self.stopped = true;
+                    break;
+                }
             } else if (self.line_len < self.line_buffer.len) {
                 // Accumulate byte into line buffer
                 self.line_buffer[self.line_len] = byte;
@@ -133,9 +161,10 @@ const StreamingPrometheusFilter = struct {
             // If line exceeds buffer, we truncate (bytes are dropped until newline)
         }
 
-        // Check if we've hit the limit after processing
-        if (self.bytes_processed >= self.max_scrape_bytes) {
+        // Check if we've hit the input limit after processing
+        if (self.bytes_processed >= self.max_input_bytes) {
             self.scrape_truncated = true;
+            self.truncation_reason = .input_limit;
             self.stopped = true;
         }
 
@@ -229,7 +258,8 @@ pub const PolicyStreamingFilter = struct {
     pub const Config = struct {
         line_buffer: []u8,
         metadata_buffer: []u8,
-        max_scrape_bytes: usize,
+        max_input_bytes: usize,
+        max_output_bytes: usize = std.math.maxInt(usize),
         registry: *PolicyRegistry,
         bus: *EventBus,
         allocator: std.mem.Allocator,
@@ -240,7 +270,8 @@ pub const PolicyStreamingFilter = struct {
             .base = StreamingPrometheusFilter.init(.{
                 .line_buffer = config.line_buffer,
                 .metadata_buffer = config.metadata_buffer,
-                .max_scrape_bytes = config.max_scrape_bytes,
+                .max_input_bytes = config.max_input_bytes,
+                .max_output_bytes = config.max_output_bytes,
             }),
             .registry = config.registry,
             .bus = config.bus,
@@ -261,16 +292,25 @@ pub const PolicyStreamingFilter = struct {
         chunk: []const u8,
         writer: *std.Io.Writer,
     ) !ProcessResult {
-        // Check data limit before processing
-        const remaining = self.base.max_scrape_bytes -| self.base.bytes_processed;
-        if (remaining == 0) {
+        // Check input limit before processing
+        const remaining_input = self.base.max_input_bytes -| self.base.bytes_processed;
+        if (remaining_input == 0) {
             self.base.scrape_truncated = true;
+            self.base.truncation_reason = .input_limit;
             self.base.stopped = true;
             return .{ .consumed = 0, .should_stop = true };
         }
 
-        // Only process up to remaining budget
-        const to_process = @min(chunk.len, remaining);
+        // Check output limit
+        if (self.base.bytes_forwarded >= self.base.max_output_bytes) {
+            self.base.scrape_truncated = true;
+            self.base.truncation_reason = .output_limit;
+            self.base.stopped = true;
+            return .{ .consumed = 0, .should_stop = true };
+        }
+
+        // Only process up to remaining input budget
+        const to_process = @min(chunk.len, remaining_input);
         var consumed: usize = 0;
 
         for (chunk[0..to_process]) |byte| {
@@ -281,14 +321,23 @@ pub const PolicyStreamingFilter = struct {
                 // Process the complete line with policy evaluation
                 try self.processLineWithPolicy(writer);
                 self.base.line_len = 0;
+
+                // Check output limit after each line
+                if (self.base.bytes_forwarded >= self.base.max_output_bytes) {
+                    self.base.scrape_truncated = true;
+                    self.base.truncation_reason = .output_limit;
+                    self.base.stopped = true;
+                    break;
+                }
             } else if (self.base.line_len < self.base.line_buffer.len) {
                 self.base.line_buffer[self.base.line_len] = byte;
                 self.base.line_len += 1;
             }
         }
 
-        if (self.base.bytes_processed >= self.base.max_scrape_bytes) {
+        if (self.base.bytes_processed >= self.base.max_input_bytes) {
             self.base.scrape_truncated = true;
+            self.base.truncation_reason = .input_limit;
             self.base.stopped = true;
         }
 
@@ -639,7 +688,7 @@ test "StreamingPrometheusFilter - passthrough simple input" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -671,7 +720,7 @@ test "StreamingPrometheusFilter - chunked input" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -705,7 +754,7 @@ test "StreamingPrometheusFilter - data limit enforcement" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 20, // Very small limit
+        .max_input_bytes = 20, // Very small limit
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -730,7 +779,7 @@ test "StreamingPrometheusFilter - empty input" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -752,7 +801,7 @@ test "StreamingPrometheusFilter - partial line at end" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -780,7 +829,7 @@ test "StreamingPrometheusFilter - line longer than buffer" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -806,7 +855,7 @@ test "StreamingPrometheusFilter - HELP and TYPE lines passthrough" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -837,7 +886,7 @@ test "StreamingPrometheusFilter - newline split across chunks" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -862,7 +911,7 @@ test "StreamingPrometheusFilter - exact buffer boundary" {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 11, // Exactly "metric_a 1\n".len
+        .max_input_bytes = 11, // Exactly "metric_a 1\n".len
     });
 
     var output_writer = std.Io.Writer.fixed(&output_buf);
@@ -899,13 +948,13 @@ fn streamThroughFilter(
     line_buf: []u8,
     metadata_buf: []u8,
     output_buf: []u8,
-    max_scrape_bytes: usize,
+    max_input_bytes: usize,
     chunk_size: usize,
 ) !struct { stats: FilterStats, output: []const u8 } {
     var filter = StreamingPrometheusFilter.init(.{
         .line_buffer = line_buf,
         .metadata_buffer = metadata_buf,
-        .max_scrape_bytes = max_scrape_bytes,
+        .max_input_bytes = max_input_bytes,
     });
 
     var output_writer = std.Io.Writer.fixed(output_buf);
@@ -1038,7 +1087,7 @@ test "Reader/Writer streaming - chunk boundary mid-line" {
     try std.testing.expectEqual(@as(usize, 3), result.stats.lines_processed);
 }
 
-test "Reader/Writer streaming - max_scrape_bytes truncation" {
+test "Reader/Writer streaming - max_input_bytes truncation" {
     var line_buf: [1024]u8 = undefined;
     var metadata_buf: [1536]u8 = undefined;
     var output_buf: [4096]u8 = undefined;
@@ -1560,7 +1609,7 @@ fn streamWithFilteringWriter(
     var filter = PolicyStreamingFilter.init(.{
         .line_buffer = line_buf,
         .metadata_buffer = metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
         .registry = registry,
         .bus = bus,
         .allocator = allocator,
@@ -2163,7 +2212,7 @@ test "PolicyStreamingFilter - stats track dropped vs kept correctly" {
     try std.testing.expectEqual(@as(usize, 3), result.stats.lines_kept);
 }
 
-test "PolicyStreamingFilter - max_scrape_bytes truncation with policy" {
+test "PolicyStreamingFilter - max_input_bytes truncation with policy" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -2209,11 +2258,11 @@ test "PolicyStreamingFilter - max_scrape_bytes truncation with policy" {
         \\
     ;
 
-    // Create filter with max_scrape_bytes = 32 (exactly first 3 lines)
+    // Create filter with max_input_bytes = 32 (exactly first 3 lines)
     var filter = PolicyStreamingFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 32,
+        .max_input_bytes = 32,
         .registry = &registry,
         .bus = noop_bus.eventBus(),
         .allocator = allocator,
@@ -2290,7 +2339,7 @@ test "FilteringWriter - basic streaming with reader.stream() pattern" {
     var filter = PolicyStreamingFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
         .registry = &registry,
         .bus = noop_bus.eventBus(),
         .allocator = allocator,
@@ -2352,7 +2401,7 @@ test "FilteringWriter - simulated chunked streaming" {
     var filter = PolicyStreamingFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 1024 * 1024,
+        .max_input_bytes = 1024 * 1024,
         .registry = &registry,
         .bus = noop_bus.eventBus(),
         .allocator = allocator,
@@ -2393,7 +2442,7 @@ test "FilteringWriter - simulated chunked streaming" {
     try std.testing.expectEqualStrings(input, output);
 }
 
-test "FilteringWriter - max_scrape_bytes limit" {
+test "FilteringWriter - max_input_bytes limit" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -2410,7 +2459,7 @@ test "FilteringWriter - max_scrape_bytes limit" {
     var filter = PolicyStreamingFilter.init(.{
         .line_buffer = &line_buf,
         .metadata_buffer = &metadata_buf,
-        .max_scrape_bytes = 25, // Small limit
+        .max_input_bytes = 25, // Small limit
         .registry = &registry,
         .bus = noop_bus.eventBus(),
         .allocator = allocator,
@@ -2432,7 +2481,7 @@ test "FilteringWriter - max_scrape_bytes limit" {
         \\
     ;
 
-    // Write all data - filter should stop at max_scrape_bytes
+    // Write all data - filter should stop at max_input_bytes
     const fw = filtering_writer.writer();
     try fw.writeAll(input);
 
