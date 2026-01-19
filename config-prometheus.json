@@ -2,7 +2,6 @@
   "listen_address": "127.0.0.1",
   "listen_port": 8080,
   "upstream_url": "http://localhost:8888",
-  "workspace_id": "${TERO_WORKSPACE_ID}",
   "log_level": "info",
   "max_body_size": 52428800,
   "prometheus": {

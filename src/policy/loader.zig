@@ -87,7 +87,6 @@ pub const PolicyLoader = struct {
     allocator: std.mem.Allocator,
     bus: *EventBus,
     registry: *Registry,
-    workspace_id: []const u8,
     service: ServiceMetadata,
 
     /// Provider states (one per configured provider)
@@ -109,7 +108,6 @@ pub const PolicyLoader = struct {
         bus: *EventBus,
         registry: *Registry,
         provider_configs: []const ProviderConfig,
-        workspace_id: []const u8,
         service: ServiceMetadata,
     ) !*PolicyLoader {
         const self = try allocator.create(PolicyLoader);
@@ -127,7 +125,6 @@ pub const PolicyLoader = struct {
             .allocator = allocator,
             .bus = bus,
             .registry = registry,
-            .workspace_id = workspace_id,
             .service = service,
             .provider_states = states,
         };
@@ -305,7 +302,6 @@ pub const PolicyLoader = struct {
                     config.id,
                     url,
                     poll_interval,
-                    self.workspace_id,
                     self.service,
                     config.headers,
                 );
@@ -360,7 +356,6 @@ test "PolicyLoader: init and deinit" {
         bus,
         &registry,
         &configs,
-        "test-workspace",
         .{
             .namespace = "test",
             .name = "test-service",

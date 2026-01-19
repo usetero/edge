@@ -61,7 +61,6 @@ const ConfigJson = struct {
     upstream_url: []const u8,
     logs_url: ?[]const u8 = null,
     metrics_url: ?[]const u8 = null,
-    workspace_id: []const u8,
     log_level: []const u8,
     max_body_size: u32,
     max_upstream_retries: ?u8 = null,
@@ -113,9 +112,6 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
     if (json_config.metrics_url) |metrics_url| {
         config.metrics_url = try substituteAndDupe(allocator, metrics_url);
     }
-
-    // Allocate and copy workspace ID (with env var substitution)
-    config.workspace_id = try substituteAndDupe(allocator, json_config.workspace_id);
 
     // Parse log level (substitute env vars first)
     const log_level_str = try substituteAndDupe(allocator, json_config.log_level);
@@ -255,7 +251,6 @@ test "parseConfigFile with JSON" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://127.0.0.1:80",
-        \\  "workspace_id": "test-workspace-123",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576
         \\}
@@ -274,7 +269,6 @@ test "parseConfigFile with JSON" {
     const config = try parseConfigFile(std.testing.allocator, tmp_path);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.destroy(config);
     }
 
@@ -310,7 +304,6 @@ test "parseConfigBytes: env var substitution in upstream_url" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "https://${UNSET_HOST_VAR}/api",
-        \\  "workspace_id": "test-workspace",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576
         \\}
@@ -319,34 +312,11 @@ test "parseConfigBytes: env var substitution in upstream_url" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.destroy(config);
     }
 
     // Unset variable becomes empty
     try std.testing.expectEqualStrings("https:///api", config.upstream_url);
-}
-
-test "parseConfigBytes: env var substitution in workspace_id" {
-    const json_content =
-        \\{
-        \\  "listen_address": "127.0.0.1",
-        \\  "listen_port": 8080,
-        \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "${UNSET_WORKSPACE_VAR}",
-        \\  "log_level": "info",
-        \\  "max_body_size": 1048576
-        \\}
-    ;
-
-    const config = try parseConfigBytes(std.testing.allocator, json_content);
-    defer {
-        std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
-        std.testing.allocator.destroy(config);
-    }
-
-    try std.testing.expectEqualStrings("", config.workspace_id);
 }
 
 test "parseConfigBytes: env var substitution in optional URLs" {
@@ -357,7 +327,6 @@ test "parseConfigBytes: env var substitution in optional URLs" {
         \\  "upstream_url": "http://localhost",
         \\  "logs_url": "https://${UNSET_LOGS_HOST}/logs",
         \\  "metrics_url": "https://${UNSET_METRICS_HOST}/metrics",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576
         \\}
@@ -368,7 +337,6 @@ test "parseConfigBytes: env var substitution in optional URLs" {
         std.testing.allocator.free(config.upstream_url);
         if (config.logs_url) |url| std.testing.allocator.free(url);
         if (config.metrics_url) |url| std.testing.allocator.free(url);
-        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.destroy(config);
     }
 
@@ -382,7 +350,6 @@ test "parseConfigBytes: env var substitution in policy provider" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576,
         \\  "policy_providers": [
@@ -398,7 +365,6 @@ test "parseConfigBytes: env var substitution in policy provider" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         for (config.policy_providers) |provider| {
             std.testing.allocator.free(provider.id);
             if (provider.url) |url| std.testing.allocator.free(url);
@@ -418,7 +384,6 @@ test "parseConfigBytes: env var substitution in headers" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576,
         \\  "policy_providers": [
@@ -444,7 +409,6 @@ test "parseConfigBytes: env var substitution in headers" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         for (config.policy_providers) |provider| {
             std.testing.allocator.free(provider.id);
             if (provider.url) |url| std.testing.allocator.free(url);
@@ -472,7 +436,6 @@ test "parseConfigBytes: env var substitution in service metadata" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576,
         \\  "service": {
@@ -486,7 +449,6 @@ test "parseConfigBytes: env var substitution in service metadata" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.free(config.service.name);
         std.testing.allocator.free(config.service.namespace);
         std.testing.allocator.free(config.service.version);
@@ -504,7 +466,6 @@ test "parseConfigBytes: unclosed variable returns error" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://${UNCLOSED",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576
         \\}
@@ -519,7 +480,6 @@ test "parseConfigBytes: empty variable name returns error" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://${}/path",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576
         \\}
@@ -533,8 +493,7 @@ test "parseConfigBytes: escape sequence preserved" {
         \\{
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
-        \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "$${NOT_SUBSTITUTED}",
+        \\  "upstream_url": "http://$${NOT_SUBSTITUTED}",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576
         \\}
@@ -543,12 +502,11 @@ test "parseConfigBytes: escape sequence preserved" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.destroy(config);
     }
 
     // $$ becomes $ - so $${VAR} becomes ${VAR} literal
-    try std.testing.expectEqualStrings("${NOT_SUBSTITUTED}", config.workspace_id);
+    try std.testing.expectEqualStrings("http://${NOT_SUBSTITUTED}", config.upstream_url);
 }
 
 test "parseConfigBytes: file provider with env var in path" {
@@ -557,7 +515,6 @@ test "parseConfigBytes: file provider with env var in path" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576,
         \\  "policy_providers": [
@@ -573,7 +530,6 @@ test "parseConfigBytes: file provider with env var in path" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         for (config.policy_providers) |provider| {
             std.testing.allocator.free(provider.id);
             if (provider.path) |path| std.testing.allocator.free(path);
@@ -591,7 +547,6 @@ test "parseConfigBytes: multiple variables in same field" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "https://${UNSET_USER}:${UNSET_PASS}@${UNSET_HOST}/api",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576
         \\}
@@ -600,7 +555,6 @@ test "parseConfigBytes: multiple variables in same field" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.destroy(config);
     }
 
@@ -613,7 +567,6 @@ test "parseConfigBytes: prometheus module configuration" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576,
         \\  "prometheus": {
@@ -625,7 +578,6 @@ test "parseConfigBytes: prometheus module configuration" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.destroy(config);
     }
 
@@ -639,7 +591,6 @@ test "parseConfigBytes: prometheus module uses defaults when not specified" {
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": 8080,
         \\  "upstream_url": "http://localhost",
-        \\  "workspace_id": "test",
         \\  "log_level": "info",
         \\  "max_body_size": 1048576
         \\}
@@ -648,7 +599,6 @@ test "parseConfigBytes: prometheus module uses defaults when not specified" {
     const config = try parseConfigBytes(std.testing.allocator, json_content);
     defer {
         std.testing.allocator.free(config.upstream_url);
-        std.testing.allocator.free(config.workspace_id);
         std.testing.allocator.destroy(config);
     }
 
