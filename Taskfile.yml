@@ -237,6 +237,7 @@ tasks:
     deps:
       - task: do
       - task: build:safe
+      - echo "✅ Built safe"
     cmds:
       - gh signoff
 
