@@ -408,14 +408,9 @@ pub const HttpProvider = struct {
         // Labels (empty - workspace.id is no longer required)
         const labels = [_]KeyValue{};
 
-        // Build supported_policy_stages
-        // Note: OTLP supports logs, metrics, and traces. Datadog only supports logs and metrics (no traces).
-        const supported_policy_stages = [_]PolicyStage{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-            .POLICY_STAGE_TRACE_SAMPLING, // OTLP only - Datadog traces are NOT supported
-        };
+        // Build supported_policy_stages from service metadata
+        // Different binaries support different stages (e.g., OTLP supports traces, Datadog does not)
+        const supported_policy_stages = self.service.supported_stages;
 
         // Build policy_statuses from our tracked state
         var policy_statuses_list = std.ArrayListUnmanaged(PolicySyncStatus){};
@@ -474,7 +469,7 @@ pub const HttpProvider = struct {
         // Create SyncRequest with the new structure
         const sync_request = SyncRequest{
             .client_metadata = ClientMetadata{
-                .supported_policy_stages = .{ .items = @constCast(&supported_policy_stages), .capacity = supported_policy_stages.len },
+                .supported_policy_stages = .{ .items = @constCast(supported_policy_stages.ptr), .capacity = supported_policy_stages.len },
                 .resource_attributes = .{ .items = @constCast(&resource_attributes), .capacity = resource_attributes.len },
                 .labels = .{ .items = @constCast(&labels), .capacity = labels.len },
             },
