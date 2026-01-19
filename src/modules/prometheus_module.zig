@@ -43,7 +43,8 @@ const PrometheusFilterStats = struct {
 pub const PrometheusConfig = struct {
     registry: *PolicyRegistry,
     bus: *EventBus,
-    max_bytes_per_scrape: usize = 10 * 1024 * 1024,
+    max_input_bytes_per_scrape: usize = 10 * 1024 * 1024,
+    max_output_bytes_per_scrape: usize = 10 * 1024 * 1024,
 };
 
 // =============================================================================
@@ -86,7 +87,8 @@ const PrometheusResponseFilter = struct {
         self.filter = PolicyStreamingFilter.init(.{
             .line_buffer = &self.line_buffer,
             .metadata_buffer = &self.metadata_buffer,
-            .max_scrape_bytes = config.max_bytes_per_scrape,
+            .max_input_bytes = config.max_input_bytes_per_scrape,
+            .max_output_bytes = config.max_output_bytes_per_scrape,
             .registry = config.registry,
             .bus = config.bus,
             .allocator = allocator,
@@ -287,7 +289,8 @@ test "PrometheusModule - createResponseFilter with config" {
     var config = PrometheusConfig{
         .registry = &registry,
         .bus = noop_bus.eventBus(),
-        .max_bytes_per_scrape = 1024 * 1024,
+        .max_input_bytes_per_scrape = 1024 * 1024,
+        .max_output_bytes_per_scrape = 1024 * 1024,
     };
 
     var module = PrometheusModule{};
@@ -360,7 +363,8 @@ test "PrometheusModule - response filter with DROP policy" {
     var config = PrometheusConfig{
         .registry = &registry,
         .bus = noop_bus.eventBus(),
-        .max_bytes_per_scrape = 1024 * 1024,
+        .max_input_bytes_per_scrape = 1024 * 1024,
+        .max_output_bytes_per_scrape = 1024 * 1024,
     };
 
     var module = PrometheusModule{};

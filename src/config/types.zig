@@ -21,9 +21,15 @@ pub const LogLevel = enum(u8) {
 
 /// Prometheus module configuration
 pub const PrometheusModuleConfig = struct {
-    /// Maximum bytes to process per scrape (data throughput limit)
+    /// Maximum input bytes to process per scrape (limits data read from upstream)
+    /// This bounds memory usage for buffering input data.
     /// Default: 10MB
-    max_bytes_per_scrape: usize = 10 * 1024 * 1024,
+    max_input_bytes_per_scrape: usize = 10 * 1024 * 1024,
+
+    /// Maximum output bytes to forward per scrape (limits response size to client)
+    /// Set higher than input limit if filtering reduces data significantly.
+    /// Default: 10MB
+    max_output_bytes_per_scrape: usize = 10 * 1024 * 1024,
 };
 
 pub const ProxyConfig = struct {

@@ -51,7 +51,8 @@ const ServiceJson = struct {
 
 /// JSON schema for Prometheus module configuration
 const PrometheusJson = struct {
-    max_bytes_per_scrape: ?usize = null,
+    max_input_bytes_per_scrape: ?usize = null,
+    max_output_bytes_per_scrape: ?usize = null,
 };
 
 /// JSON schema for configuration file
@@ -143,8 +144,11 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
 
     // Parse Prometheus module configuration if present
     if (json_config.prometheus) |prometheus_json| {
-        if (prometheus_json.max_bytes_per_scrape) |max_bytes| {
-            config.prometheus.max_bytes_per_scrape = max_bytes;
+        if (prometheus_json.max_input_bytes_per_scrape) |max_bytes| {
+            config.prometheus.max_input_bytes_per_scrape = max_bytes;
+        }
+        if (prometheus_json.max_output_bytes_per_scrape) |max_bytes| {
+            config.prometheus.max_output_bytes_per_scrape = max_bytes;
         }
     }
 
@@ -570,7 +574,8 @@ test "parseConfigBytes: prometheus module configuration" {
         \\  "log_level": "info",
         \\  "max_body_size": 1048576,
         \\  "prometheus": {
-        \\    "max_bytes_per_scrape": 5242880
+        \\    "max_input_bytes_per_scrape": 5242880,
+        \\    "max_output_bytes_per_scrape": 10485760
         \\  }
         \\}
     ;
@@ -581,8 +586,10 @@ test "parseConfigBytes: prometheus module configuration" {
         std.testing.allocator.destroy(config);
     }
 
-    // 5MB per scrape
-    try std.testing.expectEqual(@as(usize, 5242880), config.prometheus.max_bytes_per_scrape);
+    // 5MB input limit
+    try std.testing.expectEqual(@as(usize, 5242880), config.prometheus.max_input_bytes_per_scrape);
+    // 10MB output limit
+    try std.testing.expectEqual(@as(usize, 10485760), config.prometheus.max_output_bytes_per_scrape);
 }
 
 test "parseConfigBytes: prometheus module uses defaults when not specified" {
@@ -602,6 +609,7 @@ test "parseConfigBytes: prometheus module uses defaults when not specified" {
         std.testing.allocator.destroy(config);
     }
 
-    // Default: 10MB per scrape
-    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), config.prometheus.max_bytes_per_scrape);
+    // Default: 10MB per scrape for both limits
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), config.prometheus.max_input_bytes_per_scrape);
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), config.prometheus.max_output_bytes_per_scrape);
 }

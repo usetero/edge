@@ -25,6 +25,10 @@ processor Policy implementation.
    endpoint, applies policy-based filtering (DROP/KEEP), and forwards to
    Datadog.
 
+4. **Prometheus proxy** - Sits as a sidecar next to your application, proxies
+   `/metrics` scrapes with streaming policy-based metric filtering, and forwards
+   filtered metrics to Prometheus.
+
 ## Repository Structure
 
 ```
@@ -32,6 +36,7 @@ src/
 ├── main.zig              # Default distribution entry point
 ├── datadog_main.zig      # Datadog-focused distribution entry point
 ├── otlp_main.zig         # OTLP-focused distribution entry point
+├── prometheus_main.zig   # Prometheus-focused distribution entry point
 ├── root.zig              # Library root (public API exports)
 │
 ├── policy/               # Policy management package
@@ -138,6 +143,8 @@ infrastructure.
 - `ModuleRegistration` - Module configuration (routes, upstream, etc.)
 - `DatadogModule` - Datadog log ingestion with policy-based filtering
 - `OtlpModule` - OpenTelemetry log ingestion with policy-based filtering
+- `PrometheusModule` - Prometheus metrics scraping with streaming policy-based
+  filtering
 - `PassthroughModule` - No-op passthrough for unhandled routes
 
 **Integration:**
@@ -368,6 +375,24 @@ Focused distribution for OpenTelemetry Protocol (OTLP) log ingestion with:
 Build: `zig build otlp` Run: `zig build run-otlp` or
 `./zig-out/bin/edge-otlp [config-file]`
 
+### Prometheus (`prometheus_main.zig`)
+
+Focused distribution for Prometheus metrics scraping with streaming filtering:
+
+- Proxies `/metrics` endpoint with policy-based metric filtering
+- Streaming response processing (bounded memory regardless of response size)
+- Configurable per-scrape limits (`max_input_bytes_per_scrape`,
+  `max_output_bytes_per_scrape`)
+- Filters metrics by name, labels, type, and other fields
+- Zero-copy forwarding for metrics that pass policy checks
+- Fail-open behavior (errors pass metrics through unchanged)
+- Designed for sidecar deployment next to your application
+- Lock-free policy updates via atomic snapshots
+- Graceful shutdown with signal handling
+
+Build: `zig build prometheus` Run: `zig build run-prometheus` or
+`./zig-out/bin/edge-prometheus [config-file]`
+
 ## Building
 
 ```bash
@@ -378,14 +403,16 @@ zig build
 zig build test
 
 # Build specific distribution
-zig build edge     # Full distribution (Datadog + OTLP)
-zig build datadog  # Datadog-only distribution
-zig build otlp     # OTLP-only distribution
+zig build edge        # Full distribution (Datadog + OTLP + Prometheus)
+zig build datadog     # Datadog-only distribution
+zig build otlp        # OTLP-only distribution
+zig build prometheus  # Prometheus-only distribution
 
 # Run specific distribution
 zig build run-edge
 zig build run-datadog
 zig build run-otlp
+zig build run-prometheus
 ```
 
 ## Installation
