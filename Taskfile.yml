@@ -235,10 +235,9 @@ tasks:
   signoff:
     desc: "Sign off the codebase"
     aliases: ["sign", "s"]
-    deps:
+    cmds:
       - task: do
       - task: build:safe
-    cmds:
       - gh signoff
 
   install:
