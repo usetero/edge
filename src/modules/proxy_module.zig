@@ -233,6 +233,39 @@ pub const ModuleResult = struct {
     }
 };
 
+/// Response filter interface for streaming response body filtering.
+/// Modules can implement this to intercept and transform response data.
+pub const ResponseFilter = struct {
+    /// Opaque pointer to filter implementation
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Get the writer interface for streaming data through the filter.
+        /// The returned writer processes data and forwards to the inner writer.
+        getWriter: *const fn (ptr: *anyopaque) *std.Io.Writer,
+
+        /// Finish filtering and cleanup. Returns bytes forwarded to client.
+        /// This MUST be called after streaming is complete.
+        finish: *const fn (ptr: *anyopaque) anyerror!usize,
+
+        /// Destroy the filter and free resources.
+        destroy: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn writer(self: ResponseFilter) *std.Io.Writer {
+        return self.vtable.getWriter(self.ptr);
+    }
+
+    pub fn finish(self: ResponseFilter) !usize {
+        return self.vtable.finish(self.ptr);
+    }
+
+    pub fn destroy(self: ResponseFilter) void {
+        self.vtable.destroy(self.ptr);
+    }
+};
+
 /// Module interface - vtable pattern for zero-cost abstraction
 /// THREAD SAFETY: All methods MUST be thread-safe (stateless processing only)
 pub const ProxyModule = struct {
@@ -262,6 +295,16 @@ pub const ProxyModule = struct {
         /// Cleanup module resources (called once at shutdown)
         /// NOT thread-safe (called after server stops)
         deinit: *const fn (ptr: *anyopaque) void,
+
+        /// Optional: Create a response filter for streaming response body filtering.
+        /// Called per-request. Returns null if module doesn't filter responses.
+        /// MUST be thread-safe (called from worker threads).
+        /// The inner_writer is the actual response writer to forward filtered data to.
+        createResponseFilter: ?*const fn (
+            ptr: *anyopaque,
+            inner_writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) anyerror!?ResponseFilter = null,
     };
 
     pub fn init(self: ProxyModule, allocator: std.mem.Allocator, config: ModuleConfig) !void {
@@ -274,6 +317,19 @@ pub const ProxyModule = struct {
 
     pub fn deinit(self: ProxyModule) void {
         self.vtable.deinit(self.ptr);
+    }
+
+    /// Create a response filter if the module supports it.
+    /// Returns null if the module doesn't filter responses.
+    pub fn createResponseFilter(
+        self: ProxyModule,
+        inner_writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) !?ResponseFilter {
+        if (self.vtable.createResponseFilter) |create_fn| {
+            return create_fn(self.ptr, inner_writer, allocator);
+        }
+        return null;
     }
 };
 

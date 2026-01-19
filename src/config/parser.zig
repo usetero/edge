@@ -49,6 +49,11 @@ const ServiceJson = struct {
     version: ?[]const u8 = null,
 };
 
+/// JSON schema for Prometheus module configuration
+const PrometheusJson = struct {
+    max_bytes_per_scrape: ?usize = null,
+};
+
 /// JSON schema for configuration file
 const ConfigJson = struct {
     listen_address: []const u8,
@@ -62,6 +67,7 @@ const ConfigJson = struct {
     max_upstream_retries: ?u8 = null,
     policy_providers: ?[]ProviderJson = null,
     service: ?ServiceJson = null,
+    prometheus: ?PrometheusJson = null,
 };
 
 /// Parse JSON configuration file into ProxyConfig
@@ -136,6 +142,13 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
         }
         if (service_json.version) |version| {
             config.service.version = try substituteAndDupe(allocator, version);
+        }
+    }
+
+    // Parse Prometheus module configuration if present
+    if (json_config.prometheus) |prometheus_json| {
+        if (prometheus_json.max_bytes_per_scrape) |max_bytes| {
+            config.prometheus.max_bytes_per_scrape = max_bytes;
         }
     }
 
@@ -592,4 +605,53 @@ test "parseConfigBytes: multiple variables in same field" {
     }
 
     try std.testing.expectEqualStrings("https://:@/api", config.upstream_url);
+}
+
+test "parseConfigBytes: prometheus module configuration" {
+    const json_content =
+        \\{
+        \\  "listen_address": "127.0.0.1",
+        \\  "listen_port": 8080,
+        \\  "upstream_url": "http://localhost",
+        \\  "workspace_id": "test",
+        \\  "log_level": "info",
+        \\  "max_body_size": 1048576,
+        \\  "prometheus": {
+        \\    "max_bytes_per_scrape": 5242880
+        \\  }
+        \\}
+    ;
+
+    const config = try parseConfigBytes(std.testing.allocator, json_content);
+    defer {
+        std.testing.allocator.free(config.upstream_url);
+        std.testing.allocator.free(config.workspace_id);
+        std.testing.allocator.destroy(config);
+    }
+
+    // 5MB per scrape
+    try std.testing.expectEqual(@as(usize, 5242880), config.prometheus.max_bytes_per_scrape);
+}
+
+test "parseConfigBytes: prometheus module uses defaults when not specified" {
+    const json_content =
+        \\{
+        \\  "listen_address": "127.0.0.1",
+        \\  "listen_port": 8080,
+        \\  "upstream_url": "http://localhost",
+        \\  "workspace_id": "test",
+        \\  "log_level": "info",
+        \\  "max_body_size": 1048576
+        \\}
+    ;
+
+    const config = try parseConfigBytes(std.testing.allocator, json_content);
+    defer {
+        std.testing.allocator.free(config.upstream_url);
+        std.testing.allocator.free(config.workspace_id);
+        std.testing.allocator.destroy(config);
+    }
+
+    // Default: 10MB per scrape
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), config.prometheus.max_bytes_per_scrape);
 }

@@ -22,6 +22,10 @@ pub const passthrough_module = @import("modules/passthrough_module.zig");
 pub const datadog_module = @import("modules/datadog_module.zig");
 pub const otlp_module = @import("modules/otlp_module.zig");
 pub const health_module = @import("modules/health_module.zig");
+pub const prometheus_module = @import("modules/prometheus_module.zig");
+
+// Prometheus module
+pub const prometheus = @import("prometheus/root.zig");
 
 // Hyperscan/Vectorscan bindings
 pub const hyperscan = @import("hyperscan/hyperscan.zig");
@@ -36,6 +40,9 @@ pub const datadog_distribution = @import("datadog_main.zig");
 
 /// OTLP distribution - focused edge proxy for OpenTelemetry log ingestion
 pub const otlp_distribution = @import("otlp_main.zig");
+
+/// Prometheus distribution - focused edge proxy for Prometheus metrics scraping
+pub const prometheus_distribution = @import("prometheus_main.zig");
 
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
@@ -80,4 +87,6 @@ test {
     _ = @import("modules/otlp_logs.zig");
     _ = @import("modules/health_module.zig");
     _ = @import("hyperscan/hyperscan.zig");
+    _ = @import("prometheus/root.zig");
+    _ = @import("modules/prometheus_module.zig");
 }

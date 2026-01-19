@@ -68,10 +68,26 @@
       }
     },
     {
+      "id": "drop-promhttp",
+      "name": "drop-promhttp",
+      "metric": {
+        "match": [{ "metric_field": "name", "regex": "^promhttp.*$" }],
+        "keep": false
+      }
+    },
+    {
       "id": "drop-otelgen-metric",
       "name": "drop-otelgen-metric",
       "metric": {
         "match": [{ "metric_field": "name", "regex": "^.*otelgen.*$" }],
+        "keep": false
+      }
+    },
+    {
+      "id": "drop-logs-datatype-metric",
+      "name": "drop-logs-datatype-metric",
+      "metric": {
+        "match": [{ "datapoint_attribute": "data_type", "exact": "logs" }],
         "keep": false
       }
     },

@@ -239,6 +239,10 @@ pub fn main() !void {
     // Install signal handlers
     installShutdownHandlers(bus);
 
+    // Use GPA for server allocator - it's thread-safe.
+    // For memory limits, use OS-level limits (ulimit, cgroups) instead.
+    const server_allocator = allocator;
+
     // Create OTLP module configuration
     var otlp_config = OtlpConfig{
         .registry = &registry,
@@ -283,7 +287,7 @@ pub fn main() !void {
 
     // Create proxy server with modules
     var proxy = try ProxyServer.init(
-        std.heap.page_allocator,
+        server_allocator,
         bus,
         config.listen_address,
         config.listen_port,
