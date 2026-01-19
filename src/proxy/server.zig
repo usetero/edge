@@ -382,6 +382,7 @@ fn getHeaderFromHttpz(ctx: ?*const anyopaque, name: []const u8) ?[]const u8 {
 }
 
 /// Decompress body if encoding is present
+/// Uses default max decompressed size to prevent compression bombs
 fn decompressIfNeeded(
     allocator: std.mem.Allocator,
     body: []const u8,
@@ -389,8 +390,8 @@ fn decompressIfNeeded(
 ) ![]const u8 {
     return switch (encoding) {
         .none => body, // Return original, no allocation
-        .gzip => try compress.decompressGzip(allocator, body),
-        .zstd => try compress.decompressZstd(allocator, body),
+        .gzip => try compress.decompressGzip(allocator, body, 0), // 0 = use default max
+        .zstd => try compress.decompressZstd(allocator, body, 0), // 0 = use default max
     };
 }
 

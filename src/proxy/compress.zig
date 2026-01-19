@@ -8,6 +8,9 @@ const c = @cImport({
 const ZSTD_CONTENTSIZE_ERROR: u64 = @bitCast(@as(i64, -2));
 const ZSTD_CONTENTSIZE_UNKNOWN: u64 = @bitCast(@as(i64, -1));
 
+/// Default maximum decompressed size (100MB) to prevent compression bombs
+pub const default_max_decompressed_size: usize = 100 * 1024 * 1024;
+
 /// Compress data using zlib's gzip compression (actual gzip format)
 pub fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 
@@ -56,10 +59,13 @@ pub fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 /// Decompress gzip data using zlib
-pub fn decompressGzip(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
+/// max_size: Maximum allowed decompressed size to prevent compression bombs.
+///           Use 0 for default_max_decompressed_size.
+pub fn decompressGzip(allocator: std.mem.Allocator, compressed: []const u8, max_size: usize) ![]u8 {
+    const max_decompressed = if (max_size == 0) default_max_decompressed_size else max_size;
 
-    // Start with a reasonable buffer size
-    var decompressed_size: usize = compressed.len * 10; // Start with 10x the compressed size
+    // Start with a reasonable buffer size, but cap at max
+    var decompressed_size: usize = @min(compressed.len * 10, max_decompressed);
     var decompressed = try allocator.alloc(u8, decompressed_size);
     errdefer allocator.free(decompressed);
 
@@ -88,11 +94,22 @@ pub fn decompressGzip(allocator: std.mem.Allocator, compressed: []const u8) ![]u
 
         if (result == c.Z_STREAM_END) {
             total_out = stream.total_out;
+            // Final check: ensure decompressed size doesn't exceed limit
+            if (total_out > max_decompressed) {
+                return error.DecompressedSizeTooLarge;
+            }
             break;
         } else if (result == c.Z_BUF_ERROR) {
             // Need more output space
             total_out = stream.total_out;
-            decompressed_size *= 2;
+            const new_size = decompressed_size * 2;
+
+            // Check against max size limit to prevent compression bombs
+            if (new_size > max_decompressed) {
+                return error.DecompressedSizeTooLarge;
+            }
+
+            decompressed_size = new_size;
             decompressed = try allocator.realloc(decompressed, decompressed_size);
         } else if (result != c.Z_OK) {
             return error.DecompressionFailed;
@@ -136,7 +153,10 @@ pub fn compressZstd(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 /// Decompress zstd data
-pub fn decompressZstd(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
+/// max_size: Maximum allowed decompressed size to prevent compression bombs.
+///           Use 0 for default_max_decompressed_size.
+pub fn decompressZstd(allocator: std.mem.Allocator, compressed: []const u8, max_size: usize) ![]u8 {
+    const max_decompressed = if (max_size == 0) default_max_decompressed_size else max_size;
 
     // Get the decompressed size from the frame header
     const decompressed_size = c.ZSTD_getFrameContentSize(compressed.ptr, compressed.len);
@@ -148,7 +168,12 @@ pub fn decompressZstd(allocator: std.mem.Allocator, compressed: []const u8) ![]u
 
     if (decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
         // If size is unknown, we need to use streaming decompression
-        return decompressZstdStreaming(allocator, compressed);
+        return decompressZstdStreaming(allocator, compressed, max_decompressed);
+    }
+
+    // Check against max size limit to prevent compression bombs
+    if (decompressed_size > max_decompressed) {
+        return error.DecompressedSizeTooLarge;
     }
 
     // Allocate exact size needed
@@ -180,7 +205,7 @@ pub fn decompressZstd(allocator: std.mem.Allocator, compressed: []const u8) ![]u
 }
 
 /// Streaming decompression for when content size is unknown
-fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8) ![]u8 {
+fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8, max_decompressed: usize) ![]u8 {
 
     // Create a decompression context
     const dctx = c.ZSTD_createDCtx();
@@ -189,8 +214,8 @@ fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8)
     }
     defer _ = c.ZSTD_freeDCtx(dctx);
 
-    // Start with a reasonable buffer
-    var decompressed_capacity: usize = compressed.len * 10;
+    // Start with a reasonable buffer, but cap at max
+    var decompressed_capacity: usize = @min(compressed.len * 10, max_decompressed);
     var decompressed = try allocator.alloc(u8, decompressed_capacity);
     errdefer allocator.free(decompressed);
 
@@ -209,7 +234,14 @@ fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8)
     while (in_buffer.pos < in_buffer.size) {
         // Check if we need more output space
         if (out_buffer.pos == out_buffer.size) {
-            decompressed_capacity *= 2;
+            const new_capacity = decompressed_capacity * 2;
+
+            // Check against max size limit to prevent compression bombs
+            if (new_capacity > max_decompressed) {
+                return error.DecompressedSizeTooLarge;
+            }
+
+            decompressed_capacity = new_capacity;
             decompressed = try allocator.realloc(decompressed, decompressed_capacity);
             out_buffer.dst = decompressed.ptr;
             out_buffer.size = decompressed_capacity;
@@ -225,6 +257,10 @@ fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8)
 
         // result == 0 means frame is completely decoded
         if (result == 0) {
+            // Final check: ensure decompressed size doesn't exceed limit
+            if (out_buffer.pos > max_decompressed) {
+                return error.DecompressedSizeTooLarge;
+            }
             break;
         }
     }
@@ -253,8 +289,8 @@ test "compressZstd and decompressZstd" {
     try std.testing.expect(compressed[2] == 0x2F);
     try std.testing.expect(compressed[3] == 0xFD);
 
-    // Decompress to verify
-    const decompressed = try decompressZstd(allocator, compressed);
+    // Decompress to verify (0 = use default max size)
+    const decompressed = try decompressZstd(allocator, compressed, 0);
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualStrings(originalData, decompressed);
@@ -282,8 +318,8 @@ test "zstd compress and decompress JSON payload" {
     // Compression ratio should be good for JSON
     try std.testing.expect(compressed.len < originalData.len);
 
-    // Decompress to verify
-    const decompressed = try decompressZstd(allocator, compressed);
+    // Decompress to verify (0 = use default max size)
+    const decompressed = try decompressZstd(allocator, compressed, 0);
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualStrings(originalData, decompressed);
@@ -321,8 +357,8 @@ test "compressGzip and decompressGzip" {
     try std.testing.expect(compressed[0] == 0x1f);
     try std.testing.expect(compressed[1] == 0x8b);
 
-    // Decompress to verify
-    const decompressed = try decompressGzip(allocator, compressed);
+    // Decompress to verify (0 = use default max size)
+    const decompressed = try decompressGzip(allocator, compressed, 0);
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualStrings(originalData, decompressed);
@@ -352,8 +388,8 @@ test "decompress json payload" {
     try std.testing.expect(compressed[0] == 0x1f);
     try std.testing.expect(compressed[1] == 0x8b);
 
-    // Decompress to verify
-    const decompressed = try decompressGzip(allocator, compressed);
+    // Decompress to verify (0 = use default max size)
+    const decompressed = try decompressGzip(allocator, compressed, 0);
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualStrings(originalData, decompressed);
@@ -366,8 +402,37 @@ test "decompress actual gzip command output" {
     // Generated with: echo "Hello World" | gzip | xxd -i
     const gzip_data = [_]u8{ 0x1f, 0x8b, 0x08, 0x00, 0xb4, 0x6a, 0x1f, 0x69, 0x00, 0x03, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x08, 0xcf, 0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00, 0xe3, 0xe5, 0x95, 0xb0, 0x0c, 0x00, 0x00, 0x00 };
 
-    const decompressed = try decompressGzip(allocator, &gzip_data);
+    const decompressed = try decompressGzip(allocator, &gzip_data, 0);
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualStrings("Hello World\n", decompressed);
+}
+
+test "decompressGzip rejects data exceeding max size" {
+    const allocator = std.testing.allocator;
+
+    // Create highly compressible data (10000 'a' characters)
+    // This compresses very small but decompresses large
+    const original = "a" ** 10000;
+    const compressed = try compressGzip(allocator, original);
+    defer allocator.free(compressed);
+
+    // Compressed size will be ~30 bytes, initial buffer = 30 * 10 = 300
+    // We need 10000 bytes, so buffer will try to grow: 300 -> 600 -> 1200 -> 2400 -> 4800 -> 9600 -> 19200
+    // With max_size=500, it should fail when trying to grow to 600
+    const result = decompressGzip(allocator, compressed, 500);
+    try std.testing.expectError(error.DecompressedSizeTooLarge, result);
+}
+
+test "decompressZstd rejects data exceeding max size" {
+    const allocator = std.testing.allocator;
+
+    // Create highly compressible data (10000 'a' characters)
+    const original = "a" ** 10000;
+    const compressed = try compressZstd(allocator, original);
+    defer allocator.free(compressed);
+
+    // ZSTD stores the decompressed size in the header, so it checks upfront
+    const result = decompressZstd(allocator, compressed, 500);
+    try std.testing.expectError(error.DecompressedSizeTooLarge, result);
 }
