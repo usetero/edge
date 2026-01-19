@@ -423,11 +423,15 @@ pub const PolicyRegistry = struct {
         source_type: SourceType,
     ) !void {
         // Deep copy the policy so we own the memory
-        const policy_copy = try policy.dupe(self.allocator);
+        var policy_copy = try policy.dupe(self.allocator);
+        errdefer policy_copy.deinit(self.allocator);
+
         try self.policies.append(self.allocator, policy_copy);
 
         // Track source metadata by policy id
         const id_key = try self.allocator.dupe(u8, policy.id);
+        errdefer self.allocator.free(id_key);
+
         try self.policy_sources.put(id_key, PolicyMetadata.init(provider_id, source_type));
     }
 
