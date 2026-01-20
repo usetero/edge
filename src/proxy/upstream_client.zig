@@ -203,6 +203,58 @@ pub const UpstreamClientManager = struct {
 
         return fbs.getWritten();
     }
+
+    /// Build a std.Uri directly from pre-parsed components (zero parsing overhead).
+    /// The path is written into the pre-allocated uri_buffer.
+    /// This avoids the cost of std.Uri.parse() on every request.
+    pub fn buildUri(
+        self: *UpstreamClientManager,
+        module_id: ModuleId,
+        request_path: []const u8,
+        query_string: []const u8,
+    ) !std.Uri {
+        const idx = @intFromEnum(module_id);
+        const slice = self.upstreams.slice();
+
+        const scheme = slice.items(.scheme)[idx];
+        const host = slice.items(.host)[idx];
+        const port = slice.items(.port)[idx];
+        const base_path = slice.items(.base_path)[idx];
+        const uri_buffer = slice.items(.uri_buffer)[idx];
+
+        // Build combined path into buffer
+        var fbs = std.io.fixedBufferStream(uri_buffer);
+        const writer = fbs.writer();
+
+        // Add base path if present and not just "/"
+        if (base_path.len > 0 and !std.mem.eql(u8, base_path, "/")) {
+            try writer.writeAll(base_path);
+        }
+
+        // Add separator if needed between base_path and request_path
+        if (request_path.len > 0) {
+            const needs_separator = (base_path.len == 0 or base_path[base_path.len - 1] != '/') and
+                request_path[0] != '/';
+            if (needs_separator) {
+                try writer.writeAll("/");
+            }
+            try writer.writeAll(request_path);
+        }
+
+        const combined_path = fbs.getWritten();
+
+        // Build Uri struct directly without parsing
+        return .{
+            .scheme = scheme,
+            .host = .{ .raw = host },
+            .port = port,
+            .path = .{ .raw = if (combined_path.len > 0) combined_path else "/" },
+            .query = if (query_string.len > 0) .{ .raw = query_string } else null,
+            .fragment = null,
+            .user = null,
+            .password = null,
+        };
+    }
 };
 
 // =============================================================================
@@ -306,4 +358,55 @@ test "UpstreamClientManager multiple upstreams" {
 
     try std.testing.expectEqualStrings("api1.example.com", config0.host);
     try std.testing.expectEqualStrings("api2.example.com", config1.host);
+}
+
+test "UpstreamClientManager buildUri constructs Uri without parsing" {
+    const allocator = std.testing.allocator;
+
+    var manager = UpstreamClientManager.init(allocator);
+    defer manager.deinit();
+
+    const module_id = try manager.createUpstream(
+        "https://api.example.com/v2",
+        2048,
+        1024,
+        1024,
+    );
+
+    // Test basic path
+    const uri1 = try manager.buildUri(module_id, "/logs", "");
+    try std.testing.expectEqualStrings("https", uri1.scheme);
+    try std.testing.expectEqualStrings("api.example.com", uri1.host.?.raw);
+    try std.testing.expectEqual(@as(u16, 443), uri1.port.?);
+    try std.testing.expectEqualStrings("/v2/logs", uri1.path.raw);
+    try std.testing.expectEqual(@as(?std.Uri.Component, null), uri1.query);
+
+    // Test with query string
+    const uri2 = try manager.buildUri(module_id, "/logs", "api_key=xxx");
+    try std.testing.expectEqualStrings("/v2/logs", uri2.path.raw);
+    try std.testing.expectEqualStrings("api_key=xxx", uri2.query.?.raw);
+
+    // Test empty path uses root
+    const uri3 = try manager.buildUri(module_id, "", "");
+    try std.testing.expectEqualStrings("/v2", uri3.path.raw);
+}
+
+test "UpstreamClientManager buildUri with non-standard port" {
+    const allocator = std.testing.allocator;
+
+    var manager = UpstreamClientManager.init(allocator);
+    defer manager.deinit();
+
+    const module_id = try manager.createUpstream(
+        "http://localhost:9999",
+        2048,
+        1024,
+        1024,
+    );
+
+    const uri = try manager.buildUri(module_id, "/test", "");
+    try std.testing.expectEqualStrings("http", uri.scheme);
+    try std.testing.expectEqualStrings("localhost", uri.host.?.raw);
+    try std.testing.expectEqual(@as(u16, 9999), uri.port.?);
+    try std.testing.expectEqualStrings("/test", uri.path.raw);
 }

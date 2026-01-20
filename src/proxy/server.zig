@@ -54,7 +54,7 @@ const CompressError = struct {
 
 const UpstreamRequest = struct {
     method: []const u8,
-    url: []const u8,
+    uri: std.Uri,
 };
 
 const UpstreamResponse = struct {
@@ -436,18 +436,34 @@ fn compressIfNeeded(
     };
 }
 
+/// Headers to skip when forwarding requests (case-insensitive hash lookup)
+const skip_request_headers = std.StaticStringMapWithEql(
+    void,
+    std.static_string_map.eqlAsciiIgnoreCase,
+).initComptime(.{
+    .{ "host", {} },
+    .{ "connection", {} },
+    .{ "content-length", {} },
+    .{ "transfer-encoding", {} },
+});
+
+/// Headers to skip when forwarding responses (case-insensitive hash lookup)
+const skip_response_headers = std.StaticStringMapWithEql(
+    void,
+    std.static_string_map.eqlAsciiIgnoreCase,
+).initComptime(.{
+    .{ "content-length", {} },
+    .{ "transfer-encoding", {} },
+});
+
 /// Check if header should be skipped when forwarding request
 fn shouldSkipRequestHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "host") or
-        std.ascii.eqlIgnoreCase(name, "connection") or
-        std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+    return skip_request_headers.has(name);
 }
 
 /// Check if header should be skipped when forwarding response
 fn shouldSkipResponseHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+    return skip_response_headers.has(name);
 }
 
 /// Build headers array in single pass
@@ -624,19 +640,17 @@ fn proxyToUpstreamOnce(
     module: ProxyModule,
     body_to_send: []const u8,
 ) !usize {
-    // Build upstream URI using pre-allocated buffer
-    const upstream_uri_str = try ctx.upstreams.buildUpstreamUri(
+    // Build std.Uri directly from pre-parsed components (avoids Uri.parse overhead)
+    const uri = try ctx.upstreams.buildUri(
         module_id,
         req.url.path,
         req.url.query,
     );
-
-    const uri = try std.Uri.parse(upstream_uri_str);
     const method = toStdHttpMethod(toHttpMethod(req.method));
 
     ctx.bus.debug(UpstreamRequest{
         .method = @tagName(method),
-        .url = upstream_uri_str,
+        .uri = uri,
     });
 
     // Get shared HTTP client from upstream manager (thread-safe connection pooling)
