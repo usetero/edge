@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.12.2](https://github.com/usetero/edge/compare/v1.12.1...v1.12.2) (2026-01-19)
+
+
+### Bug Fixes
+
+* use two limits ([#96](https://github.com/usetero/edge/issues/96)) ([5ee667f](https://github.com/usetero/edge/commit/5ee667f0aee447b9e247197529cd81f864fe9284))
+
 ## [1.12.1](https://github.com/usetero/edge/compare/v1.12.0...v1.12.1) (2026-01-19)
 
 
