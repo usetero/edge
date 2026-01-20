@@ -487,6 +487,9 @@ OTLP distribution.
   `upstream_url`)
 - `workspace_id` - Workspace identifier for policy sync
 - `log_level` - Logging level (trace, debug, info, warn, err)
+- `worker_count` - Number of I/O worker threads (default: 1). Higher values
+  improve throughput on multi-core systems. Can be overridden by
+  `TERO_MAX_WORKERS` environment variable.
 - `policy_providers` - List of policy sources (file/http)
 - `max_body_size` - Request/response body limits
 
@@ -518,6 +521,9 @@ OTLP distribution.
 ### Environment Variables:
 
 - `TERO_LOG_LEVEL` - Override log level (trace, debug, info, warn, err)
+- `TERO_MAX_WORKERS` - Override number of I/O worker threads (default: 1, or
+  value from config file). Higher values improve throughput on multi-core
+  systems.
 
 ## Design Principles
 

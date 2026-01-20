@@ -4,8 +4,10 @@
   "upstream_url": "http://localhost:8888",
   "log_level": "info",
   "max_body_size": 52428800,
+  "worker_count": 4,
   "prometheus": {
-    "max_bytes_per_scrape": 10000
+    "max_input_bytes_per_scrape": 52428800,
+    "max_output_bytes_per_scrape": 52428800
   },
   "policy_providers": [
     {

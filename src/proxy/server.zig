@@ -245,6 +245,7 @@ pub const ProxyServer = struct {
         listen_port: u16,
         max_upstream_retries: u8,
         max_body_size: u32,
+        worker_count: u32,
         module_registrations: []const ModuleRegistration,
     ) !ProxyServer {
         var ctx = try allocator.create(ServerContext);
@@ -307,6 +308,20 @@ pub const ProxyServer = struct {
         ctx.listen_port = listen_port;
 
         // Create httpz server - using handle() for direct request handling
+        //
+        // Performance tuning notes:
+        // - workers.count: Number of I/O threads (kqueue/epoll event loops). Each worker
+        //   handles socket I/O for its assigned connections.
+        // - workers.large_buffer_size: Set to 64KB to avoid pre-allocating huge buffers
+        //   based on max_body_size. Request bodies >64KB are dynamically allocated.
+        // - thread_pool.count: Number of threads for request processing. These threads
+        //   call the handler and make upstream requests. Keep moderate to avoid
+        //   contention on the shared upstream HTTP client connection pool.
+        // - thread_pool.backlog: Queue size before rejecting requests.
+        //
+        // The upstream HTTP client has a mutex-protected connection pool. Too many
+        // handler threads cause contention when acquiring/releasing connections.
+        // Match thread_pool.count roughly to expected concurrent upstream connections.
         const server = try allocator.create(httpz.Server(*ServerContext));
         errdefer allocator.destroy(server);
         server.* = try httpz.Server(*ServerContext).init(allocator, .{
@@ -314,6 +329,14 @@ pub const ProxyServer = struct {
             .port = listen_port,
             .request = .{
                 .max_body_size = max_body_size,
+            },
+            .workers = .{
+                .count = @intCast(@max(1, worker_count)),
+                .large_buffer_size = 64 * 1024, // 64KB - avoid pre-allocating based on max_body_size
+            },
+            .thread_pool = .{
+                .count = 32, // Moderate count to reduce upstream connection pool contention
+                .backlog = 512, // Queue for burst handling
             },
         }, ctx);
 
