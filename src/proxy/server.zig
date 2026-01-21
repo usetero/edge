@@ -54,7 +54,7 @@ const CompressError = struct {
 
 const UpstreamRequest = struct {
     method: []const u8,
-    url: []const u8,
+    uri: std.Uri,
 };
 
 const UpstreamResponse = struct {
@@ -245,6 +245,7 @@ pub const ProxyServer = struct {
         listen_port: u16,
         max_upstream_retries: u8,
         max_body_size: u32,
+        worker_count: u32,
         module_registrations: []const ModuleRegistration,
     ) !ProxyServer {
         var ctx = try allocator.create(ServerContext);
@@ -307,6 +308,20 @@ pub const ProxyServer = struct {
         ctx.listen_port = listen_port;
 
         // Create httpz server - using handle() for direct request handling
+        //
+        // Performance tuning notes:
+        // - workers.count: Number of I/O threads (kqueue/epoll event loops). Each worker
+        //   handles socket I/O for its assigned connections.
+        // - workers.large_buffer_size: Set to 64KB to avoid pre-allocating huge buffers
+        //   based on max_body_size. Request bodies >64KB are dynamically allocated.
+        // - thread_pool.count: Number of threads for request processing. These threads
+        //   call the handler and make upstream requests. Keep moderate to avoid
+        //   contention on the shared upstream HTTP client connection pool.
+        // - thread_pool.backlog: Queue size before rejecting requests.
+        //
+        // The upstream HTTP client has a mutex-protected connection pool. Too many
+        // handler threads cause contention when acquiring/releasing connections.
+        // Match thread_pool.count roughly to expected concurrent upstream connections.
         const server = try allocator.create(httpz.Server(*ServerContext));
         errdefer allocator.destroy(server);
         server.* = try httpz.Server(*ServerContext).init(allocator, .{
@@ -314,6 +329,14 @@ pub const ProxyServer = struct {
             .port = listen_port,
             .request = .{
                 .max_body_size = max_body_size,
+            },
+            .workers = .{
+                .count = @intCast(@max(1, worker_count)),
+                .large_buffer_size = 64 * 1024, // 64KB - avoid pre-allocating based on max_body_size
+            },
+            .thread_pool = .{
+                .count = 32, // Moderate count to reduce upstream connection pool contention
+                .backlog = 512, // Queue for burst handling
             },
         }, ctx);
 
@@ -413,18 +436,34 @@ fn compressIfNeeded(
     };
 }
 
+/// Headers to skip when forwarding requests (case-insensitive hash lookup)
+const skip_request_headers = std.StaticStringMapWithEql(
+    void,
+    std.static_string_map.eqlAsciiIgnoreCase,
+).initComptime(.{
+    .{ "host", {} },
+    .{ "connection", {} },
+    .{ "content-length", {} },
+    .{ "transfer-encoding", {} },
+});
+
+/// Headers to skip when forwarding responses (case-insensitive hash lookup)
+const skip_response_headers = std.StaticStringMapWithEql(
+    void,
+    std.static_string_map.eqlAsciiIgnoreCase,
+).initComptime(.{
+    .{ "content-length", {} },
+    .{ "transfer-encoding", {} },
+});
+
 /// Check if header should be skipped when forwarding request
 fn shouldSkipRequestHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "host") or
-        std.ascii.eqlIgnoreCase(name, "connection") or
-        std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+    return skip_request_headers.has(name);
 }
 
 /// Check if header should be skipped when forwarding response
 fn shouldSkipResponseHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+    return skip_response_headers.has(name);
 }
 
 /// Build headers array in single pass
@@ -601,19 +640,17 @@ fn proxyToUpstreamOnce(
     module: ProxyModule,
     body_to_send: []const u8,
 ) !usize {
-    // Build upstream URI using pre-allocated buffer
-    const upstream_uri_str = try ctx.upstreams.buildUpstreamUri(
+    // Build std.Uri directly from pre-parsed components (avoids Uri.parse overhead)
+    const uri = try ctx.upstreams.buildUri(
         module_id,
         req.url.path,
         req.url.query,
     );
-
-    const uri = try std.Uri.parse(upstream_uri_str);
     const method = toStdHttpMethod(toHttpMethod(req.method));
 
     ctx.bus.debug(UpstreamRequest{
         .method = @tagName(method),
-        .url = upstream_uri_str,
+        .uri = uri,
     });
 
     // Get shared HTTP client from upstream manager (thread-safe connection pooling)

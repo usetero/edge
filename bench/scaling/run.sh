@@ -412,6 +412,7 @@ create_edge_config() {
 {
   "listen_address": "127.0.0.1",
   "listen_port": $port,
+  "worker_count": 4,
   "upstream_url": "http://127.0.0.1:$ECHO_SERVER_PORT",
   "workspace_id": "benchmark",
   "log_level": "err",

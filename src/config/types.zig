@@ -53,6 +53,11 @@ pub const ProxyConfig = struct {
     // Retry config
     max_upstream_retries: u8,
 
+    // Worker config - number of I/O threads for connection handling
+    // Higher values improve throughput on multi-core systems
+    // Can be overridden by TERO_MAX_WORKERS environment variable
+    worker_count: u32 = 1,
+
     // Policy providers
     policy_providers: []ProviderConfig,
 
@@ -68,6 +73,7 @@ pub const ProxyConfig = struct {
             .log_level = .info,
             .max_body_size = 1024 * 1024, // 1MB
             .max_upstream_retries = 10,
+            .worker_count = 1,
             .policy_providers = &.{},
         };
     }

@@ -108,6 +108,7 @@ create_edge_config() {
     cat > "$config_file" <<EOF
 {
   "listen_address": "127.0.0.1",
+  "worker_count": 4,
   "listen_port": $EDGE_OTLP_PORT,
   "upstream_url": "http://127.0.0.1:$ECHO_PORT",
   "workspace_id": "equivalence-test",

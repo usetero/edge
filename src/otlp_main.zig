@@ -299,6 +299,7 @@ pub fn main() !void {
         config.listen_port,
         config.max_upstream_retries,
         config.max_body_size,
+        config.worker_count,
         &module_registrations,
     );
     defer proxy.deinit();

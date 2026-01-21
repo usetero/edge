@@ -65,6 +65,7 @@ const ConfigJson = struct {
     log_level: []const u8,
     max_body_size: u32,
     max_upstream_retries: ?u8 = null,
+    worker_count: ?u32 = null,
     policy_providers: ?[]ProviderJson = null,
     service: ?ServiceJson = null,
     prometheus: ?PrometheusJson = null,
@@ -122,6 +123,13 @@ pub fn parseConfigBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*
     // Copy remaining fields
     config.max_body_size = json_config.max_body_size;
     config.max_upstream_retries = json_config.max_upstream_retries orelse 10;
+
+    // Parse worker_count: TERO_MAX_WORKERS env var takes precedence over config file
+    if (std.posix.getenv("TERO_MAX_WORKERS")) |env_val| {
+        config.worker_count = std.fmt.parseInt(u32, env_val, 10) catch 1;
+    } else if (json_config.worker_count) |count| {
+        config.worker_count = count;
+    }
 
     // Parse policy providers if present
     if (json_config.policy_providers) |json_providers| {

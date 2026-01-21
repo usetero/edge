@@ -4,6 +4,7 @@
   "upstream_url": "https://otlp.${TERO_DD_REGION}.datadoghq.com",
   "log_level": "info",
   "max_body_size": 1048576,
+  "worker_count": 4,
   "policy_providers": [
     {
       "id": "file",
