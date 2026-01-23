@@ -2,8 +2,8 @@ services:
   # Lambda extension test environment
   lambda-test:
     build:
-      context: ../..
-      dockerfile: testing/lambda/Dockerfile
+      context: ..
+      dockerfile: lambda/Dockerfile
     platform: linux/arm64
     ports:
       # Lambda invocation endpoint

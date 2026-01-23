@@ -20,6 +20,10 @@ bench/debug
 bench/results
 bench/bin
 
+# lambda ignores
+*.zip
+.layers*
+
 # Although this was renamed to .zig-cache, let's leave it here for a few
 # releases to make it less annoying to work with multiple branches.
 zig-cache/

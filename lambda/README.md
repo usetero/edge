@@ -13,7 +13,7 @@ extension locally using the AWS Lambda Runtime Interface Emulator (RIE).
 ### 1. Build and Run
 
 ```bash
-cd src/testing/lambda
+cd lambda
 
 # Build the Docker image (compiles Zig inside container)
 docker compose build
