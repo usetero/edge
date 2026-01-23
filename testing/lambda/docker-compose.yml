@@ -1,0 +1,40 @@
+services:
+  # Lambda extension test environment
+  lambda-test:
+    build:
+      context: ../..
+      dockerfile: testing/lambda/Dockerfile
+    platform: linux/arm64
+    ports:
+      # Lambda invocation endpoint
+      - "9000:8080"
+    environment:
+      # Extension configuration - use port 3000 to avoid conflict with RIE's 8080
+      TERO_LISTEN_PORT: "3000"
+      TERO_UPSTREAM_URL: https://http-intake.logs.us5.datadoghq.com
+      TERO_LOGS_URL: https://http-intake.logs.us5.datadoghq.com
+      TERO_METRICS_URL: https://api.datadoghq.com
+      TERO_POLICY_STATIC: '{"policies":[{"id":"drop-health","name":"Drop health checks","log":{"match":[{"log_field":"body","regex":"^Test log from Lambda.*"}],"keep":"none"}}]}'
+      TERO_LOG_LEVEL: debug
+      # Lambda environment
+      AWS_LAMBDA_FUNCTION_TIMEOUT: "30"
+      AWS_LAMBDA_FUNCTION_NAME: test-function
+      AWS_LAMBDA_FUNCTION_VERSION: $$LATEST
+      AWS_LAMBDA_FUNCTION_MEMORY_SIZE: "128"
+      AWS_REGION: us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/_health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # Optional: Mock upstream for testing without real Datadog
+  mock-upstream:
+    image: nginx:alpine
+    ports:
+      - "9001:80"
+    volumes:
+      - ./mock-upstream.conf:/etc/nginx/conf.d/default.conf:ro
+    profiles:
+      - mock
