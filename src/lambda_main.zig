@@ -173,19 +173,6 @@ pub fn main() !void {
         .metrics_url = metrics_url,
     });
 
-    // Build service metadata
-    var service_metadata = policy.ServiceMetadata{
-        .name = config.service.name,
-        .namespace = config.service.namespace,
-        .version = config.service.version,
-        .instance_id = "",
-        .supported_stages = &.{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-        },
-    };
-
     // Generate instance ID
     var instance_id_buf: [64]u8 = undefined;
     const instance_id = try std.fmt.bufPrint(&instance_id_buf, "lambda-{d}-{d}", .{
@@ -194,7 +181,19 @@ pub fn main() !void {
     });
     const instance_id_copy = try allocator.dupe(u8, instance_id);
     defer allocator.free(instance_id_copy);
-    service_metadata.instance_id = instance_id_copy;
+
+    // Build service metadata
+    const service_metadata = policy.ServiceMetadata{
+        .name = config.service.name,
+        .namespace = config.service.namespace,
+        .version = config.service.version,
+        .instance_id = instance_id_copy,
+        .supported_stages = &.{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+        },
+    };
 
     // Create policy registry
     var registry = policy.Registry.init(allocator, bus);
