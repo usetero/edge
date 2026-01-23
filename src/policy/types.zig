@@ -48,8 +48,8 @@ pub const ProviderType = enum {
 /// Configuration for a policy provider
 pub const ProviderConfig = struct {
     /// Unique identifier for this provider (used to track which policies came from where)
-    id: []const u8,
-    type: ProviderType,
+    id: []const u8 = "",
+    type: ProviderType = .file,
     // For file provider
     path: ?[]const u8 = null,
     // For http provider

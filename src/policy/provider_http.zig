@@ -20,8 +20,8 @@ const EventBus = o11y.EventBus;
 
 /// A header to be sent with HTTP requests
 pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
+    name: []const u8 = "",
+    value: []const u8 = "",
 };
 
 // =============================================================================

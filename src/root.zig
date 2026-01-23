@@ -10,8 +10,6 @@ pub const policy = @import("policy/root.zig");
 
 // Config modules (non-policy configuration)
 pub const config_types = @import("config/types.zig");
-pub const config_parser = @import("config/parser.zig");
-pub const config_env_subst = @import("config/env_subst.zig");
 
 // Proxy modules
 pub const server = @import("proxy/server.zig");
@@ -44,6 +42,12 @@ pub const otlp_distribution = @import("otlp_main.zig");
 /// Prometheus distribution - focused edge proxy for Prometheus metrics scraping
 pub const prometheus_distribution = @import("prometheus_main.zig");
 
+/// Lambda module - for Lambda extension distribution
+pub const lambda = @import("lambda/root.zig");
+
+/// Zonfig - comptime configuration with environment overrides
+pub const zonfig = @import("zonfig/root.zig");
+
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
     // are implementing gzip, then only the compressed bytes should be sent to
@@ -70,8 +74,6 @@ test "basic add functionality" {
 // because it requires C++ linkage that would conflict with the exe build
 test {
     _ = @import("config/types.zig");
-    _ = @import("config/parser.zig");
-    _ = @import("config/env_subst.zig");
     _ = @import("policy/root.zig");
     _ = @import("policy/policy_engine.zig");
     _ = @import("policy/matcher_index.zig");
@@ -89,4 +91,6 @@ test {
     _ = @import("hyperscan/hyperscan.zig");
     _ = @import("prometheus/root.zig");
     _ = @import("modules/prometheus_module.zig");
+    _ = @import("lambda/root.zig");
+    _ = @import("zonfig/root.zig");
 }
