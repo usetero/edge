@@ -1,5 +1,6 @@
 const std = @import("std");
 const proxy_module = @import("../modules/proxy_module.zig");
+const tripwire = @import("../testing/tripwire.zig");
 
 const ModuleId = proxy_module.ModuleId;
 const ModuleConfig = proxy_module.ModuleConfig;
@@ -63,11 +64,26 @@ pub const Router = struct {
         methods: MethodBitmask,
     };
 
+    /// Tripwire for testing error paths in init
+    pub const init_tw = tripwire.module(enum {
+        put_exact_match,
+        append_prefix,
+        append_suffix,
+        to_owned_prefix,
+        to_owned_suffix,
+    }, error{OutOfMemory});
+
     /// Initialize router from module configurations
     pub fn init(allocator: std.mem.Allocator, modules: []const ModuleConfig) !Router {
         var exact_matches = std.AutoHashMapUnmanaged(u64, ExactMatchEntry){};
+        errdefer exact_matches.deinit(allocator);
+
         var prefix_list = std.ArrayListUnmanaged(PrefixRoute){};
+        errdefer prefix_list.deinit(allocator);
+
         var suffix_list = std.ArrayListUnmanaged(SuffixRoute){};
+        errdefer suffix_list.deinit(allocator);
+
         var fallback: ?FallbackRoute = null;
 
         // Process all routes from all modules
@@ -75,12 +91,14 @@ pub const Router = struct {
             for (mod_config.routes) |route_pattern| {
                 switch (route_pattern.pattern_type) {
                     .exact => {
+                        try init_tw.check(.put_exact_match);
                         try exact_matches.put(allocator, route_pattern.hash, .{
                             .module_id = mod_config.id,
                             .methods = route_pattern.methods,
                         });
                     },
                     .prefix => {
+                        try init_tw.check(.append_prefix);
                         try prefix_list.append(allocator, .{
                             .prefix = route_pattern.pattern,
                             .prefix_len = @intCast(route_pattern.pattern.len),
@@ -89,6 +107,7 @@ pub const Router = struct {
                         });
                     },
                     .suffix => {
+                        try init_tw.check(.append_suffix);
                         try suffix_list.append(allocator, .{
                             .suffix = route_pattern.pattern,
                             .module_id = mod_config.id,
@@ -107,13 +126,17 @@ pub const Router = struct {
         }
 
         // Sort prefix routes by length (longest first) for correct matching
+        try init_tw.check(.to_owned_prefix);
         const prefix_routes = try prefix_list.toOwnedSlice(allocator);
+        errdefer allocator.free(prefix_routes);
+
         std.mem.sort(PrefixRoute, prefix_routes, {}, struct {
             fn lessThan(_: void, a: PrefixRoute, b: PrefixRoute) bool {
                 return a.prefix_len > b.prefix_len; // Longest first
             }
         }.lessThan);
 
+        try init_tw.check(.to_owned_suffix);
         return .{
             .exact_matches = exact_matches,
             .prefix_routes = prefix_routes,
@@ -359,4 +382,104 @@ test "Router prefix priority (longest first)" {
     const result2 = router.route("/api/v1/logs", .POST);
     try std.testing.expect(result2 != null);
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(result2.?.module_id));
+}
+
+// -----------------------------------------------------------------------------
+// Tripwire Tests for Router.init
+// -----------------------------------------------------------------------------
+
+fn testModuleConfig(id: u32, routes: []const RoutePattern) ModuleConfig {
+    return .{
+        .id = @enumFromInt(id),
+        .routes = routes,
+        .upstream = .{
+            .scheme = "https",
+            .host = "example.com",
+            .port = 443,
+            .base_path = "",
+            .max_request_body = 1024,
+            .max_response_body = 1024,
+        },
+        .module_data = null,
+    };
+}
+
+test "Router.init: tripwire put_exact_match fails" {
+    const allocator = std.testing.allocator;
+
+    const routes = [_]RoutePattern{
+        RoutePattern.exact("/api/logs", .{ .post = true }),
+    };
+    const modules = [_]ModuleConfig{testModuleConfig(0, &routes)};
+
+    Router.init_tw.errorAlways(.put_exact_match, error.OutOfMemory);
+    defer Router.init_tw.reset();
+
+    const result = Router.init(allocator, &modules);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try Router.init_tw.end(.retain);
+}
+
+test "Router.init: tripwire append_prefix fails" {
+    const allocator = std.testing.allocator;
+
+    const routes = [_]RoutePattern{
+        RoutePattern.prefix("/api/", MethodBitmask.all),
+    };
+    const modules = [_]ModuleConfig{testModuleConfig(0, &routes)};
+
+    Router.init_tw.errorAlways(.append_prefix, error.OutOfMemory);
+    defer Router.init_tw.reset();
+
+    const result = Router.init(allocator, &modules);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try Router.init_tw.end(.retain);
+}
+
+test "Router.init: tripwire append_suffix fails" {
+    const allocator = std.testing.allocator;
+
+    const routes = [_]RoutePattern{
+        RoutePattern.suffix(".json", MethodBitmask.all),
+    };
+    const modules = [_]ModuleConfig{testModuleConfig(0, &routes)};
+
+    Router.init_tw.errorAlways(.append_suffix, error.OutOfMemory);
+    defer Router.init_tw.reset();
+
+    const result = Router.init(allocator, &modules);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try Router.init_tw.end(.retain);
+}
+
+test "Router.init: tripwire to_owned_prefix fails" {
+    const allocator = std.testing.allocator;
+
+    const routes = [_]RoutePattern{
+        RoutePattern.prefix("/api/", MethodBitmask.all),
+    };
+    const modules = [_]ModuleConfig{testModuleConfig(0, &routes)};
+
+    Router.init_tw.errorAlways(.to_owned_prefix, error.OutOfMemory);
+    defer Router.init_tw.reset();
+
+    const result = Router.init(allocator, &modules);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try Router.init_tw.end(.retain);
+}
+
+test "Router.init: tripwire to_owned_suffix fails" {
+    const allocator = std.testing.allocator;
+
+    const routes = [_]RoutePattern{
+        RoutePattern.suffix(".json", MethodBitmask.all),
+    };
+    const modules = [_]ModuleConfig{testModuleConfig(0, &routes)};
+
+    Router.init_tw.errorAlways(.to_owned_suffix, error.OutOfMemory);
+    defer Router.init_tw.reset();
+
+    const result = Router.init(allocator, &modules);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try Router.init_tw.end(.retain);
 }

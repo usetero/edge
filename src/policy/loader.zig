@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const policy = @import("./root.zig");
+const tripwire = @import("../testing/tripwire.zig");
 
 const Registry = policy.Registry;
 const Provider = policy.Provider;
@@ -101,6 +102,12 @@ pub const PolicyLoader = struct {
     /// Signal when initial load is complete
     initial_load_complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Tripwire for testing error paths in init
+    pub const init_tw = tripwire.module(enum {
+        create_loader,
+        alloc_states,
+    }, error{OutOfMemory});
+
     /// Initialize the policy loader with provider configurations.
     /// Does not start loading - call `startAsync()` or `loadSync()` to begin.
     pub fn init(
@@ -110,10 +117,12 @@ pub const PolicyLoader = struct {
         provider_configs: []const ProviderConfig,
         service: ServiceMetadata,
     ) !*PolicyLoader {
+        try init_tw.check(.create_loader);
         const self = try allocator.create(PolicyLoader);
         errdefer allocator.destroy(self);
 
         // Allocate provider states
+        try init_tw.check(.alloc_states);
         const states = try allocator.alloc(ProviderState, provider_configs.len);
         errdefer allocator.free(states);
 
@@ -367,4 +376,72 @@ test "PolicyLoader: init and deinit" {
 
     try std.testing.expect(!loader.isReady());
     try std.testing.expectEqual(@as(usize, 0), loader.getLoadedCount());
+}
+
+// -----------------------------------------------------------------------------
+// Tripwire Tests for PolicyLoader.init
+// -----------------------------------------------------------------------------
+
+test "PolicyLoader.init: tripwire create_loader fails" {
+    const allocator = std.testing.allocator;
+
+    var stdio_bus: o11y.StdioEventBus = undefined;
+    stdio_bus.init();
+    const bus = stdio_bus.eventBus();
+
+    var registry = Registry.init(allocator, bus);
+    defer registry.deinit();
+
+    PolicyLoader.init_tw.errorAlways(.create_loader, error.OutOfMemory);
+    defer PolicyLoader.init_tw.reset();
+
+    const result = PolicyLoader.init(
+        allocator,
+        bus,
+        &registry,
+        &.{},
+        .{
+            .namespace = "test",
+            .name = "test-service",
+            .instance_id = "test-instance",
+            .version = "1.0.0",
+        },
+    );
+
+    try std.testing.expectError(error.OutOfMemory, result);
+    try PolicyLoader.init_tw.end(.retain);
+}
+
+test "PolicyLoader.init: tripwire alloc_states fails" {
+    const allocator = std.testing.allocator;
+
+    var stdio_bus: o11y.StdioEventBus = undefined;
+    stdio_bus.init();
+    const bus = stdio_bus.eventBus();
+
+    var registry = Registry.init(allocator, bus);
+    defer registry.deinit();
+
+    const configs = [_]ProviderConfig{
+        .{ .id = "test", .type = .file, .path = "/test.json" },
+    };
+
+    PolicyLoader.init_tw.errorAlways(.alloc_states, error.OutOfMemory);
+    defer PolicyLoader.init_tw.reset();
+
+    const result = PolicyLoader.init(
+        allocator,
+        bus,
+        &registry,
+        &configs,
+        .{
+            .namespace = "test",
+            .name = "test-service",
+            .instance_id = "test-instance",
+            .version = "1.0.0",
+        },
+    );
+
+    try std.testing.expectError(error.OutOfMemory, result);
+    try PolicyLoader.init_tw.end(.retain);
 }

@@ -89,4 +89,6 @@ test {
     _ = @import("hyperscan/hyperscan.zig");
     _ = @import("prometheus/root.zig");
     _ = @import("modules/prometheus_module.zig");
+    _ = @import("testing/tripwire.zig");
+    _ = @import("policy/provider_http.zig");
 }

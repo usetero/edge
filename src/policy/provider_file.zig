@@ -4,6 +4,7 @@ const proto = @import("proto");
 const policy_provider = @import("./provider.zig");
 const parser = @import("./parser.zig");
 const o11y = @import("../observability/root.zig");
+const tripwire = @import("../testing/tripwire.zig");
 
 const Policy = proto.policy.Policy;
 const PolicyCallback = policy_provider.PolicyCallback;
@@ -44,13 +45,23 @@ pub const FileProvider = struct {
     /// Event bus for observability
     bus: *EventBus,
 
+    /// Tripwire for testing error paths in init
+    pub const init_tw = tripwire.module(enum {
+        create_provider,
+        dupe_id,
+        dupe_path,
+    }, error{OutOfMemory});
+
     pub fn init(allocator: std.mem.Allocator, bus: *EventBus, id: []const u8, config_path: []const u8) !*FileProvider {
+        try init_tw.check(.create_provider);
         const self = try allocator.create(FileProvider);
         errdefer allocator.destroy(self);
 
+        try init_tw.check(.dupe_id);
         const id_copy = try allocator.dupe(u8, id);
         errdefer allocator.free(id_copy);
 
+        try init_tw.check(.dupe_path);
         const path_copy = try allocator.dupe(u8, config_path);
         errdefer allocator.free(path_copy);
 
@@ -635,4 +646,47 @@ test "FileProvider: multiple providers, one fails, registry has policies from su
     const snapshot = registry.getSnapshot();
     try testing.expect(snapshot != null);
     try testing.expectEqualStrings("policy-from-valid-provider", snapshot.?.policies[0].name);
+}
+
+// -----------------------------------------------------------------------------
+// Tripwire Tests for FileProvider.init
+// -----------------------------------------------------------------------------
+
+test "FileProvider.init: tripwire create_provider fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    FileProvider.init_tw.errorAlways(.create_provider, error.OutOfMemory);
+    defer FileProvider.init_tw.reset();
+
+    const result = FileProvider.init(allocator, noop_bus.eventBus(), "test-provider", "/path/to/file.json");
+    try testing.expectError(error.OutOfMemory, result);
+    try FileProvider.init_tw.end(.retain);
+}
+
+test "FileProvider.init: tripwire dupe_id fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    FileProvider.init_tw.errorAlways(.dupe_id, error.OutOfMemory);
+    defer FileProvider.init_tw.reset();
+
+    const result = FileProvider.init(allocator, noop_bus.eventBus(), "test-provider", "/path/to/file.json");
+    try testing.expectError(error.OutOfMemory, result);
+    try FileProvider.init_tw.end(.retain);
+}
+
+test "FileProvider.init: tripwire dupe_path fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    FileProvider.init_tw.errorAlways(.dupe_path, error.OutOfMemory);
+    defer FileProvider.init_tw.reset();
+
+    const result = FileProvider.init(allocator, noop_bus.eventBus(), "test-provider", "/path/to/file.json");
+    try testing.expectError(error.OutOfMemory, result);
+    try FileProvider.init_tw.end(.retain);
 }

@@ -4,6 +4,7 @@ const policy_source = @import("./source.zig");
 const policy_provider = @import("./provider.zig");
 const matcher_index = @import("./matcher_index.zig");
 const o11y = @import("../observability/root.zig");
+const tripwire = @import("../testing/tripwire.zig");
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
@@ -483,8 +484,22 @@ pub const PolicyRegistry = struct {
         return ids_to_remove.items.len;
     }
 
+    /// Tripwire for testing error paths in createSnapshot
+    pub const snapshot_tw = tripwire.module(enum {
+        alloc_policies,
+        alloc_log_indices,
+        alloc_metric_indices,
+        alloc_trace_indices,
+        build_log_index,
+        build_metric_index,
+        build_trace_index,
+        alloc_policy_stats,
+        create_snapshot,
+    }, error{OutOfMemory});
+
     /// Create immutable snapshot of current policies
     fn createSnapshot(self: *PolicyRegistry) !void {
+        try snapshot_tw.check(.alloc_policies);
         const policies_slice = try self.allocator.alloc(Policy, self.policies.items.len);
         errdefer self.allocator.free(policies_slice);
 
@@ -506,12 +521,15 @@ pub const PolicyRegistry = struct {
         }
 
         // Allocate index arrays
+        try snapshot_tw.check(.alloc_log_indices);
         const log_target_indices = try self.allocator.alloc(u32, log_target_count);
         errdefer self.allocator.free(log_target_indices);
 
+        try snapshot_tw.check(.alloc_metric_indices);
         const metric_target_indices = try self.allocator.alloc(u32, metric_target_count);
         errdefer self.allocator.free(metric_target_indices);
 
+        try snapshot_tw.check(.alloc_trace_indices);
         const trace_target_indices = try self.allocator.alloc(u32, trace_target_count);
         errdefer self.allocator.free(trace_target_indices);
 
@@ -539,12 +557,15 @@ pub const PolicyRegistry = struct {
         }
 
         // Build matcher indices for Hyperscan-based matching
+        try snapshot_tw.check(.build_log_index);
         var log_idx = try LogMatcherIndex.build(self.allocator, self.bus, policies_slice);
         errdefer log_idx.deinit();
 
+        try snapshot_tw.check(.build_metric_index);
         var metric_idx = try MetricMatcherIndex.build(self.allocator, self.bus, policies_slice);
         errdefer metric_idx.deinit();
 
+        try snapshot_tw.check(.build_trace_index);
         var trace_idx = try TraceMatcherIndex.build(self.allocator, self.bus, policies_slice);
         errdefer trace_idx.deinit();
 
@@ -553,6 +574,7 @@ pub const PolicyRegistry = struct {
         self.version.store(new_version, .monotonic);
 
         // Allocate atomic stats array for lock-free per-policy counters
+        try snapshot_tw.check(.alloc_policy_stats);
         const policy_stats = try self.allocator.alloc(PolicyAtomicStats, policies_slice.len);
         errdefer self.allocator.free(policy_stats);
         // Initialize all stats to zero (default init does this)
@@ -561,6 +583,7 @@ pub const PolicyRegistry = struct {
         }
 
         // Create new snapshot with indices
+        try snapshot_tw.check(.create_snapshot);
         const snapshot = try self.allocator.create(PolicySnapshot);
         snapshot.* = .{
             .policies = policies_slice,
@@ -1982,4 +2005,170 @@ test "PolicySnapshot: iterateMetricTargetPolicies iterates only metric policies"
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expect(found_metric1);
     try testing.expect(found_metric2);
+}
+
+// -----------------------------------------------------------------------------
+// Tripwire Tests for createSnapshot
+// -----------------------------------------------------------------------------
+
+test "PolicyRegistry.createSnapshot: tripwire alloc_policies fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.alloc_policies, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
+}
+
+test "PolicyRegistry.createSnapshot: tripwire alloc_log_indices fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.alloc_log_indices, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
+}
+
+test "PolicyRegistry.createSnapshot: tripwire alloc_metric_indices fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.alloc_metric_indices, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
+}
+
+test "PolicyRegistry.createSnapshot: tripwire alloc_trace_indices fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.alloc_trace_indices, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
+}
+
+test "PolicyRegistry.createSnapshot: tripwire build_log_index fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.build_log_index, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
+}
+
+test "PolicyRegistry.createSnapshot: tripwire build_metric_index fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.build_metric_index, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
+}
+
+test "PolicyRegistry.createSnapshot: tripwire build_trace_index fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.build_trace_index, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
+}
+
+test "PolicyRegistry.createSnapshot: tripwire alloc_policy_stats fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.alloc_policy_stats, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
+}
+
+test "PolicyRegistry.createSnapshot: tripwire create_snapshot fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    PolicyRegistry.snapshot_tw.errorAlways(.create_snapshot, error.OutOfMemory);
+    defer PolicyRegistry.snapshot_tw.reset();
+
+    var policy = try createTestPolicy(allocator, "test-policy");
+    defer freeTestPolicy(allocator, &policy);
+
+    const result = registry.updatePolicies(&.{policy}, "file-provider", .file);
+    try testing.expectError(error.OutOfMemory, result);
+    try PolicyRegistry.snapshot_tw.end(.retain);
 }

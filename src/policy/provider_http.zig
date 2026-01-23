@@ -4,6 +4,7 @@ const types = @import("./types.zig");
 const proto = @import("proto");
 const protobuf = @import("protobuf");
 const o11y = @import("../observability/root.zig");
+const tripwire = @import("../testing/tripwire.zig");
 
 const PolicyCallback = policy_provider.PolicyCallback;
 const TransformResult = policy_provider.TransformResult;
@@ -67,6 +68,9 @@ const PolicyStatusRecord = struct {
 };
 
 /// HTTP-based policy provider that polls a remote endpoint
+const testing = std.testing;
+const NoopEventBus = o11y.NoopEventBus;
+
 pub const HttpProvider = struct {
     allocator: std.mem.Allocator,
     /// Unique identifier for this provider
@@ -96,6 +100,16 @@ pub const HttpProvider = struct {
     // Event bus for observability
     bus: *EventBus,
 
+    /// Tripwire for testing error paths in init
+    pub const init_tw = tripwire.module(enum {
+        create_provider,
+        dupe_id,
+        dupe_url,
+        alloc_headers,
+        dupe_header_name,
+        dupe_header_value,
+    }, error{OutOfMemory});
+
     pub fn init(
         allocator: std.mem.Allocator,
         bus: *EventBus,
@@ -105,16 +119,20 @@ pub const HttpProvider = struct {
         service: ServiceMetadata,
         headers: []const Header,
     ) !*HttpProvider {
+        try init_tw.check(.create_provider);
         const self = try allocator.create(HttpProvider);
         errdefer allocator.destroy(self);
 
+        try init_tw.check(.dupe_id);
         const id_copy = try allocator.dupe(u8, id);
         errdefer allocator.free(id_copy);
 
+        try init_tw.check(.dupe_url);
         const url_copy = try allocator.dupe(u8, config_url);
         errdefer allocator.free(url_copy);
 
         // Copy headers (both the slice and the string contents)
+        try init_tw.check(.alloc_headers);
         const headers_copy = try allocator.alloc(Header, headers.len);
         errdefer allocator.free(headers_copy);
 
@@ -127,8 +145,10 @@ pub const HttpProvider = struct {
         }
 
         for (headers, 0..) |h, i| {
+            try init_tw.check(.dupe_header_name);
             const name_copy = try allocator.dupe(u8, h.name);
             errdefer allocator.free(name_copy);
+            try init_tw.check(.dupe_header_value);
             const value_copy = try allocator.dupe(u8, h.value);
             headers_copy[i] = .{ .name = name_copy, .value = value_copy };
             headers_initialized = i + 1;
@@ -551,3 +571,262 @@ pub const HttpProvider = struct {
         };
     }
 };
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+fn testServiceMetadata() ServiceMetadata {
+    return .{
+        .name = "test-service",
+        .instance_id = "test-instance",
+        .version = "1.0.0",
+        .namespace = "test-namespace",
+        .supported_stages = &.{},
+    };
+}
+
+test "HttpProvider: init and deinit" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const provider = try HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &.{},
+    );
+    defer provider.deinit();
+
+    try testing.expectEqualStrings("test-provider", provider.getId());
+}
+
+test "HttpProvider: init with custom headers" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const headers = [_]Header{
+        .{ .name = "Authorization", .value = "Bearer token123" },
+        .{ .name = "X-Custom-Header", .value = "custom-value" },
+    };
+
+    const provider = try HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &headers,
+    );
+    defer provider.deinit();
+
+    try testing.expectEqual(@as(usize, 2), provider.custom_headers.len);
+    try testing.expectEqualStrings("Authorization", provider.custom_headers[0].name);
+    try testing.expectEqualStrings("Bearer token123", provider.custom_headers[0].value);
+}
+
+test "HttpProvider.init: tripwire create_provider fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    HttpProvider.init_tw.errorAlways(.create_provider, error.OutOfMemory);
+    defer HttpProvider.init_tw.reset();
+
+    const result = HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &.{},
+    );
+
+    try testing.expectError(error.OutOfMemory, result);
+    try HttpProvider.init_tw.end(.retain);
+}
+
+test "HttpProvider.init: tripwire dupe_id fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    HttpProvider.init_tw.errorAlways(.dupe_id, error.OutOfMemory);
+    defer HttpProvider.init_tw.reset();
+
+    const result = HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &.{},
+    );
+
+    try testing.expectError(error.OutOfMemory, result);
+    try HttpProvider.init_tw.end(.retain);
+}
+
+test "HttpProvider.init: tripwire dupe_url fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    HttpProvider.init_tw.errorAlways(.dupe_url, error.OutOfMemory);
+    defer HttpProvider.init_tw.reset();
+
+    const result = HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &.{},
+    );
+
+    try testing.expectError(error.OutOfMemory, result);
+    try HttpProvider.init_tw.end(.retain);
+}
+
+test "HttpProvider.init: tripwire alloc_headers fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const headers = [_]Header{
+        .{ .name = "Authorization", .value = "Bearer token123" },
+    };
+
+    HttpProvider.init_tw.errorAlways(.alloc_headers, error.OutOfMemory);
+    defer HttpProvider.init_tw.reset();
+
+    const result = HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &headers,
+    );
+
+    try testing.expectError(error.OutOfMemory, result);
+    try HttpProvider.init_tw.end(.retain);
+}
+
+test "HttpProvider.init: tripwire dupe_header_name fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const headers = [_]Header{
+        .{ .name = "Authorization", .value = "Bearer token123" },
+    };
+
+    HttpProvider.init_tw.errorAlways(.dupe_header_name, error.OutOfMemory);
+    defer HttpProvider.init_tw.reset();
+
+    const result = HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &headers,
+    );
+
+    try testing.expectError(error.OutOfMemory, result);
+    try HttpProvider.init_tw.end(.retain);
+}
+
+test "HttpProvider.init: tripwire dupe_header_value fails" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const headers = [_]Header{
+        .{ .name = "Authorization", .value = "Bearer token123" },
+    };
+
+    HttpProvider.init_tw.errorAlways(.dupe_header_value, error.OutOfMemory);
+    defer HttpProvider.init_tw.reset();
+
+    const result = HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &headers,
+    );
+
+    try testing.expectError(error.OutOfMemory, result);
+    try HttpProvider.init_tw.end(.retain);
+}
+
+test "HttpProvider.init: tripwire dupe_header_name fails on second header" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const headers = [_]Header{
+        .{ .name = "Authorization", .value = "Bearer token123" },
+        .{ .name = "X-Custom", .value = "value" },
+    };
+
+    // Fail on the second header name (after 2 successful name/value copies)
+    HttpProvider.init_tw.errorAfter(.dupe_header_name, error.OutOfMemory, 1);
+    defer HttpProvider.init_tw.reset();
+
+    const result = HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &headers,
+    );
+
+    try testing.expectError(error.OutOfMemory, result);
+    try HttpProvider.init_tw.end(.retain);
+}
+
+test "HttpProvider.init: tripwire dupe_header_value fails on second header" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    const headers = [_]Header{
+        .{ .name = "Authorization", .value = "Bearer token123" },
+        .{ .name = "X-Custom", .value = "value" },
+    };
+
+    // Fail on the second header value
+    HttpProvider.init_tw.errorAfter(.dupe_header_value, error.OutOfMemory, 1);
+    defer HttpProvider.init_tw.reset();
+
+    const result = HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://localhost:8080/policies",
+        60,
+        testServiceMetadata(),
+        &headers,
+    );
+
+    try testing.expectError(error.OutOfMemory, result);
+    try HttpProvider.init_tw.end(.retain);
+}

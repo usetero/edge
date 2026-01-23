@@ -1,5 +1,6 @@
 const std = @import("std");
 const proxy_module = @import("../modules/proxy_module.zig");
+const tripwire = @import("../testing/tripwire.zig");
 
 const ModuleId = proxy_module.ModuleId;
 const UpstreamConfig = proxy_module.UpstreamConfig;
@@ -82,6 +83,15 @@ pub const UpstreamClientManager = struct {
         return &self.http_client;
     }
 
+    /// Tripwire for testing error paths in createUpstream
+    pub const create_upstream_tw = tripwire.module(enum {
+        dupe_scheme,
+        dupe_host,
+        dupe_base_path,
+        alloc_uri_buffer,
+        append_upstream,
+    }, error{OutOfMemory});
+
     /// Create an upstream configuration from a URL
     /// Returns the ModuleId that can be used to reference this upstream
     pub fn createUpstream(
@@ -93,14 +103,17 @@ pub const UpstreamClientManager = struct {
     ) !ModuleId {
         const uri = try std.Uri.parse(upstream_url);
 
+        try create_upstream_tw.check(.dupe_scheme);
         const scheme = try self.allocator.dupe(u8, uri.scheme);
         errdefer self.allocator.free(scheme);
 
         // Uri.host is a Component which can be percent_encoded or raw
         const host_str = if (uri.host) |h| h.percent_encoded else return error.MissingHost;
+        try create_upstream_tw.check(.dupe_host);
         const host = try self.allocator.dupe(u8, host_str);
         errdefer self.allocator.free(host);
 
+        try create_upstream_tw.check(.dupe_base_path);
         const base_path = if (uri.path.percent_encoded.len > 0)
             try self.allocator.dupe(u8, uri.path.percent_encoded)
         else
@@ -109,6 +122,7 @@ pub const UpstreamClientManager = struct {
 
         // URI buffer needs to fit: scheme + "://" + host + ":" + port + base_path + path + "?" + query
         // Max port is 5 digits, scheme is ~8, separators ~10, so add ~530 for overhead
+        try create_upstream_tw.check(.alloc_uri_buffer);
         const uri_buffer = try self.allocator.alloc(u8, max_path_length + 530);
         errdefer self.allocator.free(uri_buffer);
 
@@ -124,6 +138,7 @@ pub const UpstreamClientManager = struct {
             .max_response_body = max_response_body,
         };
 
+        try create_upstream_tw.check(.append_upstream);
         try self.upstreams.append(self.allocator, upstream_data);
         return @enumFromInt(@as(u32, @intCast(self.upstreams.len - 1)));
     }
@@ -306,4 +321,78 @@ test "UpstreamClientManager multiple upstreams" {
 
     try std.testing.expectEqualStrings("api1.example.com", config0.host);
     try std.testing.expectEqualStrings("api2.example.com", config1.host);
+}
+
+// -----------------------------------------------------------------------------
+// Tripwire Tests for createUpstream
+// -----------------------------------------------------------------------------
+
+test "UpstreamClientManager.createUpstream: tripwire dupe_scheme fails" {
+    const allocator = std.testing.allocator;
+
+    var manager = UpstreamClientManager.init(allocator);
+    defer manager.deinit();
+
+    UpstreamClientManager.create_upstream_tw.errorAlways(.dupe_scheme, error.OutOfMemory);
+    defer UpstreamClientManager.create_upstream_tw.reset();
+
+    const result = manager.createUpstream("https://example.com", 2048, 1024, 1024);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try UpstreamClientManager.create_upstream_tw.end(.retain);
+}
+
+test "UpstreamClientManager.createUpstream: tripwire dupe_host fails" {
+    const allocator = std.testing.allocator;
+
+    var manager = UpstreamClientManager.init(allocator);
+    defer manager.deinit();
+
+    UpstreamClientManager.create_upstream_tw.errorAlways(.dupe_host, error.OutOfMemory);
+    defer UpstreamClientManager.create_upstream_tw.reset();
+
+    const result = manager.createUpstream("https://example.com", 2048, 1024, 1024);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try UpstreamClientManager.create_upstream_tw.end(.retain);
+}
+
+test "UpstreamClientManager.createUpstream: tripwire dupe_base_path fails" {
+    const allocator = std.testing.allocator;
+
+    var manager = UpstreamClientManager.init(allocator);
+    defer manager.deinit();
+
+    UpstreamClientManager.create_upstream_tw.errorAlways(.dupe_base_path, error.OutOfMemory);
+    defer UpstreamClientManager.create_upstream_tw.reset();
+
+    const result = manager.createUpstream("https://example.com/api/v2", 2048, 1024, 1024);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try UpstreamClientManager.create_upstream_tw.end(.retain);
+}
+
+test "UpstreamClientManager.createUpstream: tripwire alloc_uri_buffer fails" {
+    const allocator = std.testing.allocator;
+
+    var manager = UpstreamClientManager.init(allocator);
+    defer manager.deinit();
+
+    UpstreamClientManager.create_upstream_tw.errorAlways(.alloc_uri_buffer, error.OutOfMemory);
+    defer UpstreamClientManager.create_upstream_tw.reset();
+
+    const result = manager.createUpstream("https://example.com", 2048, 1024, 1024);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try UpstreamClientManager.create_upstream_tw.end(.retain);
+}
+
+test "UpstreamClientManager.createUpstream: tripwire append_upstream fails" {
+    const allocator = std.testing.allocator;
+
+    var manager = UpstreamClientManager.init(allocator);
+    defer manager.deinit();
+
+    UpstreamClientManager.create_upstream_tw.errorAlways(.append_upstream, error.OutOfMemory);
+    defer UpstreamClientManager.create_upstream_tw.reset();
+
+    const result = manager.createUpstream("https://example.com", 2048, 1024, 1024);
+    try std.testing.expectError(error.OutOfMemory, result);
+    try UpstreamClientManager.create_upstream_tw.end(.retain);
 }
