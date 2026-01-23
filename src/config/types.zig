@@ -1,22 +1,14 @@
 const std = @import("std");
 const policy = @import("../policy/root.zig");
 
-const ProviderConfig = policy.ProviderConfig;
-const ServiceMetadata = policy.ServiceMetadata;
+pub const ProviderConfig = policy.ProviderConfig;
+pub const ServiceMetadata = policy.ServiceMetadata;
 
 pub const LogLevel = enum(u8) {
     debug,
     info,
     warn,
     err,
-
-    pub fn parse(s: []const u8) !LogLevel {
-        if (std.mem.eql(u8, s, "debug")) return .debug;
-        if (std.mem.eql(u8, s, "info")) return .info;
-        if (std.mem.eql(u8, s, "warn")) return .warn;
-        if (std.mem.eql(u8, s, "err")) return .err;
-        return error.InvalidLogLevel;
-    }
 };
 
 /// Prometheus module configuration
@@ -32,51 +24,31 @@ pub const PrometheusModuleConfig = struct {
     max_output_bytes_per_scrape: usize = 10 * 1024 * 1024,
 };
 
+/// Main proxy configuration - loadable via zonfig
 pub const ProxyConfig = struct {
     // Network config
-    listen_address: [4]u8,
-    listen_port: u16,
-    upstream_url: []const u8, // Default upstream URL for passthrough traffic
+    listen_address: [4]u8 = .{ 127, 0, 0, 1 },
+    listen_port: u16 = 8080,
+    upstream_url: []const u8 = "http://127.0.0.1:80",
 
     // Datadog-specific upstream URLs (optional, fall back to upstream_url if not set)
-    logs_url: ?[]const u8 = null, // e.g., "https://http-intake.logs.datadoghq.com"
-    metrics_url: ?[]const u8 = null, // e.g., "https://api.datadoghq.com"
+    logs_url: ?[]const u8 = null,
+    metrics_url: ?[]const u8 = null,
 
     // Service identity metadata
-    service: ServiceMetadata,
+    service: ServiceMetadata = .{},
 
     // Inspection config
-    log_level: LogLevel,
+    log_level: LogLevel = .info,
 
-    max_body_size: u32,
+    max_body_size: u32 = 1024 * 1024, // 1MB
 
     // Retry config
-    max_upstream_retries: u8,
+    max_upstream_retries: u8 = 10,
 
-    // Policy providers
-    policy_providers: []ProviderConfig,
+    // Policy providers - array of provider configurations
+    policy_providers: []ProviderConfig = &.{},
 
     // Module-specific configuration
     prometheus: PrometheusModuleConfig = .{},
-
-    pub fn default() ProxyConfig {
-        return .{
-            .listen_address = .{ 127, 0, 0, 1 },
-            .listen_port = 8080,
-            .upstream_url = "http://127.0.0.1:80",
-            .service = .{},
-            .log_level = .info,
-            .max_body_size = 1024 * 1024, // 1MB
-            .max_upstream_retries = 10,
-            .policy_providers = &.{},
-        };
-    }
 };
-
-test "LogLevel.parse" {
-    try std.testing.expectEqual(LogLevel.debug, try LogLevel.parse("debug"));
-    try std.testing.expectEqual(LogLevel.info, try LogLevel.parse("info"));
-    try std.testing.expectEqual(LogLevel.warn, try LogLevel.parse("warn"));
-    try std.testing.expectEqual(LogLevel.err, try LogLevel.parse("err"));
-    try std.testing.expectError(error.InvalidLogLevel, LogLevel.parse("invalid"));
-}

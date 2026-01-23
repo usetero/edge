@@ -15,7 +15,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const edge = @import("root.zig");
-const config_parser = edge.config_parser;
+const config_types = edge.config_types;
+const zonfig = edge.zonfig;
 const server_mod = edge.server;
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough_module;
@@ -24,6 +25,8 @@ const otlp_mod = edge.otlp_module;
 const prometheus_mod = edge.prometheus_module;
 const health_mod = edge.health_module;
 const policy = edge.policy;
+
+const ProxyConfig = config_types.ProxyConfig;
 
 const o11y = @import("observability/root.zig");
 const EventBus = o11y.EventBus;
@@ -57,6 +60,7 @@ const SignalHandlingNotSupported = struct { platform: []const u8 };
 
 const ServerStarting = struct {};
 const ConfigurationLoaded = struct { path: []const u8 };
+const ConfigLoadError = struct { err: []const u8 };
 const ListenAddressConfigured = struct {
     address: []const u8,
     port: u16,
@@ -178,27 +182,15 @@ pub fn main() !void {
     bus.info(ServerStarting{});
     bus.info(ConfigurationLoaded{ .path = config_path });
 
-    // Parse configuration
-    const config = try config_parser.parseConfigFile(allocator, config_path);
-    defer {
-        allocator.free(config.upstream_url);
-        if (config.logs_url) |logs_url| allocator.free(logs_url);
-        if (config.metrics_url) |metrics_url| allocator.free(metrics_url);
-        for (config.policy_providers) |provider_config| {
-            allocator.free(provider_config.id);
-            if (provider_config.path) |path| allocator.free(path);
-            if (provider_config.url) |url| allocator.free(url);
-            for (provider_config.headers) |header| {
-                allocator.free(header.name);
-                allocator.free(header.value);
-            }
-            if (provider_config.headers.len > 0) {
-                allocator.free(provider_config.headers);
-            }
-        }
-        allocator.free(config.policy_providers);
-        allocator.destroy(config);
-    }
+    // Load configuration via zonfig (JSON file with env var overrides)
+    const config = zonfig.load(ProxyConfig, allocator, .{
+        .json_path = config_path,
+        .env_prefix = "TERO",
+    }) catch |err| {
+        bus.err(ConfigLoadError{ .err = @errorName(err) });
+        return err;
+    };
+    defer zonfig.deinit(ProxyConfig, allocator, config);
 
     // Generate service instance ID (UUID-like identifier for this instance's lifetime)
     var instance_id_buf: [64]u8 = undefined;

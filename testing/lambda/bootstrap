@@ -1,0 +1,56 @@
+#!/bin/bash
+# Simple Lambda function bootstrap for testing the Tero Edge extension
+#
+# This acts as a minimal Lambda function that:
+# 1. Gets the next invocation from the Runtime API
+# 2. Sends telemetry to the Tero Edge extension (localhost:8080)
+# 3. Returns a response to the Runtime API
+
+set -euo pipefail
+
+# Lambda Runtime API endpoint
+RUNTIME_API="http://${AWS_LAMBDA_RUNTIME_API}"
+TERO_PROXY="http://127.0.0.1:${TERO_LISTEN_PORT:-3000}"
+
+echo "[bootstrap] Starting Lambda function handler"
+echo "[bootstrap] Runtime API: ${RUNTIME_API}"
+echo "[bootstrap] Tero Proxy: ${TERO_PROXY}"
+
+# Main event loop
+while true; do
+    echo "[bootstrap] Waiting for next invocation..."
+
+    # Get next invocation
+    RESPONSE=$(curl -sS -LD /tmp/headers "${RUNTIME_API}/2018-06-01/runtime/invocation/next")
+
+    # Extract request ID from headers
+    REQUEST_ID=$(grep -i "Lambda-Runtime-Aws-Request-Id" /tmp/headers | tr -d '\r' | cut -d: -f2 | xargs)
+
+    echo "[bootstrap] Received invocation: ${REQUEST_ID}"
+    echo "[bootstrap] Event payload: ${RESPONSE}"
+
+    # Simulate sending telemetry through the Tero Edge proxy
+    # This mimics what a real Lambda function would do via a Datadog library
+    TELEMETRY_PAYLOAD='[{"ddsource":"lambda","ddtags":"env:test,service:lambda-test","hostname":"test-lambda","message":"Test log from Lambda function","status":"info"}]'
+
+    echo "[bootstrap] Sending test telemetry to Tero Edge..."
+    TELEMETRY_RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -H "DD-API-KEY: test-api-key" \
+        -d "${TELEMETRY_PAYLOAD}" \
+        "${TERO_PROXY}/api/v2/logs" 2>&1 || echo "CURL_ERROR $?")
+
+    echo "[bootstrap] Telemetry response: ${TELEMETRY_RESPONSE}"
+
+    # Build response
+    RESULT='{"statusCode": 200, "body": "Hello from Lambda with Tero Edge extension!"}'
+
+    # Send response
+    echo "[bootstrap] Sending response for ${REQUEST_ID}"
+    curl -sS -X POST \
+        -H "Content-Type: application/json" \
+        -d "${RESULT}" \
+        "${RUNTIME_API}/2018-06-01/runtime/invocation/${REQUEST_ID}/response"
+
+    echo "[bootstrap] Invocation complete"
+done
