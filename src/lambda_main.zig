@@ -67,8 +67,12 @@ pub const LambdaConfig = struct {
         version: []const u8 = "latest",
     } = .{},
 
-    // Policy provider (HTTP only in Lambda)
+    // Policy configuration
     policy: struct {
+        /// JSON array of policies to load at startup
+        /// Example: TERO_POLICY_STATIC='{"policies":[{"id":"drop-health","name":"Drop health","log":{"match":[{"log_field":"body","regex":"health"}],"keep":"none"}}]}'
+        static: ?[]const u8 = null,
+        /// HTTP policy provider URL for dynamic updates
         url: ?[]const u8 = null,
         poll_interval: u64 = 60,
         api_key: ?[]const u8 = null,
@@ -96,6 +100,9 @@ const ConfigurationLoaded = struct {
     logs_url: []const u8,
     metrics_url: []const u8,
 };
+const StaticPoliciesLoading = struct {};
+const StaticPoliciesLoaded = struct { count: usize };
+const StaticPoliciesError = struct { err: []const u8 };
 
 // =============================================================================
 // Global State
@@ -193,7 +200,26 @@ pub fn main() !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
-    // Create policy loader if configured
+    // Load static policies from environment variable (TERO_POLICY_STATIC)
+    if (config.policy.static) |static_json| {
+        bus.info(StaticPoliciesLoading{});
+
+        const policies = policy.parser.parsePoliciesBytes(allocator, static_json) catch |err| {
+            bus.err(StaticPoliciesError{ .err = @errorName(err) });
+            return err;
+        };
+        defer {
+            for (policies) |*p| {
+                p.deinit(allocator);
+            }
+            allocator.free(policies);
+        }
+
+        try registry.updatePolicies(policies, "static", .file);
+        bus.info(StaticPoliciesLoaded{ .count = policies.len });
+    }
+
+    // Create HTTP policy loader if configured
     var loader: ?*policy.Loader = null;
     defer if (loader) |l| l.deinit();
 

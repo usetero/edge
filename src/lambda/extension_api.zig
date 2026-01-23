@@ -36,9 +36,10 @@ pub const EventType = enum {
 
 /// Shutdown reason from Lambda
 pub const ShutdownReason = enum {
-    spindown, // Normal shutdown
-    timeout, // Extension timeout
-    failure, // Extension failure
+    spindown, // Normal shutdown (SPINDOWN)
+    timeout, // Extension timeout (TIMEOUT)
+    failure, // Extension failure (FAILURE)
+    sandbox_terminated, // Sandbox terminated (from RIE)
     unknown,
 };
 
@@ -253,9 +254,11 @@ pub const ExtensionClient = struct {
 
     fn parseShutdownReason(reason: ?[]const u8) ShutdownReason {
         const r = reason orelse return .unknown;
-        if (std.mem.eql(u8, r, "spindown")) return .spindown;
-        if (std.mem.eql(u8, r, "timeout")) return .timeout;
-        if (std.mem.eql(u8, r, "failure")) return .failure;
+        // Lambda API uses uppercase, RIE uses mixed case
+        if (std.ascii.eqlIgnoreCase(r, "spindown")) return .spindown;
+        if (std.ascii.eqlIgnoreCase(r, "timeout")) return .timeout;
+        if (std.ascii.eqlIgnoreCase(r, "failure")) return .failure;
+        if (std.ascii.eqlIgnoreCase(r, "sandboxterminated")) return .sandbox_terminated;
         return .unknown;
     }
 };
@@ -275,8 +278,12 @@ const EventJson = struct {
 
 test "parseShutdownReason" {
     try std.testing.expectEqual(ShutdownReason.spindown, ExtensionClient.parseShutdownReason("spindown"));
+    try std.testing.expectEqual(ShutdownReason.spindown, ExtensionClient.parseShutdownReason("SPINDOWN"));
     try std.testing.expectEqual(ShutdownReason.timeout, ExtensionClient.parseShutdownReason("timeout"));
+    try std.testing.expectEqual(ShutdownReason.timeout, ExtensionClient.parseShutdownReason("TIMEOUT"));
     try std.testing.expectEqual(ShutdownReason.failure, ExtensionClient.parseShutdownReason("failure"));
+    try std.testing.expectEqual(ShutdownReason.failure, ExtensionClient.parseShutdownReason("FAILURE"));
+    try std.testing.expectEqual(ShutdownReason.sandbox_terminated, ExtensionClient.parseShutdownReason("SandboxTerminated"));
     try std.testing.expectEqual(ShutdownReason.unknown, ExtensionClient.parseShutdownReason("other"));
     try std.testing.expectEqual(ShutdownReason.unknown, ExtensionClient.parseShutdownReason(null));
 }
