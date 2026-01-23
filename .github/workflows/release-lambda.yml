@@ -1,0 +1,347 @@
+name: Release Lambda Extension
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number (e.g., 100). If not provided, auto-increments from latest."
+        required: false
+        type: string
+      regions:
+        description: "Comma-separated AWS regions to publish to (e.g., 'us-east-1,us-west-2')"
+        required: false
+        default: "us-east-1"
+        type: string
+      architectures:
+        description: "Architectures to build and publish"
+        required: false
+        default: "amd64,arm64"
+        type: choice
+        options:
+          - "amd64"
+          - "arm64"
+          - "amd64,arm64"
+      dry_run:
+        description: "Dry run - build but don't publish to AWS"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      regions_json: ${{ steps.vars.outputs.regions_json }}
+      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
+      publish_matrix: ${{ steps.matrix.outputs.publish_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            # Strip 'v' prefix if present and extract number
+            VERSION=$(echo "${{ inputs.version }}" | sed 's/^v//')
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            # Convert semver to layer version number (e.g., 1.2.3 -> 10203)
+            SEMVER="${BASH_REMATCH[1]}"
+            MAJOR=$(echo "$SEMVER" | cut -d. -f1)
+            MINOR=$(echo "$SEMVER" | cut -d. -f2)
+            PATCH=$(echo "$SEMVER" | cut -d. -f3)
+            VERSION=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Converted $SEMVER to layer version $VERSION"
+          else
+            # Auto-increment will happen at publish time per-region
+            echo "version=auto" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set variables
+        id: vars
+        run: |
+          # Convert regions to JSON array (compact, single line)
+          REGIONS="${{ inputs.regions || 'us-east-1' }}"
+          REGIONS_JSON=$(echo "$REGIONS" | jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')
+          echo "regions_json=$REGIONS_JSON" >> $GITHUB_OUTPUT
+          echo "Regions: $REGIONS_JSON"
+
+      - name: Build matrices
+        id: matrix
+        run: |
+          ARCHS="${{ inputs.architectures || 'amd64,arm64' }}"
+          REGIONS="${{ inputs.regions || 'us-east-1' }}"
+
+          # Build matrix for build job with platform-specific runners
+          BUILD_MATRIX='{"include":['
+          FIRST=true
+
+          for arch in ${ARCHS//,/ }; do
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              BUILD_MATRIX="$BUILD_MATRIX,"
+            fi
+            if [ "$arch" = "amd64" ]; then
+              BUILD_MATRIX="$BUILD_MATRIX{\"arch\":\"amd64\",\"runner\":\"ubuntu-24.04\",\"platform\":\"linux/amd64\",\"zig_target\":\"x86_64\"}"
+            else
+              BUILD_MATRIX="$BUILD_MATRIX{\"arch\":\"arm64\",\"runner\":\"ubuntu-24.04-arm\",\"platform\":\"linux/arm64\",\"zig_target\":\"aarch64\"}"
+            fi
+          done
+
+          BUILD_MATRIX="$BUILD_MATRIX]}"
+          echo "build_matrix=$BUILD_MATRIX" >> $GITHUB_OUTPUT
+          echo "Build matrix: $BUILD_MATRIX"
+
+          # Publish matrix: arch x region combinations
+          PUBLISH_MATRIX='{"include":['
+          FIRST=true
+
+          for region in ${REGIONS//,/ }; do
+            region=$(echo "$region" | xargs)  # trim whitespace
+            for arch in ${ARCHS//,/ }; do
+              if [ "$FIRST" = true ]; then
+                FIRST=false
+              else
+                PUBLISH_MATRIX="$PUBLISH_MATRIX,"
+              fi
+              PUBLISH_MATRIX="$PUBLISH_MATRIX{\"arch\":\"$arch\",\"region\":\"$region\"}"
+            done
+          done
+
+          PUBLISH_MATRIX="$PUBLISH_MATRIX]}"
+          echo "publish_matrix=$PUBLISH_MATRIX" >> $GITHUB_OUTPUT
+          echo "Publish matrix: $PUBLISH_MATRIX"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    needs: prepare
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Lambda extension
+        run: |
+          mkdir -p .layers
+
+          docker buildx build \
+            --progress plain \
+            --platform ${{ matrix.platform }} \
+            -f Lambda.Dockerfile \
+            --output type=local,dest=.layers/layer-${{ matrix.arch }} \
+            .
+
+          echo "Built extension:"
+          ls -la .layers/layer-${{ matrix.arch }}/extensions/
+
+      - name: Create Lambda layer zip
+        run: |
+          cd .layers/layer-${{ matrix.arch }}
+
+          # Create the zip with extensions directory
+          zip -r ../tero-edge-extension-${{ matrix.arch }}.zip extensions
+
+          cd ..
+          echo "Layer zip created:"
+          ls -lh *.zip
+
+      - name: Upload layer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tero-edge-extension-${{ matrix.arch }}
+          path: .layers/tero-edge-extension-${{ matrix.arch }}.zip
+          retention-days: 30
+
+  publish:
+    name: Publish ${{ matrix.arch }} to ${{ matrix.region }}
+    runs-on: ubuntu-24.04
+    needs: [prepare, build]
+    if: ${{ inputs.dry_run != true }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJson(needs.prepare.outputs.publish_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_LAMBDA_LAYER_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Set variables
+        id: vars
+        run: |
+          if [ "${{ matrix.arch }}" == "amd64" ]; then
+            ARCH_SUFFIX=""
+            COMPATIBLE_ARCH="x86_64"
+          else
+            ARCH_SUFFIX="-ARM"
+            COMPATIBLE_ARCH="arm64"
+          fi
+
+          # Add -dev suffix for workflow_dispatch (manual) runs
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            DEV_SUFFIX="-dev"
+          else
+            DEV_SUFFIX=""
+          fi
+
+          # Layer name: Tero-Edge-Extension[-ARM][-dev]
+          LAYER_NAME="Tero-Edge-Extension${ARCH_SUFFIX}${DEV_SUFFIX}"
+
+          echo "layer_name=$LAYER_NAME" >> $GITHUB_OUTPUT
+          echo "compatible_arch=$COMPATIBLE_ARCH" >> $GITHUB_OUTPUT
+
+      - name: Download layer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tero-edge-extension-${{ matrix.arch }}
+          path: .layers
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
+
+          if [ "$VERSION" = "auto" ]; then
+            # Get latest version and increment
+            LATEST=$(aws lambda list-layer-versions \
+              --layer-name "$LAYER_NAME" \
+              --query 'LayerVersions[0].Version' \
+              --output text 2>/dev/null | head -1 || echo "0")
+            # Handle empty/None result
+            if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
+              LATEST=0
+            fi
+            VERSION=$((LATEST + 1))
+            echo "Auto-incremented version to $VERSION (latest was $LATEST)"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Publish Lambda layer
+        id: publish
+        run: |
+          aws sts get-caller-identity
+          LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          LAYER_FILE=".layers/tero-edge-extension-${{ matrix.arch }}.zip"
+          COMPATIBLE_ARCH="${{ steps.vars.outputs.compatible_arch }}"
+
+          echo "Publishing $LAYER_NAME version $VERSION to ${{ matrix.region }}..."
+
+          # Check if version already exists
+          LATEST=$(aws lambda list-layer-versions \
+            --layer-name "$LAYER_NAME" \
+            --query 'LayerVersions[0].Version' \
+            --output text 2>/dev/null | head -1 || echo "0")
+          # Handle empty/None result
+          if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
+            LATEST=0
+          fi
+
+          if [ "$LATEST" -ge "$VERSION" ]; then
+            echo "::warning::Layer $LAYER_NAME version $VERSION already exists (latest: $LATEST), skipping"
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Publish missing versions up to target
+          while [ "$LATEST" -lt "$VERSION" ]; do
+            PUBLISHED_VERSION=$(aws lambda publish-layer-version \
+              --layer-name "$LAYER_NAME" \
+              --description "Tero Edge Lambda Extension - Datadog telemetry proxy with policy-based filtering" \
+              --compatible-architectures "$COMPATIBLE_ARCH" \
+              --zip-file "fileb://${LAYER_FILE}" \
+              --query 'Version' \
+              --output text)
+
+            echo "Published version $PUBLISHED_VERSION"
+
+            # Make the layer version public
+            aws lambda add-layer-version-permission \
+              --layer-name "$LAYER_NAME" \
+              --version-number "$PUBLISHED_VERSION" \
+              --statement-id public-access \
+              --action lambda:GetLayerVersion \
+              --principal "*"
+            echo "Made version $PUBLISHED_VERSION public"
+
+            LATEST=$PUBLISHED_VERSION
+          done
+
+          echo "skipped=false" >> $GITHUB_OUTPUT
+          echo "published_version=$LATEST" >> $GITHUB_OUTPUT
+
+          # Output the layer ARN for reference
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          LAYER_ARN="arn:aws:lambda:${{ matrix.region }}:${ACCOUNT_ID}:layer:${LAYER_NAME}:${LATEST}"
+          echo "Layer ARN: $LAYER_ARN"
+          echo "layer_arn=$LAYER_ARN" >> $GITHUB_OUTPUT
+
+      - name: Summary
+        if: steps.publish.outputs.skipped != 'true'
+        run: |
+          echo "### Published Layer" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Layer Name:** ${{ steps.vars.outputs.layer_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ steps.publish.outputs.published_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Region:** ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Architecture:** ${{ steps.vars.outputs.compatible_arch }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Layer ARN:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.publish.outputs.layer_arn }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  release-summary:
+    name: Release Summary
+    runs-on: ubuntu-24.04
+    needs: [prepare, build, publish]
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate summary
+        run: |
+          echo "## Tero Edge Lambda Extension Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|------|" >> $GITHUB_STEP_SUMMARY
+          find artifacts -name "*.zip" -type f | while read f; do
+            NAME=$(basename "$f")
+            SIZE=$(du -h "$f" | cut -f1)
+            echo "| $NAME | $SIZE |" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "### Dry Run Mode" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Layers were built but not published to AWS." >> $GITHUB_STEP_SUMMARY
+          fi
