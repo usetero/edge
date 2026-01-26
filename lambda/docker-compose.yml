@@ -11,7 +11,7 @@ services:
 
   # Lambda extension test using AWS Lambda RIE
   lambda-test:
-    image: public.ecr.aws/lambda/python:3.12-arm64
+    image: public.ecr.aws/lambda/python:3.12-arm64@sha256:be83d1b1d3f0f857e1652725b287915488ba4e37974d62f2fda7967ca26b02a1
     platform: linux/arm64
     ports:
       - "9000:8080"
@@ -36,7 +36,7 @@ services:
 
   # Optional: Mock upstream for testing without real Datadog
   mock-upstream:
-    image: nginx:alpine
+    image: nginx:alpine@sha256:b0f7830b6bfaa1258f45d94c240ab668ced1b3651c8a222aefe6683447c7bf55
     ports:
       - "9001:80"
     volumes:
