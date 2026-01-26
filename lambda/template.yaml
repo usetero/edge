@@ -312,6 +312,41 @@ Parameters:
     Type: CommaDelimitedList
     Default: ""
     Description: List of KMS Key ARNs the Lambda forwarder function can use to decrypt, seperated by comma
+  # Tero Edge Extension Parameters
+  TeroEdgeLayerArn:
+    Type: String
+    Default: ""
+    Description: Override the full ARN of the Tero Edge Lambda extension layer. Leave empty to use the default layer based on TeroEdgeLayerVersion.
+  TeroEdgeLayerVersion:
+    Type: String
+    Default: "4"
+    Description: Version of the Tero Edge Lambda layer to use. Set to empty string to disable Tero Edge entirely.
+  TeroPolicyStatic:
+    Type: String
+    Default: ""
+    Description: JSON string containing static policies for Tero Edge (e.g., '{"policies":[...]}')
+  TeroPolicyUrl:
+    Type: String
+    Default: "https://sync.usetero.com/v1/policy/sync"
+    Description: URL of the HTTP policy provider for dynamic policy updates
+  TeroPolicyApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: API key for authenticating with the HTTP policy provider
+  TeroListenPort:
+    Type: String
+    Default: "3000"
+    Description: Port for Tero Edge extension to listen on
+  TeroLogLevel:
+    Type: String
+    Default: "info"
+    AllowedValues:
+      - debug
+      - info
+      - warn
+      - err
+    Description: Log level for Tero Edge extension
 Conditions:
   IsAWSChina: !Equals [!Ref "AWS::Partition", aws-cn]
   IsGovCloud: !Equals [!Ref "AWS::Partition", aws-us-gov]
@@ -409,6 +444,20 @@ Conditions:
   CreateRetryScheduler: !And
     - !Equals [!Ref DdStoreFailedEvents, true]
     - !Equals [!Ref DdScheduleRetryFailedEvents, true]
+  # Tero Edge Conditions
+  SetTeroEdgeLayerArn: !Not
+    - !Equals [!Ref TeroEdgeLayerArn, ""]
+  UseTeroEdgeLayerVersion: !Not
+    - !Equals [!Ref TeroEdgeLayerVersion, ""]
+  UseTeroEdge: !Or
+    - !Condition SetTeroEdgeLayerArn
+    - !Condition UseTeroEdgeLayerVersion
+  SetTeroPolicyStatic: !Not
+    - !Equals [!Ref TeroPolicyStatic, ""]
+  SetTeroPolicyUrl: !Not
+    - !Equals [!Ref TeroPolicyUrl, ""]
+  SetTeroPolicyApiKey: !Not
+    - !Equals [!Ref TeroPolicyApiKey, ""]
 Rules:
   MustSetDdApiKey:
     Assertions:
@@ -434,20 +483,45 @@ Resources:
       Handler: lambda_function.lambda_handler
       Layers: !If
         - UseZipCopier
-        - []
-        - - !If
-            - SetLayerARN
-            - !Ref LayerARN
-            - !Join
-              - ":"
-              - - arn
-                - !Ref AWS::Partition
-                - lambda
-                - !Ref AWS::Region
-                - !If [IsGovCloud, "002406178527", "464622532012"]
-                - layer
-                - Datadog-Forwarder
-                - !FindInMap [Constants, DdForwarder, LayerVersion]
+        - !If
+          - UseTeroEdge
+          - - !If
+              - SetTeroEdgeLayerArn
+              - !Ref TeroEdgeLayerArn
+              - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:242046726909:layer:Tero-Edge-Extension-ARM:${TeroEdgeLayerVersion}"
+          - []
+        - !If
+          - UseTeroEdge
+          - - !If
+              - SetTeroEdgeLayerArn
+              - !Ref TeroEdgeLayerArn
+              - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:242046726909:layer:Tero-Edge-Extension-ARM:${TeroEdgeLayerVersion}"
+            - !If
+              - SetLayerARN
+              - !Ref LayerARN
+              - !Join
+                - ":"
+                - - arn
+                  - !Ref AWS::Partition
+                  - lambda
+                  - !Ref AWS::Region
+                  - !If [IsGovCloud, "002406178527", "464622532012"]
+                  - layer
+                  - Datadog-Forwarder
+                  - !FindInMap [Constants, DdForwarder, LayerVersion]
+          - - !If
+              - SetLayerARN
+              - !Ref LayerARN
+              - !Join
+                - ":"
+                - - arn
+                  - !Ref AWS::Partition
+                  - lambda
+                  - !Ref AWS::Region
+                  - !If [IsGovCloud, "002406178527", "464622532012"]
+                  - layer
+                  - Datadog-Forwarder
+                  - !FindInMap [Constants, DdForwarder, LayerVersion]
       Code: !If
         - UseZipCopier
         - S3Bucket: !If
@@ -511,18 +585,28 @@ Resources:
             - SetDdFetchStepFunctionsTags
             - !Ref DdFetchStepFunctionsTags
             - !Ref AWS::NoValue
+          # When Tero Edge is enabled, route through localhost extension
           DD_NO_SSL: !If
-            - SetDdNoSsl
-            - !Ref DdNoSsl
-            - !Ref AWS::NoValue
+            - UseTeroEdge
+            - "true"
+            - !If
+              - SetDdNoSsl
+              - !Ref DdNoSsl
+              - !Ref AWS::NoValue
           DD_URL: !If
-            - SetDdUrl
-            - !Ref DdUrl
-            - !Ref AWS::NoValue
+            - UseTeroEdge
+            - "localhost"
+            - !If
+              - SetDdUrl
+              - !Ref DdUrl
+              - !Ref AWS::NoValue
           DD_PORT: !If
-            - SetDdPort
-            - !Ref DdPort
-            - !Ref AWS::NoValue
+            - UseTeroEdge
+            - !Ref TeroListenPort
+            - !If
+              - SetDdPort
+              - !Ref DdPort
+              - !Ref AWS::NoValue
           DD_STORE_FAILED_EVENTS: !If
             - SetForwarderBucket
             - !Ref DdStoreFailedEvents
@@ -615,6 +699,41 @@ Resources:
             - !Ref AWS::NoValue
           DD_TRACE_ENABLED: !Ref DdTraceEnabled
           DD_ENHANCED_METRICS: !Ref DdEnhancedMetrics
+          # Tero Edge Extension Environment Variables
+          # When UseTeroEdge is true, route logs through the extension
+          # Upstream URL is derived from DdSite (e.g., us5.datadoghq.com -> https://http-intake.logs.us5.datadoghq.com)
+          TERO_UPSTREAM_URL: !If
+            - UseTeroEdge
+            - !Sub "https://http-intake.logs.${DdSite}"
+            - !Ref AWS::NoValue
+          TERO_LISTEN_PORT: !If
+            - UseTeroEdge
+            - !Ref TeroListenPort
+            - !Ref AWS::NoValue
+          TERO_LOG_LEVEL: !If
+            - UseTeroEdge
+            - !Ref TeroLogLevel
+            - !Ref AWS::NoValue
+          TERO_POLICY_STATIC: !If
+            - SetTeroPolicyStatic
+            - !Ref TeroPolicyStatic
+            - !Ref AWS::NoValue
+          TERO_POLICY_URL: !If
+            - SetTeroPolicyUrl
+            - !Ref TeroPolicyUrl
+            - !Ref AWS::NoValue
+          TERO_POLICY_API_KEY: !If
+            - SetTeroPolicyApiKey
+            - !Ref TeroPolicyApiKey
+            - !Ref AWS::NoValue
+          # Service version based on the Tero Edge layer version for tracking
+          TERO_SERVICE_VERSION: !If
+            - UseTeroEdge
+            - !If
+              - SetTeroEdgeLayerArn
+              - !Select [7, !Split [":", !Ref TeroEdgeLayerArn]]
+              - !Ref TeroEdgeLayerVersion
+            - !Ref AWS::NoValue
       ReservedConcurrentExecutions: !If
         - SetReservedConcurrentExecutions
         - !Ref ReservedConcurrency
@@ -799,6 +918,7 @@ Resources:
     Properties:
       Description: Datadog API Key
       SecretString: !Ref DdApiKey
+
   # A s3 bucket used by the Forwarder as a datastore
   ForwarderBucket:
     Type: AWS::S3::Bucket
@@ -1080,6 +1200,16 @@ Metadata:
           - DdApiKeySsmParameterName
           - DdSite
       - Label:
+          default: Tero Edge Extension (Optional)
+        Parameters:
+          - TeroEdgeLayerArn
+          - TeroEdgeLayerVersion
+          - TeroPolicyStatic
+          - TeroPolicyUrl
+          - TeroPolicyApiKey
+          - TeroListenPort
+          - TeroLogLevel
+      - Label:
           default: Lambda Function (Optional)
         Parameters:
           - FunctionName
@@ -1092,9 +1222,6 @@ Metadata:
         Parameters:
           - DdTags
           - DdMultilineLogRegexPattern
-          - DdNoSsl
-          - DdUrl
-          - DdPort
           - DdSkipSslValidation
           - DdUseCompression
           - DdCompressionLevel
