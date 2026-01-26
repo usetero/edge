@@ -1,33 +1,38 @@
 services:
-  # Lambda extension test environment
-  lambda-test:
+  # Build the Lambda extension layer
+  build-layer:
     build:
       context: ..
       dockerfile: lambda/Dockerfile
     platform: linux/arm64
+    # This service is just for building - extracts to .layers/
+    # Usage: docker-compose run --rm build-layer
+    entrypoint: ["/bin/true"]
+
+  # Lambda extension test using AWS Lambda RIE
+  lambda-test:
+    image: public.ecr.aws/lambda/python:3.12-arm64
+    platform: linux/arm64
     ports:
-      # Lambda invocation endpoint
       - "9000:8080"
+    volumes:
+      # Mount the built layer from local .layers directory
+      - ./.layers/extensions:/opt/extensions:ro
+      - ./.layers/bin:/opt/bin:ro
+      - ./.layers/lib:/opt/lib:ro
+      # Mount test handler
+      - ./test_handler.py:/var/task/handler.py:ro
     environment:
-      # Extension configuration - use port 3000 to avoid conflict with RIE's 8080
+      # Lambda handler
+      AWS_LAMBDA_FUNCTION_HANDLER: handler.handler
+      # Extension configuration
       TERO_LISTEN_PORT: "3000"
       TERO_UPSTREAM_URL: https://http-intake.logs.us5.datadoghq.com
       TERO_LOGS_URL: https://http-intake.logs.us5.datadoghq.com
       TERO_METRICS_URL: https://api.datadoghq.com
       TERO_POLICY_STATIC: '{"policies":[{"id":"drop-health","name":"Drop health checks","log":{"match":[{"log_field":"body","regex":"^Test log from Lambda.*"}],"keep":"none"}}]}'
       TERO_LOG_LEVEL: debug
-      # Lambda environment
-      AWS_LAMBDA_FUNCTION_TIMEOUT: "30"
-      AWS_LAMBDA_FUNCTION_NAME: test-function
-      AWS_LAMBDA_FUNCTION_VERSION: $$LATEST
-      AWS_LAMBDA_FUNCTION_MEMORY_SIZE: "128"
-      AWS_REGION: us-east-1
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/_health"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
+    command: ["handler.handler"]
 
   # Optional: Mock upstream for testing without real Datadog
   mock-upstream:
