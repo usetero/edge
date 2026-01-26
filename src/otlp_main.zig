@@ -186,15 +186,19 @@ pub fn main() !void {
     const instance_id_copy = try allocator.dupe(u8, instance_id);
     defer allocator.free(instance_id_copy);
 
-    // Set the instance_id in service metadata
-    config.service.instance_id = instance_id_copy;
-
-    // Set supported policy stages for this binary (OTLP: logs, metrics, and traces)
-    config.service.supported_stages = &.{
-        .POLICY_STAGE_LOG_FILTER,
-        .POLICY_STAGE_LOG_TRANSFORM,
-        .POLICY_STAGE_METRIC_FILTER,
-        .POLICY_STAGE_TRACE_SAMPLING,
+    // Build service metadata (don't mutate config - zonfig owns it)
+    const service_metadata = policy.ServiceMetadata{
+        .name = config.service.name,
+        .namespace = config.service.namespace,
+        .version = config.service.version,
+        .instance_id = instance_id_copy,
+        // OTLP: logs, metrics, and traces
+        .supported_stages = &.{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+            .POLICY_STAGE_TRACE_SAMPLING,
+        },
     };
 
     // Format listen address for logging
@@ -209,10 +213,10 @@ pub fn main() !void {
     bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
     bus.info(UpstreamConfigured{ .url = config.upstream_url });
     bus.info(ServiceConfigured{
-        .namespace = config.service.namespace,
-        .name = config.service.name,
-        .instance_id = config.service.instance_id,
-        .version = config.service.version,
+        .namespace = service_metadata.namespace,
+        .name = service_metadata.name,
+        .instance_id = service_metadata.instance_id,
+        .version = service_metadata.version,
     });
 
     // Create centralized policy registry
@@ -225,7 +229,7 @@ pub fn main() !void {
         bus,
         &registry,
         config.policy_providers,
-        config.service,
+        service_metadata,
     );
     defer loader.deinit();
 

@@ -195,12 +195,16 @@ pub fn main() !void {
     const instance_id_copy = try allocator.dupe(u8, instance_id);
     defer allocator.free(instance_id_copy);
 
-    // Set the instance_id in service metadata
-    config.service.instance_id = instance_id_copy;
-
-    // Set supported policy stages for this binary (Prometheus: metrics only)
-    config.service.supported_stages = &.{
-        .POLICY_STAGE_METRIC_FILTER,
+    // Build service metadata (don't mutate config - zonfig owns it)
+    const service_metadata = policy.ServiceMetadata{
+        .name = config.service.name,
+        .namespace = config.service.namespace,
+        .version = config.service.version,
+        .instance_id = instance_id_copy,
+        // Prometheus: metrics only
+        .supported_stages = &.{
+            .POLICY_STAGE_METRIC_FILTER,
+        },
     };
 
     // Format listen address for logging
@@ -218,10 +222,10 @@ pub fn main() !void {
         bus.info(MetricsUpstreamConfigured{ .url = metrics_url });
     }
     bus.info(ServiceConfigured{
-        .namespace = config.service.namespace,
-        .name = config.service.name,
-        .instance_id = config.service.instance_id,
-        .version = config.service.version,
+        .namespace = service_metadata.namespace,
+        .name = service_metadata.name,
+        .instance_id = service_metadata.instance_id,
+        .version = service_metadata.version,
     });
 
     // Create centralized policy registry
@@ -234,7 +238,7 @@ pub fn main() !void {
         bus,
         &registry,
         config.policy_providers,
-        config.service,
+        service_metadata,
     );
     defer loader.deinit();
 
