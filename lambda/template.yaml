@@ -313,27 +313,27 @@ Parameters:
     Default: ""
     Description: List of KMS Key ARNs the Lambda forwarder function can use to decrypt, seperated by comma
   # Tero Edge Extension Parameters
-  TeroEdgeLayerArn:
-    Type: String
-    Default: ""
-    Description: Override the full ARN of the Tero Edge Lambda extension layer. Leave empty to use the default layer based on TeroEdgeLayerVersion.
-  TeroEdgeLayerVersion:
-    Type: String
-    Default: "4"
-    Description: Version of the Tero Edge Lambda layer to use. Set to empty string to disable Tero Edge entirely.
-  TeroPolicyStatic:
-    Type: String
-    Default: ""
-    Description: JSON string containing static policies for Tero Edge (e.g., '{"policies":[...]}')
-  TeroPolicyUrl:
-    Type: String
-    Default: "https://sync.usetero.com/v1/policy/sync"
-    Description: URL of the HTTP policy provider for dynamic policy updates
   TeroPolicyApiKey:
     Type: String
     Default: ""
     NoEcho: true
-    Description: API key for authenticating with the HTTP policy provider
+    Description: API key for authenticating with the Tero policy provider. Required to enable Tero Edge.
+  TeroPolicyUrl:
+    Type: String
+    Default: "https://sync.usetero.com/v1/policy/sync"
+    Description: URL of the HTTP policy provider for dynamic policy updates
+  TeroPolicyStatic:
+    Type: String
+    Default: ""
+    Description: JSON string containing static policies for Tero Edge (e.g., '{"policies":[...]}')
+  TeroEdgeLayerVersion:
+    Type: String
+    Default: "4"
+    Description: Override the default Tero Edge layer version. Set to empty string to disable Tero Edge entirely.
+  TeroEdgeLayerArn:
+    Type: String
+    Default: ""
+    Description: Override the full ARN of the Tero Edge Lambda layer (ignores TeroEdgeLayerVersion if set).
   TeroListenPort:
     Type: String
     Default: "3000"
@@ -1202,11 +1202,11 @@ Metadata:
       - Label:
           default: Tero Edge Extension (Optional)
         Parameters:
-          - TeroEdgeLayerArn
-          - TeroEdgeLayerVersion
-          - TeroPolicyStatic
-          - TeroPolicyUrl
           - TeroPolicyApiKey
+          - TeroPolicyUrl
+          - TeroPolicyStatic
+          - TeroEdgeLayerVersion
+          - TeroEdgeLayerArn
           - TeroListenPort
           - TeroLogLevel
       - Label:
