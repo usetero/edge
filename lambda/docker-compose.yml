@@ -1,0 +1,45 @@
+services:
+  # Build the Lambda extension layer
+  build-layer:
+    build:
+      context: ..
+      dockerfile: lambda/Dockerfile
+    platform: linux/arm64
+    # This service is just for building - extracts to .layers/
+    # Usage: docker-compose run --rm build-layer
+    entrypoint: ["/bin/true"]
+
+  # Lambda extension test using AWS Lambda RIE
+  lambda-test:
+    image: public.ecr.aws/lambda/python:3.12-arm64
+    platform: linux/arm64
+    ports:
+      - "9000:8080"
+    volumes:
+      # Mount the built layer from local .layers directory
+      - ./.layers/extensions:/opt/extensions:ro
+      - ./.layers/bin:/opt/bin:ro
+      - ./.layers/lib:/opt/lib:ro
+      # Mount test handler
+      - ./test_handler.py:/var/task/handler.py:ro
+    environment:
+      # Lambda handler
+      AWS_LAMBDA_FUNCTION_HANDLER: handler.handler
+      # Extension configuration
+      TERO_LISTEN_PORT: "3000"
+      TERO_UPSTREAM_URL: https://http-intake.logs.us5.datadoghq.com
+      TERO_LOGS_URL: https://http-intake.logs.us5.datadoghq.com
+      TERO_METRICS_URL: https://api.datadoghq.com
+      TERO_POLICY_STATIC: '{"policies":[{"id":"drop-health","name":"Drop health checks","log":{"match":[{"log_field":"body","regex":"^Test log from Lambda.*"}],"keep":"none"}}]}'
+      TERO_LOG_LEVEL: debug
+    command: ["handler.handler"]
+
+  # Optional: Mock upstream for testing without real Datadog
+  mock-upstream:
+    image: nginx:alpine
+    ports:
+      - "9001:80"
+    volumes:
+      - ./mock-upstream.conf:/etc/nginx/conf.d/default.conf:ro
+    profiles:
+      - mock
