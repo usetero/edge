@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.13.0](https://github.com/usetero/edge/compare/v1.12.2...v1.13.0) (2026-01-26)
+
+
+### Features
+
+* add better organization for lambda ([#105](https://github.com/usetero/edge/issues/105)) ([3cc00a8](https://github.com/usetero/edge/commit/3cc00a8abdda4aa61c964fa580c298bd04557855))
+* create lambda extension from the edge ([#102](https://github.com/usetero/edge/issues/102)) ([90f1b33](https://github.com/usetero/edge/commit/90f1b33bd1f012965536d1b7a5af3ca5840ec799))
+
+
+### Bug Fixes
+
+* double free caused panic ([#106](https://github.com/usetero/edge/issues/106)) ([adb0309](https://github.com/usetero/edge/commit/adb03098723031c8ff0fe5262f176de470047743))
+
 ## [1.12.2](https://github.com/usetero/edge/compare/v1.12.1...v1.12.2) (2026-01-19)
 
 
