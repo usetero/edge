@@ -47,6 +47,7 @@ const TraceMatcher = proto.policy.TraceMatcher;
 const TraceTarget = proto.policy.TraceTarget;
 const TraceField = proto.policy.TraceField;
 const AttributePath = proto.policy.AttributePath;
+const LogSampleKey = proto.policy.LogSampleKey;
 
 // =============================================================================
 // Observability Events
@@ -297,6 +298,10 @@ pub const PolicyInfo = struct {
     /// Rate limiter for per_second/per_minute policies. Null for other keep types.
     /// Pointer because RateLimiter contains atomics that need stable addresses.
     rate_limiter: ?*RateLimiter,
+    /// Sample key for deterministic log sampling. When set, the specified field's
+    /// value is hashed for consistent sampling decisions (e.g., same trace_id always
+    /// gets same decision). Only applicable for log policies with percentage keep.
+    sample_key: ?LogSampleKey = null,
 };
 
 // =============================================================================
@@ -537,7 +542,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             }
 
             const keep_value = parseKeepValue(target);
-            try self.storePolicyInfo(policy, keep_value);
+            try self.storePolicyInfo(policy, target, keep_value);
         }
 
         fn getTarget(policy: *const Policy) ?*const TargetT {
@@ -697,7 +702,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             }
         }
 
-        fn storePolicyInfo(self: *Self, policy: *const Policy, keep: KeepValue) !void {
+        fn storePolicyInfo(self: *Self, policy: *const Policy, target: *const TargetT, keep: KeepValue) !void {
             const policy_id_copy = try self.allocator.dupe(u8, policy.id);
             try self.policy_id_storage.append(self.allocator, policy_id_copy);
 
@@ -716,6 +721,9 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 else => null,
             };
 
+            // Extract sample_key for log policies
+            const sample_key: ?LogSampleKey = if (T == .log) target.sample_key else null;
+
             try self.policy_info_list.append(self.temp_allocator, .{
                 .id = policy_id_copy,
                 .index = self.policy_index,
@@ -724,6 +732,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .keep = keep,
                 .enabled = policy.enabled,
                 .rate_limiter = rate_limiter,
+                .sample_key = sample_key,
             });
 
             self.bus.debug(PolicyStored{

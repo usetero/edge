@@ -21,6 +21,7 @@ const SamplingMode = proto.policy.SamplingMode;
 const SpanKind = proto.policy.SpanKind;
 const SpanStatusCode = proto.policy.SpanStatusCode;
 const AttributePath = proto.policy.AttributePath;
+const LogSampleKey = proto.policy.LogSampleKey;
 
 /// Parse an AttributePath from a JSON value.
 /// Supports three formats:
@@ -188,17 +189,30 @@ const TransformJson = struct {
     add: ?[]AddJson = null,
 };
 
+/// JSON schema for log sample key
+/// Example: { "log_field": "body" }
+/// Example: { "log_attribute": "trace_id" }
+/// Example: { "log_attribute": ["request", "id"] }
+const LogSampleKeyJson = struct {
+    log_field: ?[]const u8 = null,
+    log_attribute: ?std.json.Value = null,
+    resource_attribute: ?std.json.Value = null,
+    scope_attribute: ?std.json.Value = null,
+};
+
 /// JSON schema for log target
 /// Example:
 /// "log": {
 ///   "match": [{ "log_field": "body", "regex": "GET /health" }],
 ///   "keep": "none",
-///   "transform": { ... }
+///   "transform": { ... },
+///   "sample_key": { "log_attribute": "trace_id" }
 /// }
 const LogTargetJson = struct {
     match: ?[]LogMatcherJson = null,
     keep: []const u8 = "all",
     transform: ?TransformJson = null,
+    sample_key: ?LogSampleKeyJson = null,
 };
 
 /// JSON schema for metric target
@@ -378,11 +392,34 @@ fn parseLogTarget(allocator: std.mem.Allocator, json: LogTargetJson) !LogTarget 
         transform = try parseLogTransform(allocator, jt);
     }
 
+    var sample_key: ?LogSampleKey = null;
+    if (json.sample_key) |sk| {
+        sample_key = try parseLogSampleKey(allocator, sk);
+    }
+
     return LogTarget{
         .match = matchers,
         .keep = try allocator.dupe(u8, json.keep),
         .transform = transform,
+        .sample_key = sample_key,
     };
+}
+
+fn parseLogSampleKey(allocator: std.mem.Allocator, json: LogSampleKeyJson) !LogSampleKey {
+    const field: LogSampleKey.field_union = blk: {
+        if (json.log_field) |field_name| {
+            break :blk .{ .log_field = try parseLogFieldName(field_name) };
+        } else if (json.log_attribute) |value| {
+            break :blk .{ .log_attribute = try parseAttributePath(allocator, value) };
+        } else if (json.resource_attribute) |value| {
+            break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (json.scope_attribute) |value| {
+            break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
+        } else {
+            return error.MissingSampleKeyField;
+        }
+    };
+    return LogSampleKey{ .field = field };
 }
 
 fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher {
@@ -1904,4 +1941,192 @@ test "parsePoliciesBytes: metric policy with contains and case_insensitive" {
     try std.testing.expect(matcher.match.? == .contains);
     try std.testing.expectEqualStrings("debug", matcher.match.?.contains);
     try std.testing.expect(matcher.case_insensitive);
+}
+
+// =============================================================================
+// Tests for sample_key parsing
+// =============================================================================
+
+test "parsePoliciesBytes: log policy with sample_key log_field" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-body",
+        \\    "name": "Sample by body",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "log_field": "body" }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    try std.testing.expect(log_target.sample_key != null);
+
+    const sample_key = log_target.sample_key.?;
+    try std.testing.expect(sample_key.field != null);
+    try std.testing.expect(sample_key.field.? == .log_field);
+    try std.testing.expectEqual(LogField.LOG_FIELD_BODY, sample_key.field.?.log_field);
+}
+
+test "parsePoliciesBytes: log policy with sample_key log_attribute string" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-trace",
+        \\    "name": "Sample by trace_id",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "log_attribute": "trace_id" }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    try std.testing.expect(log_target.sample_key != null);
+
+    const sample_key = log_target.sample_key.?;
+    try std.testing.expect(sample_key.field.? == .log_attribute);
+    try std.testing.expectEqual(@as(usize, 1), sample_key.field.?.log_attribute.path.items.len);
+    try std.testing.expectEqualStrings("trace_id", sample_key.field.?.log_attribute.path.items[0]);
+}
+
+test "parsePoliciesBytes: log policy with sample_key log_attribute array" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-request-id",
+        \\    "name": "Sample by request.id",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "log_attribute": ["request", "id"] }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    const sample_key = log_target.sample_key.?;
+
+    try std.testing.expect(sample_key.field.? == .log_attribute);
+    try std.testing.expectEqual(@as(usize, 2), sample_key.field.?.log_attribute.path.items.len);
+    try std.testing.expectEqualStrings("request", sample_key.field.?.log_attribute.path.items[0]);
+    try std.testing.expectEqualStrings("id", sample_key.field.?.log_attribute.path.items[1]);
+}
+
+test "parsePoliciesBytes: log policy with sample_key resource_attribute" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-host",
+        \\    "name": "Sample by host",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "resource_attribute": "host.name" }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    const sample_key = log_target.sample_key.?;
+
+    try std.testing.expect(sample_key.field.? == .resource_attribute);
+    try std.testing.expectEqualStrings("host.name", sample_key.field.?.resource_attribute.path.items[0]);
+}
+
+test "parsePoliciesBytes: log policy with sample_key scope_attribute" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-scope",
+        \\    "name": "Sample by scope name",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "scope_attribute": "name" }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    const sample_key = log_target.sample_key.?;
+
+    try std.testing.expect(sample_key.field.? == .scope_attribute);
+    try std.testing.expectEqualStrings("name", sample_key.field.?.scope_attribute.path.items[0]);
+}
+
+test "parsePoliciesBytes: log policy without sample_key" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "no-sample-key",
+        \\    "name": "No sample key",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    try std.testing.expect(log_target.sample_key == null);
 }

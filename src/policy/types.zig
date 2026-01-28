@@ -68,6 +68,7 @@ const LogRename = proto.policy.LogRename;
 const LogAdd = proto.policy.LogAdd;
 const LogMatcher = proto.policy.LogMatcher;
 const LogField = proto.policy.LogField;
+const LogSampleKey = proto.policy.LogSampleKey;
 const MetricMatcher = proto.policy.MetricMatcher;
 const MetricField = proto.policy.MetricField;
 const AttributePath = proto.policy.AttributePath;
@@ -124,6 +125,16 @@ pub const FieldRef = union(enum) {
     }
 
     pub fn fromMatcherField(field: ?LogMatcher.field_union) ?FieldRef {
+        const f = field orelse return null;
+        return switch (f) {
+            .log_field => |v| .{ .log_field = v },
+            .log_attribute => |v| .{ .log_attribute = v },
+            .resource_attribute => |v| .{ .resource_attribute = v },
+            .scope_attribute => |v| .{ .scope_attribute = v },
+        };
+    }
+
+    pub fn fromSampleKeyField(field: ?LogSampleKey.field_union) ?FieldRef {
         const f = field orelse return null;
         return switch (f) {
             .log_field => |v| .{ .log_field = v },

@@ -315,19 +315,7 @@ pub const PolicyEngine = struct {
         var scan_state = self.scanMatcherKeys(T, ctx, field_accessor, index);
 
         // Phase 2: Find matching policies and determine decision
-        // For traces, use trace_id for deterministic sampling so all spans in a trace
-        // get the same sampling decision. For other telemetry types, use context pointer.
-        const hash_input = if (T == .trace) blk: {
-            // Try to get trace_id field for deterministic trace sampling
-            const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
-            if (field_accessor(ctx, trace_id_ref)) |trace_id_hex| {
-                // Hash the trace_id hex string for sampling
-                break :blk hashTraceId(trace_id_hex);
-            }
-            // Fallback to context pointer if no trace_id
-            break :blk @intFromPtr(ctx);
-        } else @intFromPtr(ctx);
-        const match_state = self.findMatchingPolicies(T, index, &scan_state, policy_id_buf, hash_input);
+        const match_state = self.findMatchingPolicies(T, ctx, field_accessor, index, &scan_state, policy_id_buf);
 
         self.bus.debug(EvaluateResult{ .decision = match_state.decision, .matched_count = match_state.matched_count });
 
@@ -466,15 +454,43 @@ pub const PolicyEngine = struct {
         return state;
     }
 
+    /// Compute hash for deterministic sampling based on telemetry type and policy config.
+    /// - Traces: hash trace_id so all spans in a trace get the same sampling decision
+    /// - Logs with sample_key: hash the specified field value for consistent sampling
+    /// - Otherwise: use context pointer as fallback
+    inline fn getSamplingHash(
+        comptime T: TelemetryType,
+        ctx: *anyopaque,
+        field_accessor: FieldAccessorType(T),
+        policy_info: PolicyInfo,
+    ) u64 {
+        if (T == .trace) {
+            const trace_id_ref: FieldRefType(T) = .{ .trace_field = .TRACE_FIELD_TRACE_ID };
+            if (field_accessor(ctx, trace_id_ref)) |trace_id_hex| {
+                return hashTraceId(trace_id_hex);
+            }
+        } else if (T == .log) {
+            if (policy_info.sample_key) |sample_key| {
+                if (FieldRef.fromSampleKeyField(sample_key.field)) |field_ref| {
+                    if (field_accessor(ctx, field_ref)) |value| {
+                        return hashString(value);
+                    }
+                }
+            }
+        }
+        return @intFromPtr(ctx);
+    }
+
     /// Find all matching policies, apply sampling/rate limiting, and determine final decision.
     /// Drop always beats keep: if any policy returns drop, final decision is drop.
     inline fn findMatchingPolicies(
         self: *const Self,
         comptime T: TelemetryType,
+        ctx: *anyopaque,
+        field_accessor: FieldAccessorType(T),
         index: *const matcher_index.MatcherIndexType(T),
         scan_state: *const ScanState,
         policy_id_buf: [][]const u8,
-        hash_input: u64,
     ) MatchState {
         var state = MatchState{
             .matched_indices = undefined,
@@ -491,6 +507,8 @@ pub const PolicyEngine = struct {
 
             if (scan_state.match_counts[policy_index] == policy_info.required_match_count) {
                 self.bus.debug(PolicyFullMatch{ .policy_index = policy_info.index, .policy_id = policy_info.id });
+
+                const hash_input = getSamplingHash(T, ctx, field_accessor, policy_info);
 
                 // Apply sampling/rate limiting to get this policy's decision
                 const decision = applyKeepValue(policy_info, hash_input);
@@ -615,6 +633,20 @@ fn hashTraceId(trace_id_hex: []const u8) u64 {
         hash = (hash << 4) | nibble;
     }
 
+    return hash;
+}
+
+/// Hash a string value for deterministic sampling.
+/// Uses FNV-1a for good distribution and speed.
+fn hashString(s: []const u8) u64 {
+    if (s.len == 0) return 0;
+
+    // FNV-1a 64-bit
+    var hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for (s) |byte| {
+        hash ^= byte;
+        hash *%= 0x100000001b3; // FNV prime
+    }
     return hash;
 }
 
@@ -3528,4 +3560,141 @@ test "PolicyEngine: exists=false with negate=true matches when field exists" {
     // No trace_id = field missing = exists:false+negate:true does NOT match = unset
     var no_trace = TestLogContext{ .message = "log without trace" };
     try testing.expectEqual(FilterDecision.unset, engine.evaluate(.log, &no_trace, TestLogContext.fieldAccessor, null, &policy_id_buf).decision);
+}
+
+test "PolicyEngine: sample_key provides deterministic sampling" {
+    const allocator = testing.allocator;
+
+    // Policy with 50% sampling using trace_id as sample_key
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "sample-policy"),
+        .name = try allocator.dupe(u8, "sample-by-trace"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "50%"),
+            .sample_key = .{ .field = .{ .log_attribute = try testMakeAttrPath(allocator, "trace_id") } },
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "^.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Same trace_id should always get the same decision
+    var log1 = TestLogContext{ .message = "log one", .trace_id = "trace-abc-123" };
+    const decision1 = engine.evaluate(.log, &log1, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+
+    var log2 = TestLogContext{ .message = "log two", .trace_id = "trace-abc-123" };
+    const decision2 = engine.evaluate(.log, &log2, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+
+    var log3 = TestLogContext{ .message = "log three", .trace_id = "trace-abc-123" };
+    const decision3 = engine.evaluate(.log, &log3, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+
+    // All logs with same trace_id get same decision
+    try testing.expectEqual(decision1, decision2);
+    try testing.expectEqual(decision2, decision3);
+
+    // Different trace_id may get different decision (though not guaranteed with only 2 values)
+    // But the decision for each trace_id is consistent
+    var log4 = TestLogContext{ .message = "log four", .trace_id = "trace-xyz-789" };
+    const decision4a = engine.evaluate(.log, &log4, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+    const decision4b = engine.evaluate(.log, &log4, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+    try testing.expectEqual(decision4a, decision4b);
+}
+
+test "PolicyEngine: sample_key with log_field" {
+    const allocator = testing.allocator;
+
+    // Policy with 50% sampling using body as sample_key
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "sample-by-body"),
+        .name = try allocator.dupe(u8, "sample-by-body"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "50%"),
+            .sample_key = .{ .field = .{ .log_field = .LOG_FIELD_BODY } },
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "^.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Same message body should always get the same decision
+    var log1 = TestLogContext{ .message = "exact same message" };
+    const decision1 = engine.evaluate(.log, &log1, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+
+    var log2 = TestLogContext{ .message = "exact same message" };
+    const decision2 = engine.evaluate(.log, &log2, TestLogContext.fieldAccessor, null, &policy_id_buf).decision;
+
+    try testing.expectEqual(decision1, decision2);
+}
+
+test "PolicyEngine: sample_key missing field falls back to default" {
+    const allocator = testing.allocator;
+
+    // Policy with sample_key pointing to a field that doesn't exist
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "sample-missing-key"),
+        .name = try allocator.dupe(u8, "sample-missing-key"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "50%"),
+            .sample_key = .{ .field = .{ .log_attribute = try testMakeAttrPath(allocator, "nonexistent_field") } },
+        } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "^.*") },
+    });
+    defer policy.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try registry.updatePolicies(&.{policy}, "file-provider", .file);
+
+    const engine = PolicyEngine.init(noop_bus.eventBus(), &registry);
+    var policy_id_buf: [16][]const u8 = undefined;
+
+    // Should still work (falls back to context pointer hash)
+    var log1 = TestLogContext{ .message = "test message" };
+    const result = engine.evaluate(.log, &log1, TestLogContext.fieldAccessor, null, &policy_id_buf);
+
+    // Should get a decision (either keep or drop based on hash)
+    try testing.expect(result.decision == .keep or result.decision == .drop);
+}
+
+test "hashString: deterministic" {
+    const hash1 = hashString("trace-abc-123");
+    const hash2 = hashString("trace-abc-123");
+    const hash3 = hashString("trace-xyz-789");
+
+    try testing.expectEqual(hash1, hash2);
+    try testing.expect(hash1 != hash3);
+}
+
+test "hashString: empty string" {
+    try testing.expectEqual(@as(u64, 0), hashString(""));
 }
