@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package tero.policy.v1;
 
+import "tero/policy/v1/shared.proto";
+
 option go_package = "github.com/usetero/policy/gen/go/tero/policy/v1";
 
 // =============================================================================
@@ -78,14 +80,14 @@ message MetricMatcher {
     // Simple fields (name, description, unit, etc.)
     MetricField metric_field = 1;
 
-    // Data point attribute by key
-    string datapoint_attribute = 2;
+    // Data point attribute by key or path
+    AttributePath datapoint_attribute = 2;
 
-    // Resource attribute by key
-    string resource_attribute = 3;
+    // Resource attribute by key or path
+    AttributePath resource_attribute = 3;
 
-    // Scope attribute by key
-    string scope_attribute = 4;
+    // Scope attribute by key or path
+    AttributePath scope_attribute = 4;
 
     // Metric type matcher
     MetricType metric_type = 5;
@@ -105,8 +107,20 @@ message MetricMatcher {
 
     // Field existence check
     bool exists = 12;
+
+    // Literal prefix match
+    string starts_with = 13;
+
+    // Literal suffix match
+    string ends_with = 14;
+
+    // Literal substring match
+    string contains = 15;
   }
 
   // If true, inverts the match result
   bool negate = 20;
+
+  // If true, applies case-insensitive matching to all match types
+  bool case_insensitive = 21;
 }

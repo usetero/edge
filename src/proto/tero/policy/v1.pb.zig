@@ -9,6 +9,113 @@ const google_api = @import("../../google/api.pb.zig");
 /// import package opentelemetry.proto.common.v1
 const opentelemetry_proto_common_v1 = @import("../../opentelemetry/proto/common/v1.pb.zig");
 
+/// AttributePath specifies how to access an attribute value.
+///
+/// The path is represented as an array of string segments. Each segment represents
+/// a key to traverse into nested maps.
+///
+/// Example usage:
+///
+/// For an attribute structure like:
+/// Attributes: map[string]any{
+/// "http": map[string]any{
+/// "method":      "POST",
+/// "status_code": 200,
+/// },
+/// "user_id": "u123",
+/// }
+///
+/// - To access "user_id": ["user_id"]
+/// - To access http.method: ["http", "method"]
+///
+/// YAML/JSON Unmarshaling:
+///
+/// Implementations MUST accept both the canonical proto form and shorthand forms
+/// for ergonomic policy authoring:
+///
+/// Canonical (proto-native):
+/// log_attribute:
+/// path: ["http", "method"]
+///
+/// Shorthand array (MUST be supported):
+/// log_attribute: ["http", "method"]
+///
+/// Shorthand string (MUST be supported for single-segment paths):
+/// log_attribute: "user_id"           # equivalent to ["user_id"]
+///
+/// When marshaling, implementations SHOULD use the shorthand array form for
+/// cleaner output.
+pub const AttributePath = struct {
+    path: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub const _desc_table = .{
+        .path = fd(1, .{ .repeated = .{ .scalar = .string } }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
 /// LogField identifies simple log fields (non-keyed).
 pub const LogField = enum(i32) {
     LOG_FIELD_UNSPECIFIED = 0,
@@ -27,11 +134,105 @@ pub const LogTarget = struct {
     match: std.ArrayListUnmanaged(LogMatcher) = .empty,
     keep: []const u8 = &.{},
     transform: ?LogTransform = null,
+    sample_key: ?LogSampleKey = null,
 
     pub const _desc_table = .{
         .match = fd(1, .{ .repeated = .submessage }),
         .keep = fd(2, .{ .scalar = .string }),
         .transform = fd(3, .submessage),
+        .sample_key = fd(4, .submessage),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+
+    /// This method is used by std.json
+    /// internally for serialization. DO NOT RENAME!
+    pub fn jsonStringify(self: *const @This(), jws: anytype) !void {
+        return protobuf.json.stringify(@This(), self, jws);
+    }
+};
+
+/// LogSampleKey specifies which field to use as the sampling key for consistent
+/// sampling decisions.
+pub const LogSampleKey = struct {
+    field: ?field_union = null,
+
+    pub const _field_case = enum {
+        log_field,
+        log_attribute,
+        resource_attribute,
+        scope_attribute,
+    };
+    pub const field_union = union(_field_case) {
+        log_field: LogField,
+        log_attribute: AttributePath,
+        resource_attribute: AttributePath,
+        scope_attribute: AttributePath,
+        pub const _desc_table = .{
+            .log_field = fd(1, .@"enum"),
+            .log_attribute = fd(2, .submessage),
+            .resource_attribute = fd(3, .submessage),
+            .scope_attribute = fd(4, .submessage),
+        };
+    };
+
+    pub const _desc_table = .{
+        .field = fd(null, .{ .oneof = field_union }),
     };
 
     /// Encodes the message to the writer
@@ -110,6 +311,7 @@ pub const LogTarget = struct {
 /// All regex fields use RE2 syntax for consistency across implementations.
 pub const LogMatcher = struct {
     negate: bool = false,
+    case_insensitive: bool = false,
     field: ?field_union = null,
     match: ?match_union = null,
 
@@ -121,14 +323,14 @@ pub const LogMatcher = struct {
     };
     pub const field_union = union(_field_case) {
         log_field: LogField,
-        log_attribute: []const u8,
-        resource_attribute: []const u8,
-        scope_attribute: []const u8,
+        log_attribute: AttributePath,
+        resource_attribute: AttributePath,
+        scope_attribute: AttributePath,
         pub const _desc_table = .{
             .log_field = fd(1, .@"enum"),
-            .log_attribute = fd(2, .{ .scalar = .string }),
-            .resource_attribute = fd(3, .{ .scalar = .string }),
-            .scope_attribute = fd(4, .{ .scalar = .string }),
+            .log_attribute = fd(2, .submessage),
+            .resource_attribute = fd(3, .submessage),
+            .scope_attribute = fd(4, .submessage),
         };
     };
 
@@ -136,20 +338,30 @@ pub const LogMatcher = struct {
         exact,
         regex,
         exists,
+        starts_with,
+        ends_with,
+        contains,
     };
     pub const match_union = union(_match_case) {
         exact: []const u8,
         regex: []const u8,
         exists: bool,
+        starts_with: []const u8,
+        ends_with: []const u8,
+        contains: []const u8,
         pub const _desc_table = .{
             .exact = fd(10, .{ .scalar = .string }),
             .regex = fd(11, .{ .scalar = .string }),
             .exists = fd(12, .{ .scalar = .bool }),
+            .starts_with = fd(13, .{ .scalar = .string }),
+            .ends_with = fd(14, .{ .scalar = .string }),
+            .contains = fd(15, .{ .scalar = .string }),
         };
     };
 
     pub const _desc_table = .{
         .negate = fd(20, .{ .scalar = .bool }),
+        .case_insensitive = fd(21, .{ .scalar = .bool }),
         .field = fd(null, .{ .oneof = field_union }),
         .match = fd(null, .{ .oneof = match_union }),
     };
@@ -308,14 +520,14 @@ pub const LogRemove = struct {
     };
     pub const field_union = union(_field_case) {
         log_field: LogField,
-        log_attribute: []const u8,
-        resource_attribute: []const u8,
-        scope_attribute: []const u8,
+        log_attribute: AttributePath,
+        resource_attribute: AttributePath,
+        scope_attribute: AttributePath,
         pub const _desc_table = .{
             .log_field = fd(1, .@"enum"),
-            .log_attribute = fd(2, .{ .scalar = .string }),
-            .resource_attribute = fd(3, .{ .scalar = .string }),
-            .scope_attribute = fd(4, .{ .scalar = .string }),
+            .log_attribute = fd(2, .submessage),
+            .resource_attribute = fd(3, .submessage),
+            .scope_attribute = fd(4, .submessage),
         };
     };
 
@@ -400,14 +612,14 @@ pub const LogRedact = struct {
     };
     pub const field_union = union(_field_case) {
         log_field: LogField,
-        log_attribute: []const u8,
-        resource_attribute: []const u8,
-        scope_attribute: []const u8,
+        log_attribute: AttributePath,
+        resource_attribute: AttributePath,
+        scope_attribute: AttributePath,
         pub const _desc_table = .{
             .log_field = fd(1, .@"enum"),
-            .log_attribute = fd(2, .{ .scalar = .string }),
-            .resource_attribute = fd(3, .{ .scalar = .string }),
-            .scope_attribute = fd(4, .{ .scalar = .string }),
+            .log_attribute = fd(2, .submessage),
+            .resource_attribute = fd(3, .submessage),
+            .scope_attribute = fd(4, .submessage),
         };
     };
 
@@ -494,14 +706,14 @@ pub const LogRename = struct {
     };
     pub const from_union = union(_from_case) {
         from_log_field: LogField,
-        from_log_attribute: []const u8,
-        from_resource_attribute: []const u8,
-        from_scope_attribute: []const u8,
+        from_log_attribute: AttributePath,
+        from_resource_attribute: AttributePath,
+        from_scope_attribute: AttributePath,
         pub const _desc_table = .{
             .from_log_field = fd(1, .@"enum"),
-            .from_log_attribute = fd(2, .{ .scalar = .string }),
-            .from_resource_attribute = fd(3, .{ .scalar = .string }),
-            .from_scope_attribute = fd(4, .{ .scalar = .string }),
+            .from_log_attribute = fd(2, .submessage),
+            .from_resource_attribute = fd(3, .submessage),
+            .from_scope_attribute = fd(4, .submessage),
         };
     };
 
@@ -589,14 +801,14 @@ pub const LogAdd = struct {
     };
     pub const field_union = union(_field_case) {
         log_field: LogField,
-        log_attribute: []const u8,
-        resource_attribute: []const u8,
-        scope_attribute: []const u8,
+        log_attribute: AttributePath,
+        resource_attribute: AttributePath,
+        scope_attribute: AttributePath,
         pub const _desc_table = .{
             .log_field = fd(1, .@"enum"),
-            .log_attribute = fd(2, .{ .scalar = .string }),
-            .resource_attribute = fd(3, .{ .scalar = .string }),
-            .scope_attribute = fd(4, .{ .scalar = .string }),
+            .log_attribute = fd(2, .submessage),
+            .resource_attribute = fd(3, .submessage),
+            .scope_attribute = fd(4, .submessage),
         };
     };
 
@@ -789,6 +1001,7 @@ pub const MetricTarget = struct {
 /// All regex fields use RE2 syntax for consistency across implementations.
 pub const MetricMatcher = struct {
     negate: bool = false,
+    case_insensitive: bool = false,
     field: ?field_union = null,
     match: ?match_union = null,
 
@@ -802,16 +1015,16 @@ pub const MetricMatcher = struct {
     };
     pub const field_union = union(_field_case) {
         metric_field: MetricField,
-        datapoint_attribute: []const u8,
-        resource_attribute: []const u8,
-        scope_attribute: []const u8,
+        datapoint_attribute: AttributePath,
+        resource_attribute: AttributePath,
+        scope_attribute: AttributePath,
         metric_type: MetricType,
         aggregation_temporality: AggregationTemporality,
         pub const _desc_table = .{
             .metric_field = fd(1, .@"enum"),
-            .datapoint_attribute = fd(2, .{ .scalar = .string }),
-            .resource_attribute = fd(3, .{ .scalar = .string }),
-            .scope_attribute = fd(4, .{ .scalar = .string }),
+            .datapoint_attribute = fd(2, .submessage),
+            .resource_attribute = fd(3, .submessage),
+            .scope_attribute = fd(4, .submessage),
             .metric_type = fd(5, .@"enum"),
             .aggregation_temporality = fd(6, .@"enum"),
         };
@@ -821,20 +1034,30 @@ pub const MetricMatcher = struct {
         exact,
         regex,
         exists,
+        starts_with,
+        ends_with,
+        contains,
     };
     pub const match_union = union(_match_case) {
         exact: []const u8,
         regex: []const u8,
         exists: bool,
+        starts_with: []const u8,
+        ends_with: []const u8,
+        contains: []const u8,
         pub const _desc_table = .{
             .exact = fd(10, .{ .scalar = .string }),
             .regex = fd(11, .{ .scalar = .string }),
             .exists = fd(12, .{ .scalar = .bool }),
+            .starts_with = fd(13, .{ .scalar = .string }),
+            .ends_with = fd(14, .{ .scalar = .string }),
+            .contains = fd(15, .{ .scalar = .string }),
         };
     };
 
     pub const _desc_table = .{
         .negate = fd(20, .{ .scalar = .bool }),
+        .case_insensitive = fd(21, .{ .scalar = .bool }),
         .field = fd(null, .{ .oneof = field_union }),
         .match = fd(null, .{ .oneof = match_union }),
     };
@@ -1034,6 +1257,7 @@ pub const TraceTarget = struct {
 /// All regex fields use RE2 syntax for consistency across implementations.
 pub const TraceMatcher = struct {
     negate: bool = false,
+    case_insensitive: bool = false,
     field: ?field_union = null,
     match: ?match_union = null,
 
@@ -1050,23 +1274,23 @@ pub const TraceMatcher = struct {
     };
     pub const field_union = union(_field_case) {
         trace_field: TraceField,
-        span_attribute: []const u8,
-        resource_attribute: []const u8,
-        scope_attribute: []const u8,
+        span_attribute: AttributePath,
+        resource_attribute: AttributePath,
+        scope_attribute: AttributePath,
         span_kind: SpanKind,
         span_status: SpanStatusCode,
         event_name: []const u8,
-        event_attribute: []const u8,
+        event_attribute: AttributePath,
         link_trace_id: []const u8,
         pub const _desc_table = .{
             .trace_field = fd(1, .@"enum"),
-            .span_attribute = fd(2, .{ .scalar = .string }),
-            .resource_attribute = fd(3, .{ .scalar = .string }),
-            .scope_attribute = fd(4, .{ .scalar = .string }),
+            .span_attribute = fd(2, .submessage),
+            .resource_attribute = fd(3, .submessage),
+            .scope_attribute = fd(4, .submessage),
             .span_kind = fd(5, .@"enum"),
             .span_status = fd(6, .@"enum"),
             .event_name = fd(7, .{ .scalar = .string }),
-            .event_attribute = fd(8, .{ .scalar = .string }),
+            .event_attribute = fd(8, .submessage),
             .link_trace_id = fd(9, .{ .scalar = .string }),
         };
     };
@@ -1075,20 +1299,30 @@ pub const TraceMatcher = struct {
         exact,
         regex,
         exists,
+        starts_with,
+        ends_with,
+        contains,
     };
     pub const match_union = union(_match_case) {
         exact: []const u8,
         regex: []const u8,
         exists: bool,
+        starts_with: []const u8,
+        ends_with: []const u8,
+        contains: []const u8,
         pub const _desc_table = .{
             .exact = fd(10, .{ .scalar = .string }),
             .regex = fd(11, .{ .scalar = .string }),
             .exists = fd(12, .{ .scalar = .bool }),
+            .starts_with = fd(13, .{ .scalar = .string }),
+            .ends_with = fd(14, .{ .scalar = .string }),
+            .contains = fd(15, .{ .scalar = .string }),
         };
     };
 
     pub const _desc_table = .{
         .negate = fd(20, .{ .scalar = .bool }),
+        .case_insensitive = fd(21, .{ .scalar = .bool }),
         .field = fd(null, .{ .oneof = field_union }),
         .match = fd(null, .{ .oneof = match_union }),
     };
