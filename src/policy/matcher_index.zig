@@ -37,6 +37,7 @@ pub const TelemetryType = policy_types.TelemetryType;
 
 const Policy = proto.policy.Policy;
 const LogMatcher = proto.policy.LogMatcher;
+const MatchType = LogMatcher._match_case;
 const LogTarget = proto.policy.LogTarget;
 const LogField = proto.policy.LogField;
 const MetricMatcher = proto.policy.MetricMatcher;
@@ -308,7 +309,9 @@ const PatternMeta = struct {
 
 const PatternCollector = struct {
     policy_index: PolicyIndex,
-    regex: []const u8,
+    pattern: []const u8,
+    match_type: MatchType = .regex,
+    case_insensitive: bool = false,
 };
 
 // =============================================================================
@@ -576,20 +579,37 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 return;
             };
 
-            const extract = self.extractRegex(matcher.match, matcher_idx) orelse return;
+            const m = matcher.match orelse {
+                self.bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
+                return;
+            };
 
-            // XOR: flip_negate inverts the matcher's negate flag
-            // exists: false sets flip_negate=true, so negate becomes !negate
-            const effective_negate = matcher.negate != extract.flip_negate;
+            const pattern, const match_type, const negate = switch (m) {
+                .regex => |r| .{ r, MatchType.regex, matcher.negate },
+                .exact => |e| .{ e, MatchType.exact, matcher.negate },
+                .exists => |exists| .{ "", MatchType.exists, matcher.negate != !exists },
+                .starts_with => |s| .{ s, MatchType.starts_with, matcher.negate },
+                .ends_with => |s| .{ s, MatchType.ends_with, matcher.negate },
+                .contains => |s| .{ s, MatchType.contains, matcher.negate },
+            };
+
+            if (pattern.len == 0 and match_type != .exists) {
+                self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
+                return;
+            }
 
             self.bus.debug(MatcherDetail{
                 .matcher_idx = matcher_idx,
-                .regex = extract.regex,
-                .negate = effective_negate,
+                .regex = pattern,
+                .negate = negate,
             });
 
             const matcher_key = MatcherKeyT{ .field = field_ref };
-            try self.addPattern(matcher_key, extract.regex, effective_negate, field_ref);
+            try self.addPattern(matcher_key, .{
+                .pattern = pattern,
+                .match_type = match_type,
+                .case_insensitive = matcher.case_insensitive,
+            }, negate, field_ref);
         }
 
         fn getFieldRef(matcher: *const MatcherT) ?FieldRefT {
@@ -600,39 +620,9 @@ fn IndexBuilder(comptime T: TelemetryType) type {
             };
         }
 
-        /// Pattern that matches any non-empty string (used for exists matching)
-        const EXISTS_PATTERN = "^.+$";
+        const PatternInfo = struct { pattern: []const u8, match_type: MatchType, case_insensitive: bool };
 
-        const ExtractResult = struct {
-            regex: []const u8,
-            flip_negate: bool,
-        };
-
-        fn extractRegex(self: *Self, match_union: anytype, matcher_idx: usize) ?ExtractResult {
-            const m = match_union orelse {
-                self.bus.debug(MatcherNullMatch{ .matcher_idx = matcher_idx });
-                return null;
-            };
-            const result: ExtractResult = switch (m) {
-                .regex => |r| .{ .regex = r, .flip_negate = false },
-                .exact => |e| .{ .regex = e, .flip_negate = false },
-                // exists: true  -> match ^.+$ (field has value)
-                // exists: false -> match ^.+$ negated (field is empty/missing)
-                .exists => |exists| .{ .regex = EXISTS_PATTERN, .flip_negate = !exists },
-                // Optimized literal matchers (v1.2.0) - for now, use the literal value as regex
-                // TODO (Step 3): Use Hyperscan literal mode with native caseless flag
-                .starts_with => |s| .{ .regex = s, .flip_negate = false },
-                .ends_with => |s| .{ .regex = s, .flip_negate = false },
-                .contains => |s| .{ .regex = s, .flip_negate = false },
-            };
-            if (result.regex.len == 0) {
-                self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
-                return null;
-            }
-            return result;
-        }
-
-        fn addPattern(self: *Self, key: MatcherKeyT, regex: []const u8, negate: bool, field_ref: FieldRefT) !void {
+        fn addPattern(self: *Self, key: MatcherKeyT, info: PatternInfo, negate: bool, field_ref: FieldRefT) !void {
             if (negate) {
                 self.current_negated_count += 1;
             } else {
@@ -645,7 +635,12 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 gop.value_ptr.* = .{ .positive = .{}, .negated = .{} };
             }
 
-            const collector = PatternCollector{ .policy_index = self.policy_index, .regex = regex };
+            const collector = PatternCollector{
+                .policy_index = self.policy_index,
+                .pattern = info.pattern,
+                .match_type = info.match_type,
+                .case_insensitive = info.case_insensitive,
+            };
             if (negate) {
                 try gop.value_ptr.negated.append(self.temp_allocator, collector);
             } else {
@@ -1190,19 +1185,58 @@ fn compileDatabase(
 }
 
 fn compilePatterns(allocator: std.mem.Allocator, collectors: []const PatternCollector) !struct { db: hyperscan.Database, meta: []PatternMeta } {
-    const hs_patterns = try allocator.alloc(hyperscan.Pattern, collectors.len);
-    defer allocator.free(hs_patterns);
+    // Calculate buffer size: max len+2 per pattern (for anchors)
+    var buf_size: usize = 0;
+    for (collectors) |c| {
+        buf_size += switch (c.match_type) {
+            .regex, .exists, .contains => 0,
+            .exact => c.pattern.len + 2,
+            .starts_with, .ends_with => c.pattern.len + 1,
+        };
+    }
+
+    // Single allocation for hs_patterns + pattern buffer
+    const hs_size = collectors.len * @sizeOf(hyperscan.Pattern);
+    const temp = try allocator.alloc(u8, hs_size + buf_size);
+    defer allocator.free(temp);
+
+    const hs_patterns: []hyperscan.Pattern = @alignCast(std.mem.bytesAsSlice(hyperscan.Pattern, temp[0..hs_size]));
+    var buf = temp[hs_size..];
 
     const meta = try allocator.alloc(PatternMeta, collectors.len);
     errdefer allocator.free(meta);
 
-    for (collectors, 0..) |collector, i| {
-        hs_patterns[i] = .{ .expression = collector.regex, .id = @intCast(i), .flags = .{} };
-        meta[i] = .{ .policy_index = collector.policy_index };
+    for (collectors, 0..) |c, i| {
+        hs_patterns[i] = .{
+            .expression = formatPattern(&buf, c.pattern, c.match_type),
+            .id = @intCast(i),
+            .flags = .{ .caseless = c.case_insensitive },
+        };
+        meta[i] = .{ .policy_index = c.policy_index };
     }
 
     const db = try hyperscan.Database.compileMulti(allocator, hs_patterns, .{});
     return .{ .db = db, .meta = meta };
+}
+
+fn formatPattern(buf: *[]u8, pattern: []const u8, match_type: MatchType) []const u8 {
+    const anchor_start, const anchor_end = switch (match_type) {
+        .regex => return pattern,
+        .exists => return "^.+$",
+        .exact => .{ true, true },
+        .starts_with => .{ true, false },
+        .ends_with => .{ false, true },
+        .contains => return pattern,
+    };
+
+    const out = std.fmt.bufPrint(buf.*, "{s}{s}{s}", .{
+        if (anchor_start) "^" else "",
+        pattern,
+        if (anchor_end) "$" else "",
+    }) catch unreachable;
+
+    buf.* = buf.*[out.len..];
+    return out;
 }
 
 // =============================================================================
@@ -1805,4 +1839,284 @@ test "Mixed log and metric policies: each index only gets its type" {
 
     const log_in_metric = metric_index.getPolicy("log-policy-1");
     try testing.expect(log_in_metric == null);
+}
+
+// =============================================================================
+// Tests for match types (starts_with, ends_with, contains, exact, exists)
+// =============================================================================
+
+test "formatPattern: regex returns pattern unchanged" {
+    var buf: [64]u8 = undefined;
+    var slice: []u8 = &buf;
+    const result = formatPattern(&slice, "^hello.*world$", .regex);
+    try testing.expectEqualStrings("^hello.*world$", result);
+}
+
+test "formatPattern: exists returns fixed pattern" {
+    var buf: [64]u8 = undefined;
+    var slice: []u8 = &buf;
+    const result = formatPattern(&slice, "", .exists);
+    try testing.expectEqualStrings("^.+$", result);
+}
+
+test "formatPattern: exact adds both anchors" {
+    var buf: [64]u8 = undefined;
+    var slice: []u8 = &buf;
+    const result = formatPattern(&slice, "hello", .exact);
+    try testing.expectEqualStrings("^hello$", result);
+}
+
+test "formatPattern: starts_with adds start anchor" {
+    var buf: [64]u8 = undefined;
+    var slice: []u8 = &buf;
+    const result = formatPattern(&slice, "ERROR:", .starts_with);
+    try testing.expectEqualStrings("^ERROR:", result);
+}
+
+test "formatPattern: ends_with adds end anchor" {
+    var buf: [64]u8 = undefined;
+    var slice: []u8 = &buf;
+    const result = formatPattern(&slice, ".json", .ends_with);
+    try testing.expectEqualStrings(".json$", result);
+}
+
+test "formatPattern: contains returns pattern unchanged" {
+    var buf: [64]u8 = undefined;
+    var slice: []u8 = &buf;
+    const result = formatPattern(&slice, "password", .contains);
+    try testing.expectEqualStrings("password", result);
+}
+
+test "Log matcher with starts_with" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "starts-with-policy"),
+        .name = try allocator.dupe(u8, "test"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .starts_with = try allocator.dupe(u8, "ERROR") },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy});
+    defer index.deinit();
+
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
+    var result_buf: [8]u32 = undefined;
+
+    // Should match strings starting with ERROR
+    var result = db.scanPositive("ERROR: something failed", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("ERROR", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Should not match strings not starting with ERROR
+    result = db.scanPositive("Warning: ERROR occurred", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+
+    result = db.scanPositive("Some ERROR here", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "Log matcher with ends_with" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "ends-with-policy"),
+        .name = try allocator.dupe(u8, "test"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .ends_with = try allocator.dupe(u8, ".json") },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy});
+    defer index.deinit();
+
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
+    var result_buf: [8]u32 = undefined;
+
+    // Should match strings ending with .json
+    var result = db.scanPositive("config.json", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("path/to/file.json", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Should not match strings not ending with .json
+    result = db.scanPositive("config.json.bak", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+
+    result = db.scanPositive("json file here", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "Log matcher with contains" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "contains-policy"),
+        .name = try allocator.dupe(u8, "test"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .contains = try allocator.dupe(u8, "password") },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy});
+    defer index.deinit();
+
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
+    var result_buf: [8]u32 = undefined;
+
+    // Should match strings containing password anywhere
+    var result = db.scanPositive("password", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("user password here", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("my_password_field", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Should not match strings without password
+    result = db.scanPositive("pass word", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+
+    result = db.scanPositive("secret", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "Log matcher with exact" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "exact-policy"),
+        .name = try allocator.dupe(u8, "test"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .exact = try allocator.dupe(u8, "hello") },
+    });
+    defer policy.deinit(allocator);
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy});
+    defer index.deinit();
+
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
+    var result_buf: [8]u32 = undefined;
+
+    // Should match exactly "hello"
+    var result = db.scanPositive("hello", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Should not match anything else
+    result = db.scanPositive("hello world", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+
+    result = db.scanPositive("say hello", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+
+    result = db.scanPositive("Hello", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "Log matcher with case_insensitive" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "case-insensitive-policy"),
+        .name = try allocator.dupe(u8, "test"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .exact = try allocator.dupe(u8, "hello") },
+        .case_insensitive = true,
+    });
+    defer policy.deinit(allocator);
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy});
+    defer index.deinit();
+
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
+    var result_buf: [8]u32 = undefined;
+
+    // Should match case variations
+    var result = db.scanPositive("hello", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("Hello", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("HELLO", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("HeLLo", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    // Should still not match partial
+    result = db.scanPositive("hello world", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "Log matcher with starts_with case_insensitive" {
+    const allocator = testing.allocator;
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+
+    var policy = Policy{
+        .id = try allocator.dupe(u8, "starts-with-ci-policy"),
+        .name = try allocator.dupe(u8, "test"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all") } },
+    };
+    try policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .starts_with = try allocator.dupe(u8, "error") },
+        .case_insensitive = true,
+    });
+    defer policy.deinit(allocator);
+
+    var index = try LogMatcherIndex.build(allocator, noop_bus.eventBus(), &[_]Policy{policy});
+    defer index.deinit();
+
+    const db = index.getDatabase(.{ .field = .{ .log_field = .LOG_FIELD_BODY } }).?;
+    var result_buf: [8]u32 = undefined;
+
+    var result = db.scanPositive("error: failed", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("ERROR: failed", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("Error: failed", &result_buf);
+    try testing.expectEqual(@as(usize, 1), result.count);
+
+    result = db.scanPositive("warning: error", &result_buf);
+    try testing.expectEqual(@as(usize, 0), result.count);
 }

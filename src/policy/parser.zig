@@ -98,6 +98,7 @@ fn makeAttributePath(allocator: std.mem.Allocator, key: []const u8) !AttributePa
 /// Example: { "log_attribute": "service", "regex": "payment.*" }
 /// Example: { "log_attribute": ["http", "method"], "regex": "GET" }
 /// Example: { "log_attribute": {"path": ["http", "method"]}, "regex": "GET" }
+/// Example: { "log_field": "body", "starts_with": "ERROR", "case_insensitive": true }
 const LogMatcherJson = struct {
     // Field selectors (one of these should be set)
     log_field: ?[]const u8 = null, // "body", "severity_text", etc.
@@ -109,9 +110,13 @@ const LogMatcherJson = struct {
     regex: ?[]const u8 = null,
     exact: ?[]const u8 = null,
     exists: ?bool = null,
+    starts_with: ?[]const u8 = null,
+    ends_with: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
 
-    // Optional negation
+    // Optional flags
     negate: bool = false,
+    case_insensitive: bool = false,
 };
 
 /// JSON schema for a metric matcher
@@ -129,9 +134,13 @@ const MetricMatcherJson = struct {
     regex: ?[]const u8 = null,
     exact: ?[]const u8 = null,
     exists: ?bool = null,
+    starts_with: ?[]const u8 = null,
+    ends_with: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
 
-    // Optional negation
+    // Optional flags
     negate: bool = false,
+    case_insensitive: bool = false,
 };
 
 /// JSON schema for a remove transform
@@ -224,9 +233,13 @@ const TraceMatcherJson = struct {
     regex: ?[]const u8 = null,
     exact: ?[]const u8 = null,
     exists: ?bool = null,
+    starts_with: ?[]const u8 = null,
+    ends_with: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
 
-    // Optional negation
+    // Optional flags
     negate: bool = false,
+    case_insensitive: bool = false,
 };
 
 /// JSON schema for trace sampling config
@@ -396,6 +409,12 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
             break :blk .{ .exact = try allocator.dupe(u8, pattern) };
         } else if (jm.exists) |exists| {
             break :blk .{ .exists = exists };
+        } else if (jm.starts_with) |pattern| {
+            break :blk .{ .starts_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.ends_with) |pattern| {
+            break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.contains) |pattern| {
+            break :blk .{ .contains = try allocator.dupe(u8, pattern) };
         } else {
             return error.MissingMatch;
         }
@@ -403,6 +422,7 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
 
     return LogMatcher{
         .negate = jm.negate,
+        .case_insensitive = jm.case_insensitive,
         .field = field,
         .match = match,
     };
@@ -585,6 +605,12 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
             break :blk .{ .exact = try allocator.dupe(u8, pattern) };
         } else if (jm.exists) |exists| {
             break :blk .{ .exists = exists };
+        } else if (jm.starts_with) |pattern| {
+            break :blk .{ .starts_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.ends_with) |pattern| {
+            break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.contains) |pattern| {
+            break :blk .{ .contains = try allocator.dupe(u8, pattern) };
         } else {
             return error.MissingMatch;
         }
@@ -592,6 +618,7 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
 
     return MetricMatcher{
         .negate = jm.negate,
+        .case_insensitive = jm.case_insensitive,
         .field = field,
         .match = match,
     };
@@ -668,6 +695,12 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
             break :blk .{ .exact = try allocator.dupe(u8, pattern) };
         } else if (jm.exists) |exists| {
             break :blk .{ .exists = exists };
+        } else if (jm.starts_with) |pattern| {
+            break :blk .{ .starts_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.ends_with) |pattern| {
+            break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.contains) |pattern| {
+            break :blk .{ .contains = try allocator.dupe(u8, pattern) };
         } else {
             return error.MissingMatch;
         }
@@ -675,6 +708,7 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
 
     return TraceMatcher{
         .negate = jm.negate,
+        .case_insensitive = jm.case_insensitive,
         .field = field,
         .match = match,
     };
@@ -1681,4 +1715,193 @@ test "parsePoliciesBytes: trace policy with nested span attribute" {
     try std.testing.expectEqualStrings("http", path[0]);
     try std.testing.expectEqualStrings("response", path[1]);
     try std.testing.expectEqualStrings("status_code", path[2]);
+}
+
+// =============================================================================
+// Tests for optimized literal matchers and case_insensitive
+// =============================================================================
+
+test "parsePoliciesBytes: log policy with starts_with matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-error-logs",
+        \\    "name": "Drop error logs",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_field": "body",
+        \\        "starts_with": "ERROR:"
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .starts_with);
+    try std.testing.expectEqualStrings("ERROR:", matcher.match.?.starts_with);
+    try std.testing.expect(!matcher.case_insensitive);
+}
+
+test "parsePoliciesBytes: log policy with ends_with matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-json-logs",
+        \\    "name": "Drop JSON logs",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_field": "body",
+        \\        "ends_with": ".json"
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .ends_with);
+    try std.testing.expectEqualStrings(".json", matcher.match.?.ends_with);
+}
+
+test "parsePoliciesBytes: log policy with contains matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-secret-logs",
+        \\    "name": "Drop secret logs",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_field": "body",
+        \\        "contains": "password"
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .contains);
+    try std.testing.expectEqualStrings("password", matcher.match.?.contains);
+}
+
+test "parsePoliciesBytes: log policy with case_insensitive flag" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-error-logs-ci",
+        \\    "name": "Drop error logs case insensitive",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_field": "body",
+        \\        "starts_with": "error",
+        \\        "case_insensitive": true
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .starts_with);
+    try std.testing.expectEqualStrings("error", matcher.match.?.starts_with);
+    try std.testing.expect(matcher.case_insensitive);
+}
+
+test "parsePoliciesBytes: metric policy with contains and case_insensitive" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "filter-debug-metrics",
+        \\    "name": "Filter debug metrics",
+        \\    "metric": {
+        \\      "match": [{
+        \\        "metric_field": "name",
+        \\        "contains": "debug",
+        \\        "case_insensitive": true
+        \\      }],
+        \\      "keep": false
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const metric_target = policies[0].target.?.metric;
+    const matcher = metric_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .contains);
+    try std.testing.expectEqualStrings("debug", matcher.match.?.contains);
+    try std.testing.expect(matcher.case_insensitive);
 }
