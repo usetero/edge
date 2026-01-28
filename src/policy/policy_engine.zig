@@ -625,6 +625,14 @@ fn hashTraceId(trace_id_hex: []const u8) u64 {
 const testing = std.testing;
 const SourceType = policy_mod.SourceType;
 const LogField = proto.policy.LogField;
+const AttributePath = proto.policy.AttributePath;
+
+/// Helper to create AttributePath for tests
+fn testMakeAttrPath(allocator: std.mem.Allocator, key: []const u8) !AttributePath {
+    var attr_path = AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, key));
+    return attr_path;
+}
 
 /// Test context for unit tests - simple struct with known fields
 const TestLogContext = struct {
@@ -643,7 +651,8 @@ const TestLogContext = struct {
                 .LOG_FIELD_SEVERITY_TEXT => self.level,
                 else => null,
             },
-            .log_attribute => |key| {
+            .log_attribute => |attr_path| {
+                const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return null;
                 if (std.mem.eql(u8, key, "service")) return self.service;
                 if (std.mem.eql(u8, key, "ddtags")) return self.ddtags;
                 if (std.mem.eql(u8, key, "message")) return self.message;
@@ -768,7 +777,7 @@ test "PolicyEngine: multiple matchers AND logic" {
         .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "service") },
         .match = .{ .regex = try allocator.dupe(u8, "payment") },
     });
     defer policy.deinit(allocator);
@@ -851,7 +860,7 @@ test "PolicyEngine: mixed negated and non-negated matchers" {
     });
     // Must NOT be from production
     try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "env") },
         .match = .{ .regex = try allocator.dupe(u8, "prod") },
         .negate = true,
     });
@@ -911,7 +920,7 @@ test "PolicyEngine: most restrictive wins - drop beats keep" {
         .match = .{ .regex = try allocator.dupe(u8, "error") },
     });
     try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "service") },
         .match = .{ .regex = try allocator.dupe(u8, "payment") },
     });
     defer drop_policy.deinit(allocator);
@@ -1019,7 +1028,7 @@ test "PolicyEngine: missing field with negated matcher succeeds" {
         } },
     };
     try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "service") },
         .match = .{ .regex = try allocator.dupe(u8, "^critical-s.*$") },
         .negate = true,
     });
@@ -1075,7 +1084,7 @@ test "PolicyEngine: multiple policies with different matcher keys" {
         } },
     };
     try policy2.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "service") },
         .match = .{ .regex = try allocator.dupe(u8, "debug") },
     });
     defer policy2.deinit(allocator);
@@ -1480,7 +1489,8 @@ const MutableTestLogContext = struct {
                 .LOG_FIELD_SEVERITY_TEXT => self.level,
                 else => null,
             },
-            .log_attribute => |key| {
+            .log_attribute => |attr_path| {
+                const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return null;
                 // Check fixed fields first
                 if (std.mem.eql(u8, key, "service")) return self.service;
                 if (std.mem.eql(u8, key, "ddtags")) return self.ddtags;
@@ -1498,7 +1508,8 @@ const MutableTestLogContext = struct {
         switch (op) {
             .remove => |field| {
                 switch (field) {
-                    .log_attribute => |key| {
+                    .log_attribute => |attr_path| {
+                        const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return false;
                         // Handle fixed fields
                         if (std.mem.eql(u8, key, "service")) {
                             if (self.service != null) {
@@ -1522,7 +1533,8 @@ const MutableTestLogContext = struct {
             },
             .set => |s| {
                 switch (s.field) {
-                    .log_attribute => |key| {
+                    .log_attribute => |attr_path| {
+                        const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return false;
                         // For fixed fields, just update the pointer
                         if (std.mem.eql(u8, key, "service")) {
                             self.service = s.value;
@@ -1541,7 +1553,8 @@ const MutableTestLogContext = struct {
             },
             .rename => |r| {
                 switch (r.from) {
-                    .log_attribute => |from_key| {
+                    .log_attribute => |attr_path| {
+                        const from_key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return false;
                         // Get the source value
                         var value: ?[]const u8 = null;
                         if (std.mem.eql(u8, from_key, "service")) {
@@ -1615,7 +1628,7 @@ test "evaluate: policy with keep=all and remove transform" {
 
     var transform = proto.policy.LogTransform{};
     try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "env") },
     });
 
     var policy = Policy{
@@ -1662,7 +1675,7 @@ test "evaluate: policy with keep=all and redact transform" {
 
     var transform = proto.policy.LogTransform{};
     try transform.redact.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "service") },
         .replacement = try allocator.dupe(u8, "[REDACTED]"),
     });
 
@@ -1707,7 +1720,7 @@ test "evaluate: policy with keep=all and add transform" {
 
     var transform = proto.policy.LogTransform{};
     try transform.add.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "processed") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "processed") },
         .value = try allocator.dupe(u8, "true"),
         .upsert = true,
     });
@@ -1752,7 +1765,7 @@ test "evaluate: policy with no keep (drop) skips transform" {
 
     var transform = proto.policy.LogTransform{};
     try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "env") },
     });
 
     var policy = Policy{
@@ -1799,7 +1812,7 @@ test "evaluate: multiple policies with different transforms" {
     // Policy 1: matches "error", adds tag
     var transform1 = proto.policy.LogTransform{};
     try transform1.add.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "error_tag") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "error_tag") },
         .value = try allocator.dupe(u8, "true"),
         .upsert = true,
     });
@@ -1821,7 +1834,7 @@ test "evaluate: multiple policies with different transforms" {
     // Policy 2: matches "payment", removes env
     var transform2 = proto.policy.LogTransform{};
     try transform2.remove.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "env") },
     });
 
     var policy2 = Policy{
@@ -1834,7 +1847,7 @@ test "evaluate: multiple policies with different transforms" {
         } },
     };
     try policy2.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "service") },
         .match = .{ .regex = try allocator.dupe(u8, "payment") },
     });
 
@@ -1872,7 +1885,7 @@ test "evaluate: policy with unset keep applies transform" {
 
     var transform = proto.policy.LogTransform{};
     try transform.add.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "tagged") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "tagged") },
         .value = try allocator.dupe(u8, "yes"),
         .upsert = true,
     });
@@ -1920,7 +1933,7 @@ test "evaluate: null mutator skips transforms" {
 
     var transform = proto.policy.LogTransform{};
     try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "env") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "env") },
     });
 
     var policy = Policy{
@@ -2007,7 +2020,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
     // Policy 1: drop errors (no transform should apply)
     var drop_transform = proto.policy.LogTransform{};
     try drop_transform.add.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "dropped") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "dropped") },
         .value = try allocator.dupe(u8, "should-not-appear"),
         .upsert = true,
     });
@@ -2029,7 +2042,7 @@ test "evaluate: mixed keep and drop policies - only keep applies transforms" {
     // Policy 2: keep errors with transform
     var keep_transform = proto.policy.LogTransform{};
     try keep_transform.add.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "kept") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "kept") },
         .value = try allocator.dupe(u8, "yes"),
         .upsert = true,
     });
@@ -2532,13 +2545,15 @@ const TestMetricContext = struct {
                 .METRIC_FIELD_SCOPE_NAME => self.scope_name,
                 else => null,
             },
-            .datapoint_attribute => |key| {
+            .datapoint_attribute => |attr_path| {
+                const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return null;
                 if (self.datapoint_attributes) |attrs| {
                     return attrs.get(key);
                 }
                 return null;
             },
-            .resource_attribute => |key| {
+            .resource_attribute => |attr_path| {
+                const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return null;
                 if (self.resource_attributes) |attrs| {
                     return attrs.get(key);
                 }
@@ -2759,7 +2774,7 @@ test "MetricPolicyEngine: datapoint attribute matching" {
         } },
     };
     try policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .datapoint_attribute = try allocator.dupe(u8, "status_code") },
+        .field = .{ .datapoint_attribute = try testMakeAttrPath(allocator, "status_code") },
         .match = .{ .regex = try allocator.dupe(u8, "5[0-9][0-9]") },
     });
     defer policy.deinit(allocator);
@@ -2810,7 +2825,7 @@ test "MetricPolicyEngine: resource attribute matching" {
         } },
     };
     try policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .resource_attribute = try allocator.dupe(u8, "deployment.environment") },
+        .field = .{ .resource_attribute = try testMakeAttrPath(allocator, "deployment.environment") },
         .match = .{ .regex = try allocator.dupe(u8, "test|staging") },
     });
     defer policy.deinit(allocator);
@@ -3455,7 +3470,7 @@ test "PolicyEngine: exists=false matches when field is missing or empty" {
         } },
     };
     try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "trace_id") },
         .match = .{ .exists = false },
     });
     defer policy.deinit(allocator);
@@ -3491,7 +3506,7 @@ test "PolicyEngine: exists=false with negate=true matches when field exists" {
         } },
     };
     try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .field = .{ .log_attribute = try testMakeAttrPath(allocator, "trace_id") },
         .match = .{ .exists = false },
         .negate = true,
     });

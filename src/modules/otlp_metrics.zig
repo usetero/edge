@@ -169,6 +169,28 @@ fn findAttribute(attributes: []const KeyValue, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Find nested attribute value by path in a KeyValue list
+fn findNestedAttribute(attributes: []const KeyValue, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+
+    for (attributes) |kv| {
+        if (std.mem.eql(u8, kv.key, path[0])) {
+            if (path.len == 1) {
+                return getAnyValueString(kv.value);
+            }
+            const val = kv.value orelse return null;
+            const inner = val.value orelse return null;
+            switch (inner) {
+                .kvlist_value => |kvlist| {
+                    return findNestedAttribute(kvlist.values.items, path[1..]);
+                },
+                else => return null,
+            }
+        }
+    }
+    return null;
+}
+
 /// Field accessor for OTLP metric format
 /// Maps MetricFieldRef to the appropriate field in the OTLP metric structure
 fn otlpMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
@@ -185,14 +207,14 @@ fn otlpMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]cons
             .METRIC_FIELD_SCOPE_VERSION => if (metric_ctx.scope_metrics.scope) |scope| (if (scope.version.len > 0) scope.version else null) else null,
             else => null,
         },
-        .datapoint_attribute => |key| {
+        .datapoint_attribute => |attr_path| {
             // For datapoint attributes, we need to check attributes in the data points
             // This is complex as metrics have different data types (gauge, sum, histogram, etc.)
             // For now, we check metadata attributes on the metric itself
-            return findAttribute(metric_ctx.metric.metadata.items, key);
+            return findNestedAttribute(metric_ctx.metric.metadata.items, attr_path.path.items);
         },
-        .resource_attribute => |key| if (metric_ctx.resource_metrics.resource) |res| findAttribute(res.attributes.items, key) else null,
-        .scope_attribute => |key| if (metric_ctx.scope_metrics.scope) |scope| findAttribute(scope.attributes.items, key) else null,
+        .resource_attribute => |attr_path| if (metric_ctx.resource_metrics.resource) |res| findNestedAttribute(res.attributes.items, attr_path.path.items) else null,
+        .scope_attribute => |attr_path| if (metric_ctx.scope_metrics.scope) |scope| findNestedAttribute(scope.attributes.items, attr_path.path.items) else null,
         .metric_type => getMetricTypeString(metric_ctx.metric),
         .aggregation_temporality => getAggregationTemporalityString(metric_ctx.metric),
     };
@@ -507,8 +529,10 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
             .keep = false,
         } },
     };
+    var attr_path = proto.policy.AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
     try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .resource_attribute = try allocator.dupe(u8, "service.name") },
+        .field = .{ .resource_attribute = attr_path },
         .match = .{ .regex = try allocator.dupe(u8, "test-service") },
     });
     defer drop_policy.deinit(allocator);

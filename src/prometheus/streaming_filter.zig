@@ -11,10 +11,13 @@
 //!
 
 const std = @import("std");
+const proto = @import("proto");
 const line_parser = @import("line_parser.zig");
 const field_accessor = @import("field_accessor.zig");
 const policy = @import("../policy/root.zig");
 const o11y = @import("../observability/root.zig");
+
+const AttributePath = proto.policy.AttributePath;
 
 const PolicyEngine = policy.PolicyEngine;
 const PolicyRegistry = policy.Registry;
@@ -679,6 +682,13 @@ pub const FilteringWriter = struct {
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// Helper function to create an AttributePath from a simple key for tests
+fn testMakeAttrPath(allocator: std.mem.Allocator, key: []const u8) !AttributePath {
+    var attr_path = AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, key));
+    return attr_path;
+}
 
 test "StreamingPrometheusFilter - passthrough simple input" {
     var line_buf: [1024]u8 = undefined;
@@ -1591,7 +1601,6 @@ test "Reader/Writer streaming - realistic prometheus output" {
 // to filter metrics while preserving correct HELP/TYPE metadata handling.
 // All tests use FilteringWriter - the public API for integration.
 
-const proto = @import("proto");
 const NoopEventBus = o11y.NoopEventBus;
 
 /// Helper to stream through FilteringWriter with a given registry.
@@ -1811,7 +1820,7 @@ test "PolicyStreamingFilter - filter by label value" {
         },
     };
     try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .datapoint_attribute = try allocator.dupe(u8, "env") },
+        .field = .{ .datapoint_attribute = try testMakeAttrPath(allocator, "env") },
         .match = .{ .exact = try allocator.dupe(u8, "debug") },
     });
     defer drop_policy.deinit(allocator);
@@ -1931,7 +1940,7 @@ test "PolicyStreamingFilter - metadata included when some samples kept" {
         },
     };
     try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .datapoint_attribute = try allocator.dupe(u8, "instance") },
+        .field = .{ .datapoint_attribute = try testMakeAttrPath(allocator, "instance") },
         .match = .{ .exact = try allocator.dupe(u8, "debug") },
     });
     defer drop_policy.deinit(allocator);

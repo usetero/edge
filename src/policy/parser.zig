@@ -20,6 +20,16 @@ const TraceSamplingConfig = proto.policy.TraceSamplingConfig;
 const SamplingMode = proto.policy.SamplingMode;
 const SpanKind = proto.policy.SpanKind;
 const SpanStatusCode = proto.policy.SpanStatusCode;
+const AttributePath = proto.policy.AttributePath;
+
+/// Create an AttributePath from a simple key string.
+/// For backward compatibility, a single key becomes a single-element path.
+/// TODO (Step 2): Support full AttributePath formats (array, dot notation)
+fn makeAttributePath(allocator: std.mem.Allocator, key: []const u8) !AttributePath {
+    var attr_path = AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, key));
+    return attr_path;
+}
 
 // =============================================================================
 // New JSON Schema - matches YAML format closely
@@ -306,11 +316,11 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
         if (jm.log_field) |field_name| {
             break :blk .{ .log_field = try parseLogFieldName(field_name) };
         } else if (jm.log_attribute) |key| {
-            break :blk .{ .log_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .log_attribute = try makeAttributePath(allocator, key) };
         } else if (jm.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .resource_attribute = try makeAttributePath(allocator, key) };
         } else if (jm.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .scope_attribute = try makeAttributePath(allocator, key) };
         } else {
             return error.MissingField;
         }
@@ -390,11 +400,11 @@ fn parseLogRemove(allocator: std.mem.Allocator, jr: RemoveJson) !LogRemove {
         if (jr.log_field) |field_name| {
             break :blk .{ .log_field = try parseLogFieldName(field_name) };
         } else if (jr.log_attribute) |key| {
-            break :blk .{ .log_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .log_attribute = try makeAttributePath(allocator, key) };
         } else if (jr.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .resource_attribute = try makeAttributePath(allocator, key) };
         } else if (jr.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .scope_attribute = try makeAttributePath(allocator, key) };
         } else {
             return error.MissingField;
         }
@@ -408,11 +418,11 @@ fn parseLogRedact(allocator: std.mem.Allocator, jr: RedactJson) !LogRedact {
         if (jr.log_field) |field_name| {
             break :blk .{ .log_field = try parseLogFieldName(field_name) };
         } else if (jr.log_attribute) |key| {
-            break :blk .{ .log_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .log_attribute = try makeAttributePath(allocator, key) };
         } else if (jr.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .resource_attribute = try makeAttributePath(allocator, key) };
         } else if (jr.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .scope_attribute = try makeAttributePath(allocator, key) };
         } else {
             return error.MissingField;
         }
@@ -429,11 +439,11 @@ fn parseLogRename(allocator: std.mem.Allocator, jr: RenameJson) !LogRename {
         if (jr.from_log_field) |field_name| {
             break :blk .{ .from_log_field = try parseLogFieldName(field_name) };
         } else if (jr.from_log_attribute) |key| {
-            break :blk .{ .from_log_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .from_log_attribute = try makeAttributePath(allocator, key) };
         } else if (jr.from_resource_attribute) |key| {
-            break :blk .{ .from_resource_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .from_resource_attribute = try makeAttributePath(allocator, key) };
         } else if (jr.from_scope_attribute) |key| {
-            break :blk .{ .from_scope_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .from_scope_attribute = try makeAttributePath(allocator, key) };
         } else {
             return error.MissingField;
         }
@@ -451,11 +461,11 @@ fn parseLogAdd(allocator: std.mem.Allocator, ja: AddJson) !LogAdd {
         if (ja.log_field) |field_name| {
             break :blk .{ .log_field = try parseLogFieldName(field_name) };
         } else if (ja.log_attribute) |key| {
-            break :blk .{ .log_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .log_attribute = try makeAttributePath(allocator, key) };
         } else if (ja.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .resource_attribute = try makeAttributePath(allocator, key) };
         } else if (ja.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .scope_attribute = try makeAttributePath(allocator, key) };
         } else {
             return error.MissingField;
         }
@@ -495,11 +505,11 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
         if (jm.metric_field) |field_name| {
             break :blk .{ .metric_field = try parseMetricFieldName(field_name) };
         } else if (jm.datapoint_attribute) |key| {
-            break :blk .{ .datapoint_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .datapoint_attribute = try makeAttributePath(allocator, key) };
         } else if (jm.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .resource_attribute = try makeAttributePath(allocator, key) };
         } else if (jm.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .scope_attribute = try makeAttributePath(allocator, key) };
         } else {
             return error.MissingField;
         }
@@ -568,11 +578,11 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
         if (jm.trace_field) |field_name| {
             break :blk .{ .trace_field = try parseTraceFieldName(field_name) };
         } else if (jm.span_attribute) |key| {
-            break :blk .{ .span_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .span_attribute = try makeAttributePath(allocator, key) };
         } else if (jm.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .resource_attribute = try makeAttributePath(allocator, key) };
         } else if (jm.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .scope_attribute = try makeAttributePath(allocator, key) };
         } else if (jm.span_kind) |kind_name| {
             break :blk .{ .span_kind = try parseSpanKind(kind_name) };
         } else if (jm.span_status) |status_name| {
@@ -580,7 +590,7 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
         } else if (jm.event_name) |name| {
             break :blk .{ .event_name = try allocator.dupe(u8, name) };
         } else if (jm.event_attribute) |key| {
-            break :blk .{ .event_attribute = try allocator.dupe(u8, key) };
+            break :blk .{ .event_attribute = try makeAttributePath(allocator, key) };
         } else if (jm.link_trace_id) |id| {
             break :blk .{ .link_trace_id = try allocator.dupe(u8, id) };
         } else {
@@ -843,7 +853,7 @@ test "parsePoliciesBytes: log policy with attribute matcher" {
     const log_target = policies[0].target.?.log;
     const matcher = log_target.match.items[0];
     try std.testing.expect(matcher.field.? == .log_attribute);
-    try std.testing.expectEqualStrings("environment", matcher.field.?.log_attribute);
+    try std.testing.expectEqualStrings("environment", matcher.field.?.log_attribute.path.items[0]);
     try std.testing.expect(matcher.match.? == .exact);
     try std.testing.expectEqualStrings("development", matcher.match.?.exact);
 }
@@ -881,7 +891,7 @@ test "parsePoliciesBytes: metric policy with datapoint attribute" {
     const metric_target = policies[0].target.?.metric;
     const matcher = metric_target.match.items[0];
     try std.testing.expect(matcher.field.? == .datapoint_attribute);
-    try std.testing.expectEqualStrings("env", matcher.field.?.datapoint_attribute);
+    try std.testing.expectEqualStrings("env", matcher.field.?.datapoint_attribute.path.items[0]);
     try std.testing.expect(matcher.match.? == .regex);
     try std.testing.expectEqualStrings("dev", matcher.match.?.regex);
 }
@@ -935,13 +945,13 @@ test "parsePoliciesBytes: log policy with transform" {
     // Check redact
     const redact = transform.redact.items[0];
     try std.testing.expect(redact.field.? == .log_attribute);
-    try std.testing.expectEqualStrings("password", redact.field.?.log_attribute);
+    try std.testing.expectEqualStrings("password", redact.field.?.log_attribute.path.items[0]);
     try std.testing.expectEqualStrings("***", redact.replacement);
 
     // Check remove
     const remove = transform.remove.items[0];
     try std.testing.expect(remove.field.? == .log_attribute);
-    try std.testing.expectEqualStrings("secret_key", remove.field.?.log_attribute);
+    try std.testing.expectEqualStrings("secret_key", remove.field.?.log_attribute.path.items[0]);
 }
 
 test "parsePoliciesBytes: mixed log and metric policies" {
@@ -1065,7 +1075,7 @@ test "parsePoliciesBytes: exists matcher" {
     const log_target = policies[0].target.?.log;
     const matcher = log_target.match.items[0];
     try std.testing.expect(matcher.field.? == .log_attribute);
-    try std.testing.expectEqualStrings("trace_id", matcher.field.?.log_attribute);
+    try std.testing.expectEqualStrings("trace_id", matcher.field.?.log_attribute.path.items[0]);
     try std.testing.expect(matcher.match.? == .exists);
     try std.testing.expectEqual(true, matcher.match.?.exists);
 }
@@ -1245,7 +1255,7 @@ test "parsePoliciesBytes: trace policy with span attribute" {
     const trace_target = policies[0].target.?.trace;
     const matcher = trace_target.match.items[0];
     try std.testing.expect(matcher.field.? == .span_attribute);
-    try std.testing.expectEqualStrings("peer.service", matcher.field.?.span_attribute);
+    try std.testing.expectEqualStrings("peer.service", matcher.field.?.span_attribute.path.items[0]);
 
     const sampling = trace_target.keep.?;
     try std.testing.expectEqual(@as(f32, 10.0), sampling.percentage);
@@ -1290,7 +1300,7 @@ test "parsePoliciesBytes: trace policy with resource attribute and exact match" 
     const trace_target = policies[0].target.?.trace;
     const matcher = trace_target.match.items[0];
     try std.testing.expect(matcher.field.? == .resource_attribute);
-    try std.testing.expectEqualStrings("service.name", matcher.field.?.resource_attribute);
+    try std.testing.expectEqualStrings("service.name", matcher.field.?.resource_attribute.path.items[0]);
     try std.testing.expect(matcher.match.? == .exact);
     try std.testing.expectEqualStrings("test-service", matcher.match.?.exact);
 

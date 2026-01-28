@@ -496,8 +496,10 @@ test "OtlpModule: filter logs by resource attribute" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
+    var attr_path = proto.policy.AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
     try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .resource_attribute = try allocator.dupe(u8, "service.name") },
+        .field = .{ .resource_attribute = attr_path },
         .match = .{ .regex = try allocator.dupe(u8, "test-service") },
     });
     defer drop_policy.deinit(allocator);

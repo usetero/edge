@@ -45,6 +45,7 @@ const MetricField = proto.policy.MetricField;
 const TraceMatcher = proto.policy.TraceMatcher;
 const TraceTarget = proto.policy.TraceTarget;
 const TraceField = proto.policy.TraceField;
+const AttributePath = proto.policy.AttributePath;
 
 // =============================================================================
 // Observability Events
@@ -115,7 +116,19 @@ fn hashFieldRef(comptime FieldRefT: type, field: FieldRefT) u64 {
         inline else => |val, tag| {
             h.update(std.mem.asBytes(&tag));
             const T = @TypeOf(val);
-            if (T == []const u8) {
+            if (T == AttributePath) {
+                // Hash AttributePath: each path segment plus separator
+                for (val.path.items) |segment| {
+                    h.update(segment);
+                    h.update(&[_]u8{0}); // null separator between segments
+                }
+            } else if (T == []const []const u8) {
+                // Hash path array: each segment plus separator
+                for (val) |segment| {
+                    h.update(segment);
+                    h.update(&[_]u8{0}); // null separator between segments
+                }
+            } else if (T == []const u8) {
                 h.update(val);
             } else {
                 h.update(std.mem.asBytes(&val));
@@ -135,7 +148,23 @@ fn eqlFieldRef(comptime FieldRefT: type, a: FieldRefT, b: FieldRefT) bool {
         inline else => |val_a, tag| {
             const val_b = @field(b, @tagName(tag));
             const T = @TypeOf(val_a);
-            if (T == []const u8) {
+            if (T == AttributePath) {
+                // Compare AttributePath: same length and all segments equal
+                const path_a = val_a.path.items;
+                const path_b = val_b.path.items;
+                if (path_a.len != path_b.len) return false;
+                for (path_a, path_b) |seg_a, seg_b| {
+                    if (!std.mem.eql(u8, seg_a, seg_b)) return false;
+                }
+                return true;
+            } else if (T == []const []const u8) {
+                // Compare path arrays: same length and all segments equal
+                if (val_a.len != val_b.len) return false;
+                for (val_a, val_b) |seg_a, seg_b| {
+                    if (!std.mem.eql(u8, seg_a, seg_b)) return false;
+                }
+                return true;
+            } else if (T == []const u8) {
                 return std.mem.eql(u8, val_a, val_b);
             } else {
                 return val_a == val_b;
@@ -458,7 +487,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         bus: *EventBus,
         patterns_by_key: std.HashMap(MatcherKeyT, PatternsPerKey, HashContextT, std.hash_map.default_max_load_percentage),
         policy_info_list: std.ArrayListUnmanaged(PolicyInfo),
-        key_storage: std.ArrayListUnmanaged([]const u8),
+        path_storage: std.ArrayListUnmanaged([]const []const u8),
         policy_id_storage: std.ArrayListUnmanaged([]const u8),
         policy_index: PolicyIndex,
         current_positive_count: u16,
@@ -473,7 +502,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .bus = bus,
                 .patterns_by_key = std.HashMap(MatcherKeyT, PatternsPerKey, HashContextT, std.hash_map.default_max_load_percentage).init(temp_allocator),
                 .policy_info_list = .{},
-                .key_storage = .{},
+                .path_storage = .{},
                 .policy_id_storage = .{},
                 .policy_index = 0,
                 .current_positive_count = 0,
@@ -590,6 +619,11 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 // exists: true  -> match ^.+$ (field has value)
                 // exists: false -> match ^.+$ negated (field is empty/missing)
                 .exists => |exists| .{ .regex = EXISTS_PATTERN, .flip_negate = !exists },
+                // Optimized literal matchers (v1.2.0) - for now, use the literal value as regex
+                // TODO (Step 3): Use Hyperscan literal mode with native caseless flag
+                .starts_with => |s| .{ .regex = s, .flip_negate = false },
+                .ends_with => |s| .{ .regex = s, .flip_negate = false },
+                .contains => |s| .{ .regex = s, .flip_negate = false },
             };
             if (result.regex.len == 0) {
                 self.bus.debug(MatcherEmptyRegex{ .matcher_idx = matcher_idx });
@@ -620,37 +654,49 @@ fn IndexBuilder(comptime T: TelemetryType) type {
         }
 
         fn dupeKeyIfNeeded(self: *Self, key_ptr: *MatcherKeyT, field_ref: FieldRefT) !void {
-            const attr_key = field_ref.getKey();
-            if (attr_key.len == 0) return;
+            const path = field_ref.getPath();
+            if (path.len == 0) return;
 
-            const key_copy = try self.allocator.dupe(u8, attr_key);
-            try self.key_storage.append(self.allocator, key_copy);
+            // Dupe each segment of the path
+            const path_copy = try self.allocator.alloc([]const u8, path.len);
+            errdefer self.allocator.free(path_copy);
 
-            // Update the key's field to point to the duped key
-            key_ptr.field = dupeFieldRef(FieldRefT, field_ref, key_copy);
+            for (path, 0..) |segment, i| {
+                path_copy[i] = try self.allocator.dupe(u8, segment);
+            }
+
+            try self.path_storage.append(self.allocator, path_copy);
+
+            // Update the key's field to point to the duped path
+            key_ptr.field = dupeFieldRef(FieldRefT, field_ref, path_copy);
         }
 
-        fn dupeFieldRef(comptime FieldRefTT: type, field_ref: FieldRefTT, key_copy: []const u8) FieldRefTT {
+        fn dupeFieldRef(comptime FieldRefTT: type, field_ref: FieldRefTT, path_copy: []const []const u8) FieldRefTT {
+            // Create an AttributePath with the copied path segments
+            // Cast is safe because we own these allocations and they won't be mutated
+            const attr_path = AttributePath{ .path = .{ .items = @constCast(path_copy) } };
+
             switch (T) {
                 .log => return switch (field_ref) {
-                    .log_attribute => .{ .log_attribute = key_copy },
-                    .resource_attribute => .{ .resource_attribute = key_copy },
-                    .scope_attribute => .{ .scope_attribute = key_copy },
+                    .log_attribute => .{ .log_attribute = attr_path },
+                    .resource_attribute => .{ .resource_attribute = attr_path },
+                    .scope_attribute => .{ .scope_attribute = attr_path },
                     .log_field => field_ref,
                 },
                 .metric => return switch (field_ref) {
-                    .datapoint_attribute => .{ .datapoint_attribute = key_copy },
-                    .resource_attribute => .{ .resource_attribute = key_copy },
-                    .scope_attribute => .{ .scope_attribute = key_copy },
+                    .datapoint_attribute => .{ .datapoint_attribute = attr_path },
+                    .resource_attribute => .{ .resource_attribute = attr_path },
+                    .scope_attribute => .{ .scope_attribute = attr_path },
                     .metric_field, .metric_type, .aggregation_temporality => field_ref,
                 },
                 .trace => return switch (field_ref) {
-                    .span_attribute => .{ .span_attribute = key_copy },
-                    .resource_attribute => .{ .resource_attribute = key_copy },
-                    .scope_attribute => .{ .scope_attribute = key_copy },
-                    .event_name => .{ .event_name = key_copy },
-                    .event_attribute => .{ .event_attribute = key_copy },
-                    .link_trace_id => .{ .link_trace_id = key_copy },
+                    .span_attribute => .{ .span_attribute = attr_path },
+                    .resource_attribute => .{ .resource_attribute = attr_path },
+                    .scope_attribute => .{ .scope_attribute = attr_path },
+                    .event_attribute => .{ .event_attribute = attr_path },
+                    // These fields use []const u8, not AttributePath
+                    .event_name => .{ .event_name = if (path_copy.len > 0) path_copy[0] else "" },
+                    .link_trace_id => .{ .link_trace_id = if (path_copy.len > 0) path_copy[0] else "" },
                     .trace_field, .span_kind, .span_status => field_ref,
                 },
             }
@@ -729,7 +775,7 @@ fn IndexBuilder(comptime T: TelemetryType) type {
                 .policies = policies,
                 .policies_with_negation = policies_with_negation,
                 .matcher_keys = matcher_keys,
-                .key_storage = self.key_storage,
+                .path_storage = self.path_storage,
                 .policy_id_storage = self.policy_id_storage,
                 .bus = self.bus,
             };
@@ -747,7 +793,7 @@ pub const LogMatcherIndex = struct {
     policies: []PolicyInfo,
     policies_with_negation: []PolicyIndex,
     matcher_keys: []LogMatcherKey,
-    key_storage: std.ArrayListUnmanaged([]const u8),
+    path_storage: std.ArrayListUnmanaged([]const []const u8),
     policy_id_storage: std.ArrayListUnmanaged([]const u8),
     bus: *EventBus,
 
@@ -838,10 +884,13 @@ pub const LogMatcherIndex = struct {
         self.allocator.free(self.policies_with_negation);
         self.allocator.free(self.matcher_keys);
 
-        for (self.key_storage.items) |key| {
-            self.allocator.free(key);
+        for (self.path_storage.items) |path| {
+            for (path) |segment| {
+                self.allocator.free(segment);
+            }
+            self.allocator.free(path);
         }
-        self.key_storage.deinit(self.allocator);
+        self.path_storage.deinit(self.allocator);
 
         for (self.policy_id_storage.items) |id| {
             self.allocator.free(id);
@@ -860,7 +909,7 @@ pub const MetricMatcherIndex = struct {
     policies: []PolicyInfo,
     policies_with_negation: []PolicyIndex,
     matcher_keys: []MetricMatcherKey,
-    key_storage: std.ArrayListUnmanaged([]const u8),
+    path_storage: std.ArrayListUnmanaged([]const []const u8),
     policy_id_storage: std.ArrayListUnmanaged([]const u8),
     bus: *EventBus,
 
@@ -951,10 +1000,13 @@ pub const MetricMatcherIndex = struct {
         self.allocator.free(self.policies_with_negation);
         self.allocator.free(self.matcher_keys);
 
-        for (self.key_storage.items) |key| {
-            self.allocator.free(key);
+        for (self.path_storage.items) |path| {
+            for (path) |segment| {
+                self.allocator.free(segment);
+            }
+            self.allocator.free(path);
         }
-        self.key_storage.deinit(self.allocator);
+        self.path_storage.deinit(self.allocator);
 
         for (self.policy_id_storage.items) |id| {
             self.allocator.free(id);
@@ -973,7 +1025,7 @@ pub const TraceMatcherIndex = struct {
     policies: []PolicyInfo,
     policies_with_negation: []PolicyIndex,
     matcher_keys: []TraceMatcherKey,
-    key_storage: std.ArrayListUnmanaged([]const u8),
+    path_storage: std.ArrayListUnmanaged([]const []const u8),
     policy_id_storage: std.ArrayListUnmanaged([]const u8),
     bus: *EventBus,
 
@@ -1064,10 +1116,13 @@ pub const TraceMatcherIndex = struct {
         self.allocator.free(self.policies_with_negation);
         self.allocator.free(self.matcher_keys);
 
-        for (self.key_storage.items) |key| {
-            self.allocator.free(key);
+        for (self.path_storage.items) |path| {
+            for (path) |segment| {
+                self.allocator.free(segment);
+            }
+            self.allocator.free(path);
         }
-        self.key_storage.deinit(self.allocator);
+        self.path_storage.deinit(self.allocator);
 
         for (self.policy_id_storage.items) |id| {
             self.allocator.free(id);
@@ -1160,9 +1215,9 @@ test "LogMatcherKey: hash and equality" {
     const key1 = LogMatcherKey{ .field = .{ .log_field = .LOG_FIELD_BODY } };
     const key2 = LogMatcherKey{ .field = .{ .log_field = .LOG_FIELD_BODY } };
     const key3 = LogMatcherKey{ .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT } };
-    const key4 = LogMatcherKey{ .field = .{ .log_attribute = "service" } };
-    const key5 = LogMatcherKey{ .field = .{ .log_attribute = "service" } };
-    const key6 = LogMatcherKey{ .field = .{ .log_attribute = "env" } };
+    const key4 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}) } } } };
+    const key5 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}) } } } };
+    const key6 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}) } } } };
 
     try testing.expect(key1.eql(key2));
     try testing.expect(key4.eql(key5));
@@ -1170,15 +1225,24 @@ test "LogMatcherKey: hash and equality" {
     try testing.expect(!key4.eql(key6));
     try testing.expectEqual(key1.hash(), key2.hash());
     try testing.expectEqual(key4.hash(), key5.hash());
+
+    // Test nested paths
+    const key7 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }) } } } };
+    const key8 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }) } } } };
+    const key9 = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{ "http", "status" }) } } } };
+
+    try testing.expect(key7.eql(key8));
+    try testing.expect(!key7.eql(key9));
+    try testing.expectEqual(key7.hash(), key8.hash());
 }
 
 test "MetricMatcherKey: hash and equality" {
     const key1 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_NAME } };
     const key2 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_NAME } };
     const key3 = MetricMatcherKey{ .field = .{ .metric_field = .METRIC_FIELD_UNIT } };
-    const key4 = MetricMatcherKey{ .field = .{ .datapoint_attribute = "status" } };
-    const key5 = MetricMatcherKey{ .field = .{ .datapoint_attribute = "status" } };
-    const key6 = MetricMatcherKey{ .field = .{ .datapoint_attribute = "env" } };
+    const key4 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"status"}) } } } };
+    const key5 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"status"}) } } } };
+    const key6 = MetricMatcherKey{ .field = .{ .datapoint_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}) } } } };
 
     try testing.expect(key1.eql(key2));
     try testing.expect(key4.eql(key5));
@@ -1190,8 +1254,8 @@ test "MetricMatcherKey: hash and equality" {
 
 test "FieldRef: isKeyed" {
     const log_field = FieldRef{ .log_field = .LOG_FIELD_BODY };
-    const log_attr = FieldRef{ .log_attribute = "service" };
-    const resource_attr = FieldRef{ .resource_attribute = "env" };
+    const log_attr = FieldRef{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}) } } };
+    const resource_attr = FieldRef{ .resource_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"env"}) } } };
 
     try testing.expect(!log_field.isKeyed());
     try testing.expect(log_attr.isKeyed());
@@ -1325,8 +1389,11 @@ test "LogMatcherIndex: build with keyed matchers" {
             .keep = try allocator.dupe(u8, "all"),
         } },
     };
+    // Create AttributePath with "service" as single path segment
+    var attr_path = proto.policy.AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
     try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .field = .{ .log_attribute = attr_path },
         .match = .{ .regex = try allocator.dupe(u8, "payment-api") },
     });
     defer policy.deinit(allocator);
@@ -1336,7 +1403,7 @@ test "LogMatcherIndex: build with keyed matchers" {
 
     try testing.expect(!index.isEmpty());
 
-    const expected_key = LogMatcherKey{ .field = .{ .log_attribute = "service" } };
+    const expected_key = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"service"}) } } } };
     const db = index.getDatabase(expected_key);
     try testing.expect(db != null);
 }
@@ -1421,8 +1488,11 @@ test "LogMatcherIndex: exists=true matcher uses ^.+$ pattern" {
             .keep = try allocator.dupe(u8, "all"),
         } },
     };
+    // Create AttributePath with "trace_id" as single path segment
+    var attr_path = AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "trace_id"));
     try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .field = .{ .log_attribute = attr_path },
         .match = .{ .exists = true },
     });
     defer policy.deinit(allocator);
@@ -1462,8 +1532,11 @@ test "LogMatcherIndex: exists=false matcher creates negated pattern" {
             .keep = try allocator.dupe(u8, "all"),
         } },
     };
+    // Create AttributePath with "trace_id" as single path segment
+    var attr_path = AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "trace_id"));
     try policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .field = .{ .log_attribute = attr_path },
         .match = .{ .exists = false },
     });
     defer policy.deinit(allocator);
@@ -1476,7 +1549,7 @@ test "LogMatcherIndex: exists=false matcher creates negated pattern" {
     try testing.expectEqual(@as(usize, 1), index.getPolicyCount());
 
     // Verify the pattern is in the negated database
-    const key = LogMatcherKey{ .field = .{ .log_attribute = "trace_id" } };
+    const key = LogMatcherKey{ .field = .{ .log_attribute = .{ .path = .{ .items = @constCast(&[_][]const u8{"trace_id"}) } } } };
     const db = index.getDatabase(key);
     try testing.expect(db != null);
     try testing.expectEqual(@as(usize, 1), db.?.negated_patterns.len);
@@ -1496,8 +1569,11 @@ test "MetricMatcherIndex: exists=true matcher uses ^.+$ pattern" {
             .keep = false,
         } },
     };
+    // Create AttributePath with "service.name" as single path segment
+    var attr_path = AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
     try policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .resource_attribute = try allocator.dupe(u8, "service.name") },
+        .field = .{ .resource_attribute = attr_path },
         .match = .{ .exists = true },
     });
     defer policy.deinit(allocator);

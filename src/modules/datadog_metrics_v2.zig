@@ -78,6 +78,13 @@ const FieldAccessorContext = struct {
 const MetricMutateOp = policy.MetricMutateOp;
 const MetricFieldMutator = policy.MetricFieldMutator;
 
+/// Get the first path segment for flat attribute lookup
+/// Datadog uses flat attributes, so only the first path segment is used
+fn getFirstPathSegment(path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    return path[0];
+}
+
 /// Field accessor for Datadog metric format
 /// Maps MetricFieldRef to actual field values in MetricSeries
 fn datadogMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
@@ -99,7 +106,8 @@ fn datadogMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]c
             // Handle any unknown/future enum values
             _ => null,
         },
-        .datapoint_attribute => |key| {
+        .datapoint_attribute => |attr_path| {
+            const key = getFirstPathSegment(attr_path.path.items) orelse return null;
             // For tags, we match on the concatenated tags string
             if (std.mem.eql(u8, key, "tags")) {
                 return field_ctx.tags_cache;
@@ -110,7 +118,8 @@ fn datadogMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]c
             }
             return null;
         },
-        .resource_attribute => |key| {
+        .resource_attribute => |attr_path| {
+            const key = getFirstPathSegment(attr_path.path.items) orelse return null;
             // Check resources for matching type
             if (series.resources) |resources| {
                 for (resources) |*res| {
@@ -168,7 +177,8 @@ fn datadogMetricFieldMutator(ctx: *anyopaque, op: MetricMutateOp) bool {
                     },
                     else => return false,
                 },
-                .datapoint_attribute => |key| {
+                .datapoint_attribute => |attr_path| {
+                    const key = getFirstPathSegment(attr_path.path.items) orelse return false;
                     if (std.mem.eql(u8, key, "tags")) {
                         if (series.tags != null) {
                             series.tags = null;
@@ -207,7 +217,8 @@ fn datadogMetricFieldMutator(ctx: *anyopaque, op: MetricMutateOp) bool {
                     },
                     else => return false,
                 },
-                .datapoint_attribute => |key| {
+                .datapoint_attribute => |attr_path| {
+                    const key = getFirstPathSegment(attr_path.path.items) orelse return false;
                     if (std.mem.eql(u8, key, "source_type_name")) {
                         if (s.upsert or series.source_type_name != null) {
                             series.source_type_name = s.value;
@@ -413,6 +424,12 @@ fn processJsonMetricsWithFilter(
 
 const proto = @import("proto");
 
+/// Test helper to create an AttributePath from a single key string.
+/// Uses comptime to ensure the array literal has static storage.
+fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
+    return .{ .path = .{ .items = @constCast(&[_][]const u8{key}) } };
+}
+
 test "datadogMetricFieldAccessor - extra field lookup" {
     // Unit test to verify the field accessor can retrieve fields
     const allocator = std.testing.allocator;
@@ -443,7 +460,7 @@ test "datadogMetricFieldAccessor - extra field lookup" {
     try std.testing.expectEqualStrings("system.load.1", metric_val.?);
 
     // Test tags field
-    const tags_val = datadogMetricFieldAccessor(&field_ctx, .{ .datapoint_attribute = "tags" });
+    const tags_val = datadogMetricFieldAccessor(&field_ctx, .{ .datapoint_attribute = testAttrPath("tags") });
     try std.testing.expect(tags_val != null);
     try std.testing.expectEqualStrings("env:prod,service:web", tags_val.?);
 
@@ -610,8 +627,10 @@ test "processMetrics - filter on tags" {
             },
         },
     };
+    var attr_path_tags = proto.policy.AttributePath{};
+    try attr_path_tags.path.append(allocator, try allocator.dupe(u8, "tags"));
     try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .datapoint_attribute = try allocator.dupe(u8, "tags") },
+        .field = .{ .datapoint_attribute = attr_path_tags },
         .match = .{ .regex = try allocator.dupe(u8, "env:dev") },
     });
     defer drop_policy.deinit(allocator);

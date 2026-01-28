@@ -77,8 +77,13 @@ pub const AttributePath = struct {
     }
 
     /// Duplicates the message.
+    /// Custom implementation for AttributePath because protobuf.dupe doesn't handle repeated string fields.
     pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
-        return protobuf.dupe(@This(), self, allocator);
+        var result = AttributePath{};
+        for (self.path.items) |segment| {
+            try result.path.append(allocator, try allocator.dupe(u8, segment));
+        }
+        return result;
     }
 
     /// Decodes the message from the JSON string.

@@ -558,32 +558,44 @@ be explicit.
 
 ## Implementation Order
 
-1. **Task 1: Nested Attribute Accessors** (most foundational)
-   - Update `FieldRef` types to use path arrays
-   - Update `fromMatcherField` and related methods
-   - Implement `findNestedAttribute` in OTLP/Datadog modules
-   - Update hash/equality for `MatcherKey`
-   - Add tests
+Each task includes a checkpoint requiring user confirmation before proceeding.
 
-2. **Task 4: Policy Parser Updates** (needed before Task 1 can be tested
-   end-to-end)
-   - Implement custom JSON parsing for AttributePath
-   - Update LogMatcherJson and related types
-   - Update sample_key parsing
-   - Add tests for all three input formats
+### Step 1: Task 1 - Nested Attribute Accessors (most foundational)
 
-3. **Task 2: Optimized Literal Matchers**
-   - Add regex escape helper
-   - Update `extractPattern` to handle new match types
-   - Add per-pattern Hyperscan flags for case-insensitivity
-   - Build regex patterns from literals
-   - Add tests
+- Update `FieldRef` types to use path arrays
+- Update `fromMatcherField` and related methods
+- Implement `findNestedAttribute` in OTLP/Datadog modules
+- Update hash/equality for `MatcherKey`
+- Add tests
+- **CHECKPOINT**: Run `task test`, verify tests pass, await user confirmation
 
-4. **Task 3: Sampling Key Support**
-   - Add `SampleKeyRef` type and `sample_key` to `PolicyInfo`
-   - Extract sample_key during index building
-   - Integrate into `applyKeepValue`
-   - Add tests
+### Step 2: Task 4 - Policy Parser Updates (needed for end-to-end testing)
+
+- Implement custom JSON parsing for AttributePath
+- Update LogMatcherJson and related types
+- Update sample_key parsing
+- Add tests for all three input formats
+- **CHECKPOINT**: Run `task test`, verify all three JSON formats work, await
+  user confirmation
+
+### Step 3: Task 2 - Optimized Literal Matchers
+
+- Add regex escape helper
+- Update `extractPattern` to handle new match types
+- Add per-pattern Hyperscan flags for case-insensitivity
+- Build regex patterns from literals
+- Add tests
+- **CHECKPOINT**: Run `task test`, verify literal matchers and
+  case-insensitivity work, await user confirmation
+
+### Step 4: Task 3 - Sampling Key Support
+
+- Add `SampleKeyRef` type and `sample_key` to `PolicyInfo`
+- Extract sample_key during index building
+- Integrate into `applyKeepValue`
+- Add tests
+- **CHECKPOINT**: Run `task test`, verify consistent sampling, await user
+  confirmation
 
 ---
 
