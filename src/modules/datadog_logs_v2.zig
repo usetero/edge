@@ -78,6 +78,13 @@ const FieldAccessorContext = struct {
 const MutateOp = policy.MutateOp;
 const FieldMutator = policy.FieldMutator;
 
+/// Get the first path segment for flat attribute lookup
+/// Datadog uses flat attributes, so only the first path segment is used
+fn getFirstPathSegment(path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    return path[0];
+}
+
 /// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
 fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
@@ -91,8 +98,9 @@ fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             // Datadog JSON format doesn't have direct equivalents for these OTLP fields
             else => null,
         },
-        .log_attribute => |key| {
-            // For attributes, look up by key name
+        .log_attribute => |attr_path| {
+            // For attributes, look up by key name (first path segment only - Datadog has flat structure)
+            const key = getFirstPathSegment(attr_path.path.items) orelse return null;
             if (std.mem.eql(u8, key, "service")) return log.service;
             if (std.mem.eql(u8, key, "hostname")) return log.hostname;
             if (std.mem.eql(u8, key, "ddsource")) return log.ddsource;
@@ -144,7 +152,8 @@ fn datadogFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
                     },
                     else => return false,
                 },
-                .log_attribute => |key| {
+                .log_attribute => |attr_path| {
+                    const key = getFirstPathSegment(attr_path.path.items) orelse return false;
                     if (std.mem.eql(u8, key, "service")) {
                         if (log.service != null) {
                             log.service = null;
@@ -211,7 +220,8 @@ fn datadogFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
                     },
                     else => return false,
                 },
-                .log_attribute => |key| {
+                .log_attribute => |attr_path| {
+                    const key = getFirstPathSegment(attr_path.path.items) orelse return false;
                     if (std.mem.eql(u8, key, "service")) {
                         if (s.upsert or log.service != null) {
                             log.service = s.value;
@@ -432,6 +442,12 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
 
 const proto = @import("proto");
 
+/// Test helper to create an AttributePath from a single key string.
+/// Uses comptime to ensure the array literal has static storage.
+fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
+    return .{ .path = .{ .items = @constCast(&[_][]const u8{key}) } };
+}
+
 test "datadogFieldAccessor - extra field lookup" {
     // Unit test to verify the field accessor can retrieve extra fields
     const allocator = std.testing.allocator;
@@ -466,7 +482,7 @@ test "datadogFieldAccessor - extra field lookup" {
     try std.testing.expectEqualStrings("test", message_val.?);
 
     // Test extra field - this is the critical test
-    const trace_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = "trace_id" });
+    const trace_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = testAttrPath("trace_id") });
     try std.testing.expect(trace_val != null);
     try std.testing.expectEqualStrings("abc123-def456", trace_val.?);
 }
@@ -641,8 +657,10 @@ test "processLogs - filter on arbitrary custom field" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
+    var attr_path_env = proto.policy.AttributePath{};
+    try attr_path_env.path.append(allocator, try allocator.dupe(u8, "environment"));
     try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "environment") },
+        .field = .{ .log_attribute = attr_path_env },
         .match = .{ .regex = try allocator.dupe(u8, "development") },
     });
     defer drop_policy.deinit(allocator);
@@ -703,8 +721,10 @@ test "processLogs - mutation triggers reserialization and removes field" {
 
     // Create a policy with keep=all and a transform that removes the 'service' field
     var transform = proto.policy.LogTransform{};
+    var remove_attr_path = proto.policy.AttributePath{};
+    try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
     try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "service") },
+        .field = .{ .log_attribute = remove_attr_path },
     });
 
     var test_policy = proto.policy.Policy{
@@ -765,8 +785,10 @@ test "processLogs - filter on dynamic extra field not in schema" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
+    var attr_path_trace = proto.policy.AttributePath{};
+    try attr_path_trace.path.append(allocator, try allocator.dupe(u8, "trace_id"));
     try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "trace_id") },
+        .field = .{ .log_attribute = attr_path_trace },
         .match = .{ .regex = try allocator.dupe(u8, "^abc123") },
     });
     defer drop_policy.deinit(allocator);
@@ -811,8 +833,10 @@ test "processLogs - filter on nested extra field with exists" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
+    var attr_path_debug = proto.policy.AttributePath{};
+    try attr_path_debug.path.append(allocator, try allocator.dupe(u8, "debug_info"));
     try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "debug_info") },
+        .field = .{ .log_attribute = attr_path_debug },
         .match = .{ .exists = true },
     });
     defer drop_policy.deinit(allocator);

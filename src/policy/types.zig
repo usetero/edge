@@ -68,15 +68,21 @@ const LogRename = proto.policy.LogRename;
 const LogAdd = proto.policy.LogAdd;
 const LogMatcher = proto.policy.LogMatcher;
 const LogField = proto.policy.LogField;
+const LogSampleKey = proto.policy.LogSampleKey;
 const MetricMatcher = proto.policy.MetricMatcher;
 const MetricField = proto.policy.MetricField;
+const AttributePath = proto.policy.AttributePath;
 
-/// Reference to a field for accessor/mutator operations
+/// Reference to a field for accessor/mutator operations.
+/// Attribute fields now use AttributePath for nested attribute access (v1.2.0).
 pub const FieldRef = union(enum) {
     log_field: LogField,
-    log_attribute: []const u8,
-    resource_attribute: []const u8,
-    scope_attribute: []const u8,
+    /// AttributePath for nested log attribute access (e.g., path: ["http", "method"])
+    log_attribute: AttributePath,
+    /// AttributePath for nested resource attribute access
+    resource_attribute: AttributePath,
+    /// AttributePath for nested scope attribute access
+    scope_attribute: AttributePath,
 
     pub fn fromRemoveField(field: ?LogRemove.field_union) ?FieldRef {
         const f = field orelse return null;
@@ -128,6 +134,16 @@ pub const FieldRef = union(enum) {
         };
     }
 
+    pub fn fromSampleKeyField(field: ?LogSampleKey.field_union) ?FieldRef {
+        const f = field orelse return null;
+        return switch (f) {
+            .log_field => |v| .{ .log_field = v },
+            .log_attribute => |v| .{ .log_attribute = v },
+            .resource_attribute => |v| .{ .resource_attribute = v },
+            .scope_attribute => |v| .{ .scope_attribute = v },
+        };
+    }
+
     /// Check if this field ref requires a key (attribute-based fields)
     pub fn isKeyed(self: FieldRef) bool {
         return switch (self) {
@@ -136,14 +152,23 @@ pub const FieldRef = union(enum) {
         };
     }
 
-    /// Get the key for attribute-based fields, empty string for log_field
-    pub fn getKey(self: FieldRef) []const u8 {
+    /// Get the path for attribute-based fields, empty slice for log_field.
+    /// For backward compatibility, use getKey() which returns first segment as string.
+    pub fn getPath(self: FieldRef) []const []const u8 {
         return switch (self) {
-            .log_attribute => |k| k,
-            .resource_attribute => |k| k,
-            .scope_attribute => |k| k,
-            .log_field => "",
+            .log_attribute => |attr| attr.path.items,
+            .resource_attribute => |attr| attr.path.items,
+            .scope_attribute => |attr| attr.path.items,
+            .log_field => &.{},
         };
+    }
+
+    /// Get the key for attribute-based fields (first path segment), empty string for log_field.
+    /// For nested paths, this returns the first segment only - use getPath() for full path.
+    pub fn getKey(self: FieldRef) []const u8 {
+        const path = self.getPath();
+        if (path.len > 0) return path[0];
+        return "";
     }
 };
 
@@ -156,11 +181,15 @@ const AggregationTemporality = proto.policy.AggregationTemporality;
 
 /// Reference to a metric field for accessor/mutator operations.
 /// Enum fields (metric_type, aggregation_temporality) are matched as strings via Hyperscan.
+/// Attribute fields now use AttributePath for nested attribute access (v1.2.0).
 pub const MetricFieldRef = union(enum) {
     metric_field: MetricField,
-    datapoint_attribute: []const u8,
-    resource_attribute: []const u8,
-    scope_attribute: []const u8,
+    /// AttributePath for nested datapoint attribute access
+    datapoint_attribute: AttributePath,
+    /// AttributePath for nested resource attribute access
+    resource_attribute: AttributePath,
+    /// AttributePath for nested scope attribute access
+    scope_attribute: AttributePath,
     /// Match on metric type (gauge, sum, histogram, etc.)
     /// The field accessor returns the type as a string, matched via regex.
     metric_type: void,
@@ -188,14 +217,21 @@ pub const MetricFieldRef = union(enum) {
         };
     }
 
-    /// Get the key for attribute-based fields, empty string for simple fields
-    pub fn getKey(self: MetricFieldRef) []const u8 {
+    /// Get the path for attribute-based fields, empty slice for simple fields.
+    pub fn getPath(self: MetricFieldRef) []const []const u8 {
         return switch (self) {
-            .datapoint_attribute => |k| k,
-            .resource_attribute => |k| k,
-            .scope_attribute => |k| k,
-            .metric_field, .metric_type, .aggregation_temporality => "",
+            .datapoint_attribute => |attr| attr.path.items,
+            .resource_attribute => |attr| attr.path.items,
+            .scope_attribute => |attr| attr.path.items,
+            .metric_field, .metric_type, .aggregation_temporality => &.{},
         };
+    }
+
+    /// Get the key for attribute-based fields (first path segment), empty string for simple fields.
+    pub fn getKey(self: MetricFieldRef) []const u8 {
+        const path = self.getPath();
+        if (path.len > 0) return path[0];
+        return "";
     }
 };
 
@@ -270,23 +306,24 @@ const SpanStatusCode = proto.policy.SpanStatusCode;
 
 /// Reference to a trace/span field for accessor/mutator operations.
 /// Supports all field types from TraceMatcher for comprehensive span matching.
+/// Attribute fields now use AttributePath for nested attribute access (v1.2.0).
 pub const TraceFieldRef = union(enum) {
     /// Simple trace fields (name, trace_id, span_id, etc.)
     trace_field: TraceField,
-    /// Span attribute by key
-    span_attribute: []const u8,
-    /// Resource attribute by key
-    resource_attribute: []const u8,
-    /// Scope attribute by key
-    scope_attribute: []const u8,
+    /// AttributePath for nested span attribute access
+    span_attribute: AttributePath,
+    /// AttributePath for nested resource attribute access
+    resource_attribute: AttributePath,
+    /// AttributePath for nested scope attribute access
+    scope_attribute: AttributePath,
     /// Match on span kind (enum value)
     span_kind: SpanKind,
     /// Match on span status code (enum value)
     span_status: SpanStatusCode,
     /// Event name matcher (matches if span contains an event with this name)
     event_name: []const u8,
-    /// Event attribute matcher (matches if span contains an event with this attribute)
-    event_attribute: []const u8,
+    /// AttributePath for nested event attribute access
+    event_attribute: AttributePath,
     /// Link trace ID matcher (matches if span has a link to this trace)
     link_trace_id: []const u8,
 
@@ -308,19 +345,32 @@ pub const TraceFieldRef = union(enum) {
     /// Check if this field ref requires a key (attribute-based fields)
     pub fn isKeyed(self: TraceFieldRef) bool {
         return switch (self) {
-            .span_attribute, .resource_attribute, .scope_attribute, .event_name, .event_attribute, .link_trace_id => true,
+            .span_attribute, .resource_attribute, .scope_attribute, .event_attribute => true,
+            .event_name, .link_trace_id => true,
             .trace_field, .span_kind, .span_status => false,
         };
     }
 
-    /// Get the key for attribute-based fields, empty string for simple fields
+    /// Get the path for attribute-based fields, empty slice for simple fields.
+    pub fn getPath(self: TraceFieldRef) []const []const u8 {
+        return switch (self) {
+            .span_attribute => |attr| attr.path.items,
+            .resource_attribute => |attr| attr.path.items,
+            .scope_attribute => |attr| attr.path.items,
+            .event_attribute => |attr| attr.path.items,
+            .event_name, .link_trace_id, .trace_field, .span_kind, .span_status => &.{},
+        };
+    }
+
+    /// Get the key for attribute-based fields (first path segment), empty string for simple fields.
+    /// For event_name and link_trace_id, returns the value itself.
     pub fn getKey(self: TraceFieldRef) []const u8 {
         return switch (self) {
-            .span_attribute => |k| k,
-            .resource_attribute => |k| k,
-            .scope_attribute => |k| k,
+            .span_attribute, .resource_attribute, .scope_attribute, .event_attribute => |attr| blk: {
+                const path = attr.path.items;
+                break :blk if (path.len > 0) path[0] else "";
+            },
             .event_name => |k| k,
-            .event_attribute => |k| k,
             .link_trace_id => |k| k,
             .trace_field, .span_kind, .span_status => "",
         };

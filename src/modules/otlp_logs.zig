@@ -160,6 +160,32 @@ fn findAttribute(attributes: []const KeyValue, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Find nested attribute value by path in a KeyValue list
+/// For path ["http", "method"], finds the "http" key first, then "method" within its kvlist_value
+fn findNestedAttribute(attributes: []const KeyValue, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+
+    // Find the first key in the path
+    for (attributes) |kv| {
+        if (std.mem.eql(u8, kv.key, path[0])) {
+            // If this is the last segment, return the value
+            if (path.len == 1) {
+                return getAnyValueString(kv.value);
+            }
+            // Otherwise, traverse into nested kvlist
+            const val = kv.value orelse return null;
+            const inner = val.value orelse return null;
+            switch (inner) {
+                .kvlist_value => |kvlist| {
+                    return findNestedAttribute(kvlist.values.items, path[1..]);
+                },
+                else => return null,
+            }
+        }
+    }
+    return null;
+}
+
 /// Field accessor for OTLP log format
 /// Maps FieldRef to the appropriate field in the OTLP log structure
 fn otlpFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
@@ -176,9 +202,9 @@ fn otlpFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             .LOG_FIELD_SCOPE_SCHEMA_URL => if (log_ctx.scope_logs.schema_url.len > 0) log_ctx.scope_logs.schema_url else null,
             else => null,
         },
-        .log_attribute => |key| findAttribute(log_ctx.log_record.attributes.items, key),
-        .resource_attribute => |key| if (log_ctx.resource_logs.resource) |res| findAttribute(res.attributes.items, key) else null,
-        .scope_attribute => |key| if (log_ctx.scope_logs.scope) |scope| findAttribute(scope.attributes.items, key) else null,
+        .log_attribute => |attr_path| findNestedAttribute(log_ctx.log_record.attributes.items, attr_path.path.items),
+        .resource_attribute => |attr_path| if (log_ctx.resource_logs.resource) |res| findNestedAttribute(res.attributes.items, attr_path.path.items) else null,
+        .scope_attribute => |attr_path| if (log_ctx.scope_logs.scope) |scope| findNestedAttribute(scope.attributes.items, attr_path.path.items) else null,
     };
 }
 
@@ -195,6 +221,15 @@ fn removeAttribute(attributes: *std.ArrayListUnmanaged(KeyValue), key: []const u
         }
     }
     return false;
+}
+
+/// Remove attribute by path - for nested paths, only removes top-level key
+/// (Nested mutation would require more complex traversal)
+fn removeAttributeByPath(attributes: *std.ArrayListUnmanaged(KeyValue), path: []const []const u8) bool {
+    if (path.len == 0) return false;
+    // For now, only support removing top-level attributes
+    // Nested removal would require traversing into kvlist_value
+    return removeAttribute(attributes, path[0]);
 }
 
 /// Find and set an attribute value by key, or return false if not found (when upsert=false)
@@ -217,6 +252,15 @@ fn setAttribute(attributes: *std.ArrayListUnmanaged(KeyValue), key: []const u8, 
         return true;
     }
     return false;
+}
+
+/// Set attribute by path - for nested paths, only sets top-level key
+/// (Nested mutation would require more complex traversal)
+fn setAttributeByPath(attributes: *std.ArrayListUnmanaged(KeyValue), path: []const []const u8, value: []const u8, upsert: bool) bool {
+    if (path.len == 0) return false;
+    // For now, only support setting top-level attributes
+    // Nested setting would require traversing into kvlist_value
+    return setAttribute(attributes, path[0], value, upsert);
 }
 
 /// Field mutator for OTLP log format
@@ -279,18 +323,18 @@ fn otlpFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
                     },
                     else => return false,
                 },
-                .log_attribute => |key| {
-                    return removeAttribute(&log_ctx.log_record.attributes, key);
+                .log_attribute => |attr_path| {
+                    return removeAttributeByPath(&log_ctx.log_record.attributes, attr_path.path.items);
                 },
-                .resource_attribute => |key| {
+                .resource_attribute => |attr_path| {
                     if (log_ctx.resource_logs.resource) |*res| {
-                        return removeAttribute(&res.attributes, key);
+                        return removeAttributeByPath(&res.attributes, attr_path.path.items);
                     }
                     return false;
                 },
-                .scope_attribute => |key| {
+                .scope_attribute => |attr_path| {
                     if (log_ctx.scope_logs.scope) |*scope| {
-                        return removeAttribute(&scope.attributes, key);
+                        return removeAttributeByPath(&scope.attributes, attr_path.path.items);
                     }
                     return false;
                 },
@@ -350,18 +394,18 @@ fn otlpFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
                     },
                     else => return false,
                 },
-                .log_attribute => |key| {
-                    return setAttribute(&log_ctx.log_record.attributes, key, s.value, s.upsert);
+                .log_attribute => |attr_path| {
+                    return setAttributeByPath(&log_ctx.log_record.attributes, attr_path.path.items, s.value, s.upsert);
                 },
-                .resource_attribute => |key| {
+                .resource_attribute => |attr_path| {
                     if (log_ctx.resource_logs.resource) |*res| {
-                        return setAttribute(&res.attributes, key, s.value, s.upsert);
+                        return setAttributeByPath(&res.attributes, attr_path.path.items, s.value, s.upsert);
                     }
                     return false;
                 },
-                .scope_attribute => |key| {
+                .scope_attribute => |attr_path| {
                     if (log_ctx.scope_logs.scope) |*scope| {
-                        return setAttribute(&scope.attributes, key, s.value, s.upsert);
+                        return setAttributeByPath(&scope.attributes, attr_path.path.items, s.value, s.upsert);
                     }
                     return false;
                 },
@@ -766,8 +810,11 @@ test "processLogs - DROP policy filters logs by resource attribute" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
+    // Create AttributePath with "service.name" as single path segment
+    var attr_path = proto.policy.AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
     try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .resource_attribute = try allocator.dupe(u8, "service.name") },
+        .field = .{ .resource_attribute = attr_path },
         .match = .{ .regex = try allocator.dupe(u8, "test-service") },
     });
     defer drop_policy.deinit(allocator);
@@ -1040,8 +1087,10 @@ test "processLogs - JSON transform removes log attribute" {
 
     // Create a policy with keep=all and a transform that removes a log attribute
     var transform = proto.policy.LogTransform{};
+    var remove_attr_path = proto.policy.AttributePath{};
+    try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "sensitive.data"));
     try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = try allocator.dupe(u8, "sensitive.data") },
+        .field = .{ .log_attribute = remove_attr_path },
     });
 
     var test_policy = proto.policy.Policy{
@@ -1170,4 +1219,278 @@ test "processLogs - JSON transform removes event_name field" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "sensitive.event") == null);
     // But the body should still be present
     try std.testing.expect(std.mem.indexOf(u8, result.data, "test message") != null);
+}
+
+// =============================================================================
+// Tests for nested attribute path traversal
+// =============================================================================
+
+test "findNestedAttribute - single segment path" {
+    // Test that single-segment paths work correctly
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer attrs.deinit(std.testing.allocator);
+
+    try attrs.append(std.testing.allocator, .{
+        .key = "service",
+        .value = .{ .value = .{ .string_value = "payment-api" } },
+    });
+
+    const result = findNestedAttribute(attrs.items, &.{"service"});
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("payment-api", result.?);
+}
+
+test "findNestedAttribute - two segment path through kvlist" {
+    // Test path ["http", "method"] where http contains a kvlist
+    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer inner_attrs.deinit(std.testing.allocator);
+
+    try inner_attrs.append(std.testing.allocator, .{
+        .key = "method",
+        .value = .{ .value = .{ .string_value = "GET" } },
+    });
+    try inner_attrs.append(std.testing.allocator, .{
+        .key = "status_code",
+        .value = .{ .value = .{ .string_value = "200" } },
+    });
+
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer attrs.deinit(std.testing.allocator);
+
+    try attrs.append(std.testing.allocator, .{
+        .key = "http",
+        .value = .{ .value = .{ .kvlist_value = .{ .values = inner_attrs } } },
+    });
+
+    // Should find http.method
+    const method = findNestedAttribute(attrs.items, &.{ "http", "method" });
+    try std.testing.expect(method != null);
+    try std.testing.expectEqualStrings("GET", method.?);
+
+    // Should find http.status_code
+    const status = findNestedAttribute(attrs.items, &.{ "http", "status_code" });
+    try std.testing.expect(status != null);
+    try std.testing.expectEqualStrings("200", status.?);
+}
+
+test "findNestedAttribute - three segment deep path" {
+    // Test path ["request", "headers", "content-type"]
+    var headers_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer headers_attrs.deinit(std.testing.allocator);
+
+    try headers_attrs.append(std.testing.allocator, .{
+        .key = "content-type",
+        .value = .{ .value = .{ .string_value = "application/json" } },
+    });
+
+    var request_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer request_attrs.deinit(std.testing.allocator);
+
+    try request_attrs.append(std.testing.allocator, .{
+        .key = "headers",
+        .value = .{ .value = .{ .kvlist_value = .{ .values = headers_attrs } } },
+    });
+
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer attrs.deinit(std.testing.allocator);
+
+    try attrs.append(std.testing.allocator, .{
+        .key = "request",
+        .value = .{ .value = .{ .kvlist_value = .{ .values = request_attrs } } },
+    });
+
+    const result = findNestedAttribute(attrs.items, &.{ "request", "headers", "content-type" });
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("application/json", result.?);
+}
+
+test "findNestedAttribute - path segment not found" {
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer attrs.deinit(std.testing.allocator);
+
+    try attrs.append(std.testing.allocator, .{
+        .key = "service",
+        .value = .{ .value = .{ .string_value = "payment-api" } },
+    });
+
+    // Non-existent top-level key
+    const result1 = findNestedAttribute(attrs.items, &.{"nonexistent"});
+    try std.testing.expect(result1 == null);
+
+    // Non-existent nested key
+    const result2 = findNestedAttribute(attrs.items, &.{ "service", "name" });
+    try std.testing.expect(result2 == null);
+}
+
+test "findNestedAttribute - path longer than nesting depth" {
+    // Path ["http", "method", "extra"] but http.method is a string, not kvlist
+    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer inner_attrs.deinit(std.testing.allocator);
+
+    try inner_attrs.append(std.testing.allocator, .{
+        .key = "method",
+        .value = .{ .value = .{ .string_value = "GET" } },
+    });
+
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer attrs.deinit(std.testing.allocator);
+
+    try attrs.append(std.testing.allocator, .{
+        .key = "http",
+        .value = .{ .value = .{ .kvlist_value = .{ .values = inner_attrs } } },
+    });
+
+    // Path is longer than nesting - should return null
+    const result = findNestedAttribute(attrs.items, &.{ "http", "method", "extra" });
+    try std.testing.expect(result == null);
+}
+
+test "findNestedAttribute - intermediate segment is not kvlist" {
+    // Path ["service", "name"] but service is a string, not a kvlist
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer attrs.deinit(std.testing.allocator);
+
+    try attrs.append(std.testing.allocator, .{
+        .key = "service",
+        .value = .{ .value = .{ .string_value = "payment-api" } },
+    });
+
+    // service is a string, can't traverse into it
+    const result = findNestedAttribute(attrs.items, &.{ "service", "name" });
+    try std.testing.expect(result == null);
+}
+
+test "findNestedAttribute - empty path returns null" {
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer attrs.deinit(std.testing.allocator);
+
+    try attrs.append(std.testing.allocator, .{
+        .key = "service",
+        .value = .{ .value = .{ .string_value = "payment-api" } },
+    });
+
+    const result = findNestedAttribute(attrs.items, &.{});
+    try std.testing.expect(result == null);
+}
+
+test "findNestedAttribute - intermediate segment missing" {
+    // Path ["http", "request", "method"] but http only has "response"
+    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer inner_attrs.deinit(std.testing.allocator);
+
+    try inner_attrs.append(std.testing.allocator, .{
+        .key = "response",
+        .value = .{ .value = .{ .string_value = "ok" } },
+    });
+
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    defer attrs.deinit(std.testing.allocator);
+
+    try attrs.append(std.testing.allocator, .{
+        .key = "http",
+        .value = .{ .value = .{ .kvlist_value = .{ .values = inner_attrs } } },
+    });
+
+    // "request" doesn't exist under "http"
+    const result = findNestedAttribute(attrs.items, &.{ "http", "request", "method" });
+    try std.testing.expect(result == null);
+}
+
+test "processLogs - DROP policy with nested attribute path" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy matching nested path http.method = GET
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-get-requests"),
+        .name = try allocator.dupe(u8, "drop-get-requests"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+
+    // Create AttributePath with ["http", "method"]
+    var attr_path = proto.policy.AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "http"));
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "method"));
+
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = attr_path },
+        .match = .{ .regex = try allocator.dupe(u8, "GET") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // OTLP log with nested attribute: attributes containing http.method
+    // The structure uses kvlist_value for nested objects
+    const logs =
+        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[
+        \\{"body":{"stringValue":"GET request"},"attributes":[{"key":"http","value":{"kvlistValue":{"values":[{"key":"method","value":{"stringValue":"GET"}}]}}}]},
+        \\{"body":{"stringValue":"POST request"},"attributes":[{"key":"http","value":{"kvlistValue":{"values":[{"key":"method","value":{"stringValue":"POST"}}]}}}]}
+        \\]}]}]}
+    ;
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    defer allocator.free(result.data);
+
+    // GET request should be dropped, POST request should remain
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "GET request") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "POST request") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+}
+
+test "processLogs - policy with misaligned nested path returns no match" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create a DROP policy matching nested path http.request.method
+    // but the actual data only has http.method (one level less)
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-misaligned"),
+        .name = try allocator.dupe(u8, "drop-misaligned"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+
+    // Create AttributePath with ["http", "request", "method"] - 3 levels deep
+    var attr_path = proto.policy.AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "http"));
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "request"));
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "method"));
+
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = attr_path },
+        .match = .{ .regex = try allocator.dupe(u8, "GET") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // OTLP log with only 2 levels: http.method (no "request" in between)
+    const logs =
+        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[
+        \\{"body":{"stringValue":"GET request"},"attributes":[{"key":"http","value":{"kvlistValue":{"values":[{"key":"method","value":{"stringValue":"GET"}}]}}}]}
+        \\]}]}]}
+    ;
+
+    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    defer allocator.free(result.data);
+
+    // Nothing should be dropped because path doesn't match
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "GET request") != null);
 }

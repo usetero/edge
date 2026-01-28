@@ -20,6 +20,75 @@ const TraceSamplingConfig = proto.policy.TraceSamplingConfig;
 const SamplingMode = proto.policy.SamplingMode;
 const SpanKind = proto.policy.SpanKind;
 const SpanStatusCode = proto.policy.SpanStatusCode;
+const AttributePath = proto.policy.AttributePath;
+const LogSampleKey = proto.policy.LogSampleKey;
+
+/// Parse an AttributePath from a JSON value.
+/// Supports three formats:
+/// - String shorthand: "key" -> ["key"]
+/// - Array shorthand: ["http", "method"] -> ["http", "method"]
+/// - Canonical: {"path": ["http", "method"]} -> ["http", "method"]
+fn parseAttributePath(allocator: std.mem.Allocator, value: std.json.Value) !AttributePath {
+    var attr_path = AttributePath{};
+    errdefer {
+        for (attr_path.path.items) |segment| {
+            allocator.free(segment);
+        }
+        attr_path.path.deinit(allocator);
+    }
+
+    switch (value) {
+        .string => |s| {
+            // String shorthand: "key" -> single-element path
+            try attr_path.path.append(allocator, try allocator.dupe(u8, s));
+        },
+        .array => |arr| {
+            // Array shorthand: ["http", "method"]
+            try attr_path.path.ensureTotalCapacity(allocator, arr.items.len);
+            for (arr.items) |item| {
+                switch (item) {
+                    .string => |s| {
+                        attr_path.path.appendAssumeCapacity(try allocator.dupe(u8, s));
+                    },
+                    else => return error.InvalidAttributePath,
+                }
+            }
+        },
+        .object => |obj| {
+            // Canonical format: {"path": ["http", "method"]}
+            const path_value = obj.get("path") orelse return error.InvalidAttributePath;
+            switch (path_value) {
+                .array => |arr| {
+                    try attr_path.path.ensureTotalCapacity(allocator, arr.items.len);
+                    for (arr.items) |item| {
+                        switch (item) {
+                            .string => |s| {
+                                attr_path.path.appendAssumeCapacity(try allocator.dupe(u8, s));
+                            },
+                            else => return error.InvalidAttributePath,
+                        }
+                    }
+                },
+                else => return error.InvalidAttributePath,
+            }
+        },
+        else => return error.InvalidAttributePath,
+    }
+
+    if (attr_path.path.items.len == 0) {
+        return error.EmptyAttributePath;
+    }
+
+    return attr_path;
+}
+
+/// Create an AttributePath from a simple key string.
+/// For backward compatibility, a single key becomes a single-element path.
+fn makeAttributePath(allocator: std.mem.Allocator, key: []const u8) !AttributePath {
+    var attr_path = AttributePath{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, key));
+    return attr_path;
+}
 
 // =============================================================================
 // New JSON Schema - matches YAML format closely
@@ -28,64 +97,76 @@ const SpanStatusCode = proto.policy.SpanStatusCode;
 /// JSON schema for a log matcher
 /// Example: { "log_field": "body", "regex": "GET /health" }
 /// Example: { "log_attribute": "service", "regex": "payment.*" }
+/// Example: { "log_attribute": ["http", "method"], "regex": "GET" }
+/// Example: { "log_attribute": {"path": ["http", "method"]}, "regex": "GET" }
+/// Example: { "log_field": "body", "starts_with": "ERROR", "case_insensitive": true }
 const LogMatcherJson = struct {
     // Field selectors (one of these should be set)
     log_field: ?[]const u8 = null, // "body", "severity_text", etc.
-    log_attribute: ?[]const u8 = null, // attribute key
-    resource_attribute: ?[]const u8 = null, // resource attribute key
-    scope_attribute: ?[]const u8 = null, // scope attribute key
+    log_attribute: ?std.json.Value = null, // attribute path (string, array, or object)
+    resource_attribute: ?std.json.Value = null, // resource attribute path
+    scope_attribute: ?std.json.Value = null, // scope attribute path
 
     // Match type (one of these should be set)
     regex: ?[]const u8 = null,
     exact: ?[]const u8 = null,
     exists: ?bool = null,
+    starts_with: ?[]const u8 = null,
+    ends_with: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
 
-    // Optional negation
+    // Optional flags
     negate: bool = false,
+    case_insensitive: bool = false,
 };
 
 /// JSON schema for a metric matcher
 /// Example: { "metric_field": "name", "regex": "^debug\\." }
 /// Example: { "datapoint_attribute": "env", "exact": "dev" }
+/// Example: { "datapoint_attribute": ["tags", "env"], "exact": "prod" }
 const MetricMatcherJson = struct {
     // Field selectors (one of these should be set)
     metric_field: ?[]const u8 = null, // "name", "unit", etc.
-    datapoint_attribute: ?[]const u8 = null, // datapoint attribute key
-    resource_attribute: ?[]const u8 = null, // resource attribute key
-    scope_attribute: ?[]const u8 = null, // scope attribute key
+    datapoint_attribute: ?std.json.Value = null, // datapoint attribute path
+    resource_attribute: ?std.json.Value = null, // resource attribute path
+    scope_attribute: ?std.json.Value = null, // scope attribute path
 
     // Match type (one of these should be set)
     regex: ?[]const u8 = null,
     exact: ?[]const u8 = null,
     exists: ?bool = null,
+    starts_with: ?[]const u8 = null,
+    ends_with: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
 
-    // Optional negation
+    // Optional flags
     negate: bool = false,
+    case_insensitive: bool = false,
 };
 
 /// JSON schema for a remove transform
 const RemoveJson = struct {
     log_field: ?[]const u8 = null,
-    log_attribute: ?[]const u8 = null,
-    resource_attribute: ?[]const u8 = null,
-    scope_attribute: ?[]const u8 = null,
+    log_attribute: ?std.json.Value = null,
+    resource_attribute: ?std.json.Value = null,
+    scope_attribute: ?std.json.Value = null,
 };
 
 /// JSON schema for a redact transform
 const RedactJson = struct {
     log_field: ?[]const u8 = null,
-    log_attribute: ?[]const u8 = null,
-    resource_attribute: ?[]const u8 = null,
-    scope_attribute: ?[]const u8 = null,
+    log_attribute: ?std.json.Value = null,
+    resource_attribute: ?std.json.Value = null,
+    scope_attribute: ?std.json.Value = null,
     replacement: []const u8 = "[REDACTED]",
 };
 
 /// JSON schema for a rename transform
 const RenameJson = struct {
     from_log_field: ?[]const u8 = null,
-    from_log_attribute: ?[]const u8 = null,
-    from_resource_attribute: ?[]const u8 = null,
-    from_scope_attribute: ?[]const u8 = null,
+    from_log_attribute: ?std.json.Value = null,
+    from_resource_attribute: ?std.json.Value = null,
+    from_scope_attribute: ?std.json.Value = null,
     to: []const u8,
     upsert: bool = true,
 };
@@ -93,9 +174,9 @@ const RenameJson = struct {
 /// JSON schema for an add transform
 const AddJson = struct {
     log_field: ?[]const u8 = null,
-    log_attribute: ?[]const u8 = null,
-    resource_attribute: ?[]const u8 = null,
-    scope_attribute: ?[]const u8 = null,
+    log_attribute: ?std.json.Value = null,
+    resource_attribute: ?std.json.Value = null,
+    scope_attribute: ?std.json.Value = null,
     value: []const u8,
     upsert: bool = true,
 };
@@ -108,17 +189,30 @@ const TransformJson = struct {
     add: ?[]AddJson = null,
 };
 
+/// JSON schema for log sample key
+/// Example: { "log_field": "body" }
+/// Example: { "log_attribute": "trace_id" }
+/// Example: { "log_attribute": ["request", "id"] }
+const LogSampleKeyJson = struct {
+    log_field: ?[]const u8 = null,
+    log_attribute: ?std.json.Value = null,
+    resource_attribute: ?std.json.Value = null,
+    scope_attribute: ?std.json.Value = null,
+};
+
 /// JSON schema for log target
 /// Example:
 /// "log": {
 ///   "match": [{ "log_field": "body", "regex": "GET /health" }],
 ///   "keep": "none",
-///   "transform": { ... }
+///   "transform": { ... },
+///   "sample_key": { "log_attribute": "trace_id" }
 /// }
 const LogTargetJson = struct {
     match: ?[]LogMatcherJson = null,
     keep: []const u8 = "all",
     transform: ?TransformJson = null,
+    sample_key: ?LogSampleKeyJson = null,
 };
 
 /// JSON schema for metric target
@@ -135,26 +229,31 @@ const MetricTargetJson = struct {
 /// JSON schema for a trace matcher
 /// Example: { "trace_field": "TRACE_FIELD_NAME", "regex": "^ping$" }
 /// Example: { "span_attribute": "peer.service", "exists": true }
+/// Example: { "span_attribute": ["http", "method"], "regex": "GET" }
 /// Example: { "span_kind": "SPAN_KIND_INTERNAL", "exists": true }
 const TraceMatcherJson = struct {
     // Field selectors (one of these should be set)
     trace_field: ?[]const u8 = null, // "TRACE_FIELD_NAME", "TRACE_FIELD_TRACE_ID", etc.
-    span_attribute: ?[]const u8 = null, // span attribute key
-    resource_attribute: ?[]const u8 = null, // resource attribute key
-    scope_attribute: ?[]const u8 = null, // scope attribute key
+    span_attribute: ?std.json.Value = null, // span attribute path
+    resource_attribute: ?std.json.Value = null, // resource attribute path
+    scope_attribute: ?std.json.Value = null, // scope attribute path
     span_kind: ?[]const u8 = null, // "SPAN_KIND_INTERNAL", "SPAN_KIND_SERVER", etc.
     span_status: ?[]const u8 = null, // "SPAN_STATUS_CODE_OK", "SPAN_STATUS_CODE_ERROR"
     event_name: ?[]const u8 = null, // event name to match
-    event_attribute: ?[]const u8 = null, // event attribute key
+    event_attribute: ?std.json.Value = null, // event attribute path
     link_trace_id: ?[]const u8 = null, // link trace_id matcher
 
     // Match type (one of these should be set)
     regex: ?[]const u8 = null,
     exact: ?[]const u8 = null,
     exists: ?bool = null,
+    starts_with: ?[]const u8 = null,
+    ends_with: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
 
-    // Optional negation
+    // Optional flags
     negate: bool = false,
+    case_insensitive: bool = false,
 };
 
 /// JSON schema for trace sampling config
@@ -293,11 +392,34 @@ fn parseLogTarget(allocator: std.mem.Allocator, json: LogTargetJson) !LogTarget 
         transform = try parseLogTransform(allocator, jt);
     }
 
+    var sample_key: ?LogSampleKey = null;
+    if (json.sample_key) |sk| {
+        sample_key = try parseLogSampleKey(allocator, sk);
+    }
+
     return LogTarget{
         .match = matchers,
         .keep = try allocator.dupe(u8, json.keep),
         .transform = transform,
+        .sample_key = sample_key,
     };
+}
+
+fn parseLogSampleKey(allocator: std.mem.Allocator, json: LogSampleKeyJson) !LogSampleKey {
+    const field: LogSampleKey.field_union = blk: {
+        if (json.log_field) |field_name| {
+            break :blk .{ .log_field = try parseLogFieldName(field_name) };
+        } else if (json.log_attribute) |value| {
+            break :blk .{ .log_attribute = try parseAttributePath(allocator, value) };
+        } else if (json.resource_attribute) |value| {
+            break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (json.scope_attribute) |value| {
+            break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
+        } else {
+            return error.MissingSampleKeyField;
+        }
+    };
+    return LogSampleKey{ .field = field };
 }
 
 fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher {
@@ -305,12 +427,12 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
     const field: LogMatcher.field_union = blk: {
         if (jm.log_field) |field_name| {
             break :blk .{ .log_field = try parseLogFieldName(field_name) };
-        } else if (jm.log_attribute) |key| {
-            break :blk .{ .log_attribute = try allocator.dupe(u8, key) };
-        } else if (jm.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
-        } else if (jm.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+        } else if (jm.log_attribute) |value| {
+            break :blk .{ .log_attribute = try parseAttributePath(allocator, value) };
+        } else if (jm.resource_attribute) |value| {
+            break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (jm.scope_attribute) |value| {
+            break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
         } else {
             return error.MissingField;
         }
@@ -324,6 +446,12 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
             break :blk .{ .exact = try allocator.dupe(u8, pattern) };
         } else if (jm.exists) |exists| {
             break :blk .{ .exists = exists };
+        } else if (jm.starts_with) |pattern| {
+            break :blk .{ .starts_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.ends_with) |pattern| {
+            break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.contains) |pattern| {
+            break :blk .{ .contains = try allocator.dupe(u8, pattern) };
         } else {
             return error.MissingMatch;
         }
@@ -331,6 +459,7 @@ fn parseLogMatcher(allocator: std.mem.Allocator, jm: LogMatcherJson) !LogMatcher
 
     return LogMatcher{
         .negate = jm.negate,
+        .case_insensitive = jm.case_insensitive,
         .field = field,
         .match = match,
     };
@@ -389,12 +518,12 @@ fn parseLogRemove(allocator: std.mem.Allocator, jr: RemoveJson) !LogRemove {
     const field: LogRemove.field_union = blk: {
         if (jr.log_field) |field_name| {
             break :blk .{ .log_field = try parseLogFieldName(field_name) };
-        } else if (jr.log_attribute) |key| {
-            break :blk .{ .log_attribute = try allocator.dupe(u8, key) };
-        } else if (jr.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
-        } else if (jr.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+        } else if (jr.log_attribute) |value| {
+            break :blk .{ .log_attribute = try parseAttributePath(allocator, value) };
+        } else if (jr.resource_attribute) |value| {
+            break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (jr.scope_attribute) |value| {
+            break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
         } else {
             return error.MissingField;
         }
@@ -407,12 +536,12 @@ fn parseLogRedact(allocator: std.mem.Allocator, jr: RedactJson) !LogRedact {
     const field: LogRedact.field_union = blk: {
         if (jr.log_field) |field_name| {
             break :blk .{ .log_field = try parseLogFieldName(field_name) };
-        } else if (jr.log_attribute) |key| {
-            break :blk .{ .log_attribute = try allocator.dupe(u8, key) };
-        } else if (jr.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
-        } else if (jr.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+        } else if (jr.log_attribute) |value| {
+            break :blk .{ .log_attribute = try parseAttributePath(allocator, value) };
+        } else if (jr.resource_attribute) |value| {
+            break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (jr.scope_attribute) |value| {
+            break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
         } else {
             return error.MissingField;
         }
@@ -428,12 +557,12 @@ fn parseLogRename(allocator: std.mem.Allocator, jr: RenameJson) !LogRename {
     const from: LogRename.from_union = blk: {
         if (jr.from_log_field) |field_name| {
             break :blk .{ .from_log_field = try parseLogFieldName(field_name) };
-        } else if (jr.from_log_attribute) |key| {
-            break :blk .{ .from_log_attribute = try allocator.dupe(u8, key) };
-        } else if (jr.from_resource_attribute) |key| {
-            break :blk .{ .from_resource_attribute = try allocator.dupe(u8, key) };
-        } else if (jr.from_scope_attribute) |key| {
-            break :blk .{ .from_scope_attribute = try allocator.dupe(u8, key) };
+        } else if (jr.from_log_attribute) |value| {
+            break :blk .{ .from_log_attribute = try parseAttributePath(allocator, value) };
+        } else if (jr.from_resource_attribute) |value| {
+            break :blk .{ .from_resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (jr.from_scope_attribute) |value| {
+            break :blk .{ .from_scope_attribute = try parseAttributePath(allocator, value) };
         } else {
             return error.MissingField;
         }
@@ -450,12 +579,12 @@ fn parseLogAdd(allocator: std.mem.Allocator, ja: AddJson) !LogAdd {
     const field: LogAdd.field_union = blk: {
         if (ja.log_field) |field_name| {
             break :blk .{ .log_field = try parseLogFieldName(field_name) };
-        } else if (ja.log_attribute) |key| {
-            break :blk .{ .log_attribute = try allocator.dupe(u8, key) };
-        } else if (ja.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
-        } else if (ja.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+        } else if (ja.log_attribute) |value| {
+            break :blk .{ .log_attribute = try parseAttributePath(allocator, value) };
+        } else if (ja.resource_attribute) |value| {
+            break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (ja.scope_attribute) |value| {
+            break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
         } else {
             return error.MissingField;
         }
@@ -494,12 +623,12 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
     const field: MetricMatcher.field_union = blk: {
         if (jm.metric_field) |field_name| {
             break :blk .{ .metric_field = try parseMetricFieldName(field_name) };
-        } else if (jm.datapoint_attribute) |key| {
-            break :blk .{ .datapoint_attribute = try allocator.dupe(u8, key) };
-        } else if (jm.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
-        } else if (jm.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+        } else if (jm.datapoint_attribute) |value| {
+            break :blk .{ .datapoint_attribute = try parseAttributePath(allocator, value) };
+        } else if (jm.resource_attribute) |value| {
+            break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (jm.scope_attribute) |value| {
+            break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
         } else {
             return error.MissingField;
         }
@@ -513,6 +642,12 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
             break :blk .{ .exact = try allocator.dupe(u8, pattern) };
         } else if (jm.exists) |exists| {
             break :blk .{ .exists = exists };
+        } else if (jm.starts_with) |pattern| {
+            break :blk .{ .starts_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.ends_with) |pattern| {
+            break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.contains) |pattern| {
+            break :blk .{ .contains = try allocator.dupe(u8, pattern) };
         } else {
             return error.MissingMatch;
         }
@@ -520,6 +655,7 @@ fn parseMetricMatcher(allocator: std.mem.Allocator, jm: MetricMatcherJson) !Metr
 
     return MetricMatcher{
         .negate = jm.negate,
+        .case_insensitive = jm.case_insensitive,
         .field = field,
         .match = match,
     };
@@ -567,20 +703,20 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
     const field: TraceMatcher.field_union = blk: {
         if (jm.trace_field) |field_name| {
             break :blk .{ .trace_field = try parseTraceFieldName(field_name) };
-        } else if (jm.span_attribute) |key| {
-            break :blk .{ .span_attribute = try allocator.dupe(u8, key) };
-        } else if (jm.resource_attribute) |key| {
-            break :blk .{ .resource_attribute = try allocator.dupe(u8, key) };
-        } else if (jm.scope_attribute) |key| {
-            break :blk .{ .scope_attribute = try allocator.dupe(u8, key) };
+        } else if (jm.span_attribute) |value| {
+            break :blk .{ .span_attribute = try parseAttributePath(allocator, value) };
+        } else if (jm.resource_attribute) |value| {
+            break :blk .{ .resource_attribute = try parseAttributePath(allocator, value) };
+        } else if (jm.scope_attribute) |value| {
+            break :blk .{ .scope_attribute = try parseAttributePath(allocator, value) };
         } else if (jm.span_kind) |kind_name| {
             break :blk .{ .span_kind = try parseSpanKind(kind_name) };
         } else if (jm.span_status) |status_name| {
             break :blk .{ .span_status = try parseSpanStatusCode(status_name) };
         } else if (jm.event_name) |name| {
             break :blk .{ .event_name = try allocator.dupe(u8, name) };
-        } else if (jm.event_attribute) |key| {
-            break :blk .{ .event_attribute = try allocator.dupe(u8, key) };
+        } else if (jm.event_attribute) |value| {
+            break :blk .{ .event_attribute = try parseAttributePath(allocator, value) };
         } else if (jm.link_trace_id) |id| {
             break :blk .{ .link_trace_id = try allocator.dupe(u8, id) };
         } else {
@@ -596,6 +732,12 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
             break :blk .{ .exact = try allocator.dupe(u8, pattern) };
         } else if (jm.exists) |exists| {
             break :blk .{ .exists = exists };
+        } else if (jm.starts_with) |pattern| {
+            break :blk .{ .starts_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.ends_with) |pattern| {
+            break :blk .{ .ends_with = try allocator.dupe(u8, pattern) };
+        } else if (jm.contains) |pattern| {
+            break :blk .{ .contains = try allocator.dupe(u8, pattern) };
         } else {
             return error.MissingMatch;
         }
@@ -603,6 +745,7 @@ fn parseTraceMatcher(allocator: std.mem.Allocator, jm: TraceMatcherJson) !TraceM
 
     return TraceMatcher{
         .negate = jm.negate,
+        .case_insensitive = jm.case_insensitive,
         .field = field,
         .match = match,
     };
@@ -843,7 +986,7 @@ test "parsePoliciesBytes: log policy with attribute matcher" {
     const log_target = policies[0].target.?.log;
     const matcher = log_target.match.items[0];
     try std.testing.expect(matcher.field.? == .log_attribute);
-    try std.testing.expectEqualStrings("environment", matcher.field.?.log_attribute);
+    try std.testing.expectEqualStrings("environment", matcher.field.?.log_attribute.path.items[0]);
     try std.testing.expect(matcher.match.? == .exact);
     try std.testing.expectEqualStrings("development", matcher.match.?.exact);
 }
@@ -881,7 +1024,7 @@ test "parsePoliciesBytes: metric policy with datapoint attribute" {
     const metric_target = policies[0].target.?.metric;
     const matcher = metric_target.match.items[0];
     try std.testing.expect(matcher.field.? == .datapoint_attribute);
-    try std.testing.expectEqualStrings("env", matcher.field.?.datapoint_attribute);
+    try std.testing.expectEqualStrings("env", matcher.field.?.datapoint_attribute.path.items[0]);
     try std.testing.expect(matcher.match.? == .regex);
     try std.testing.expectEqualStrings("dev", matcher.match.?.regex);
 }
@@ -935,13 +1078,13 @@ test "parsePoliciesBytes: log policy with transform" {
     // Check redact
     const redact = transform.redact.items[0];
     try std.testing.expect(redact.field.? == .log_attribute);
-    try std.testing.expectEqualStrings("password", redact.field.?.log_attribute);
+    try std.testing.expectEqualStrings("password", redact.field.?.log_attribute.path.items[0]);
     try std.testing.expectEqualStrings("***", redact.replacement);
 
     // Check remove
     const remove = transform.remove.items[0];
     try std.testing.expect(remove.field.? == .log_attribute);
-    try std.testing.expectEqualStrings("secret_key", remove.field.?.log_attribute);
+    try std.testing.expectEqualStrings("secret_key", remove.field.?.log_attribute.path.items[0]);
 }
 
 test "parsePoliciesBytes: mixed log and metric policies" {
@@ -1065,7 +1208,7 @@ test "parsePoliciesBytes: exists matcher" {
     const log_target = policies[0].target.?.log;
     const matcher = log_target.match.items[0];
     try std.testing.expect(matcher.field.? == .log_attribute);
-    try std.testing.expectEqualStrings("trace_id", matcher.field.?.log_attribute);
+    try std.testing.expectEqualStrings("trace_id", matcher.field.?.log_attribute.path.items[0]);
     try std.testing.expect(matcher.match.? == .exists);
     try std.testing.expectEqual(true, matcher.match.?.exists);
 }
@@ -1245,7 +1388,7 @@ test "parsePoliciesBytes: trace policy with span attribute" {
     const trace_target = policies[0].target.?.trace;
     const matcher = trace_target.match.items[0];
     try std.testing.expect(matcher.field.? == .span_attribute);
-    try std.testing.expectEqualStrings("peer.service", matcher.field.?.span_attribute);
+    try std.testing.expectEqualStrings("peer.service", matcher.field.?.span_attribute.path.items[0]);
 
     const sampling = trace_target.keep.?;
     try std.testing.expectEqual(@as(f32, 10.0), sampling.percentage);
@@ -1290,7 +1433,7 @@ test "parsePoliciesBytes: trace policy with resource attribute and exact match" 
     const trace_target = policies[0].target.?.trace;
     const matcher = trace_target.match.items[0];
     try std.testing.expect(matcher.field.? == .resource_attribute);
-    try std.testing.expectEqualStrings("service.name", matcher.field.?.resource_attribute);
+    try std.testing.expectEqualStrings("service.name", matcher.field.?.resource_attribute.path.items[0]);
     try std.testing.expect(matcher.match.? == .exact);
     try std.testing.expectEqualStrings("test-service", matcher.match.?.exact);
 
@@ -1339,4 +1482,651 @@ test "parsePoliciesBytes: trace policy with span status matcher" {
 
     const sampling = trace_target.keep.?;
     try std.testing.expectEqual(@as(f32, 100.0), sampling.percentage);
+}
+
+// =============================================================================
+// Tests for AttributePath parsing formats
+// =============================================================================
+
+test "parseAttributePath: string shorthand" {
+    const allocator = std.testing.allocator;
+
+    // Parse JSON value representing a string
+    const json_str =
+        \\"service"
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    var attr_path = try parseAttributePath(allocator, parsed.value);
+    defer {
+        for (attr_path.path.items) |segment| {
+            allocator.free(segment);
+        }
+        attr_path.path.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), attr_path.path.items.len);
+    try std.testing.expectEqualStrings("service", attr_path.path.items[0]);
+}
+
+test "parseAttributePath: array shorthand" {
+    const allocator = std.testing.allocator;
+
+    // Parse JSON value representing an array
+    const json_str =
+        \\["http", "method"]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    var attr_path = try parseAttributePath(allocator, parsed.value);
+    defer {
+        for (attr_path.path.items) |segment| {
+            allocator.free(segment);
+        }
+        attr_path.path.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), attr_path.path.items.len);
+    try std.testing.expectEqualStrings("http", attr_path.path.items[0]);
+    try std.testing.expectEqualStrings("method", attr_path.path.items[1]);
+}
+
+test "parseAttributePath: canonical object format" {
+    const allocator = std.testing.allocator;
+
+    // Parse JSON value representing canonical format
+    const json_str =
+        \\{"path": ["request", "headers", "content-type"]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    var attr_path = try parseAttributePath(allocator, parsed.value);
+    defer {
+        for (attr_path.path.items) |segment| {
+            allocator.free(segment);
+        }
+        attr_path.path.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), attr_path.path.items.len);
+    try std.testing.expectEqualStrings("request", attr_path.path.items[0]);
+    try std.testing.expectEqualStrings("headers", attr_path.path.items[1]);
+    try std.testing.expectEqualStrings("content-type", attr_path.path.items[2]);
+}
+
+test "parseAttributePath: empty array returns error" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\[]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = parseAttributePath(allocator, parsed.value);
+    try std.testing.expectError(error.EmptyAttributePath, result);
+}
+
+test "parseAttributePath: invalid type returns error" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\123
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = parseAttributePath(allocator, parsed.value);
+    try std.testing.expectError(error.InvalidAttributePath, result);
+}
+
+test "parseAttributePath: array with non-string element returns error" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\["http", 123, "method"]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const result = parseAttributePath(allocator, parsed.value);
+    try std.testing.expectError(error.InvalidAttributePath, result);
+}
+
+test "parsePoliciesBytes: log policy with array attribute path" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-get-requests",
+        \\    "name": "Drop GET requests",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_attribute": ["http", "method"],
+        \\        "regex": "GET"
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    // Verify the path has two segments
+    const path = matcher.field.?.log_attribute.path.items;
+    try std.testing.expectEqual(@as(usize, 2), path.len);
+    try std.testing.expectEqualStrings("http", path[0]);
+    try std.testing.expectEqualStrings("method", path[1]);
+}
+
+test "parsePoliciesBytes: log policy with canonical attribute path" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-json-content",
+        \\    "name": "Drop JSON content type",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_attribute": {"path": ["request", "headers", "content-type"]},
+        \\        "regex": "application/json"
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    // Verify the path has three segments
+    const path = matcher.field.?.log_attribute.path.items;
+    try std.testing.expectEqual(@as(usize, 3), path.len);
+    try std.testing.expectEqualStrings("request", path[0]);
+    try std.testing.expectEqualStrings("headers", path[1]);
+    try std.testing.expectEqualStrings("content-type", path[2]);
+}
+
+test "parsePoliciesBytes: metric policy with nested datapoint attribute" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "filter-by-nested-tag",
+        \\    "name": "Filter by nested tag",
+        \\    "metric": {
+        \\      "match": [{
+        \\        "datapoint_attribute": ["tags", "env"],
+        \\        "exact": "production"
+        \\      }],
+        \\      "keep": false
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const metric_target = policies[0].target.?.metric;
+    const matcher = metric_target.match.items[0];
+
+    // Verify the path has two segments
+    const path = matcher.field.?.datapoint_attribute.path.items;
+    try std.testing.expectEqual(@as(usize, 2), path.len);
+    try std.testing.expectEqualStrings("tags", path[0]);
+    try std.testing.expectEqualStrings("env", path[1]);
+}
+
+test "parsePoliciesBytes: trace policy with nested span attribute" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-http-status",
+        \\    "name": "Sample by HTTP status",
+        \\    "trace": {
+        \\      "match": [{
+        \\        "span_attribute": ["http", "response", "status_code"],
+        \\        "regex": "5[0-9]{2}"
+        \\      }],
+        \\      "keep": {"percentage": 100.0}
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const trace_target = policies[0].target.?.trace;
+    const matcher = trace_target.match.items[0];
+
+    // Verify the path has three segments
+    const path = matcher.field.?.span_attribute.path.items;
+    try std.testing.expectEqual(@as(usize, 3), path.len);
+    try std.testing.expectEqualStrings("http", path[0]);
+    try std.testing.expectEqualStrings("response", path[1]);
+    try std.testing.expectEqualStrings("status_code", path[2]);
+}
+
+// =============================================================================
+// Tests for optimized literal matchers and case_insensitive
+// =============================================================================
+
+test "parsePoliciesBytes: log policy with starts_with matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-error-logs",
+        \\    "name": "Drop error logs",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_field": "body",
+        \\        "starts_with": "ERROR:"
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .starts_with);
+    try std.testing.expectEqualStrings("ERROR:", matcher.match.?.starts_with);
+    try std.testing.expect(!matcher.case_insensitive);
+}
+
+test "parsePoliciesBytes: log policy with ends_with matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-json-logs",
+        \\    "name": "Drop JSON logs",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_field": "body",
+        \\        "ends_with": ".json"
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .ends_with);
+    try std.testing.expectEqualStrings(".json", matcher.match.?.ends_with);
+}
+
+test "parsePoliciesBytes: log policy with contains matcher" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-secret-logs",
+        \\    "name": "Drop secret logs",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_field": "body",
+        \\        "contains": "password"
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .contains);
+    try std.testing.expectEqualStrings("password", matcher.match.?.contains);
+}
+
+test "parsePoliciesBytes: log policy with case_insensitive flag" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "drop-error-logs-ci",
+        \\    "name": "Drop error logs case insensitive",
+        \\    "log": {
+        \\      "match": [{
+        \\        "log_field": "body",
+        \\        "starts_with": "error",
+        \\        "case_insensitive": true
+        \\      }],
+        \\      "keep": "none"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    const matcher = log_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .starts_with);
+    try std.testing.expectEqualStrings("error", matcher.match.?.starts_with);
+    try std.testing.expect(matcher.case_insensitive);
+}
+
+test "parsePoliciesBytes: metric policy with contains and case_insensitive" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "filter-debug-metrics",
+        \\    "name": "Filter debug metrics",
+        \\    "metric": {
+        \\      "match": [{
+        \\        "metric_field": "name",
+        \\        "contains": "debug",
+        \\        "case_insensitive": true
+        \\      }],
+        \\      "keep": false
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| {
+            p.deinit(allocator);
+        }
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const metric_target = policies[0].target.?.metric;
+    const matcher = metric_target.match.items[0];
+
+    try std.testing.expect(matcher.match.? == .contains);
+    try std.testing.expectEqualStrings("debug", matcher.match.?.contains);
+    try std.testing.expect(matcher.case_insensitive);
+}
+
+// =============================================================================
+// Tests for sample_key parsing
+// =============================================================================
+
+test "parsePoliciesBytes: log policy with sample_key log_field" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-body",
+        \\    "name": "Sample by body",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "log_field": "body" }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), policies.len);
+
+    const log_target = policies[0].target.?.log;
+    try std.testing.expect(log_target.sample_key != null);
+
+    const sample_key = log_target.sample_key.?;
+    try std.testing.expect(sample_key.field != null);
+    try std.testing.expect(sample_key.field.? == .log_field);
+    try std.testing.expectEqual(LogField.LOG_FIELD_BODY, sample_key.field.?.log_field);
+}
+
+test "parsePoliciesBytes: log policy with sample_key log_attribute string" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-trace",
+        \\    "name": "Sample by trace_id",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "log_attribute": "trace_id" }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    try std.testing.expect(log_target.sample_key != null);
+
+    const sample_key = log_target.sample_key.?;
+    try std.testing.expect(sample_key.field.? == .log_attribute);
+    try std.testing.expectEqual(@as(usize, 1), sample_key.field.?.log_attribute.path.items.len);
+    try std.testing.expectEqualStrings("trace_id", sample_key.field.?.log_attribute.path.items[0]);
+}
+
+test "parsePoliciesBytes: log policy with sample_key log_attribute array" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-request-id",
+        \\    "name": "Sample by request.id",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "log_attribute": ["request", "id"] }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    const sample_key = log_target.sample_key.?;
+
+    try std.testing.expect(sample_key.field.? == .log_attribute);
+    try std.testing.expectEqual(@as(usize, 2), sample_key.field.?.log_attribute.path.items.len);
+    try std.testing.expectEqualStrings("request", sample_key.field.?.log_attribute.path.items[0]);
+    try std.testing.expectEqualStrings("id", sample_key.field.?.log_attribute.path.items[1]);
+}
+
+test "parsePoliciesBytes: log policy with sample_key resource_attribute" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-host",
+        \\    "name": "Sample by host",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "resource_attribute": "host.name" }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    const sample_key = log_target.sample_key.?;
+
+    try std.testing.expect(sample_key.field.? == .resource_attribute);
+    try std.testing.expectEqualStrings("host.name", sample_key.field.?.resource_attribute.path.items[0]);
+}
+
+test "parsePoliciesBytes: log policy with sample_key scope_attribute" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "sample-by-scope",
+        \\    "name": "Sample by scope name",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%",
+        \\      "sample_key": { "scope_attribute": "name" }
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    const sample_key = log_target.sample_key.?;
+
+    try std.testing.expect(sample_key.field.? == .scope_attribute);
+    try std.testing.expectEqualStrings("name", sample_key.field.?.scope_attribute.path.items[0]);
+}
+
+test "parsePoliciesBytes: log policy without sample_key" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "policies": [{
+        \\    "id": "no-sample-key",
+        \\    "name": "No sample key",
+        \\    "log": {
+        \\      "match": [{ "log_field": "body", "regex": ".*" }],
+        \\      "keep": "50%"
+        \\    }
+        \\  }]
+        \\}
+    ;
+
+    const policies = try parsePoliciesBytes(allocator, json);
+    defer {
+        for (policies) |*p| p.deinit(allocator);
+        allocator.free(policies);
+    }
+
+    const log_target = policies[0].target.?.log;
+    try std.testing.expect(log_target.sample_key == null);
 }

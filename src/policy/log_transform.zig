@@ -191,28 +191,35 @@ const TestContext = struct {
         }
     }
 
+    /// Get first path segment for flat test storage
+    fn getFirstPathSegment(path: []const []const u8) ?[]const u8 {
+        if (path.len == 0) return null;
+        return path[0];
+    }
+
     fn fieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
         const self: *const TestContext = @ptrCast(@alignCast(ctx));
-        const key = switch (field) {
+        const key: ?[]const u8 = switch (field) {
             .log_field => |f| @tagName(f),
-            .log_attribute => |k| k,
-            .resource_attribute => |k| k,
-            .scope_attribute => |k| k,
+            .log_attribute => |p| getFirstPathSegment(p.path.items),
+            .resource_attribute => |p| getFirstPathSegment(p.path.items),
+            .scope_attribute => |p| getFirstPathSegment(p.path.items),
         };
-        return self.fields.get(key);
+        return if (key) |k| self.fields.get(k) else null;
     }
 
     fn fieldMutator(ctx: *anyopaque, op: MutateOp) bool {
         const self: *TestContext = @ptrCast(@alignCast(ctx));
         switch (op) {
             .remove => |field| {
-                const key = switch (field) {
+                const key: ?[]const u8 = switch (field) {
                     .log_field => |f| @tagName(f),
-                    .log_attribute => |k| k,
-                    .resource_attribute => |k| k,
-                    .scope_attribute => |k| k,
+                    .log_attribute => |p| getFirstPathSegment(p.path.items),
+                    .resource_attribute => |p| getFirstPathSegment(p.path.items),
+                    .scope_attribute => |p| getFirstPathSegment(p.path.items),
                 };
-                if (self.fields.fetchRemove(key)) |removed| {
+                const k = key orelse return false;
+                if (self.fields.fetchRemove(k)) |removed| {
                     self.allocator.free(removed.key);
                     self.allocator.free(removed.value);
                     return true;
@@ -220,28 +227,30 @@ const TestContext = struct {
                 return false;
             },
             .set => |s| {
-                const key = switch (s.field) {
+                const key: ?[]const u8 = switch (s.field) {
                     .log_field => |f| @tagName(f),
-                    .log_attribute => |k| k,
-                    .resource_attribute => |k| k,
-                    .scope_attribute => |k| k,
+                    .log_attribute => |p| getFirstPathSegment(p.path.items),
+                    .resource_attribute => |p| getFirstPathSegment(p.path.items),
+                    .scope_attribute => |p| getFirstPathSegment(p.path.items),
                 };
-                const exists = self.fields.contains(key);
+                const k = key orelse return false;
+                const exists = self.fields.contains(k);
                 if (!s.upsert and !exists) return false;
 
-                self.set(key, s.value) catch return false;
+                self.set(k, s.value) catch return false;
                 return true;
             },
             .rename => |r| {
-                const from_key = switch (r.from) {
+                const from_key: ?[]const u8 = switch (r.from) {
                     .log_field => |f| @tagName(f),
-                    .log_attribute => |k| k,
-                    .resource_attribute => |k| k,
-                    .scope_attribute => |k| k,
+                    .log_attribute => |p| getFirstPathSegment(p.path.items),
+                    .resource_attribute => |p| getFirstPathSegment(p.path.items),
+                    .scope_attribute => |p| getFirstPathSegment(p.path.items),
                 };
+                const fk = from_key orelse return false;
 
                 // Get and remove the source value
-                const removed = self.fields.fetchRemove(from_key) orelse return false;
+                const removed = self.fields.fetchRemove(fk) orelse return false;
                 defer self.allocator.free(removed.key);
 
                 // Check if target exists
@@ -265,6 +274,11 @@ const TestContext = struct {
     }
 };
 
+/// Helper to create AttributePath for tests
+fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
+    return .{ .path = .{ .items = @constCast(&[_][]const u8{key}), .capacity = 1 } };
+}
+
 test "applyRemove: removes existing field" {
     const allocator = testing.allocator;
     var ctx = TestContext.init(allocator);
@@ -273,7 +287,7 @@ test "applyRemove: removes existing field" {
     try ctx.set("service", "payment-api");
 
     var rule = LogRemove{
-        .field = .{ .log_attribute = "service" },
+        .field = .{ .log_attribute = testAttrPath("service") },
     };
 
     const result = applyRemove(&rule, @ptrCast(&ctx), TestContext.fieldMutator);
@@ -287,7 +301,7 @@ test "applyRemove: returns false for non-existent field" {
     defer ctx.deinit();
 
     var rule = LogRemove{
-        .field = .{ .log_attribute = "nonexistent" },
+        .field = .{ .log_attribute = testAttrPath("nonexistent") },
     };
 
     const result = applyRemove(&rule, @ptrCast(&ctx), TestContext.fieldMutator);
@@ -315,7 +329,7 @@ test "applyRedact: replaces field value" {
     try testing.expectEqualStrings("secret123", ctx.fields.get("password").?);
 
     var rule = LogRedact{
-        .field = .{ .log_attribute = "password" },
+        .field = .{ .log_attribute = testAttrPath("password") },
         .replacement = "[REDACTED]",
     };
 
@@ -330,7 +344,7 @@ test "applyRedact: returns false for non-existent field" {
     defer ctx.deinit();
 
     var rule = LogRedact{
-        .field = .{ .log_attribute = "nonexistent" },
+        .field = .{ .log_attribute = testAttrPath("nonexistent") },
         .replacement = "[REDACTED]",
     };
 
@@ -346,7 +360,7 @@ test "applyRename: renames existing field" {
     try ctx.set("old_name", "value123");
 
     var rule = LogRename{
-        .from = .{ .from_log_attribute = "old_name" },
+        .from = .{ .from_log_attribute = testAttrPath("old_name") },
         .to = "new_name",
         .upsert = true,
     };
@@ -363,7 +377,7 @@ test "applyRename: returns false for non-existent source" {
     defer ctx.deinit();
 
     var rule = LogRename{
-        .from = .{ .from_log_attribute = "nonexistent" },
+        .from = .{ .from_log_attribute = testAttrPath("nonexistent") },
         .to = "new_name",
         .upsert = true,
     };
@@ -378,7 +392,7 @@ test "applyAdd: adds new field" {
     defer ctx.deinit();
 
     var rule = LogAdd{
-        .field = .{ .log_attribute = "new_field" },
+        .field = .{ .log_attribute = testAttrPath("new_field") },
         .value = "new_value",
         .upsert = true,
     };
@@ -396,7 +410,7 @@ test "applyAdd: upsert=false skips existing field" {
     try ctx.set("existing", "original");
 
     var rule = LogAdd{
-        .field = .{ .log_attribute = "existing" },
+        .field = .{ .log_attribute = testAttrPath("existing") },
         .value = "new_value",
         .upsert = false,
     };
@@ -414,7 +428,7 @@ test "applyAdd: upsert=true overwrites existing field" {
     try ctx.set("existing", "original");
 
     var rule = LogAdd{
-        .field = .{ .log_attribute = "existing" },
+        .field = .{ .log_attribute = testAttrPath("existing") },
         .value = "new_value",
         .upsert = true,
     };
@@ -439,25 +453,25 @@ test "applyTransforms: applies in correct order" {
 
     // Remove
     try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = "to_remove" },
+        .field = .{ .log_attribute = testAttrPath("to_remove") },
     });
 
     // Redact
     try transform.redact.append(allocator, .{
-        .field = .{ .log_attribute = "to_redact" },
+        .field = .{ .log_attribute = testAttrPath("to_redact") },
         .replacement = "[HIDDEN]",
     });
 
     // Rename
     try transform.rename.append(allocator, .{
-        .from = .{ .from_log_attribute = "to_rename" },
+        .from = .{ .from_log_attribute = testAttrPath("to_rename") },
         .to = "renamed",
         .upsert = true,
     });
 
     // Add
     try transform.add.append(allocator, .{
-        .field = .{ .log_attribute = "added" },
+        .field = .{ .log_attribute = testAttrPath("added") },
         .value = "new_value",
         .upsert = true,
     });
@@ -509,45 +523,45 @@ test "applyTransforms: counts attempted vs applied when some operations fail" {
     var transform = LogTransform{};
 
     // 3 removes: 2 exist, 1 doesn't
-    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = "exists1" } });
-    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = "missing1" } });
-    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = "exists2" } });
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = testAttrPath("exists1") } });
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = testAttrPath("missing1") } });
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = testAttrPath("exists2") } });
 
     // 2 redacts: 1 exists, 1 doesn't
     try transform.redact.append(allocator, .{
-        .field = .{ .log_attribute = "missing2" },
+        .field = .{ .log_attribute = testAttrPath("missing2") },
         .replacement = "[REDACTED]",
     });
     try transform.redact.append(allocator, .{
-        .field = .{ .log_attribute = "existing_field" },
+        .field = .{ .log_attribute = testAttrPath("existing_field") },
         .replacement = "[REDACTED]",
     });
 
     // 2 renames: 1 source exists, 1 doesn't
     try transform.rename.append(allocator, .{
-        .from = .{ .from_log_attribute = "existing_field" },
+        .from = .{ .from_log_attribute = testAttrPath("existing_field") },
         .to = "renamed_field",
         .upsert = true,
     });
     try transform.rename.append(allocator, .{
-        .from = .{ .from_log_attribute = "missing3" },
+        .from = .{ .from_log_attribute = testAttrPath("missing3") },
         .to = "wont_exist",
         .upsert = true,
     });
 
     // 3 adds: 2 with upsert=true succeed, 1 with upsert=false on existing field fails
     try transform.add.append(allocator, .{
-        .field = .{ .log_attribute = "new1" },
+        .field = .{ .log_attribute = testAttrPath("new1") },
         .value = "added1",
         .upsert = true,
     });
     try transform.add.append(allocator, .{
-        .field = .{ .log_attribute = "renamed_field" }, // Will exist after rename
+        .field = .{ .log_attribute = testAttrPath("renamed_field") }, // Will exist after rename
         .value = "should_not_overwrite",
         .upsert = false, // Won't overwrite existing
     });
     try transform.add.append(allocator, .{
-        .field = .{ .log_attribute = "new2" },
+        .field = .{ .log_attribute = testAttrPath("new2") },
         .value = "added2",
         .upsert = true,
     });
@@ -620,17 +634,17 @@ test "applyTransforms: all operations fail returns zero applied" {
     var transform = LogTransform{};
 
     // Remove non-existent field
-    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = "missing" } });
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = testAttrPath("missing") } });
 
     // Redact non-existent field
     try transform.redact.append(allocator, .{
-        .field = .{ .log_attribute = "missing" },
+        .field = .{ .log_attribute = testAttrPath("missing") },
         .replacement = "[REDACTED]",
     });
 
     // Rename non-existent field
     try transform.rename.append(allocator, .{
-        .from = .{ .from_log_attribute = "missing" },
+        .from = .{ .from_log_attribute = testAttrPath("missing") },
         .to = "new_name",
         .upsert = true,
     });
@@ -639,7 +653,7 @@ test "applyTransforms: all operations fail returns zero applied" {
     // So let's test add with upsert=false when field exists
     try ctx.set("blocker", "blocks_add");
     try transform.add.append(allocator, .{
-        .field = .{ .log_attribute = "blocker" },
+        .field = .{ .log_attribute = testAttrPath("blocker") },
         .value = "wont_work",
         .upsert = false,
     });

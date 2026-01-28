@@ -179,6 +179,28 @@ fn findAttribute(attributes: []const KeyValue, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Find nested attribute value by path in a KeyValue list
+fn findNestedAttribute(attributes: []const KeyValue, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+
+    for (attributes) |kv| {
+        if (std.mem.eql(u8, kv.key, path[0])) {
+            if (path.len == 1) {
+                return getAnyValueString(kv.value);
+            }
+            const val = kv.value orelse return null;
+            const inner = val.value orelse return null;
+            switch (inner) {
+                .kvlist_value => |kvlist| {
+                    return findNestedAttribute(kvlist.values.items, path[1..]);
+                },
+                else => return null,
+            }
+        }
+    }
+    return null;
+}
+
 /// Convert trace ID bytes to hex string (16 bytes -> 32 chars)
 fn traceIdToHex(trace_id: []const u8, buf: *[32]u8) ?[]const u8 {
     if (trace_id.len != 16) return null;
@@ -259,9 +281,9 @@ fn otlpSpanFieldAccessor(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u
             .TRACE_FIELD_SCOPE_VERSION => if (span_ctx.scope_spans.scope) |scope| (if (scope.version.len > 0) scope.version else null) else null,
             else => null,
         },
-        .span_attribute => |key| findAttribute(span_ctx.span.attributes.items, key),
-        .resource_attribute => |key| if (span_ctx.resource_spans.resource) |res| findAttribute(res.attributes.items, key) else null,
-        .scope_attribute => |key| if (span_ctx.scope_spans.scope) |scope| findAttribute(scope.attributes.items, key) else null,
+        .span_attribute => |attr_path| findNestedAttribute(span_ctx.span.attributes.items, attr_path.path.items),
+        .resource_attribute => |attr_path| if (span_ctx.resource_spans.resource) |res| findNestedAttribute(res.attributes.items, attr_path.path.items) else null,
+        .scope_attribute => |attr_path| if (span_ctx.scope_spans.scope) |scope| findNestedAttribute(scope.attributes.items, attr_path.path.items) else null,
         .span_kind => |_| spanKindToString(span_ctx.span.kind),
         .span_status => |_| if (span_ctx.span.status) |status| statusCodeToString(status.code) else null,
         .event_name => |name| blk: {
@@ -273,10 +295,10 @@ fn otlpSpanFieldAccessor(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u
             }
             break :blk null;
         },
-        .event_attribute => |key| blk: {
-            // Check if any event has an attribute with the given key
+        .event_attribute => |attr_path| blk: {
+            // Check if any event has an attribute with the given path
             for (span_ctx.span.events.items) |event| {
-                if (findAttribute(event.attributes.items, key)) |val| {
+                if (findNestedAttribute(event.attributes.items, attr_path.path.items)) |val| {
                     break :blk val;
                 }
             }
