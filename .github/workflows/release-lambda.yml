@@ -44,7 +44,7 @@ jobs:
       build_matrix: ${{ steps.matrix.outputs.build_matrix }}
       publish_matrix: ${{ steps.matrix.outputs.publish_matrix }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Determine version
         id: version
@@ -132,7 +132,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare.outputs.build_matrix) }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -163,7 +163,7 @@ jobs:
           ls -lh *.zip
 
       - name: Upload layer artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: tero-edge-extension-${{ matrix.arch }}
           path: .layers/tero-edge-extension-${{ matrix.arch }}.zip
@@ -179,10 +179,10 @@ jobs:
       max-parallel: 5
       matrix: ${{ fromJson(needs.prepare.outputs.publish_matrix) }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           role-to-assume: ${{ secrets.AWS_LAMBDA_LAYER_ROLE_ARN }}
           aws-region: ${{ matrix.region }}
@@ -212,7 +212,7 @@ jobs:
           echo "compatible_arch=$COMPATIBLE_ARCH" >> $GITHUB_OUTPUT
 
       - name: Download layer artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: tero-edge-extension-${{ matrix.arch }}
           path: .layers
@@ -320,10 +320,10 @@ jobs:
     needs: [prepare]
     if: ${{ inputs.dry_run != true }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           role-to-assume: ${{ secrets.AWS_LAMBDA_LAYER_ROLE_ARN }}
           aws-region: us-east-1
@@ -344,7 +344,7 @@ jobs:
     if: always()
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: artifacts
 
