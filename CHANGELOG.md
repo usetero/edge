@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.0](https://github.com/usetero/edge/compare/v1.13.0...v1.14.0) (2026-01-28)
+
+
+### Features
+
+* update policy spec to v1.2.0 ([#110](https://github.com/usetero/edge/issues/110)) ([9dab3d7](https://github.com/usetero/edge/commit/9dab3d7e7530c371b9ea35fe86f05d8a592d62c8))
+
 ## [1.13.0](https://github.com/usetero/edge/compare/v1.12.2...v1.13.0) (2026-01-26)
 
 
