@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.1](https://github.com/usetero/edge/compare/v1.14.0...v1.14.1) (2026-01-30)
+
+
+### Bug Fixes
+
+* lambda release ([#112](https://github.com/usetero/edge/issues/112)) ([3b34642](https://github.com/usetero/edge/commit/3b3464295ad6126187feb7a21ccd9faeba8108ae))
+
 ## [1.14.0](https://github.com/usetero/edge/compare/v1.13.0...v1.14.0) (2026-01-28)
 
 
