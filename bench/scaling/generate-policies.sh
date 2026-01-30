@@ -673,6 +673,60 @@ YAML_SINKS
     fi
 }
 
+# Generate tero-collector config with policy processor
+# tero-collector uses the same policy file as Edge
+# Port 4323 for OTLP HTTP, exports to echo server via debug exporter replaced with otlphttp
+generate_tero_collector_config() {
+    local count=$1
+    local policy_file="$OUTPUT_DIR/policies-$count.json"
+
+    cat <<YAML_CONFIG
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+      http:
+        endpoint: 127.0.0.1:4323
+
+processors:
+  batch: {}
+  policy:
+    providers:
+      - type: file
+        id: default
+        path: $policy_file
+
+exporters:
+  otlphttp:
+    endpoint: http://127.0.0.1:9999
+    compression: none
+
+extensions:
+  healthcheckv2:
+    endpoint: 127.0.0.1:13133
+
+service:
+  telemetry:
+    logs:
+      level: error
+  extensions: [healthcheckv2]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, policy]
+      exporters: [otlphttp]
+    metrics:
+      receivers: [otlp]
+      processors: [batch, policy]
+      exporters: [otlphttp]
+    logs:
+      receivers: [otlp]
+      processors: [batch, policy]
+      exporters: [otlphttp]
+YAML_CONFIG
+}
+
 # Main
 echo "Generating $COUNT policies..."
 
@@ -685,10 +739,14 @@ generate_otelcol_config "$COUNT" > "$OUTPUT_DIR/otelcol-$COUNT.yaml"
 # Generate Vector config
 generate_vector_config "$COUNT" > "$OUTPUT_DIR/vector-$COUNT.yaml"
 
+# Generate tero-collector config
+generate_tero_collector_config "$COUNT" > "$OUTPUT_DIR/tero-collector-$COUNT.yaml"
+
 echo "Generated:"
 echo "  - $OUTPUT_DIR/policies-$COUNT.json"
 echo "  - $OUTPUT_DIR/otelcol-$COUNT.yaml"
 echo "  - $OUTPUT_DIR/vector-$COUNT.yaml"
+echo "  - $OUTPUT_DIR/tero-collector-$COUNT.yaml"
 
 # Show summary
 if command -v jq &> /dev/null; then

@@ -26,12 +26,14 @@ ECHO_PORT=9999
 EDGE_OTLP_PORT=8081
 OTELCOL_OTLP_PORT=4318
 VECTOR_OTLP_PORT=4320
+TERO_COLLECTOR_OTLP_PORT=4323
 
 # PIDs
 ECHO_PID=""
 EDGE_PID=""
 OTELCOL_PID=""
 VECTOR_PID=""
+TERO_COLLECTOR_PID=""
 
 # Colors
 RED='\033[0;31m'
@@ -51,9 +53,11 @@ cleanup() {
     [[ -n "$EDGE_PID" ]] && kill "$EDGE_PID" 2>/dev/null || true
     [[ -n "$OTELCOL_PID" ]] && kill "$OTELCOL_PID" 2>/dev/null || true
     [[ -n "$VECTOR_PID" ]] && kill "$VECTOR_PID" 2>/dev/null || true
+    [[ -n "$TERO_COLLECTOR_PID" ]] && kill "$TERO_COLLECTOR_PID" 2>/dev/null || true
     pkill -f "echo-server" 2>/dev/null || true
     pkill -f "edge-otlp" 2>/dev/null || true
     pkill -f "otelcol" 2>/dev/null || true
+    pkill -f "tero-collector" 2>/dev/null || true
     pkill -f "vector.*--config" 2>/dev/null || true
     sleep 0.5
 }
@@ -195,6 +199,26 @@ main() {
         log_warn "vector not found, skipping"
     fi
 
+    # Start tero-collector
+    TERO_COLLECTOR_BIN=""
+    local known_path="/Users/jea/Code/tero/tero-collector-distro/collector/_build/tero-collector"
+    if [[ -x "$known_path" ]]; then
+        TERO_COLLECTOR_BIN="$known_path"
+    elif [[ -x "$PROJECT_ROOT/bench/bin/tero-collector" ]]; then
+        TERO_COLLECTOR_BIN="$PROJECT_ROOT/bench/bin/tero-collector"
+    elif command -v tero-collector >/dev/null 2>&1; then
+        TERO_COLLECTOR_BIN=$(command -v tero-collector)
+    fi
+
+    if [[ -n "$TERO_COLLECTOR_BIN" ]]; then
+        log_info "Starting tero-collector..."
+        "$TERO_COLLECTOR_BIN" --config "$CONFIGS_DIR/tero-collector-${POLICY_COUNT}.yaml" &
+        TERO_COLLECTOR_PID=$!
+        wait_for_port "$TERO_COLLECTOR_OTLP_PORT" "tero-collector" 120
+    else
+        log_warn "tero-collector not found, skipping"
+    fi
+
     echo ""
     log_info "All systems started. Running tests..."
 
@@ -223,6 +247,14 @@ main() {
         stop_capture
     fi
 
+    if [[ -n "$TERO_COLLECTOR_PID" ]]; then
+        reset_echo
+        start_capture "tero-collector-otlp-logs"
+        send_otlp_payload "$TERO_COLLECTOR_OTLP_PORT" "/v1/logs" "$PAYLOADS_DIR/otlp-logs.pb" "application/x-protobuf"
+        sleep 2  # tero-collector batches
+        stop_capture
+    fi
+
     # Test OTLP Traces
     log_info "Testing OTLP Traces..."
 
@@ -248,6 +280,14 @@ main() {
         stop_capture
     fi
 
+    if [[ -n "$TERO_COLLECTOR_PID" ]]; then
+        reset_echo
+        start_capture "tero-collector-otlp-traces"
+        send_otlp_payload "$TERO_COLLECTOR_OTLP_PORT" "/v1/traces" "$PAYLOADS_DIR/otlp-traces.pb" "application/x-protobuf"
+        sleep 2
+        stop_capture
+    fi
+
     # Test OTLP Metrics
     log_info "Testing OTLP Metrics..."
 
@@ -269,6 +309,14 @@ main() {
         reset_echo
         start_capture "vector-otlp-metrics"
         send_otlp_payload "$VECTOR_OTLP_PORT" "/v1/metrics" "$PAYLOADS_DIR/otlp-metrics.pb" "application/x-protobuf"
+        sleep 2
+        stop_capture
+    fi
+
+    if [[ -n "$TERO_COLLECTOR_PID" ]]; then
+        reset_echo
+        start_capture "tero-collector-otlp-metrics"
+        send_otlp_payload "$TERO_COLLECTOR_OTLP_PORT" "/v1/metrics" "$PAYLOADS_DIR/otlp-metrics.pb" "application/x-protobuf"
         sleep 2
         stop_capture
     fi
