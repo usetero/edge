@@ -222,14 +222,11 @@ receivers:
   datadog:
     endpoint: 127.0.0.1:4319
     read_timeout: 60s
-
-processors:
-  batch: {}
 YAML_HEAD
 
-    local log_processors="batch"
-    local metric_processors="batch"
-    local trace_processors="batch"
+    local log_processors=""
+    local metric_processors=""
+    local trace_processors=""
 
     if [[ $count -gt 0 ]]; then
         # Split: ~34% logs, ~33% metrics, ~33% traces
@@ -242,14 +239,23 @@ YAML_HEAD
         local log_transform_count=$((log_count - log_drop_count))
 
         # Build processor lists based on what we actually have
-        local log_proc_list="batch"
-        local metric_proc_list="batch"
-        local trace_proc_list="batch"
+        local log_proc_list=""
+        local metric_proc_list=""
+        local trace_proc_list=""
+        local need_processors_header=true
 
         # Filter processor for logs - drop rules (only if we have drops)
         if [[ $log_drop_count -gt 0 ]]; then
-            log_proc_list="$log_proc_list, filter/logs"
-            echo ""
+            if [[ -z "$log_proc_list" ]]; then
+                log_proc_list="filter/logs"
+            else
+                log_proc_list="$log_proc_list, filter/logs"
+            fi
+            if [[ "$need_processors_header" == "true" ]]; then
+                echo ""
+                echo "processors:"
+                need_processors_header=false
+            fi
             echo "  filter/logs:"
             echo "    error_mode: ignore"
             echo "    logs:"
@@ -268,8 +274,16 @@ YAML_HEAD
 
         # Transform processor for logs - add attributes (only if we have transforms)
         if [[ $log_transform_count -gt 0 ]]; then
-            log_proc_list="$log_proc_list, transform/logs"
-            echo ""
+            if [[ -z "$log_proc_list" ]]; then
+                log_proc_list="transform/logs"
+            else
+                log_proc_list="$log_proc_list, transform/logs"
+            fi
+            if [[ "$need_processors_header" == "true" ]]; then
+                echo ""
+                echo "processors:"
+                need_processors_header=false
+            fi
             echo "  transform/logs:"
             echo "    error_mode: ignore"
             echo "    log_statements:"
@@ -286,8 +300,16 @@ YAML_HEAD
 
         # Filter processor for metrics - drop rules (only if we have metrics)
         if [[ $metric_count -gt 0 ]]; then
-            metric_proc_list="$metric_proc_list, filter/metrics"
-            echo ""
+            if [[ -z "$metric_proc_list" ]]; then
+                metric_proc_list="filter/metrics"
+            else
+                metric_proc_list="$metric_proc_list, filter/metrics"
+            fi
+            if [[ "$need_processors_header" == "true" ]]; then
+                echo ""
+                echo "processors:"
+                need_processors_header=false
+            fi
             echo "  filter/metrics:"
             echo "    error_mode: ignore"
             echo "    metrics:"
@@ -308,9 +330,17 @@ YAML_HEAD
         # otelcol's probabilistic_sampler applies a single sampling rate to all traces
         # We use the average of our sampling percentages for comparison
         if [[ $trace_count -gt 0 ]]; then
-            trace_proc_list="$trace_proc_list, probabilistic_sampler"
+            if [[ -z "$trace_proc_list" ]]; then
+                trace_proc_list="probabilistic_sampler"
+            else
+                trace_proc_list="$trace_proc_list, probabilistic_sampler"
+            fi
+            if [[ "$need_processors_header" == "true" ]]; then
+                echo ""
+                echo "processors:"
+                need_processors_header=false
+            fi
             # Use 50% as average sampling rate (matches our 10/25/50/75/100 distribution)
-            echo ""
             echo "  probabilistic_sampler:"
             echo "    sampling_percentage: 50"
         fi
@@ -328,16 +358,25 @@ exporters:
     endpoint: http://127.0.0.1:9999
     compression: none
     encoding: proto
+    sending_queue:
+      queue_size: 100000
+      batch: {}
 
   otlphttp/metrics:
     endpoint: http://127.0.0.1:9999
     compression: none
     encoding: proto
+    sending_queue:
+      queue_size: 100000
+      batch: {}
 
   otlphttp/traces:
     endpoint: http://127.0.0.1:9999
     compression: none
     encoding: proto
+    sending_queue:
+      queue_size: 100000
+      batch: {}
 
   # For Datadog input, convert to OTLP protobuf for consistent output format
   # Note: otelcol's datadog exporter requires an API key, so we use otlphttp
@@ -345,6 +384,9 @@ exporters:
     endpoint: http://127.0.0.1:9999
     compression: none
     encoding: proto
+    sending_queue:
+      queue_size: 100000
+      batch: {}
 
 service:
   telemetry:
@@ -685,12 +727,11 @@ receivers:
   otlp:
     protocols:
       grpc:
-        endpoint: 127.0.0.1:4317
+        endpoint: 127.0.0.1:4324
       http:
         endpoint: 127.0.0.1:4323
 
 processors:
-  batch: {}
   policy:
     providers:
       - type: file
@@ -701,6 +742,9 @@ exporters:
   otlphttp:
     endpoint: http://127.0.0.1:9999
     compression: none
+    sending_queue:
+      queue_size: 100000
+      batch: {}
 
 extensions:
   healthcheckv2:
@@ -710,19 +754,26 @@ service:
   telemetry:
     logs:
       level: error
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: '127.0.0.1'
+                port: 8889
   extensions: [healthcheckv2]
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch, policy]
+      processors: [policy]
       exporters: [otlphttp]
     metrics:
       receivers: [otlp]
-      processors: [batch, policy]
+      processors: [policy]
       exporters: [otlphttp]
     logs:
       receivers: [otlp]
-      processors: [batch, policy]
+      processors: [policy]
       exporters: [otlphttp]
 YAML_CONFIG
 }
