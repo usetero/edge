@@ -217,90 +217,45 @@ jobs:
           name: tero-edge-extension-${{ matrix.arch }}
           path: .layers
 
-      - name: Determine version
-        id: version
-        run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
-
-          if [ "$VERSION" = "auto" ]; then
-            # Get latest version and increment
-            LATEST=$(aws lambda list-layer-versions \
-              --layer-name "$LAYER_NAME" \
-              --query 'LayerVersions[0].Version' \
-              --output text 2>/dev/null | head -1 || echo "0")
-            # Handle empty/None result
-            if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
-              LATEST=0
-            fi
-            VERSION=$((LATEST + 1))
-            echo "Auto-incremented version to $VERSION (latest was $LATEST)"
-          fi
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Publish Lambda layer
         id: publish
         run: |
           aws sts get-caller-identity
           LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
-          VERSION="${{ steps.version.outputs.version }}"
           LAYER_FILE=".layers/tero-edge-extension-${{ matrix.arch }}.zip"
           COMPATIBLE_ARCH="${{ steps.vars.outputs.compatible_arch }}"
 
-          echo "Publishing $LAYER_NAME version $VERSION to ${{ matrix.region }}..."
+          echo "Publishing $LAYER_NAME to ${{ matrix.region }}..."
 
-          # Check if version already exists
-          LATEST=$(aws lambda list-layer-versions \
+          # Publish a single new version (AWS auto-increments)
+          PUBLISHED_VERSION=$(aws lambda publish-layer-version \
             --layer-name "$LAYER_NAME" \
-            --query 'LayerVersions[0].Version' \
-            --output text 2>/dev/null | head -1 || echo "0")
-          # Handle empty/None result
-          if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
-            LATEST=0
-          fi
+            --description "Tero Edge Lambda Extension - Datadog telemetry proxy with policy-based filtering" \
+            --compatible-architectures "$COMPATIBLE_ARCH" \
+            --zip-file "fileb://${LAYER_FILE}" \
+            --query 'Version' \
+            --output text)
 
-          if [ "$LATEST" -ge "$VERSION" ]; then
-            echo "::warning::Layer $LAYER_NAME version $VERSION already exists (latest: $LATEST), skipping"
-            echo "skipped=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          echo "Published version $PUBLISHED_VERSION"
 
-          # Publish missing versions up to target
-          while [ "$LATEST" -lt "$VERSION" ]; do
-            PUBLISHED_VERSION=$(aws lambda publish-layer-version \
-              --layer-name "$LAYER_NAME" \
-              --description "Tero Edge Lambda Extension - Datadog telemetry proxy with policy-based filtering" \
-              --compatible-architectures "$COMPATIBLE_ARCH" \
-              --zip-file "fileb://${LAYER_FILE}" \
-              --query 'Version' \
-              --output text)
+          # Make the layer version public
+          aws lambda add-layer-version-permission \
+            --layer-name "$LAYER_NAME" \
+            --version-number "$PUBLISHED_VERSION" \
+            --statement-id public-access \
+            --action lambda:GetLayerVersion \
+            --principal "*"
+          echo "Made version $PUBLISHED_VERSION public"
 
-            echo "Published version $PUBLISHED_VERSION"
-
-            # Make the layer version public
-            aws lambda add-layer-version-permission \
-              --layer-name "$LAYER_NAME" \
-              --version-number "$PUBLISHED_VERSION" \
-              --statement-id public-access \
-              --action lambda:GetLayerVersion \
-              --principal "*"
-            echo "Made version $PUBLISHED_VERSION public"
-
-            LATEST=$PUBLISHED_VERSION
-          done
-
-          echo "skipped=false" >> $GITHUB_OUTPUT
-          echo "published_version=$LATEST" >> $GITHUB_OUTPUT
+          echo "published_version=$PUBLISHED_VERSION" >> $GITHUB_OUTPUT
 
           # Output the layer ARN for reference
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          LAYER_ARN="arn:aws:lambda:${{ matrix.region }}:${ACCOUNT_ID}:layer:${LAYER_NAME}:${LATEST}"
+          LAYER_ARN="arn:aws:lambda:${{ matrix.region }}:${ACCOUNT_ID}:layer:${LAYER_NAME}:${PUBLISHED_VERSION}"
           echo "Layer ARN: $LAYER_ARN"
           echo "layer_arn=$LAYER_ARN" >> $GITHUB_OUTPUT
 
       - name: Summary
-        if: steps.publish.outputs.skipped != 'true'
         run: |
           echo "### Published Layer" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
