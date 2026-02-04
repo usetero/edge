@@ -27,8 +27,8 @@ RUN_OTELCOL=true
 RUN_VECTOR=true
 RUN_TERO_COLLECTOR=true
 
-# For initial testing, only test 0 and 10 policies
-# POLICY_COUNTS=(0 10)
+# For initial testing, only test 0 and 1 policies
+# POLICY_COUNTS=(0 1)
 # Full test:
 POLICY_COUNTS=(0 1 5 10 50 100 500 1000 2000 4000)
 # Quick 1000 test:
@@ -574,7 +574,7 @@ main() {
     start_echo_server
 
     # CSV header
-    local results_file="$OUTPUT_DIR/results.csv"
+    local results_file="$OUTPUT_DIR/results-$(date -Iseconds).csv"
     echo "binary,telemetry_type,policy_count,payload_bytes,rps,p50_ms,p99_ms,success_pct,cpu_pct,mem_mb,echo_requests,echo_bytes" > "$results_file"
 
     echo ""
@@ -595,7 +595,7 @@ main() {
             local edge_scenarios=(
                 "edge-otlp|OTLP Logs|$OTLP_PORT|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "edge-otlp|OTLP Metrics|$OTLP_PORT|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
-                # "edge-otlp|OTLP Traces|$OTLP_PORT|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
+                "edge-otlp|OTLP Traces|$OTLP_PORT|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
                 "edge-datadog|DD Logs|$DATADOG_PORT|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
                 "edge-datadog|DD Metrics|$DATADOG_PORT|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
@@ -663,11 +663,10 @@ main() {
             local otelcol_scenarios=(
                 "otelcol|OTLP Logs|4318|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "otelcol|OTLP Metrics|4318|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
-                # "otelcol|OTLP Traces|4318|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
+                "otelcol|OTLP Traces|4318|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
                 "otelcol|DD Logs|4319|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
-                # DD Metrics disabled - otelcol datadog receiver has issues with /api/v1/series format
+                "otelcol|DD Metrics|4319|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
-
             for scenario in "${otelcol_scenarios[@]}"; do
                 IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
 
@@ -795,12 +794,15 @@ main() {
 
             # tero-collector scenarios:
             # - OTLP HTTP on port 4323 (protobuf)
+            # - Datadog on port 4325 (JSON)
             # Uses policy processor for filtering
             # Format: binary|name|port|endpoint|payload|content_type
             local tero_collector_scenarios=(
                 "tero-collector|OTLP Logs|4323|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "tero-collector|OTLP Metrics|4323|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
                 "tero-collector|OTLP Traces|4323|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
+                "tero-collector|DD Logs|4325|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "tero-collector|DD Metrics|4325|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
 
             for scenario in "${tero_collector_scenarios[@]}"; do
