@@ -384,6 +384,9 @@ pub const HttpProvider = struct {
             .url = self.config_url,
             .sync_timestamp = response.sync_timestamp_unix_nano,
         });
+
+        // Clear policy statuses after successful sync
+        self.clearPolicyStatuses();
     }
 
     fn fetchPolicies(self: *HttpProvider) !FetchResult {
