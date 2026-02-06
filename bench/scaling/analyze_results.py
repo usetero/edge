@@ -51,12 +51,12 @@ class PlotStyle:
     grid_color: str = "#404040"  # neutral-700
     text_color: str = "#d4d4d4"  # neutral-300
 
-    # Color palette for binaries (Tailwind CSS palette - brighter for dark bg)
+    # Color palette for binaries (maximally distinct colors for dark bg)
     binary_colors: dict[str, str] = {
-        "edge": "#6ee7b7",  # emerald-300
-        "otelcol": "#e4e4e7",  # zinc-200
-        "vector": "#fbbf24",  # amber-400
-        "tero-collector": "#93c5fd",  # blue-300
+        "edge": "#22c55e",  # green-500 - bright green
+        "otelcol": "#f97316",  # orange-500 - orange
+        "vector": "#a855f7",  # purple-500 - purple
+        "tero-collector": "#06b6d4",  # cyan-500 - cyan
     }
 
     # Marker styles for binaries
@@ -550,6 +550,501 @@ def create_summary_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# Advanced Analysis Functions
+# =============================================================================
+
+
+def plot_winner_matrix(
+    df: pd.DataFrame,
+    output_path: str = "plots/winner_matrix.png",
+    style: type[PlotStyle] = PlotStyle,
+) -> plt.Figure:
+    """
+    Create a heatmap showing which binary wins each metric for each telemetry type.
+
+    "Wins" means: highest RPS, lowest latency, lowest memory, lowest CPU.
+    """
+    style.apply_style()
+
+    metrics = {
+        "rps": ("RPS", "max"),  # Higher is better
+        "p50_ms": ("P50 Latency", "min"),  # Lower is better
+        "p99_ms": ("P99 Latency", "min"),  # Lower is better
+        "mem_mb": ("Memory", "min"),  # Lower is better
+        "cpu_pct": ("CPU", "min"),  # Lower is better
+    }
+
+    telemetry_types = sorted(df["telemetry_type"].unique())
+    binaries = sorted(df["binary"].unique())
+
+    # Build winner matrix: rows = telemetry types, cols = metrics
+    # Values = winning binary name
+    winner_data = []
+
+    for telemetry in telemetry_types:
+        tel_df = df[df["telemetry_type"] == telemetry]
+        row = {"telemetry_type": telemetry}
+
+        for metric_col, (metric_label, agg_type) in metrics.items():
+            # Aggregate by binary (mean across policy counts and runs)
+            agg = tel_df.groupby("binary")[metric_col].mean()
+
+            if agg_type == "max":
+                winner = agg.idxmax()
+            else:
+                winner = agg.idxmin()
+
+            row[metric_label] = winner
+
+        winner_data.append(row)
+
+    winner_df = pd.DataFrame(winner_data).set_index("telemetry_type")
+
+    # Create numeric matrix for heatmap coloring
+    binary_to_num = {b: i for i, b in enumerate(binaries)}
+    numeric_matrix = winner_df.replace(binary_to_num).values.astype(float)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Create heatmap with binary colors
+    cmap_colors = [style.get_color(b) for b in binaries]
+    from matplotlib.colors import ListedColormap
+
+    cmap = ListedColormap(cmap_colors)
+
+    im = ax.imshow(
+        numeric_matrix, cmap=cmap, aspect="auto", vmin=0, vmax=len(binaries) - 1
+    )
+
+    # Set ticks
+    ax.set_xticks(range(len(winner_df.columns)))
+    ax.set_xticklabels(winner_df.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(winner_df.index)))
+    ax.set_yticklabels(winner_df.index)
+
+    # Add text annotations showing winner names
+    for i in range(len(winner_df.index)):
+        for j in range(len(winner_df.columns)):
+            winner = winner_df.iloc[i, j]
+            # Use contrasting text color
+            text_color = "#0a0a0a" if winner in ["otelcol", "vector"] else "#fafafa"
+            ax.text(
+                j,
+                i,
+                winner,
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=9,
+                fontweight="bold",
+            )
+
+    ax.set_title("Winner Matrix: Best Binary per Metric & Telemetry Type")
+
+    # Add legend
+    from matplotlib.patches import Patch
+
+    legend_patches = [Patch(facecolor=style.get_color(b), label=b) for b in binaries]
+    ax.legend(handles=legend_patches, loc="upper left", bbox_to_anchor=(1.02, 1))
+
+    plt.tight_layout()
+
+    Path(output_path).parent.mkdir(exist_ok=True)
+    fig.savefig(output_path, dpi=style.dpi, bbox_inches="tight")
+    print(f"Saved: {output_path}")
+
+    return fig
+
+
+def plot_crossover_analysis(
+    df: pd.DataFrame,
+    output_path: str = "plots/crossover_analysis.png",
+    style: type[PlotStyle] = PlotStyle,
+) -> plt.Figure:
+    """
+    Analyze at what policy count one binary overtakes another.
+
+    Shows crossover points for key metrics (RPS, memory).
+    """
+    style.apply_style()
+
+    telemetry_types = sorted(df["telemetry_type"].unique())
+    n_types = len(telemetry_types)
+
+    fig, axes = plt.subplots(n_types, 2, figsize=(14, 4 * n_types))
+    if n_types == 1:
+        axes = axes.reshape(1, -1)
+
+    metrics = [("rps", "RPS (higher=better)"), ("mem_mb", "Memory MB (lower=better)")]
+
+    for row_idx, telemetry in enumerate(telemetry_types):
+        tel_df = df[df["telemetry_type"] == telemetry]
+
+        for col_idx, (metric_col, metric_label) in enumerate(metrics):
+            ax = axes[row_idx, col_idx]
+
+            # Aggregate by binary and policy_count
+            agg = aggregate_by_binary(tel_df, ["binary", "policy_count"], metric_col)
+            binaries = sorted(agg["binary"].unique())
+
+            # Plot each binary
+            for binary in binaries:
+                binary_data = agg[agg["binary"] == binary].sort_values("policy_count")
+                x = binary_data["policy_count"].values
+                y = binary_data["mean"].values
+
+                # Handle log scale
+                x_plot = np.where(x == 0, 0.5, x)
+
+                color = style.get_color(binary)
+                ax.plot(
+                    x_plot,
+                    y,
+                    label=binary,
+                    color=color,
+                    linewidth=2,
+                    marker=style.get_marker(binary),
+                    markersize=6,
+                )
+
+            # Find and annotate crossover points
+            crossovers = _find_crossovers(agg, metric_col)
+            for (b1, b2), policy_count, value in crossovers:
+                x_cross = policy_count if policy_count > 0 else 0.5
+                ax.axvline(
+                    x=x_cross, color="#ef4444", linestyle="--", alpha=0.5, linewidth=1
+                )
+                ax.annotate(
+                    f"{b1}↔{b2}\n@{policy_count}",
+                    xy=(x_cross, value),
+                    xytext=(5, 10),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color="#fca5a5",
+                    bbox=dict(
+                        boxstyle="round,pad=0.2",
+                        facecolor="#1f1f1f",
+                        edgecolor="#404040",
+                    ),
+                )
+
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel("Policy Count")
+            ax.set_ylabel(metric_label)
+            ax.set_title(f"{telemetry}: {metric_label}")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best", fontsize=8)
+
+    plt.suptitle("Crossover Analysis: Where Binaries Overtake Each Other", fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+    Path(output_path).parent.mkdir(exist_ok=True)
+    fig.savefig(output_path, dpi=style.dpi, bbox_inches="tight")
+    print(f"Saved: {output_path}")
+
+    return fig
+
+
+def _find_crossovers(
+    agg: pd.DataFrame,
+    metric_col: str,
+) -> list[tuple[tuple[str, str], int, float]]:
+    """
+    Find policy counts where binaries cross over each other.
+
+    Returns list of ((binary1, binary2), policy_count, value) tuples.
+    """
+    crossovers = []
+    binaries = sorted(agg["binary"].unique())
+    policy_counts = sorted(agg["policy_count"].unique())
+
+    # Build matrix: binaries x policy_counts -> mean values
+    pivot = agg.pivot(index="policy_count", columns="binary", values="mean")
+
+    # Check each pair of binaries
+    for i, b1 in enumerate(binaries):
+        for b2 in binaries[i + 1 :]:
+            if b1 not in pivot.columns or b2 not in pivot.columns:
+                continue
+
+            prev_diff = None
+            for pc in policy_counts:
+                if pc not in pivot.index:
+                    continue
+                v1 = pivot.loc[pc, b1]
+                v2 = pivot.loc[pc, b2]
+                if pd.isna(v1) or pd.isna(v2):
+                    continue
+
+                curr_diff = v1 - v2
+
+                # Check for sign change (crossover)
+                if prev_diff is not None and prev_diff * curr_diff < 0:
+                    crossovers.append(((b1, b2), pc, (v1 + v2) / 2))
+
+                prev_diff = curr_diff
+
+    return crossovers
+
+
+def plot_scaling_exponents(
+    df: pd.DataFrame,
+    output_path: str = "plots/scaling_exponents.png",
+    style: type[PlotStyle] = PlotStyle,
+) -> plt.Figure:
+    """
+    Calculate log-log slope (scaling exponent) for each binary.
+
+    Fits power law: metric = a * policy_count^b
+    The exponent b tells us:
+    - b ≈ 0: O(1) constant - metric stays flat as policies increase
+    - b ≈ 1: O(n) linear - metric grows proportionally with policies
+    - b > 1: superlinear - metric grows faster than policy count
+
+    For "cost" metrics (memory, CPU, latency): lower slope = better scaling
+    For "benefit" metrics (RPS): negative slope = degradation with more policies
+    """
+    style.apply_style()
+    from scipy import stats
+
+    # Metrics with their interpretations
+    metrics = {
+        "mem_mb": ("Memory Growth", "cost"),
+        "cpu_pct": ("CPU Growth", "cost"),
+        "p99_ms": ("P99 Latency Growth", "cost"),
+        "rps": ("RPS Change", "benefit"),
+    }
+
+    telemetry_types = sorted(df["telemetry_type"].unique())
+    binaries = sorted(df["binary"].unique())
+
+    # Compute scaling exponents with additional context
+    results = []
+    for telemetry in telemetry_types:
+        tel_df = df[df["telemetry_type"] == telemetry]
+
+        for binary in binaries:
+            binary_df = tel_df[tel_df["binary"] == binary]
+
+            for metric_col, (metric_label, metric_type) in metrics.items():
+                agg = binary_df.groupby("policy_count")[metric_col].mean().reset_index()
+
+                # Filter out zero policy count for log-log fit
+                agg = agg[agg["policy_count"] > 0]
+
+                if len(agg) < 2:
+                    continue
+
+                x = np.log10(agg["policy_count"].values)
+                y = np.log10(agg[metric_col].values)
+
+                # Filter out -inf from log of zeros
+                mask = np.isfinite(x) & np.isfinite(y)
+                if mask.sum() < 2:
+                    continue
+
+                slope, intercept, r_value, p_value, std_err = stats.linregress(
+                    x[mask], y[mask]
+                )
+                r_squared = r_value**2
+
+                # Calculate actual change ratio (last / first)
+                change_ratio = agg[metric_col].iloc[-1] / agg[metric_col].iloc[0]
+
+                results.append(
+                    {
+                        "telemetry_type": telemetry,
+                        "binary": binary,
+                        "metric": metric_label,
+                        "metric_type": metric_type,
+                        "exponent": slope,
+                        "r_squared": r_squared,
+                        "std_err": std_err,
+                        "change_ratio": change_ratio,
+                        "start_val": agg[metric_col].iloc[0],
+                        "end_val": agg[metric_col].iloc[-1],
+                    }
+                )
+
+    results_df = pd.DataFrame(results)
+
+    # Create a 2x2 grid for the 4 metrics
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+
+    for idx, (metric_col, (metric_label, metric_type)) in enumerate(metrics.items()):
+        ax = axes[idx]
+        metric_df = results_df[results_df["metric"] == metric_label]
+
+        if metric_df.empty:
+            ax.set_visible(False)
+            continue
+
+        # Pivot for grouped bar chart
+        pivot = metric_df.pivot(
+            index="telemetry_type", columns="binary", values="exponent"
+        )
+        r2_pivot = metric_df.pivot(
+            index="telemetry_type", columns="binary", values="r_squared"
+        )
+
+        x = np.arange(len(pivot.index))
+        width = 0.8 / len(binaries)
+
+        for i, binary in enumerate(binaries):
+            if binary not in pivot.columns:
+                continue
+            values = pivot[binary].values
+            r2_values = r2_pivot[binary].values
+            offset = (i - len(binaries) / 2 + 0.5) * width
+            bars = ax.bar(
+                x + offset, values, width, label=binary, color=style.get_color(binary)
+            )
+
+            # Add value labels on bars with R² indicator
+            for bar, val, r2 in zip(bars, values, r2_values):
+                if not np.isnan(val):
+                    # Position label above or below bar depending on sign
+                    y_pos = val + 0.02 if val >= 0 else val - 0.06
+                    va = "bottom" if val >= 0 else "top"
+                    # Dim the label if R² is low (poor fit)
+                    alpha = 1.0 if r2 > 0.5 else 0.5
+                    label = f"{val:.2f}"
+                    if r2 < 0.5:
+                        label += "*"  # Mark unreliable fits
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        y_pos,
+                        label,
+                        ha="center",
+                        va=va,
+                        fontsize=7,
+                        color=style.text_color,
+                        alpha=alpha,
+                    )
+
+        ax.set_xlabel("Telemetry Type")
+        ax.set_ylabel("Scaling Exponent")
+
+        # Add interpretation to title
+        if metric_type == "cost":
+            subtitle = "lower = better scaling"
+        else:
+            subtitle = "near 0 = stable; negative = degrades"
+        ax.set_title(f"{metric_label} ({subtitle})", fontsize=11)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(pivot.index, rotation=30, ha="right")
+
+        # Reference lines
+        ax.axhline(y=0, color="#22c55e", linestyle="-", alpha=0.7, linewidth=1.5)
+        ax.axhline(y=1, color="#eab308", linestyle="--", alpha=0.7, linewidth=1.5)
+
+        # Set y-axis limits to show context
+        y_min, y_max = ax.get_ylim()
+        ax.set_ylim(min(y_min, -0.6), max(y_max, 1.1))
+
+        ax.legend(loc="best", fontsize=7)
+        ax.grid(True, alpha=0.3, axis="y")
+
+    plt.suptitle(
+        "Scaling Exponents: How Metrics Change with Policy Count (1→4000)\n"
+        "green=O(1) constant | yellow=O(n) linear | * = low R², unreliable fit",
+        fontsize=13,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+
+    Path(output_path).parent.mkdir(exist_ok=True)
+    fig.savefig(output_path, dpi=style.dpi, bbox_inches="tight")
+    print(f"Saved: {output_path}")
+
+    # Print detailed summary table
+    print("\nScaling Exponents Summary (slope | R² | start→end):")
+    print("-" * 100)
+    for metric_label in results_df["metric"].unique():
+        print(f"\n{metric_label}:")
+        metric_data = results_df[results_df["metric"] == metric_label]
+        for _, row in metric_data.iterrows():
+            r2_marker = "" if row["r_squared"] > 0.5 else " (unreliable)"
+            print(
+                f"  {row['telemetry_type']:15} {row['binary']:15} "
+                f"slope={row['exponent']:+.3f} R²={row['r_squared']:.2f}{r2_marker:12} "
+                f"| {row['start_val']:.1f} → {row['end_val']:.1f} ({row['change_ratio']:.2f}x)"
+            )
+
+    return fig
+
+
+def plot_box_plots_by_binary(
+    df: pd.DataFrame,
+    output_path: str = "plots/box_plots.png",
+    style: type[PlotStyle] = PlotStyle,
+) -> plt.Figure:
+    """
+    Create box plots showing distribution spread and outliers for each binary.
+    """
+    style.apply_style()
+
+    metrics = [
+        ("rps", "RPS"),
+        ("mem_mb", "Memory (MB)"),
+        ("cpu_pct", "CPU (%)"),
+        ("p99_ms", "P99 Latency (ms)"),
+        ("p50_ms", "P50 Latency (ms)"),
+    ]
+
+    binaries = sorted(df["binary"].unique())
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    axes = axes.flatten()
+
+    for idx, (metric_col, metric_label) in enumerate(metrics):
+        ax = axes[idx]
+
+        # Prepare data for box plot
+        data = [df[df["binary"] == b][metric_col].values for b in binaries]
+        colors = [style.get_color(b) for b in binaries]
+
+        bp = ax.boxplot(
+            data,
+            tick_labels=binaries,
+            patch_artist=True,
+            medianprops=dict(color="#ffffff", linewidth=2),
+            whiskerprops=dict(color=style.grid_color),
+            capprops=dict(color=style.grid_color),
+            flierprops=dict(
+                marker="o", markerfacecolor="#ef4444", markersize=4, alpha=0.6
+            ),
+        )
+
+        # Color the boxes
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+
+        ax.set_ylabel(metric_label)
+        ax.set_title(f"{metric_label} Distribution")
+        ax.grid(True, alpha=0.3, axis="y")
+
+        # Use log scale for metrics that vary widely
+        if metric_col in ["rps", "mem_mb", "p99_ms"]:
+            ax.set_yscale("log")
+
+    # Hide the 6th subplot
+    axes[5].set_visible(False)
+
+    plt.suptitle("Distribution by Binary (Box Plots)", fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    Path(output_path).parent.mkdir(exist_ok=True)
+    fig.savefig(output_path, dpi=style.dpi, bbox_inches="tight")
+    print(f"Saved: {output_path}")
+
+    return fig
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -591,10 +1086,22 @@ def main():
             output_path=f"plots/{name}_by_telemetry.png",
         )
 
+    # Generate advanced analysis plots
+    print("\n" + "=" * 60)
+    print("Generating Advanced Analysis Plots")
+    print("=" * 60)
+
+    plot_winner_matrix(df)
+    plot_crossover_analysis(df)
+    plot_box_plots_by_binary(df)
+
     print("\nDone! Check the 'plots' directory for output.")
 
-    # Show plots interactively (comment out for headless)
-    plt.show()
+    # Show plots interactively
+    try:
+        plt.show()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
