@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.2](https://github.com/usetero/edge/compare/v1.14.1...v1.14.2) (2026-02-06)
+
+
+### Bug Fixes
+
+* stats recording should clear after sync ([#120](https://github.com/usetero/edge/issues/120)) ([d43a740](https://github.com/usetero/edge/commit/d43a7405a58af5e596cf44997878968d6d7bdbdd))
+
 ## [1.14.1](https://github.com/usetero/edge/compare/v1.14.0...v1.14.1) (2026-01-30)
 
 
