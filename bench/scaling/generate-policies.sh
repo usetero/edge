@@ -731,6 +731,10 @@ receivers:
       http:
         endpoint: 127.0.0.1:4323
 
+  datadog:
+    endpoint: 127.0.0.1:4325
+    read_timeout: 60s
+
 processors:
   policy:
     providers:
@@ -771,8 +775,12 @@ service:
       receivers: [otlp]
       processors: [policy]
       exporters: [otlphttp]
-    logs:
+    logs/otlp:
       receivers: [otlp]
+      processors: [policy]
+      exporters: [otlphttp]
+    logs/datadog:
+      receivers: [datadog]
       processors: [policy]
       exporters: [otlphttp]
 YAML_CONFIG
