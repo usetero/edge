@@ -554,3 +554,133 @@ pub const HttpProvider = struct {
         };
     }
 };
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+const testing = std.testing;
+
+test "HttpProvider: recordPolicyStats accumulates hits and misses" {
+    const allocator = testing.allocator;
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init();
+
+    var provider = try HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://test.local/policies",
+        60,
+        .{},
+        &.{},
+    );
+    defer provider.deinit();
+
+    // Record initial stats
+    provider.recordPolicyStats("policy-1", 10, 5, .{});
+
+    // Verify stats were recorded
+    {
+        provider.sync_state_mutex.lock();
+        defer provider.sync_state_mutex.unlock();
+
+        const record = provider.policy_statuses.get("policy-1");
+        try testing.expect(record != null);
+        try testing.expectEqual(@as(i64, 10), record.?.hits);
+        try testing.expectEqual(@as(i64, 5), record.?.misses);
+    }
+
+    // Accumulate more stats for the same policy
+    provider.recordPolicyStats("policy-1", 20, 10, .{});
+
+    // Verify stats were accumulated
+    {
+        provider.sync_state_mutex.lock();
+        defer provider.sync_state_mutex.unlock();
+
+        const record = provider.policy_statuses.get("policy-1");
+        try testing.expect(record != null);
+        try testing.expectEqual(@as(i64, 30), record.?.hits);
+        try testing.expectEqual(@as(i64, 15), record.?.misses);
+    }
+}
+
+test "HttpProvider: clearPolicyStatuses resets all counters" {
+    const allocator = testing.allocator;
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init();
+
+    var provider = try HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://test.local/policies",
+        60,
+        .{},
+        &.{},
+    );
+    defer provider.deinit();
+
+    // Record stats for multiple policies
+    provider.recordPolicyStats("policy-1", 10, 5, .{});
+    provider.recordPolicyStats("policy-2", 20, 10, .{});
+    provider.recordPolicyStats("policy-3", 30, 15, .{});
+
+    // Verify all policies have stats
+    {
+        provider.sync_state_mutex.lock();
+        defer provider.sync_state_mutex.unlock();
+        try testing.expectEqual(@as(usize, 3), provider.policy_statuses.count());
+    }
+
+    // Clear all statuses
+    provider.clearPolicyStatuses();
+
+    // Verify all stats are cleared
+    {
+        provider.sync_state_mutex.lock();
+        defer provider.sync_state_mutex.unlock();
+        try testing.expectEqual(@as(usize, 0), provider.policy_statuses.count());
+    }
+}
+
+test "HttpProvider: recordPolicyStats after clear starts fresh" {
+    const allocator = testing.allocator;
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init();
+
+    var provider = try HttpProvider.init(
+        allocator,
+        noop_bus.eventBus(),
+        "test-provider",
+        "http://test.local/policies",
+        60,
+        .{},
+        &.{},
+    );
+    defer provider.deinit();
+
+    // Record initial stats
+    provider.recordPolicyStats("policy-1", 100, 50, .{});
+
+    // Clear
+    provider.clearPolicyStatuses();
+
+    // Record new stats for the same policy
+    provider.recordPolicyStats("policy-1", 5, 2, .{});
+
+    // Verify stats start fresh (not accumulated with previous values)
+    {
+        provider.sync_state_mutex.lock();
+        defer provider.sync_state_mutex.unlock();
+
+        const record = provider.policy_statuses.get("policy-1");
+        try testing.expect(record != null);
+        try testing.expectEqual(@as(i64, 5), record.?.hits);
+        try testing.expectEqual(@as(i64, 2), record.?.misses);
+    }
+}
