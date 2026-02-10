@@ -32,3 +32,4 @@ zig-cache/
 bench/scaling/proto_gen
 equivalence-test-*/
 plots/
+PLAN.md

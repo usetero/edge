@@ -1219,7 +1219,7 @@ fn compilePatterns(allocator: std.mem.Allocator, collectors: []const PatternColl
         hs_patterns[i] = .{
             .expression = formatPattern(&buf, c.pattern, c.match_type),
             .id = @intCast(i),
-            .flags = .{ .caseless = c.case_insensitive },
+            .flags = .{ .caseless = c.case_insensitive, .single_match = true },
         };
         meta[i] = .{ .policy_index = c.policy_index };
     }
