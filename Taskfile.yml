@@ -19,11 +19,6 @@ tasks:
     cmds:
       - zig build -Doptimize={{.OPTIMIZE | default "Debug"}}
 
-  build:protos:
-    desc: "Build the project with protos"
-    cmds:
-      - zig build -Dgen-proto=true gen-proto
-
   build:release:
     desc: "Build the project in release mode (ReleaseFast)"
     aliases: [br, release]
@@ -274,13 +269,6 @@ tasks:
         else
           echo "No Zig REPL found. Install ziggy: https://github.com/zigtools/ziggy"
         fi
-
-  update:protos:
-    desc: "Update proto files"
-    cmds:
-      - buf export buf.build/tero/policy -o proto
-      - buf export buf.build/opentelemetry/opentelemetry -o proto
-      - task: build:protos
 
   # =============================================================================
   # Build & Release

@@ -1,10 +1,10 @@
 const std = @import("std");
 const proxy_module = @import("./proxy_module.zig");
-const policy = @import("../policy/root.zig");
+const policy = @import("policy_zig");
 const otlp_logs = @import("./otlp_logs.zig");
 const otlp_metrics = @import("./otlp_metrics.zig");
 const otlp_traces = @import("./otlp_traces.zig");
-const o11y = @import("../observability/root.zig");
+const o11y = @import("o11y");
 
 const ProxyModule = proxy_module.ProxyModule;
 const ModuleConfig = proxy_module.ModuleConfig;

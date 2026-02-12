@@ -19,8 +19,8 @@
 
 const std = @import("std");
 const proto = @import("proto");
-const policy = @import("../policy/root.zig");
-const o11y = @import("../observability/root.zig");
+const policy = @import("policy_zig");
+const o11y = @import("o11y");
 
 const MetricsData = proto.metrics.MetricsData;
 const ResourceMetrics = proto.metrics.ResourceMetrics;

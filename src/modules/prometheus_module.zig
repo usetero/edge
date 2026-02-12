@@ -6,8 +6,8 @@
 const std = @import("std");
 const proxy_module = @import("./proxy_module.zig");
 const prometheus = @import("../prometheus/root.zig");
-const policy = @import("../policy/root.zig");
-const o11y = @import("../observability/root.zig");
+const policy = @import("policy_zig");
+const o11y = @import("o11y");
 
 const ProxyModule = proxy_module.ProxyModule;
 const ModuleConfig = proxy_module.ModuleConfig;

@@ -25,7 +25,7 @@ const policy = edge.policy;
 
 const ProxyConfig = config_types.ProxyConfig;
 
-const o11y = @import("observability/root.zig");
+const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 const StdLogAdapter = o11y.StdLogAdapter;
 const Level = o11y.Level;

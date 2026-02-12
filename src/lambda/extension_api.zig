@@ -10,7 +10,7 @@
 //! 3. Shut down gracefully when receiving SHUTDOWN event
 
 const std = @import("std");
-const o11y = @import("../observability/root.zig");
+const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 
 // =============================================================================
