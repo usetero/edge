@@ -1,5 +1,5 @@
 const std = @import("std");
-const policy = @import("../policy/root.zig");
+const policy = @import("policy_zig");
 
 pub const ProviderConfig = policy.ProviderConfig;
 pub const ServiceMetadata = policy.ServiceMetadata;

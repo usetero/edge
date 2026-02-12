@@ -37,100 +37,32 @@ src/
 ├── datadog_main.zig      # Datadog-focused distribution entry point
 ├── otlp_main.zig         # OTLP-focused distribution entry point
 ├── prometheus_main.zig   # Prometheus-focused distribution entry point
+├── lambda_main.zig       # AWS Lambda extension entry point
 ├── root.zig              # Library root (public API exports)
 │
-├── policy/               # Policy management package
-├── hyperscan/            # Pattern matching package (Vectorscan bindings)
 ├── modules/              # Protocol-specific processing modules
 ├── proxy/                # HTTP proxy infrastructure
-├── observability/        # Logging and tracing infrastructure
+├── prometheus/           # Prometheus metric parsing and filtering
 ├── config/               # Configuration parsing (non-policy)
-└── proto/                # Protobuf definitions and generated code
+├── lambda/               # AWS Lambda extension support
+└── zonfig/               # Comptime configuration with env overrides
 ```
+
+## External Dependencies
+
+Edge consumes the following shared modules from
+[policy-zig](https://github.com/usetero/policy-zig):
+
+- **`policy_zig`** - Policy engine, registry, matchers, transforms, and
+  Hyperscan/Vectorscan bindings
+- **`proto`** - Protobuf types (policy, common, OTLP
+  logs/metrics/trace/resource)
+- **`o11y`** - Observability (EventBus, structured logging, spans)
 
 ## Package Overview
 
 Each package is designed to be as independent as possible, with clear interfaces
 for integration.
-
-### `policy/` - Policy Management
-
-The policy package provides centralized policy lifecycle management including
-loading, hot-reloading, and evaluation.
-
-**Key exports:**
-
-- `Registry` - Thread-safe policy store with lock-free reads via atomic snapshot
-  pointers
-- `Provider` - Vtable interface for policy sources (file, HTTP, etc.)
-- `FileProvider` - File-based policy loading with inotify/kqueue watching
-- `HttpProvider` - HTTP-based policy loading with polling and sync state
-- `FilterEngine` - Hyperscan-based policy evaluation engine
-- `SourceType` - Policy source classification (file, http)
-
-**Integration:**
-
-```zig
-const policy = @import("policy/root.zig");
-
-// Create registry
-var registry = policy.Registry.init(allocator, event_bus);
-defer registry.deinit();
-
-// Create and register a file provider
-const file_provider = try policy.FileProvider.init(allocator, bus, "local", "/path/to/policies.json");
-const provider = policy.Provider.init(file_provider);
-try registry.registerProvider(&provider);
-
-// Evaluate policies (lock-free read)
-var engine = policy.FilterEngine.init(allocator, bus, &registry);
-
-// Evaluate data where ctx is the data you want to evaluate
-// and field_accessor_fn is a function that informs the engine how to access fields in the data.
-const result = engine.evaluate(ctx, field_accessor_fn);
-```
-
-**Dependencies:** `hyperscan/` (for FilterEngine), `observability/`, `proto/`
-
----
-
-### `hyperscan/` - Pattern Matching
-
-High-performance regex matching via Vectorscan (Hyperscan fork). Provides both
-low-level bindings and a higher-level matcher index for policy evaluation.
-
-**Key exports:**
-
-- `Database` - Compiled Hyperscan database
-- `Scratch` - Per-thread scratch space for scanning
-- `Pattern` - Pattern definition with flags
-- `MatcherIndex` - Inverted index mapping (MatchCase, key) tuples to compiled
-  databases
-- `MatcherDatabase` - Single compiled database with pattern metadata
-
-**Integration:**
-
-```zig
-const hyperscan = @import("hyperscan/hyperscan.zig");
-
-// Compile patterns
-const patterns = [_]hyperscan.Pattern{
-    .{ .expression = "error", .id = 0, .flags = .{} },
-    .{ .expression = "warning", .id = 1, .flags = .{} },
-};
-var db = try hyperscan.Database.compileMulti(allocator, &patterns, .{});
-defer db.deinit();
-
-// Create scratch and scan
-var scratch = try hyperscan.Scratch.init(&db);
-defer scratch.deinit();
-_ = try db.scanWithCallback(&scratch, input_text, &ctx, callback_fn);
-```
-
-**Dependencies:** `observability/`, `proto/` (for MatcherIndex), links to libhs
-(Vectorscan)
-
----
 
 ### `modules/` - Protocol Modules
 
@@ -147,45 +79,7 @@ infrastructure.
   filtering
 - `PassthroughModule` - No-op passthrough for unhandled routes
 
-**Integration:**
-
-```zig
-const modules = @import("modules/proxy_module.zig");
-const datadog = @import("modules/datadog_module.zig");
-
-var datadog_logs_module = datadog.DatadogModule{};
-var datadog_metrics_module = datadog.DatadogModule{};
-var passthrough = modules.PassthroughModule{};
-
-const registrations = [_]modules.ModuleRegistration{
-    .{
-        .module = datadog_logs_module.asProxyModule(),
-        .routes = &datadog.logs_routes,
-        .upstream_url = "https://intake.logs.datadoghq.com",
-        .max_request_body = 10 * 1024 * 1024,
-        .max_response_body = 1024 * 1024,
-        .module_data = @ptrCast(&config),
-    },
-    .{
-        .module = datadog_metrics_module.asProxyModule(),
-        .routes = &datadog.metrics_routes,
-        .upstream_url = "https://api.datadoghq.com",
-        .max_request_body = 10 * 1024 * 1024,
-        .max_response_body = 1024 * 1024,
-        .module_data = @ptrCast(&config),
-    },
-    .{
-        .module = passthrough.asProxyModule(),
-        .routes = &passthrough.default_routes,
-        .upstream_url = upstream_url,
-        .max_request_body = max_body,
-        .max_response_body = max_body,
-        .module_data = null,
-    },
-};
-```
-
-**Dependencies:** `policy/` (for DatadogModule, OtlpModule), `observability/`
+**Dependencies:** `policy_zig`, `proto`, `o11y`
 
 #### OtlpModule
 
@@ -221,60 +115,22 @@ Core HTTP proxy server and routing infrastructure.
 - `UpstreamClient` - HTTP client for forwarding requests
 - `compress` - gzip compression/decompression utilities
 
-**Integration:**
-
-```zig
-const proxy = @import("proxy/server.zig");
-
-var server = try proxy.ProxyServer.init(
-    allocator,
-    event_bus,
-    listen_address,
-    listen_port,
-    &module_registrations,
-);
-defer server.deinit();
-
-try server.listen(); // Blocks until server.stop() called
-```
-
-**Dependencies:** `modules/`, `observability/`, links to httpz
+**Dependencies:** `o11y`, links to httpz
 
 ---
 
-### `observability/` - Logging and Tracing
+### `prometheus/` - Prometheus Metrics
 
-Structured event-based observability infrastructure. All logging goes through an
-EventBus that can route to different backends.
+Streaming Prometheus exposition format parsing and policy-based filtering.
 
 **Key exports:**
 
-- `EventBus` - Vtable interface for event emission
-- `StdioEventBus` - JSON-formatted output to stdout/stderr
-- `NoopEventBus` - Silent bus for testing
-- `Level` - Log levels (trace, debug, info, warn, err)
-- `Span` - Duration tracking with start/complete events
-- `StdLogAdapter` - Routes `std.log` through the EventBus
+- `PolicyStreamingFilter` - Streaming filter that applies policies to metrics
+- `FilteringWriter` - Writer that filters metrics line-by-line
+- `FieldAccessor` - Maps policy field references to Prometheus metric fields
+- `LineParser` - Prometheus exposition format parser
 
-**Integration:**
-
-```zig
-const o11y = @import("observability/root.zig");
-
-var stdio_bus: o11y.StdioEventBus = undefined;
-stdio_bus.init();
-const bus = stdio_bus.eventBus();
-
-bus.setLevel(.info);
-bus.info(MyEvent{ .field = value });
-
-// Spans for timing
-var span = bus.started(.info, StartEvent{});
-// ... do work ...
-span.completed(EndEvent{});
-```
-
-**Dependencies:** None (leaf package)
+**Dependencies:** `policy_zig`, `proto`, `o11y`
 
 ---
 
@@ -284,38 +140,11 @@ Application configuration loading and parsing (non-policy configuration).
 
 **Key exports:**
 
-- `Config` - Main configuration struct
-- `parseConfigFile` - JSON config file parsing
+- `ProxyConfig` - Main proxy configuration struct
+- `ProviderConfig` - Policy provider configuration (re-exported from policy-zig)
+- `ServiceMetadata` - Service metadata (re-exported from policy-zig)
 
-**Integration:**
-
-```zig
-const config = @import("config/parser.zig");
-
-const cfg = try config.parseConfigFile(allocator, "config.json");
-defer {
-    allocator.free(cfg.upstream_url);
-    // ... cleanup ...
-    allocator.destroy(cfg);
-}
-```
-
-**Dependencies:** `policy/` (for ProviderConfig types)
-
----
-
-### `proto/` - Protocol Buffers
-
-Generated Zig code from protobuf definitions. Provides policy and telemetry data
-structures.
-
-**Key exports:**
-
-- `policy.Policy` - Policy definition
-- `policy.LogMatcher` - Log matching rules
-- `policy.FilterAction` - DROP/KEEP actions
-
-**Dependencies:** None (leaf package)
+**Dependencies:** `policy_zig`
 
 ---
 
@@ -393,6 +222,12 @@ Focused distribution for Prometheus metrics scraping with streaming filtering:
 Build: `zig build prometheus` Run: `zig build run-prometheus` or
 `./zig-out/bin/edge-prometheus [config-file]`
 
+### Lambda (`lambda_main.zig`)
+
+AWS Lambda extension distribution for Datadog telemetry processing.
+
+Build: `zig build lambda` Run: Deployed as a Lambda layer
+
 ## Building
 
 ```bash
@@ -407,6 +242,7 @@ zig build edge        # Full distribution (Datadog + OTLP + Prometheus)
 zig build datadog     # Datadog-only distribution
 zig build otlp        # OTLP-only distribution
 zig build prometheus  # Prometheus-only distribution
+zig build lambda      # Lambda extension distribution
 
 # Run specific distribution
 zig build run-edge

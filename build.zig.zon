@@ -36,13 +36,13 @@
             .url = "git+https://github.com/karlseguin/http.zig?ref=master#a4477b1dbdc5b820fd4ad301797ca6399f7eb6e4",
             .hash = "httpz-0.0.0-PNVzrBgtBwCVkSJyophIX6WHwDR0r8XhBGQr96Kk-1El",
         },
-        .protobuf = .{
-            .url = "git+https://github.com/jaronoff97/zig-protobuf?ref=fix-json-oneof-shadowing#464170e22be3460e44f9e79dad0184e969d1407b",
-            .hash = "protobuf-3.0.0-0e82atQRKQAeWaBvhs4mtvWwJ6oZ42Deivtk1rZLUKx3",
-        },
         .zimdjson = .{
             .url = "git+https://github.com/jaronoff97/zimdjson?ref=zig-0.15.1-support#f31efc9e698246f994df8eba44646134a93fa2b6",
             .hash = "zimdjson-0.1.1-89pgxT5VBgBMxsGpAd90DI0e-DzHGKiRVlquliE5FivH",
+        },
+        .policy_zig = .{
+            .url = "git+https://github.com/usetero/policy-zig?ref=v0.1.3#3367463db1fdb322d66e7a64aa5d8b00111dc521",
+            .hash = "policy_zig-0.1.3-5_dp3l37FgCw1ZfsRdVHkOJONEbu01hNh1xJD5jl_TeR",
         },
     },
     .paths = .{

@@ -4,7 +4,7 @@ const compress = @import("compress.zig");
 const proxy_module = @import("../modules/proxy_module.zig");
 const router_mod = @import("router.zig");
 const upstream_client = @import("upstream_client.zig");
-const o11y = @import("../observability/root.zig");
+const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 
 const ModuleId = proxy_module.ModuleId;

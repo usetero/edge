@@ -1,9 +1,9 @@
 const std = @import("std");
 const proxy_module = @import("./proxy_module.zig");
-const policy = @import("../policy/root.zig");
+const policy = @import("policy_zig");
 const logs_v2 = @import("./datadog_logs_v2.zig");
 const metrics_v2 = @import("./datadog_metrics_v2.zig");
-const o11y = @import("../observability/root.zig");
+const o11y = @import("o11y");
 
 const ProxyModule = proxy_module.ProxyModule;
 const ModuleConfig = proxy_module.ModuleConfig;
