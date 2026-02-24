@@ -47,7 +47,9 @@ OTLP_PORT=8081
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUTPUT_DIR="$SCRIPT_DIR/results"
+RUN_DATE="$(date +"%Y-%m-%dT%H-%M-%S")"
+OUTPUT_BASE_DIR="$SCRIPT_DIR/results"
+OUTPUT_DIR="$OUTPUT_BASE_DIR/$RUN_DATE"
 DEBUG_DIR="$SCRIPT_DIR/debug"
 PAYLOADS_DIR="$SCRIPT_DIR/payloads"
 CONFIGS_DIR="$SCRIPT_DIR/configs"
@@ -574,7 +576,7 @@ main() {
     start_echo_server
 
     # CSV header
-    local results_file="$OUTPUT_DIR/results-$(date -Iseconds).csv"
+    local results_file="$OUTPUT_DIR/results.csv"
     echo "binary,telemetry_type,policy_count,payload_bytes,rps,p50_ms,p99_ms,success_pct,cpu_pct,mem_mb,echo_requests,echo_bytes" > "$results_file"
 
     echo ""

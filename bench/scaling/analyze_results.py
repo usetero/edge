@@ -132,7 +132,7 @@ class PlotStyle:
 # =============================================================================
 
 
-def load_results(pattern: str = "results/results-*.csv") -> pd.DataFrame:
+def load_results(pattern: str = "results/*.results.csv") -> pd.DataFrame:
     """
     Load all CSV files matching pattern and combine into single DataFrame.
 
@@ -1052,7 +1052,7 @@ def plot_box_plots_by_binary(
 def main():
     """Main entry point for the analysis script."""
     # Load data
-    df = load_results("results/results-*.csv")
+    df = load_results("results/*/results.csv")
 
     # Print summary
     print("\n" + "=" * 60)
