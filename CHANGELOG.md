@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.15.0](https://github.com/usetero/edge/compare/v1.14.2...v1.15.0) (2026-02-24)
+
+
+### Features
+
+* use new policy-zig lib ([#124](https://github.com/usetero/edge/issues/124)) ([a9a36d3](https://github.com/usetero/edge/commit/a9a36d380940bae165e9f7e54c83a48d7198cb22))
+
+
+### Bug Fixes
+
+* update from policy ([#128](https://github.com/usetero/edge/issues/128)) ([5b8b743](https://github.com/usetero/edge/commit/5b8b743647607814157f36aed9022c90f766d202))
+
 ## [1.14.2](https://github.com/usetero/edge/compare/v1.14.1...v1.14.2) (2026-02-06)
 
 
