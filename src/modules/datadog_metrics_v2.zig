@@ -465,7 +465,7 @@ test "datadogMetricFieldAccessor - extra field lookup" {
     try std.testing.expectEqualStrings("env:prod,service:web", tags_val.?);
 
     // Test metric type
-    const type_val = datadogMetricFieldAccessor(&field_ctx, .metric_type);
+    const type_val = datadogMetricFieldAccessor(&field_ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
     try std.testing.expect(type_val != null);
     try std.testing.expectEqualStrings("gauge", type_val.?);
 }
