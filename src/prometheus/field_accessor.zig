@@ -261,7 +261,7 @@ test "prometheusFieldAccessor - unsupported fields return null" {
     try std.testing.expect(res == null);
 
     // Metric type null when not provided
-    const mt = prometheusFieldAccessor(&ctx, .metric_type);
+    const mt = prometheusFieldAccessor(&ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
     try std.testing.expect(mt == null);
 }
 
@@ -284,7 +284,7 @@ test "prometheusFieldAccessor - metric type from metadata" {
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
     ctx.metric_type = "counter";
 
-    const mt = prometheusFieldAccessor(&ctx, .metric_type);
+    const mt = prometheusFieldAccessor(&ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
     try std.testing.expect(mt != null);
     try std.testing.expectEqualStrings("counter", mt.?);
 }

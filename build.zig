@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
 
     // Shared modules from policy-zig ensure type identity across boundaries.
     const proto_mod = policy_dep.module("proto");
-    const o11y_mod = policy_dep.module("o11y");
+    const o11y_mod = policy_dep.module("observability");
 
     // ==========================================================================
     // Edge Library Module
