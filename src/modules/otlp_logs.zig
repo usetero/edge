@@ -2,6 +2,7 @@ const std = @import("std");
 const proto = @import("proto");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
+const otlp_attr = @import("otlp_attributes.zig");
 
 const LogsData = proto.logs.LogsData;
 const ResourceLogs = proto.logs.ResourceLogs;
@@ -138,53 +139,15 @@ const OtlpLogContext = struct {
     log_record: *LogRecord,
     resource_logs: *ResourceLogs,
     scope_logs: *ScopeLogs,
+    allocator: std.mem.Allocator,
 };
 
-/// Extract string value from an AnyValue
-fn getAnyValueString(value: ?AnyValue) ?[]const u8 {
-    const v = value orelse return null;
-    const val_union = v.value orelse return null;
-    return switch (val_union) {
-        .string_value => |s| s,
-        else => null,
-    };
-}
-
-/// Find attribute value by key in a KeyValue list
-fn findAttribute(attributes: []const KeyValue, key: []const u8) ?[]const u8 {
-    for (attributes) |kv| {
-        if (std.mem.eql(u8, kv.key, key)) {
-            return getAnyValueString(kv.value);
-        }
-    }
-    return null;
-}
-
-/// Find nested attribute value by path in a KeyValue list
-/// For path ["http", "method"], finds the "http" key first, then "method" within its kvlist_value
-fn findNestedAttribute(attributes: []const KeyValue, path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return null;
-
-    // Find the first key in the path
-    for (attributes) |kv| {
-        if (std.mem.eql(u8, kv.key, path[0])) {
-            // If this is the last segment, return the value
-            if (path.len == 1) {
-                return getAnyValueString(kv.value);
-            }
-            // Otherwise, traverse into nested kvlist
-            const val = kv.value orelse return null;
-            const inner = val.value orelse return null;
-            switch (inner) {
-                .kvlist_value => |kvlist| {
-                    return findNestedAttribute(kvlist.values.items, path[1..]);
-                },
-                else => return null,
-            }
-        }
-    }
-    return null;
-}
+const getAnyValueString = otlp_attr.getStringValue;
+const findNestedAttribute = otlp_attr.findNestedAttribute;
+const findAttrIndex = otlp_attr.findAttrIndex;
+const removeAttributeByPath = otlp_attr.removeAttributeByPath;
+const setAttributeByPath = otlp_attr.setAttributeByPath;
+const setAttribute = otlp_attr.setAttribute;
 
 /// Field accessor for OTLP log format
 /// Maps FieldRef to the appropriate field in the OTLP log structure
@@ -210,58 +173,6 @@ fn otlpFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
 
 const MutateOp = policy.MutateOp;
 const FieldMutator = policy.FieldMutator;
-
-/// Find and remove an attribute by key from a KeyValue list
-/// Returns true if the attribute was found and removed
-fn removeAttribute(attributes: *std.ArrayListUnmanaged(KeyValue), key: []const u8) bool {
-    for (attributes.items, 0..) |kv, i| {
-        if (std.mem.eql(u8, kv.key, key)) {
-            _ = attributes.orderedRemove(i);
-            return true;
-        }
-    }
-    return false;
-}
-
-/// Remove attribute by path - for nested paths, only removes top-level key
-/// (Nested mutation would require more complex traversal)
-fn removeAttributeByPath(attributes: *std.ArrayListUnmanaged(KeyValue), path: []const []const u8) bool {
-    if (path.len == 0) return false;
-    // For now, only support removing top-level attributes
-    // Nested removal would require traversing into kvlist_value
-    return removeAttribute(attributes, path[0]);
-}
-
-/// Find and set an attribute value by key, or return false if not found (when upsert=false)
-/// When upsert=true, adds the attribute if not found
-fn setAttribute(attributes: *std.ArrayListUnmanaged(KeyValue), key: []const u8, value: []const u8, upsert: bool) bool {
-    for (attributes.items) |*kv| {
-        if (std.mem.eql(u8, kv.key, key)) {
-            kv.value = .{ .value = .{ .string_value = value } };
-            return true;
-        }
-    }
-    if (upsert) {
-        // Note: This append may fail if allocator runs out of memory.
-        // Since mutator returns bool, we return false on failure.
-        // The attributes list uses the arena allocator from processing context.
-        attributes.appendAssumeCapacity(.{
-            .key = key,
-            .value = .{ .value = .{ .string_value = value } },
-        });
-        return true;
-    }
-    return false;
-}
-
-/// Set attribute by path - for nested paths, only sets top-level key
-/// (Nested mutation would require more complex traversal)
-fn setAttributeByPath(attributes: *std.ArrayListUnmanaged(KeyValue), path: []const []const u8, value: []const u8, upsert: bool) bool {
-    if (path.len == 0) return false;
-    // For now, only support setting top-level attributes
-    // Nested setting would require traversing into kvlist_value
-    return setAttribute(attributes, path[0], value, upsert);
-}
 
 /// Field mutator for OTLP log format
 /// Supports remove, set, and rename operations on log fields and attributes
@@ -344,76 +255,88 @@ fn otlpFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
             switch (s.field) {
                 .log_field => |lf| switch (lf) {
                     .LOG_FIELD_BODY => {
-                        if (s.upsert or log_ctx.log_record.body != null) {
-                            log_ctx.log_record.body = .{ .value = .{ .string_value = s.value } };
-                            return true;
-                        }
-                        return false;
+                        log_ctx.log_record.body = .{ .value = .{ .string_value = s.value } };
+                        return true;
                     },
                     .LOG_FIELD_SEVERITY_TEXT => {
-                        if (s.upsert or log_ctx.log_record.severity_text.len > 0) {
-                            log_ctx.log_record.severity_text = s.value;
-                            return true;
-                        }
-                        return false;
+                        log_ctx.log_record.severity_text = s.value;
+                        return true;
                     },
                     .LOG_FIELD_TRACE_ID => {
-                        if (s.upsert or log_ctx.log_record.trace_id.len > 0) {
-                            log_ctx.log_record.trace_id = s.value;
-                            return true;
-                        }
-                        return false;
+                        log_ctx.log_record.trace_id = s.value;
+                        return true;
                     },
                     .LOG_FIELD_SPAN_ID => {
-                        if (s.upsert or log_ctx.log_record.span_id.len > 0) {
-                            log_ctx.log_record.span_id = s.value;
-                            return true;
-                        }
-                        return false;
+                        log_ctx.log_record.span_id = s.value;
+                        return true;
                     },
                     .LOG_FIELD_EVENT_NAME => {
-                        if (s.upsert or log_ctx.log_record.event_name.len > 0) {
-                            log_ctx.log_record.event_name = s.value;
-                            return true;
-                        }
-                        return false;
+                        log_ctx.log_record.event_name = s.value;
+                        return true;
                     },
                     .LOG_FIELD_RESOURCE_SCHEMA_URL => {
-                        if (s.upsert or log_ctx.resource_logs.schema_url.len > 0) {
-                            log_ctx.resource_logs.schema_url = s.value;
-                            return true;
-                        }
-                        return false;
+                        log_ctx.resource_logs.schema_url = s.value;
+                        return true;
                     },
                     .LOG_FIELD_SCOPE_SCHEMA_URL => {
-                        if (s.upsert or log_ctx.scope_logs.schema_url.len > 0) {
-                            log_ctx.scope_logs.schema_url = s.value;
-                            return true;
-                        }
-                        return false;
+                        log_ctx.scope_logs.schema_url = s.value;
+                        return true;
                     },
                     else => return false,
                 },
                 .log_attribute => |attr_path| {
-                    return setAttributeByPath(&log_ctx.log_record.attributes, attr_path.path.items, s.value, s.upsert);
+                    return setAttributeByPath(log_ctx.allocator, &log_ctx.log_record.attributes, attr_path.path.items, s.value);
                 },
                 .resource_attribute => |attr_path| {
                     if (log_ctx.resource_logs.resource) |*res| {
-                        return setAttributeByPath(&res.attributes, attr_path.path.items, s.value, s.upsert);
+                        return setAttributeByPath(log_ctx.allocator, &res.attributes, attr_path.path.items, s.value);
                     }
                     return false;
                 },
                 .scope_attribute => |attr_path| {
                     if (log_ctx.scope_logs.scope) |*scope| {
-                        return setAttributeByPath(&scope.attributes, attr_path.path.items, s.value, s.upsert);
+                        return setAttributeByPath(log_ctx.allocator, &scope.attributes, attr_path.path.items, s.value);
                     }
                     return false;
                 },
             }
         },
-        .rename => {
-            // Rename not yet supported for OTLP logs
-            return false;
+        .rename => |r| {
+            const attrs: *std.ArrayListUnmanaged(KeyValue) = switch (r.from) {
+                .log_attribute => &log_ctx.log_record.attributes,
+                .resource_attribute => if (log_ctx.resource_logs.resource) |*res| &res.attributes else return false,
+                .scope_attribute => if (log_ctx.scope_logs.scope) |*scope| &scope.attributes else return false,
+                .log_field => return false, // renaming fixed fields not supported
+            };
+            const key = switch (r.from) {
+                .log_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
+                .resource_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
+                .scope_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
+                .log_field => return false,
+            };
+
+            // Find source attribute
+            const src_idx = findAttrIndex(attrs.items, key) orelse return false;
+            const src_val = attrs.items[src_idx].value;
+
+            // If not upsert and target exists, don't overwrite
+            if (!r.upsert) {
+                if (findAttrIndex(attrs.items, r.to) != null) return true; // blocked but not an error
+            }
+
+            // Remove source
+            _ = attrs.orderedRemove(src_idx);
+
+            // Remove existing target if upsert
+            if (r.upsert) {
+                if (findAttrIndex(attrs.items, r.to)) |ti| {
+                    _ = attrs.orderedRemove(ti);
+                }
+            }
+
+            // Add renamed entry
+            attrs.append(log_ctx.allocator, .{ .key = r.to, .value = src_val }) catch return false;
+            return true;
         },
     }
 }
@@ -431,6 +354,7 @@ const FilterCounts = struct {
 /// Note: This function does not free dropped log records. The caller is responsible
 /// for memory management (e.g., via json.Parsed.deinit() or LogsData.deinit()).
 fn filterLogsInPlace(
+    allocator: std.mem.Allocator,
     logs_data: *LogsData,
     registry: *const PolicyRegistry,
     bus: *EventBus,
@@ -458,6 +382,7 @@ fn filterLogsInPlace(
                     .log_record = log_record,
                     .resource_logs = resource_logs,
                     .scope_logs = scope_logs,
+                    .allocator = allocator,
                 };
 
                 const result = engine.evaluate(.log, &ctx, otlpFieldAccessor, otlpFieldMutator, &policy_id_buf);
@@ -480,7 +405,27 @@ fn filterLogsInPlace(
             // Shrink the list to only kept items (zero allocation)
             scope_logs.log_records.shrinkRetainingCapacity(write_idx);
         }
+
+        // Prune empty scope containers
+        var scope_write_idx: usize = 0;
+        for (resource_logs.scope_logs.items) |scope_logs_item| {
+            if (scope_logs_item.log_records.items.len > 0) {
+                resource_logs.scope_logs.items[scope_write_idx] = scope_logs_item;
+                scope_write_idx += 1;
+            }
+        }
+        resource_logs.scope_logs.shrinkRetainingCapacity(scope_write_idx);
     }
+
+    // Prune empty resource containers
+    var resource_write_idx: usize = 0;
+    for (logs_data.resource_logs.items) |resource_logs_item| {
+        if (resource_logs_item.scope_logs.items.len > 0) {
+            logs_data.resource_logs.items[resource_write_idx] = resource_logs_item;
+            resource_write_idx += 1;
+        }
+    }
+    logs_data.resource_logs.shrinkRetainingCapacity(resource_write_idx);
 
     return .{
         .original_count = original_count,
@@ -516,7 +461,7 @@ fn processJsonLogs(
     defer parsed.deinit();
 
     // Filter logs in-place
-    const counts = filterLogsInPlace(&parsed.value, registry, bus);
+    const counts = filterLogsInPlace(allocator, &parsed.value, registry, bus);
 
     // Fast path: if nothing was modified, return original data without re-encoding
     if (counts.dropped_count == 0 and !counts.was_transformed) {
@@ -586,7 +531,7 @@ fn processProtobufLogs(
     var logs_data = try LogsData.decode(&reader, arena_alloc);
 
     // Filter logs in-place
-    const counts = filterLogsInPlace(&logs_data, registry, bus);
+    const counts = filterLogsInPlace(arena_alloc, &logs_data, registry, bus);
 
     // Fast path: if nothing was modified, return original data without re-encoding
     if (counts.dropped_count == 0 and !counts.was_transformed) {

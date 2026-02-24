@@ -3,6 +3,7 @@ const zimdjson = @import("zimdjson");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const datadog_log = @import("datadog_log.zig");
+const otlp_attr = @import("otlp_attributes.zig");
 
 const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;
@@ -80,10 +81,7 @@ const FieldMutator = policy.FieldMutator;
 
 /// Get the first path segment for flat attribute lookup
 /// Datadog uses flat attributes, so only the first path segment is used
-fn getFirstPathSegment(path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return null;
-    return path[0];
-}
+const getFirstPathSegment = otlp_attr.getFirstPathSegment;
 
 /// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.

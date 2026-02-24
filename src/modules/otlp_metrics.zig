@@ -21,6 +21,7 @@ const std = @import("std");
 const proto = @import("proto");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
+const otlp_attr = @import("otlp_attributes.zig");
 
 const MetricsData = proto.metrics.MetricsData;
 const ResourceMetrics = proto.metrics.ResourceMetrics;
@@ -28,11 +29,7 @@ const ScopeMetrics = proto.metrics.ScopeMetrics;
 const Metric = proto.metrics.Metric;
 const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
-const AggregationTemporality = proto.metrics.AggregationTemporality;
-
 const PolicyEngine = policy.PolicyEngine;
-const PolicyResult = policy.PolicyResult;
-const FilterDecision = policy.FilterDecision;
 const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = proto.policy.MetricField;
 const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
@@ -147,49 +144,12 @@ const OtlpMetricContext = struct {
     metric: *Metric,
     resource_metrics: *ResourceMetrics,
     scope_metrics: *ScopeMetrics,
+    datapoint_attributes: []const KeyValue,
 };
 
-/// Extract string value from an AnyValue
-fn getAnyValueString(value: ?AnyValue) ?[]const u8 {
-    const v = value orelse return null;
-    const val_union = v.value orelse return null;
-    return switch (val_union) {
-        .string_value => |s| s,
-        else => null,
-    };
-}
-
-/// Find attribute value by key in a KeyValue list
-fn findAttribute(attributes: []const KeyValue, key: []const u8) ?[]const u8 {
-    for (attributes) |kv| {
-        if (std.mem.eql(u8, kv.key, key)) {
-            return getAnyValueString(kv.value);
-        }
-    }
-    return null;
-}
-
-/// Find nested attribute value by path in a KeyValue list
-fn findNestedAttribute(attributes: []const KeyValue, path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return null;
-
-    for (attributes) |kv| {
-        if (std.mem.eql(u8, kv.key, path[0])) {
-            if (path.len == 1) {
-                return getAnyValueString(kv.value);
-            }
-            const val = kv.value orelse return null;
-            const inner = val.value orelse return null;
-            switch (inner) {
-                .kvlist_value => |kvlist| {
-                    return findNestedAttribute(kvlist.values.items, path[1..]);
-                },
-                else => return null,
-            }
-        }
-    }
-    return null;
-}
+const getAnyValueString = otlp_attr.getStringValue;
+const findAttribute = otlp_attr.findAttribute;
+const findNestedAttribute = otlp_attr.findNestedAttribute;
 
 /// Field accessor for OTLP metric format
 /// Maps MetricFieldRef to the appropriate field in the OTLP metric structure
@@ -207,46 +167,42 @@ fn otlpMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]cons
             .METRIC_FIELD_SCOPE_VERSION => if (metric_ctx.scope_metrics.scope) |scope| (if (scope.version.len > 0) scope.version else null) else null,
             else => null,
         },
-        .datapoint_attribute => |attr_path| {
-            // For datapoint attributes, we need to check attributes in the data points
-            // This is complex as metrics have different data types (gauge, sum, histogram, etc.)
-            // For now, we check metadata attributes on the metric itself
-            return findNestedAttribute(metric_ctx.metric.metadata.items, attr_path.path.items);
-        },
+        .datapoint_attribute => |attr_path| findNestedAttribute(metric_ctx.datapoint_attributes, attr_path.path.items),
         .resource_attribute => |attr_path| if (metric_ctx.resource_metrics.resource) |res| findNestedAttribute(res.attributes.items, attr_path.path.items) else null,
         .scope_attribute => |attr_path| if (metric_ctx.scope_metrics.scope) |scope| findNestedAttribute(scope.attributes.items, attr_path.path.items) else null,
-        .metric_type => getMetricTypeString(metric_ctx.metric),
-        .aggregation_temporality => getAggregationTemporalityString(metric_ctx.metric),
+        .metric_type => |requested_type| blk: {
+            const data = metric_ctx.metric.data orelse break :blk null;
+            const actual_type: @TypeOf(requested_type) = switch (data) {
+                .gauge => .METRIC_TYPE_GAUGE,
+                .sum => .METRIC_TYPE_SUM,
+                .histogram => .METRIC_TYPE_HISTOGRAM,
+                .exponential_histogram => .METRIC_TYPE_EXPONENTIAL_HISTOGRAM,
+                .summary => .METRIC_TYPE_SUMMARY,
+            };
+            break :blk if (actual_type == requested_type) @tagName(requested_type) else null;
+        },
+        .aggregation_temporality => |requested_at| blk: {
+            const data = metric_ctx.metric.data orelse break :blk null;
+            const actual_at = switch (data) {
+                .sum => |s| s.aggregation_temporality,
+                .histogram => |h| h.aggregation_temporality,
+                .exponential_histogram => |eh| eh.aggregation_temporality,
+                .gauge, .summary => break :blk null,
+            };
+            break :blk if (@intFromEnum(actual_at) == @intFromEnum(requested_at)) @tagName(requested_at) else null;
+        },
     };
 }
 
-/// Returns the metric type as a string for regex matching
-fn getMetricTypeString(metric: *Metric) ?[]const u8 {
-    const data = metric.data orelse return null;
+/// Get attributes from the first datapoint of a metric
+fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
+    const data = metric.data orelse return &.{};
     return switch (data) {
-        .gauge => "gauge",
-        .sum => "sum",
-        .histogram => "histogram",
-        .exponential_histogram => "exponential_histogram",
-        .summary => "summary",
-    };
-}
-
-/// Returns the aggregation temporality as a string for regex matching
-/// Only sum, histogram, and exponential_histogram have temporality
-fn getAggregationTemporalityString(metric: *Metric) ?[]const u8 {
-    const data = metric.data orelse return null;
-    const temporality: AggregationTemporality = switch (data) {
-        .sum => |s| s.aggregation_temporality,
-        .histogram => |h| h.aggregation_temporality,
-        .exponential_histogram => |eh| eh.aggregation_temporality,
-        .gauge, .summary => return null, // These don't have temporality
-    };
-    return switch (temporality) {
-        .AGGREGATION_TEMPORALITY_UNSPECIFIED => "unspecified",
-        .AGGREGATION_TEMPORALITY_DELTA => "delta",
-        .AGGREGATION_TEMPORALITY_CUMULATIVE => "cumulative",
-        _ => null,
+        .gauge => |g| if (g.data_points.items.len > 0) g.data_points.items[0].attributes.items else &.{},
+        .sum => |s| if (s.data_points.items.len > 0) s.data_points.items[0].attributes.items else &.{},
+        .histogram => |h| if (h.data_points.items.len > 0) h.data_points.items[0].attributes.items else &.{},
+        .exponential_histogram => |eh| if (eh.data_points.items.len > 0) eh.data_points.items[0].attributes.items else &.{},
+        .summary => |s| if (s.data_points.items.len > 0) s.data_points.items[0].attributes.items else &.{},
     };
 }
 
@@ -294,6 +250,7 @@ fn filterMetricsInPlace(
                     .metric = metric,
                     .resource_metrics = resource_metrics,
                     .scope_metrics = scope_metrics,
+                    .datapoint_attributes = getDatapointAttrs(metric),
                 };
 
                 const result = engine.evaluate(.metric, &ctx, otlpMetricFieldAccessor, otlpMetricFieldMutator, &policy_id_buf);
@@ -312,7 +269,27 @@ fn filterMetricsInPlace(
             // Shrink the list to only kept items (zero allocation)
             scope_metrics.metrics.shrinkRetainingCapacity(write_idx);
         }
+
+        // Prune empty scope containers
+        var scope_write_idx: usize = 0;
+        for (resource_metrics.scope_metrics.items) |scope_metrics_item| {
+            if (scope_metrics_item.metrics.items.len > 0) {
+                resource_metrics.scope_metrics.items[scope_write_idx] = scope_metrics_item;
+                scope_write_idx += 1;
+            }
+        }
+        resource_metrics.scope_metrics.shrinkRetainingCapacity(scope_write_idx);
     }
+
+    // Prune empty resource containers
+    var resource_write_idx: usize = 0;
+    for (metrics_data.resource_metrics.items) |resource_metrics_item| {
+        if (resource_metrics_item.scope_metrics.items.len > 0) {
+            metrics_data.resource_metrics.items[resource_write_idx] = resource_metrics_item;
+            resource_write_idx += 1;
+        }
+    }
+    metrics_data.resource_metrics.shrinkRetainingCapacity(resource_write_idx);
 
     return .{
         .original_count = original_count,

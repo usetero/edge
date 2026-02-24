@@ -713,7 +713,6 @@ test "OtlpModule: filter metrics by metric type" {
     };
     try drop_policy.target.?.metric.match.append(allocator, .{
         .field = .{ .metric_type = MetricType.METRIC_TYPE_GAUGE },
-        .match = .{ .regex = try allocator.dupe(u8, "^gauge$") },
     });
     defer drop_policy.deinit(allocator);
 
