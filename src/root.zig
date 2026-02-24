@@ -74,6 +74,7 @@ test {
     _ = @import("modules/datadog_module.zig");
     _ = @import("modules/datadog_logs_v2.zig");
     _ = @import("modules/otlp_module.zig");
+    _ = @import("modules/otlp_attributes.zig");
     _ = @import("modules/otlp_logs.zig");
     _ = @import("modules/health_module.zig");
     _ = @import("prometheus/root.zig");
