@@ -401,6 +401,10 @@ fn processJsonTraces(
 ) !ProcessResult {
     // Parse JSON into TracesData protobuf struct
     proto.protobuf.json.pb_options.emit_oneof_field_name = false;
+
+    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.)
+    proto.protobuf.json.pb_options.bytes_as_hex = true;
+
     var parsed = try TracesData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
     }, allocator);
