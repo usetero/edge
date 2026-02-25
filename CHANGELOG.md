@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.15.1](https://github.com/usetero/edge/compare/v1.15.0...v1.15.1) (2026-02-25)
+
+
+### Bug Fixes
+
+* need an allocator for attributes ([#129](https://github.com/usetero/edge/issues/129)) ([b7b6419](https://github.com/usetero/edge/commit/b7b6419b628cc39d9daea1c298dd155c27775bb1))
+* use otel hex encoding off-spec hack ([#131](https://github.com/usetero/edge/issues/131)) ([6da34fe](https://github.com/usetero/edge/commit/6da34fec1e268e17d6776c18869e2c8d9a9a7e25))
+
 ## [1.15.0](https://github.com/usetero/edge/compare/v1.14.2...v1.15.0) (2026-02-24)
 
 
