@@ -29,6 +29,9 @@ bench/bin
 zig-cache/
 
 .DS_Store
+
+# Local symlink created by conformance wrapper task
+testcases-conformance
 bench/scaling/proto_gen
 equivalence-test-*/
 plots/

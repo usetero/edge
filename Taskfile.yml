@@ -182,6 +182,41 @@ tasks:
         fi
         echo "Benchmark dependencies installed"
 
+  # =============================================================================
+  # Policy Conformance
+  # =============================================================================
+
+  conformance:edge:link:
+    desc: "Link local edge binary and testcases into policy-conformance"
+    vars:
+      CONFORMANCE_DIR: '{{.CONFORMANCE_DIR | default "../policy-conformance"}}'
+    cmds:
+      - |
+        if [ ! -d "{{.CONFORMANCE_DIR}}" ]; then
+          echo "policy-conformance repo not found at {{.CONFORMANCE_DIR}}"
+          echo "Set CONFORMANCE_DIR=/absolute/path if needed"
+          exit 1
+        fi
+      - zig build otlp -Doptimize=ReleaseFast
+      - mkdir -p "{{.CONFORMANCE_DIR}}/implementations/edge"
+      - ln -sfn "{{.TASKFILE_DIR}}/zig-out/bin/edge-otlp" "{{.CONFORMANCE_DIR}}/implementations/edge/edge"
+      - ln -sfn "{{.CONFORMANCE_DIR}}/testcases" "{{.TASKFILE_DIR}}/testcases-conformance"
+      - echo "✅ Linked edge binary and testcases"
+
+  conformance:edge:test:
+    desc: "Run policy-conformance test:impl:edge from this repo"
+    aliases: [tce]
+    vars:
+      CONFORMANCE_DIR: '{{.CONFORMANCE_DIR | default "../policy-conformance"}}'
+    deps: [conformance:edge:link]
+    cmds:
+      - |
+        if [ -n "{{.TC}}" ]; then
+          "{{.TASKFILE_DIR}}/bin/task" --taskfile "{{.CONFORMANCE_DIR}}/Taskfile.yml" test:impl:edge TC={{.TC}}
+        else
+          "{{.TASKFILE_DIR}}/bin/task" --taskfile "{{.CONFORMANCE_DIR}}/Taskfile.yml" test:impl:edge
+        fi
+
   watch:
     desc: "Watch for changes and rebuild"
     aliases: [w]
