@@ -8,7 +8,7 @@
 #   docker buildx build --platform linux/arm64 -f lambda/Dockerfile -o type=local,dest=.layers .
 #   docker buildx build --platform linux/amd64 -f lambda/Dockerfile -o type=local,dest=.layers .
 
-FROM alpine:edge@sha256:115729ec5cb049ba6359c3ab005ac742012d92bbaa5b8bc1a878f1e8f62c0cb8
+FROM alpine:edge@sha256:9a341ff2287c54b86425cbee0141114d811ae69d88a36019087be6d896cef241
 
 # Install Zig and build dependencies
 RUN apk add --no-cache \
