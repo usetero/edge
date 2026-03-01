@@ -59,6 +59,7 @@ pub const LambdaConfig = struct {
     // Limits
     max_body_size: u32 = 5 * 1024 * 1024, // 5MB
     max_upstream_retries: u8 = 3,
+    upstream_retry_time_budget_ms: u32 = 2000,
 
     // Service metadata
     service: struct {
@@ -315,6 +316,7 @@ pub fn main() !void {
         config.listen_address,
         config.listen_port,
         config.max_upstream_retries,
+        config.upstream_retry_time_budget_ms,
         config.max_body_size,
         &module_registrations,
     );

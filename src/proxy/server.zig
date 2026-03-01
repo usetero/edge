@@ -169,6 +169,9 @@ const ServerContext = struct {
     /// Maximum retries for failed upstream requests
     max_upstream_retries: u8,
 
+    /// Upper bound on total retry time budget per request (ms)
+    upstream_retry_time_budget_ms: u32,
+
     /// Event bus for observability
     bus: *EventBus,
 
@@ -244,6 +247,7 @@ pub const ProxyServer = struct {
         listen_address: [4]u8,
         listen_port: u16,
         max_upstream_retries: u8,
+        upstream_retry_time_budget_ms: u32,
         max_body_size: u32,
         module_registrations: []const ModuleRegistration,
     ) !ProxyServer {
@@ -253,6 +257,7 @@ pub const ProxyServer = struct {
         ctx.allocator = allocator;
         ctx.bus = bus;
         ctx.max_upstream_retries = max_upstream_retries;
+        ctx.upstream_retry_time_budget_ms = upstream_retry_time_budget_ms;
         ctx.upstreams = UpstreamClientManager.init(allocator);
         errdefer ctx.upstreams.deinit();
         ctx.modules = .{ .modules = .{} };
@@ -559,6 +564,8 @@ fn proxyToUpstream(
     body_to_send: []const u8,
 ) !usize {
     const max_retries = ctx.max_upstream_retries;
+    const retry_budget_ms = ctx.upstream_retry_time_budget_ms;
+    const start_ms = std.time.milliTimestamp();
     var attempt: u8 = 0;
 
     // https://codeberg.org/ziglang/zig/issues/30165
@@ -579,6 +586,13 @@ fn proxyToUpstream(
 
             if (!is_retryable or attempt + 1 >= max_retries) {
                 return err;
+            }
+
+            if (retry_budget_ms > 0) {
+                const elapsed_ms = std.time.milliTimestamp() - start_ms;
+                if (elapsed_ms >= @as(i64, @intCast(retry_budget_ms))) {
+                    return err;
+                }
             }
 
             ctx.bus.warn(UpstreamRetry{
