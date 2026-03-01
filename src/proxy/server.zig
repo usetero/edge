@@ -427,6 +427,29 @@ fn shouldSkipResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "transfer-encoding");
 }
 
+const HeaderTarget = struct {
+    headers: []std.http.Header,
+    dynamic: bool,
+};
+
+fn selectHeaderTarget(
+    allocator: std.mem.Allocator,
+    header_count: usize,
+    buffer: []std.http.Header,
+) !HeaderTarget {
+    if (header_count <= buffer.len) {
+        return .{
+            .headers = buffer[0..header_count],
+            .dynamic = false,
+        };
+    }
+
+    return .{
+        .headers = try allocator.alloc(std.http.Header, header_count),
+        .dynamic = true,
+    };
+}
+
 /// Build headers array in single pass
 fn buildHeadersArray(
     allocator: std.mem.Allocator,
@@ -441,36 +464,21 @@ fn buildHeadersArray(
         header_count += 1;
     }
 
-    if (header_count <= buffer.len) {
-        var count: usize = 0;
-        var it = req.headers.iterator();
-
-        while (it.next()) |header| {
-            if (shouldSkipRequestHeader(header.key)) continue;
-            buffer[count] = .{
-                .name = header.key,
-                .value = header.value,
-            };
-            count += 1;
-        }
-
-        return buffer[0..count];
-    }
-
-    const dynamic_headers = try allocator.alloc(std.http.Header, header_count);
+    const target = try selectHeaderTarget(allocator, header_count, buffer);
+    const out = target.headers;
     var count: usize = 0;
     var it = req.headers.iterator();
 
     while (it.next()) |header| {
         if (shouldSkipRequestHeader(header.key)) continue;
-        dynamic_headers[count] = .{
+        out[count] = .{
             .name = header.key,
             .value = header.value,
         };
         count += 1;
     }
 
-    return dynamic_headers[0..count];
+    return out[0..count];
 }
 
 /// Main proxy handler - catchall for all requests
@@ -823,4 +831,26 @@ test "shouldSkipResponseHeader" {
     try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
     try std.testing.expect(!shouldSkipResponseHeader("content-type"));
     try std.testing.expect(!shouldSkipResponseHeader("x-custom-header"));
+}
+
+test "selectHeaderTarget uses dynamic allocation when header count exceeds stack buffer" {
+    const allocator = std.testing.allocator;
+    var stack_buf: [64]std.http.Header = undefined;
+
+    const target = try selectHeaderTarget(allocator, 65, &stack_buf);
+    defer if (target.dynamic) allocator.free(target.headers);
+
+    try std.testing.expect(target.dynamic);
+    try std.testing.expectEqual(@as(usize, 65), target.headers.len);
+}
+
+test "selectHeaderTarget uses stack buffer when header count fits" {
+    const allocator = std.testing.allocator;
+    var stack_buf: [64]std.http.Header = undefined;
+
+    const target = try selectHeaderTarget(allocator, 10, &stack_buf);
+
+    try std.testing.expect(!target.dynamic);
+    try std.testing.expectEqual(@as(usize, 10), target.headers.len);
+    try std.testing.expect(@intFromPtr(target.headers.ptr) == @intFromPtr((&stack_buf).ptr));
 }
