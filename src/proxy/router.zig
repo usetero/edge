@@ -29,12 +29,6 @@ const SuffixRoute = struct {
     methods: MethodBitmask,
 };
 
-/// Hash key for exact matches (includes method)
-const ExactMatchKey = struct {
-    hash: u64,
-    method: HttpMethod,
-};
-
 /// Fast routing table built at startup
 /// O(1) for exact matches, O(n) for prefix/suffix matches
 pub const Router = struct {
@@ -54,6 +48,7 @@ pub const Router = struct {
     allocator: std.mem.Allocator,
 
     const ExactMatchEntry = struct {
+        path: []const u8,
         module_id: ModuleId,
         methods: MethodBitmask,
     };
@@ -76,6 +71,7 @@ pub const Router = struct {
                 switch (route_pattern.pattern_type) {
                     .exact => {
                         try exact_matches.put(allocator, route_pattern.hash, .{
+                            .path = route_pattern.pattern,
                             .module_id = mod_config.id,
                             .methods = route_pattern.methods,
                         });
@@ -135,7 +131,7 @@ pub const Router = struct {
         // 1. Try exact hash match first (fastest path)
         const hash = std.hash.Wyhash.hash(0, path);
         if (self.exact_matches.get(hash)) |entry| {
-            if (entry.methods.matches(method)) {
+            if (std.mem.eql(u8, entry.path, path) and entry.methods.matches(method)) {
                 return .{
                     .module_id = entry.module_id,
                     .remaining_path = "",
@@ -224,6 +220,38 @@ test "Router exact match" {
     // No match for different path
     const no_path = router.route("/api/v1/logs", .POST);
     try std.testing.expect(no_path == null);
+}
+
+test "Router exact hash hit requires path equality" {
+    const allocator = std.testing.allocator;
+
+    var exact_matches = std.AutoHashMapUnmanaged(u64, Router.ExactMatchEntry){};
+    defer exact_matches.deinit(allocator);
+
+    const target_path = "/api/v2/logs";
+    const hash = std.hash.Wyhash.hash(0, target_path);
+
+    try exact_matches.put(allocator, hash, .{
+        .path = "/different-path",
+        .module_id = @enumFromInt(0),
+        .methods = .{ .post = true },
+    });
+
+    const empty_prefix = try allocator.alloc(PrefixRoute, 0);
+    defer allocator.free(empty_prefix);
+    const empty_suffix = try allocator.alloc(SuffixRoute, 0);
+    defer allocator.free(empty_suffix);
+
+    const router = Router{
+        .exact_matches = exact_matches,
+        .prefix_routes = empty_prefix,
+        .suffix_routes = empty_suffix,
+        .fallback = null,
+        .allocator = allocator,
+    };
+
+    const result = router.route(target_path, .POST);
+    try std.testing.expect(result == null);
 }
 
 test "Router prefix match" {
