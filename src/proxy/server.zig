@@ -429,24 +429,48 @@ fn shouldSkipResponseHeader(name: []const u8) bool {
 
 /// Build headers array in single pass
 fn buildHeadersArray(
+    allocator: std.mem.Allocator,
     req: *httpz.Request,
     buffer: []std.http.Header,
 ) ![]std.http.Header {
+    // Count forwardable headers first so we can avoid fixed-buffer overflow.
+    var header_count: usize = 0;
+    var count_it = req.headers.iterator();
+    while (count_it.next()) |header| {
+        if (shouldSkipRequestHeader(header.key)) continue;
+        header_count += 1;
+    }
+
+    if (header_count <= buffer.len) {
+        var count: usize = 0;
+        var it = req.headers.iterator();
+
+        while (it.next()) |header| {
+            if (shouldSkipRequestHeader(header.key)) continue;
+            buffer[count] = .{
+                .name = header.key,
+                .value = header.value,
+            };
+            count += 1;
+        }
+
+        return buffer[0..count];
+    }
+
+    const dynamic_headers = try allocator.alloc(std.http.Header, header_count);
     var count: usize = 0;
     var it = req.headers.iterator();
 
     while (it.next()) |header| {
         if (shouldSkipRequestHeader(header.key)) continue;
-        if (count >= buffer.len) return error.TooManyHeaders;
-
-        buffer[count] = .{
+        dynamic_headers[count] = .{
             .name = header.key,
             .value = header.value,
         };
         count += 1;
     }
 
-    return buffer[0..count];
+    return dynamic_headers[0..count];
 }
 
 /// Main proxy handler - catchall for all requests
@@ -621,7 +645,7 @@ fn proxyToUpstreamOnce(
 
     // Build headers array (single pass)
     var headers_buf: [64]std.http.Header = undefined;
-    const headers = try buildHeadersArray(req, &headers_buf);
+    const headers = try buildHeadersArray(req.arena, req, &headers_buf);
 
     // Determine if we have a body to send
     const has_body = body_to_send.len > 0 and switch (method) {
