@@ -553,6 +553,34 @@ fn getUnderlyingWriteError(upstream_req: *std.http.Client.Request) ?[]const u8 {
     return @errorName(write_err);
 }
 
+fn isRetryableUpstreamErrorName(err_name: []const u8) bool {
+    return std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
+        std.mem.eql(u8, err_name, "BrokenPipe") or
+        std.mem.eql(u8, err_name, "ConnectionTimedOut") or
+        std.mem.eql(u8, err_name, "UnexpectedReadFailure") or
+        std.mem.eql(u8, err_name, "HttpConnectionClosing") or
+        std.mem.eql(u8, err_name, "UnexpectedWriteFailure");
+}
+
+fn shouldRetryUpstreamRequest(
+    err_name: []const u8,
+    attempt: u8,
+    max_retries: u8,
+    start_ms: i64,
+    now_ms: i64,
+    retry_budget_ms: u32,
+) bool {
+    if (!isRetryableUpstreamErrorName(err_name)) return false;
+    if (attempt + 1 >= max_retries) return false;
+
+    if (retry_budget_ms > 0) {
+        const elapsed_ms = now_ms - start_ms;
+        if (elapsed_ms >= @as(i64, @intCast(retry_budget_ms))) return false;
+    }
+
+    return true;
+}
+
 /// Forward request to upstream and stream response back
 /// Returns the number of bytes in the response body
 fn proxyToUpstream(
@@ -575,24 +603,16 @@ fn proxyToUpstream(
         if (result) |bytes| {
             return bytes;
         } else |err| {
-            // Only retry on connection-related errors (stale connections from pool)
             const err_name = @errorName(err);
-            const is_retryable = std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
-                std.mem.eql(u8, err_name, "BrokenPipe") or
-                std.mem.eql(u8, err_name, "ConnectionTimedOut") or
-                std.mem.eql(u8, err_name, "UnexpectedReadFailure") or
-                std.mem.eql(u8, err_name, "HttpConnectionClosing") or
-                std.mem.eql(u8, err_name, "UnexpectedWriteFailure");
-
-            if (!is_retryable or attempt + 1 >= max_retries) {
+            if (!shouldRetryUpstreamRequest(
+                err_name,
+                attempt,
+                max_retries,
+                start_ms,
+                std.time.milliTimestamp(),
+                retry_budget_ms,
+            )) {
                 return err;
-            }
-
-            if (retry_budget_ms > 0) {
-                const elapsed_ms = std.time.milliTimestamp() - start_ms;
-                if (elapsed_ms >= @as(i64, @intCast(retry_budget_ms))) {
-                    return err;
-                }
             }
 
             ctx.bus.warn(UpstreamRetry{
@@ -813,4 +833,57 @@ test "shouldSkipResponseHeader" {
     try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
     try std.testing.expect(!shouldSkipResponseHeader("content-type"));
     try std.testing.expect(!shouldSkipResponseHeader("x-custom-header"));
+}
+
+test "shouldRetryUpstreamRequest respects retryable errors and attempt budget" {
+    const start_ms: i64 = 1000;
+
+    try std.testing.expect(shouldRetryUpstreamRequest(
+        "ConnectionResetByPeer",
+        0,
+        3,
+        start_ms,
+        start_ms + 10,
+        2000,
+    ));
+
+    try std.testing.expect(!shouldRetryUpstreamRequest(
+        "InvalidArgument",
+        0,
+        3,
+        start_ms,
+        start_ms + 10,
+        2000,
+    ));
+
+    try std.testing.expect(!shouldRetryUpstreamRequest(
+        "ConnectionResetByPeer",
+        2,
+        3,
+        start_ms,
+        start_ms + 10,
+        2000,
+    ));
+}
+
+test "shouldRetryUpstreamRequest respects retry time budget" {
+    const start_ms: i64 = 1000;
+
+    try std.testing.expect(shouldRetryUpstreamRequest(
+        "BrokenPipe",
+        0,
+        3,
+        start_ms,
+        start_ms + 1999,
+        2000,
+    ));
+
+    try std.testing.expect(!shouldRetryUpstreamRequest(
+        "BrokenPipe",
+        0,
+        3,
+        start_ms,
+        start_ms + 2000,
+        2000,
+    ));
 }
