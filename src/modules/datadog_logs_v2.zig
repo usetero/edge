@@ -101,46 +101,11 @@ fn lookupLogAttribute(log: *DatadogLog, path: []const []const u8) ?[]const u8 {
         if (std.mem.eql(u8, key, "custom_field")) return log.custom_field;
     }
 
-    // Check extra fields (supports nested paths via zimdjson Value.at())
-    return findNestedExtra(&log.extra, path);
+    // Check extra fields (supports nested dotted-key paths)
+    return findExtraField(&log.extra, path);
 }
 
-/// Look up an attribute in the extra fields HashMap.
-/// Supports multi-segment paths by joining segments with '.' to form a dotted key,
-/// which matches Datadog's flat attribute convention (e.g., "http.request.method").
-fn findNestedExtra(extra: *const std.StringHashMapUnmanaged(datadog_log.AnyValue), path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return null;
-
-    // Try direct lookup of first segment
-    if (extra.get(path[0])) |value| {
-        if (path.len == 1) {
-            if (value == .string) return value.string.get() catch null;
-            return null;
-        }
-    }
-
-    // For multi-segment paths, try dotted key (e.g., ["http", "method"] -> "http.method")
-    if (path.len > 1) {
-        // Build dotted key on stack
-        var buf: [512]u8 = undefined;
-        var pos: usize = 0;
-        for (path) |segment| {
-            if (pos > 0) {
-                if (pos >= buf.len) return null;
-                buf[pos] = '.';
-                pos += 1;
-            }
-            if (pos + segment.len > buf.len) return null;
-            @memcpy(buf[pos .. pos + segment.len], segment);
-            pos += segment.len;
-        }
-        if (extra.get(buf[0..pos])) |value| {
-            if (value == .string) return value.string.get() catch null;
-        }
-    }
-
-    return null;
-}
+const findExtraField = otlp_attr.findExtraField;
 
 /// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
