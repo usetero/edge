@@ -202,11 +202,17 @@ fn removeMetricAttribute(series: *MetricSeries, path: []const []const u8) bool {
     const key = getFirstPathSegment(path) orelse return false;
     if (path.len > 1) return false;
     if (std.mem.eql(u8, key, "tags")) {
-        if (series.tags != null) { series.tags = null; return true; }
+        if (series.tags != null) {
+            series.tags = null;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "source_type_name")) {
-        if (series.source_type_name != null) { series.source_type_name = null; return true; }
+        if (series.source_type_name != null) {
+            series.source_type_name = null;
+            return true;
+        }
         return false;
     }
     return false;
@@ -217,7 +223,10 @@ fn setMetricAttribute(series: *MetricSeries, path: []const []const u8, value: []
     const key = getFirstPathSegment(path) orelse return false;
     if (path.len > 1) return false;
     if (std.mem.eql(u8, key, "source_type_name")) {
-        if (upsert or series.source_type_name != null) { series.source_type_name = value; return true; }
+        if (upsert or series.source_type_name != null) {
+            series.source_type_name = value;
+            return true;
+        }
         return false;
     }
     return false;

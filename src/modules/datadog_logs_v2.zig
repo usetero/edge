@@ -168,27 +168,45 @@ fn removeLogAttribute(log: *DatadogLog, path: []const []const u8) bool {
     // Only support removing top-level known fields (nested extra fields are read-only)
     if (path.len > 1) return false;
     if (std.mem.eql(u8, key, "service")) {
-        if (log.service != null) { log.service = null; return true; }
+        if (log.service != null) {
+            log.service = null;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "hostname")) {
-        if (log.hostname != null) { log.hostname = null; return true; }
+        if (log.hostname != null) {
+            log.hostname = null;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "ddsource")) {
-        if (log.ddsource != null) { log.ddsource = null; return true; }
+        if (log.ddsource != null) {
+            log.ddsource = null;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "ddtags")) {
-        if (log.ddtags != null) { log.ddtags = null; return true; }
+        if (log.ddtags != null) {
+            log.ddtags = null;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "environment")) {
-        if (log.environment != null) { log.environment = null; return true; }
+        if (log.environment != null) {
+            log.environment = null;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "custom_field")) {
-        if (log.custom_field != null) { log.custom_field = null; return true; }
+        if (log.custom_field != null) {
+            log.custom_field = null;
+            return true;
+        }
         return false;
     }
     return false;
@@ -200,27 +218,45 @@ fn setLogAttribute(log: *DatadogLog, path: []const []const u8, value: []const u8
     // Only support setting top-level known fields (nested extra fields are read-only)
     if (path.len > 1) return false;
     if (std.mem.eql(u8, key, "service")) {
-        if (upsert or log.service != null) { log.service = value; return true; }
+        if (upsert or log.service != null) {
+            log.service = value;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "hostname")) {
-        if (upsert or log.hostname != null) { log.hostname = value; return true; }
+        if (upsert or log.hostname != null) {
+            log.hostname = value;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "ddsource")) {
-        if (upsert or log.ddsource != null) { log.ddsource = value; return true; }
+        if (upsert or log.ddsource != null) {
+            log.ddsource = value;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "ddtags")) {
-        if (upsert or log.ddtags != null) { log.ddtags = value; return true; }
+        if (upsert or log.ddtags != null) {
+            log.ddtags = value;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "environment")) {
-        if (upsert or log.environment != null) { log.environment = value; return true; }
+        if (upsert or log.environment != null) {
+            log.environment = value;
+            return true;
+        }
         return false;
     }
     if (std.mem.eql(u8, key, "custom_field")) {
-        if (upsert or log.custom_field != null) { log.custom_field = value; return true; }
+        if (upsert or log.custom_field != null) {
+            log.custom_field = value;
+            return true;
+        }
         return false;
     }
     return false;
