@@ -427,26 +427,58 @@ fn shouldSkipResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "transfer-encoding");
 }
 
+const HeaderTarget = struct {
+    headers: []std.http.Header,
+    dynamic: bool,
+};
+
+fn selectHeaderTarget(
+    allocator: std.mem.Allocator,
+    header_count: usize,
+    buffer: []std.http.Header,
+) !HeaderTarget {
+    if (header_count <= buffer.len) {
+        return .{
+            .headers = buffer[0..header_count],
+            .dynamic = false,
+        };
+    }
+
+    return .{
+        .headers = try allocator.alloc(std.http.Header, header_count),
+        .dynamic = true,
+    };
+}
+
 /// Build headers array in single pass
 fn buildHeadersArray(
+    allocator: std.mem.Allocator,
     req: *httpz.Request,
     buffer: []std.http.Header,
 ) ![]std.http.Header {
+    // Count forwardable headers first so we can avoid fixed-buffer overflow.
+    var header_count: usize = 0;
+    var count_it = req.headers.iterator();
+    while (count_it.next()) |header| {
+        if (shouldSkipRequestHeader(header.key)) continue;
+        header_count += 1;
+    }
+
+    const target = try selectHeaderTarget(allocator, header_count, buffer);
+    const out = target.headers;
     var count: usize = 0;
     var it = req.headers.iterator();
 
     while (it.next()) |header| {
         if (shouldSkipRequestHeader(header.key)) continue;
-        if (count >= buffer.len) return error.TooManyHeaders;
-
-        buffer[count] = .{
+        out[count] = .{
             .name = header.key,
             .value = header.value,
         };
         count += 1;
     }
 
-    return buffer[0..count];
+    return out[0..count];
 }
 
 /// Main proxy handler - catchall for all requests
@@ -621,7 +653,7 @@ fn proxyToUpstreamOnce(
 
     // Build headers array (single pass)
     var headers_buf: [64]std.http.Header = undefined;
-    const headers = try buildHeadersArray(req, &headers_buf);
+    const headers = try buildHeadersArray(req.arena, req, &headers_buf);
 
     // Determine if we have a body to send
     const has_body = body_to_send.len > 0 and switch (method) {
@@ -799,4 +831,26 @@ test "shouldSkipResponseHeader" {
     try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
     try std.testing.expect(!shouldSkipResponseHeader("content-type"));
     try std.testing.expect(!shouldSkipResponseHeader("x-custom-header"));
+}
+
+test "selectHeaderTarget uses dynamic allocation when header count exceeds stack buffer" {
+    const allocator = std.testing.allocator;
+    var stack_buf: [64]std.http.Header = undefined;
+
+    const target = try selectHeaderTarget(allocator, 65, &stack_buf);
+    defer if (target.dynamic) allocator.free(target.headers);
+
+    try std.testing.expect(target.dynamic);
+    try std.testing.expectEqual(@as(usize, 65), target.headers.len);
+}
+
+test "selectHeaderTarget uses stack buffer when header count fits" {
+    const allocator = std.testing.allocator;
+    var stack_buf: [64]std.http.Header = undefined;
+
+    const target = try selectHeaderTarget(allocator, 10, &stack_buf);
+
+    try std.testing.expect(!target.dynamic);
+    try std.testing.expectEqual(@as(usize, 10), target.headers.len);
+    try std.testing.expect(@intFromPtr(target.headers.ptr) == @intFromPtr((&stack_buf).ptr));
 }
