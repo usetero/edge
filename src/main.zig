@@ -365,6 +365,7 @@ pub fn main() !void {
         config.listen_address,
         config.listen_port,
         config.max_upstream_retries,
+        config.upstream_retry_time_budget_ms,
         config.max_body_size,
         &module_registrations,
     );
