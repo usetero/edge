@@ -82,6 +82,10 @@ const ResponseTruncated = struct {
     max_size: usize,
 };
 
+const ModifiedPayloadBypassed = struct {
+    reason: []const u8,
+};
+
 const UpstreamRetry = struct {
     attempt: u8,
     max_retries: u8,
@@ -529,9 +533,13 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
             if (encoding != .none) {
                 body_to_send = compressIfNeeded(req.arena, module_result.modified_body, encoding) catch |err| blk: {
                     ctx.bus.warn(CompressError{ .err = @errorName(err) });
-                    break :blk module_result.modified_body; // Fall back to uncompressed
+                    // Payload integrity first: if we cannot safely re-encode a modified payload,
+                    // bypass modification and forward the original body unchanged.
+                    ctx.bus.warn(ModifiedPayloadBypassed{ .reason = "recompression_failed" });
+                    break :blk original_body;
                 };
-                compressed_allocated = (body_to_send.ptr != module_result.modified_body.ptr);
+                compressed_allocated = (body_to_send.ptr != module_result.modified_body.ptr and
+                    body_to_send.ptr != original_body.ptr);
             }
             defer if (compressed_allocated) req.arena.free(body_to_send);
 
