@@ -252,7 +252,7 @@ fn jsonType(comptime T: type) type {
 }
 
 /// Apply parsed JSON values to config.
-fn applyJsonValues(comptime T: type, allocator: std.mem.Allocator, config: *T, json: jsonType(T)) LoadError!void {
+fn applyJsonValues(comptime T: type, allocator: std.mem.Allocator, config: *T, json: anytype) LoadError!void {
     const info = @typeInfo(T);
 
     switch (info) {

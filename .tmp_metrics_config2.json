@@ -1,0 +1,14 @@
+{
+  "listen_address": "127.0.0.1",
+  "listen_port": 18090,
+  "upstream_url": "http://127.0.0.1:18081",
+  "log_level": "warn",
+  "max_body_size": 10485760,
+  "policy_providers": [
+    {
+      "id": "file",
+      "type": "file",
+      "path": "/Users/jea/Code/tero/policy-conformance/testcases/metrics_drop_by_name/policies.json"
+    }
+  ]
+}
