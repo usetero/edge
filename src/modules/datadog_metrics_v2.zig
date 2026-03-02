@@ -83,8 +83,81 @@ const MetricFieldMutator = policy.MetricFieldMutator;
 /// Datadog uses flat attributes, so only the first path segment is used
 const getFirstPathSegment = otlp_attr.getFirstPathSegment;
 
+/// Look up an attribute across all Datadog metric data sources.
+/// Searches tags, source_type_name, resources, and extra HashMap (with nested support).
+/// Since Datadog has no resource/scope distinction, all attribute types
+/// search the same flat namespace.
+fn lookupMetricAttribute(series: *MetricSeries, tags_cache: ?[]const u8, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    const key = path[0];
+
+    // Check tags and source_type_name (single-segment only)
+    if (path.len == 1) {
+        if (std.mem.eql(u8, key, "tags")) return tags_cache;
+        if (std.mem.eql(u8, key, "source_type_name")) return series.source_type_name;
+    }
+
+    // Check resources array: path[0] matches resource type
+    if (series.resources) |resources| {
+        for (resources) |*res| {
+            if (res.type) |res_type| {
+                if (std.mem.eql(u8, key, res_type)) {
+                    if (path.len == 1) return res.name;
+                    // Two-segment path: ["host", "name"] or ["host", "type"]
+                    if (path.len == 2) {
+                        if (std.mem.eql(u8, path[1], "name")) return res.name;
+                        if (std.mem.eql(u8, path[1], "type")) return res.type;
+                    }
+                }
+            }
+        }
+    }
+
+    // Check extra fields (supports nested paths via zimdjson Value.at())
+    return findNestedExtra(&series.extra, path);
+}
+
+/// Look up an attribute in the extra fields HashMap.
+/// Supports multi-segment paths by joining segments with '.' to form a dotted key,
+/// which matches Datadog's flat attribute convention (e.g., "http.request.method").
+fn findNestedExtra(extra: *const std.StringHashMapUnmanaged(datadog_metric.AnyValue), path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+
+    // Try direct lookup of first segment
+    if (extra.get(path[0])) |value| {
+        if (path.len == 1) {
+            if (value == .string) return value.string.get() catch null;
+            return null;
+        }
+    }
+
+    // For multi-segment paths, try dotted key (e.g., ["http", "method"] -> "http.method")
+    if (path.len > 1) {
+        // Build dotted key on stack
+        var buf: [512]u8 = undefined;
+        var pos: usize = 0;
+        for (path) |segment| {
+            if (pos > 0) {
+                if (pos >= buf.len) return null;
+                buf[pos] = '.';
+                pos += 1;
+            }
+            if (pos + segment.len > buf.len) return null;
+            @memcpy(buf[pos .. pos + segment.len], segment);
+            pos += segment.len;
+        }
+        if (extra.get(buf[0..pos])) |value| {
+            if (value == .string) return value.string.get() catch null;
+        }
+    }
+
+    return null;
+}
+
 /// Field accessor for Datadog metric format
-/// Maps MetricFieldRef to actual field values in MetricSeries
+/// Maps MetricFieldRef to actual field values in MetricSeries.
+/// All attribute types (datapoint, resource, scope) search the same flat namespace since
+/// Datadog has no OTLP-style resource/scope hierarchy.
 fn datadogMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
     const field_ctx: *const FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const series = field_ctx.series;
@@ -104,35 +177,10 @@ fn datadogMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]c
             // Handle any unknown/future enum values
             _ => null,
         },
-        .datapoint_attribute => |attr_path| {
-            const key = getFirstPathSegment(attr_path.path.items) orelse return null;
-            // For tags, we match on the concatenated tags string
-            if (std.mem.eql(u8, key, "tags")) {
-                return field_ctx.tags_cache;
-            }
-            // source_type_name is accessible as an attribute
-            if (std.mem.eql(u8, key, "source_type_name")) {
-                return series.source_type_name;
-            }
-            return null;
-        },
-        .resource_attribute => |attr_path| {
-            const key = getFirstPathSegment(attr_path.path.items) orelse return null;
-            // Check resources for matching type
-            if (series.resources) |resources| {
-                for (resources) |*res| {
-                    if (res.type) |res_type| {
-                        if (std.mem.eql(u8, key, res_type)) {
-                            return res.name;
-                        }
-                    }
-                }
-            }
-            return null;
-        },
-        .scope_attribute => null, // Datadog format doesn't have scope attributes
+        // All attribute types search the same Datadog flat namespace
+        .datapoint_attribute, .resource_attribute, .scope_attribute => |attr_path| lookupMetricAttribute(series, field_ctx.tags_cache, attr_path.path.items),
         .metric_type => getDatadogMetricTypeString(series),
-        .aggregation_temporality => null, // Datadog format doesn't have aggregation temporality
+        .aggregation_temporality => null,
     };
 }
 
@@ -149,8 +197,35 @@ fn getDatadogMetricTypeString(series: *MetricSeries) ?[]const u8 {
     };
 }
 
+/// Remove a known metric attribute by key. Only supports top-level (single-segment) keys.
+fn removeMetricAttribute(series: *MetricSeries, path: []const []const u8) bool {
+    const key = getFirstPathSegment(path) orelse return false;
+    if (path.len > 1) return false;
+    if (std.mem.eql(u8, key, "tags")) {
+        if (series.tags != null) { series.tags = null; return true; }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "source_type_name")) {
+        if (series.source_type_name != null) { series.source_type_name = null; return true; }
+        return false;
+    }
+    return false;
+}
+
+/// Set a known metric attribute by key. Only supports top-level (single-segment) keys.
+fn setMetricAttribute(series: *MetricSeries, path: []const []const u8, value: []const u8, upsert: bool) bool {
+    const key = getFirstPathSegment(path) orelse return false;
+    if (path.len > 1) return false;
+    if (std.mem.eql(u8, key, "source_type_name")) {
+        if (upsert or series.source_type_name != null) { series.source_type_name = value; return true; }
+        return false;
+    }
+    return false;
+}
+
 /// Field mutator for Datadog metric format
-/// Supports remove and set operations on known fields
+/// Supports remove and set operations on known fields.
+/// All attribute types (datapoint, resource, scope) use the same mutation logic.
 fn datadogMetricFieldMutator(ctx: *anyopaque, op: MetricMutateOp) bool {
     const field_ctx: *FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const series = field_ctx.series;
@@ -175,25 +250,10 @@ fn datadogMetricFieldMutator(ctx: *anyopaque, op: MetricMutateOp) bool {
                     },
                     else => return false,
                 },
-                .datapoint_attribute => |attr_path| {
-                    const key = getFirstPathSegment(attr_path.path.items) orelse return false;
-                    if (std.mem.eql(u8, key, "tags")) {
-                        if (series.tags != null) {
-                            series.tags = null;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "source_type_name")) {
-                        if (series.source_type_name != null) {
-                            series.source_type_name = null;
-                            return true;
-                        }
-                        return false;
-                    }
-                    return false;
+                .datapoint_attribute, .resource_attribute, .scope_attribute => |attr_path| {
+                    return removeMetricAttribute(series, attr_path.path.items);
                 },
-                .resource_attribute, .scope_attribute, .metric_type, .aggregation_temporality => return false,
+                .metric_type, .aggregation_temporality => return false,
             }
         },
         .set => |s| {
@@ -215,18 +275,10 @@ fn datadogMetricFieldMutator(ctx: *anyopaque, op: MetricMutateOp) bool {
                     },
                     else => return false,
                 },
-                .datapoint_attribute => |attr_path| {
-                    const key = getFirstPathSegment(attr_path.path.items) orelse return false;
-                    if (std.mem.eql(u8, key, "source_type_name")) {
-                        if (s.upsert or series.source_type_name != null) {
-                            series.source_type_name = s.value;
-                            return true;
-                        }
-                        return false;
-                    }
-                    return false;
+                .datapoint_attribute, .resource_attribute, .scope_attribute => |attr_path| {
+                    return setMetricAttribute(series, attr_path.path.items, s.value, s.upsert);
                 },
-                .resource_attribute, .scope_attribute, .metric_type, .aggregation_temporality => return false,
+                .metric_type, .aggregation_temporality => return false,
             }
         },
         .rename => {
@@ -746,6 +798,105 @@ test "processMetrics - filter on metric type" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "cpu.usage") != null);
     try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
+}
+
+test "datadogMetricFieldAccessor - scope_attribute searches metric attributes" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"metric": "system.load.1", "type": 3, "tags": ["env:prod", "service:web"], "resources": [{"type": "host", "name": "web-01"}]}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.tags.?);
+    defer allocator.free(series.resources.?);
+
+    const tags_cache = try buildTagsCache(allocator, series.tags);
+    defer if (tags_cache) |tc| allocator.free(tc);
+
+    var field_ctx = FieldAccessorContext{
+        .series = &series,
+        .tags_cache = tags_cache,
+    };
+
+    // scope_attribute should find tags
+    const tags_val = datadogMetricFieldAccessor(&field_ctx, .{ .scope_attribute = testAttrPath("tags") });
+    try std.testing.expect(tags_val != null);
+    try std.testing.expectEqualStrings("env:prod,service:web", tags_val.?);
+
+    // scope_attribute should find resources
+    const host_val = datadogMetricFieldAccessor(&field_ctx, .{ .scope_attribute = testAttrPath("host") });
+    try std.testing.expect(host_val != null);
+    try std.testing.expectEqualStrings("web-01", host_val.?);
+}
+
+test "datadogMetricFieldAccessor - resource with nested path" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"metric": "system.cpu", "type": 3, "resources": [{"type": "host", "name": "web-01"}]}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.resources.?);
+
+    var field_ctx = FieldAccessorContext{
+        .series = &series,
+        .tags_cache = null,
+    };
+
+    // Two-segment path ["host", "name"] should find resource type=host and return name
+    const nested_path = proto.policy.AttributePath{
+        .path = .{ .items = @constCast(&[_][]const u8{ "host", "name" }) },
+    };
+    const name_val = datadogMetricFieldAccessor(&field_ctx, .{ .resource_attribute = nested_path });
+    try std.testing.expect(name_val != null);
+    try std.testing.expectEqualStrings("web-01", name_val.?);
+
+    // Two-segment path ["host", "type"] should return the type
+    const type_path = proto.policy.AttributePath{
+        .path = .{ .items = @constCast(&[_][]const u8{ "host", "type" }) },
+    };
+    const type_val = datadogMetricFieldAccessor(&field_ctx, .{ .resource_attribute = type_path });
+    try std.testing.expect(type_val != null);
+    try std.testing.expectEqualStrings("host", type_val.?);
+}
+
+test "datadogMetricFieldAccessor - nested extra field via dotted key" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    // Datadog uses dotted keys for nested attributes
+    const json =
+        \\{"metric": "custom.metric", "type": 3, "custom_data.region": "us-east"}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer series.deinit(allocator);
+
+    var field_ctx = FieldAccessorContext{
+        .series = &series,
+        .tags_cache = null,
+    };
+
+    // Two-segment path joined with '.' to match dotted key
+    const nested_path = proto.policy.AttributePath{
+        .path = .{ .items = @constCast(&[_][]const u8{ "custom_data", "region" }) },
+    };
+    const val = datadogMetricFieldAccessor(&field_ctx, .{ .datapoint_attribute = nested_path });
+    try std.testing.expect(val != null);
+    try std.testing.expectEqualStrings("us-east", val.?);
 }
 
 test "buildTagsCache - concatenates tags with comma separator" {
