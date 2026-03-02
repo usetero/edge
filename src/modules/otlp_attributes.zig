@@ -1,10 +1,12 @@
-//! Shared attribute helpers for OTLP modules (logs, traces, metrics).
+//! Shared attribute helpers for OTLP and Datadog modules.
 //!
-//! These functions operate on proto KeyValue / AnyValue types and are
-//! used by all three OTLP signal modules for field access and mutation.
+//! These functions operate on proto KeyValue / AnyValue types and zimdjson
+//! types, and are used by OTLP and Datadog signal modules for field access
+//! and mutation.
 
 const std = @import("std");
 const proto = @import("proto");
+const zimdjson = @import("zimdjson");
 
 pub const AnyValue = proto.common.AnyValue;
 pub const KeyValue = proto.common.KeyValue;
@@ -118,6 +120,45 @@ pub fn setAttributeByPath(allocator: std.mem.Allocator, attributes: *std.ArrayLi
 pub fn getFirstPathSegment(path: []const []const u8) ?[]const u8 {
     if (path.len == 0) return null;
     return path[0];
+}
+
+/// zimdjson AnyValue type used by Datadog log/metric extra fields.
+pub const ZimdjsonAnyValue = zimdjson.ondemand.FullParser(.default).AnyValue;
+
+/// Look up an attribute in a zimdjson extra fields HashMap.
+/// Supports multi-segment paths by joining segments with '.' to form a dotted key,
+/// which matches Datadog's flat attribute convention (e.g., "http.request.method").
+pub fn findExtraField(extra: *const std.StringHashMapUnmanaged(ZimdjsonAnyValue), path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+
+    // Try direct lookup of first segment
+    if (extra.get(path[0])) |value| {
+        if (path.len == 1) {
+            if (value == .string) return value.string.get() catch null;
+            return null;
+        }
+    }
+
+    // For multi-segment paths, try dotted key (e.g., ["http", "method"] -> "http.method")
+    if (path.len > 1) {
+        var buf: [512]u8 = undefined;
+        var pos: usize = 0;
+        for (path) |segment| {
+            if (pos > 0) {
+                if (pos >= buf.len) return null;
+                buf[pos] = '.';
+                pos += 1;
+            }
+            if (pos + segment.len > buf.len) return null;
+            @memcpy(buf[pos .. pos + segment.len], segment);
+            pos += segment.len;
+        }
+        if (extra.get(buf[0..pos])) |value| {
+            if (value == .string) return value.string.get() catch null;
+        }
+    }
+
+    return null;
 }
 
 // =============================================================================
@@ -538,4 +579,51 @@ test "getFirstPathSegment - single element" {
 test "getFirstPathSegment - empty" {
     const path = [_][]const u8{};
     try std.testing.expectEqual(@as(?[]const u8, null), getFirstPathSegment(&path));
+}
+
+// ── findExtraField ──────────────────────────────────────────────────
+
+test "findExtraField - empty path" {
+    var map: std.StringHashMapUnmanaged(ZimdjsonAnyValue) = .empty;
+    const path = [_][]const u8{};
+    try std.testing.expectEqual(@as(?[]const u8, null), findExtraField(&map, &path));
+}
+
+test "findExtraField - empty map" {
+    var map: std.StringHashMapUnmanaged(ZimdjsonAnyValue) = .empty;
+    const path = [_][]const u8{"key"};
+    try std.testing.expectEqual(@as(?[]const u8, null), findExtraField(&map, &path));
+}
+
+test "findExtraField - dotted key joins segments" {
+    // This tests the path joining logic with a pre-populated map.
+    // Real integration is tested in datadog_logs_v2 and datadog_metrics_v2.
+    const allocator = std.testing.allocator;
+    const Parser = zimdjson.ondemand.FullParser(.default);
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"http.method": "GET"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var obj = try doc.asValue().asObject();
+    var map: std.StringHashMapUnmanaged(ZimdjsonAnyValue) = .empty;
+    defer map.deinit(allocator);
+    var it = obj.iterator();
+    while (try it.next()) |field| {
+        const key_copy = try allocator.dupe(u8, try field.key.get());
+        map.put(allocator, key_copy, try field.value.asAny()) catch {
+            allocator.free(key_copy);
+        };
+    }
+    defer {
+        var key_it = map.keyIterator();
+        while (key_it.next()) |k| allocator.free(k.*);
+    }
+
+    const path = [_][]const u8{ "http", "method" };
+    const result = findExtraField(&map, &path);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("GET", result.?);
 }

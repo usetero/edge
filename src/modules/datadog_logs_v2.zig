@@ -83,8 +83,34 @@ const FieldMutator = policy.FieldMutator;
 /// Datadog uses flat attributes, so only the first path segment is used
 const getFirstPathSegment = otlp_attr.getFirstPathSegment;
 
+/// Look up an attribute across all Datadog log data sources.
+/// Searches known fields, ddtags, and extra HashMap (with nested support).
+/// Since Datadog has no resource/scope distinction, all attribute types
+/// search the same flat namespace.
+fn lookupLogAttribute(log: *DatadogLog, path: []const []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    const key = path[0];
+
+    // Check known fields (only for single-segment paths)
+    if (path.len == 1) {
+        if (std.mem.eql(u8, key, "service")) return log.service;
+        if (std.mem.eql(u8, key, "hostname")) return log.hostname;
+        if (std.mem.eql(u8, key, "ddsource")) return log.ddsource;
+        if (std.mem.eql(u8, key, "ddtags")) return log.ddtags;
+        if (std.mem.eql(u8, key, "environment")) return log.environment;
+        if (std.mem.eql(u8, key, "custom_field")) return log.custom_field;
+    }
+
+    // Check extra fields (supports nested dotted-key paths)
+    return findExtraField(&log.extra, path);
+}
+
+const findExtraField = otlp_attr.findExtraField;
+
 /// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
+/// All attribute types (log, resource, scope) search the same flat namespace since
+/// Datadog has no OTLP-style resource/scope hierarchy.
 fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     const field_ctx: *const FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const log = field_ctx.log;
@@ -96,31 +122,114 @@ fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             // Datadog JSON format doesn't have direct equivalents for these OTLP fields
             else => null,
         },
-        .log_attribute => |attr_path| {
-            // For attributes, look up by key name (first path segment only - Datadog has flat structure)
-            const key = getFirstPathSegment(attr_path.path.items) orelse return null;
-            if (std.mem.eql(u8, key, "service")) return log.service;
-            if (std.mem.eql(u8, key, "hostname")) return log.hostname;
-            if (std.mem.eql(u8, key, "ddsource")) return log.ddsource;
-            if (std.mem.eql(u8, key, "ddtags")) return log.ddtags;
-            if (std.mem.eql(u8, key, "environment")) return log.environment;
-            if (std.mem.eql(u8, key, "custom_field")) return log.custom_field;
-            // Check extra fields for dynamic attributes
-            if (log.extra.get(key)) |any_value| {
-                // Only string values can be matched with regex
-                if (any_value == .string) {
-                    return any_value.string.get() catch null;
-                }
-            }
-            return null;
-        },
-        // Datadog JSON format doesn't have resource/scope attributes
-        .resource_attribute, .scope_attribute => null,
+        // All attribute types search the same Datadog flat namespace
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| lookupLogAttribute(log, attr_path.path.items),
     };
 }
 
+/// Remove a known log attribute by key. Only supports top-level (single-segment) keys.
+fn removeLogAttribute(log: *DatadogLog, path: []const []const u8) bool {
+    const key = getFirstPathSegment(path) orelse return false;
+    // Only support removing top-level known fields (nested extra fields are read-only)
+    if (path.len > 1) return false;
+    if (std.mem.eql(u8, key, "service")) {
+        if (log.service != null) {
+            log.service = null;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "hostname")) {
+        if (log.hostname != null) {
+            log.hostname = null;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "ddsource")) {
+        if (log.ddsource != null) {
+            log.ddsource = null;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "ddtags")) {
+        if (log.ddtags != null) {
+            log.ddtags = null;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "environment")) {
+        if (log.environment != null) {
+            log.environment = null;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "custom_field")) {
+        if (log.custom_field != null) {
+            log.custom_field = null;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+/// Set a known log attribute by key. Only supports top-level (single-segment) keys.
+fn setLogAttribute(log: *DatadogLog, path: []const []const u8, value: []const u8, upsert: bool) bool {
+    const key = getFirstPathSegment(path) orelse return false;
+    // Only support setting top-level known fields (nested extra fields are read-only)
+    if (path.len > 1) return false;
+    if (std.mem.eql(u8, key, "service")) {
+        if (upsert or log.service != null) {
+            log.service = value;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "hostname")) {
+        if (upsert or log.hostname != null) {
+            log.hostname = value;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "ddsource")) {
+        if (upsert or log.ddsource != null) {
+            log.ddsource = value;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "ddtags")) {
+        if (upsert or log.ddtags != null) {
+            log.ddtags = value;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "environment")) {
+        if (upsert or log.environment != null) {
+            log.environment = value;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, key, "custom_field")) {
+        if (upsert or log.custom_field != null) {
+            log.custom_field = value;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 /// Field mutator for Datadog JSON log format
-/// Supports remove and set operations on known fields
+/// Supports remove and set operations on known fields.
+/// All attribute types (log, resource, scope) use the same mutation logic.
 fn datadogFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
     const field_ctx: *FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const log = field_ctx.log;
@@ -150,53 +259,9 @@ fn datadogFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
                     },
                     else => return false,
                 },
-                .log_attribute => |attr_path| {
-                    const key = getFirstPathSegment(attr_path.path.items) orelse return false;
-                    if (std.mem.eql(u8, key, "service")) {
-                        if (log.service != null) {
-                            log.service = null;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "hostname")) {
-                        if (log.hostname != null) {
-                            log.hostname = null;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "ddsource")) {
-                        if (log.ddsource != null) {
-                            log.ddsource = null;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "ddtags")) {
-                        if (log.ddtags != null) {
-                            log.ddtags = null;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "environment")) {
-                        if (log.environment != null) {
-                            log.environment = null;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "custom_field")) {
-                        if (log.custom_field != null) {
-                            log.custom_field = null;
-                            return true;
-                        }
-                        return false;
-                    }
-                    return false;
+                .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
+                    return removeLogAttribute(log, attr_path.path.items);
                 },
-                .resource_attribute, .scope_attribute => return false,
             }
         },
         .set => |s| {
@@ -218,53 +283,9 @@ fn datadogFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
                     },
                     else => return false,
                 },
-                .log_attribute => |attr_path| {
-                    const key = getFirstPathSegment(attr_path.path.items) orelse return false;
-                    if (std.mem.eql(u8, key, "service")) {
-                        if (s.upsert or log.service != null) {
-                            log.service = s.value;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "hostname")) {
-                        if (s.upsert or log.hostname != null) {
-                            log.hostname = s.value;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "ddsource")) {
-                        if (s.upsert or log.ddsource != null) {
-                            log.ddsource = s.value;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "ddtags")) {
-                        if (s.upsert or log.ddtags != null) {
-                            log.ddtags = s.value;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "environment")) {
-                        if (s.upsert or log.environment != null) {
-                            log.environment = s.value;
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (std.mem.eql(u8, key, "custom_field")) {
-                        if (s.upsert or log.custom_field != null) {
-                            log.custom_field = s.value;
-                            return true;
-                        }
-                        return false;
-                    }
-                    return false;
+                .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
+                    return setLogAttribute(log, attr_path.path.items, s.value, s.upsert);
                 },
-                .resource_attribute, .scope_attribute => return false,
             }
         },
         .rename => {
@@ -483,6 +504,129 @@ test "datadogFieldAccessor - extra field lookup" {
     const trace_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = testAttrPath("trace_id") });
     try std.testing.expect(trace_val != null);
     try std.testing.expectEqualStrings("abc123-def456", trace_val.?);
+}
+
+test "datadogFieldAccessor - resource_attribute searches log attributes" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message": "test", "service": "my-svc", "trace_id": "abc123"}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    var field_ctx = FieldAccessorContext{ .log = &log };
+
+    // resource_attribute should find known fields
+    const svc_val = datadogFieldAccessor(&field_ctx, .{ .resource_attribute = testAttrPath("service") });
+    try std.testing.expect(svc_val != null);
+    try std.testing.expectEqualStrings("my-svc", svc_val.?);
+
+    // resource_attribute should find extra fields
+    const trace_val = datadogFieldAccessor(&field_ctx, .{ .resource_attribute = testAttrPath("trace_id") });
+    try std.testing.expect(trace_val != null);
+    try std.testing.expectEqualStrings("abc123", trace_val.?);
+}
+
+test "datadogFieldAccessor - scope_attribute searches log attributes" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message": "test", "hostname": "web-01"}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    var field_ctx = FieldAccessorContext{ .log = &log };
+
+    // scope_attribute should find known fields
+    const host_val = datadogFieldAccessor(&field_ctx, .{ .scope_attribute = testAttrPath("hostname") });
+    try std.testing.expect(host_val != null);
+    try std.testing.expectEqualStrings("web-01", host_val.?);
+}
+
+test "datadogFieldAccessor - nested extra field access via dotted key" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    // Datadog uses dotted keys for nested attributes
+    const json =
+        \\{"message": "test", "http.method": "GET", "http.status_code": "200"}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    var field_ctx = FieldAccessorContext{ .log = &log };
+
+    // Two-segment path should be joined with '.' to match dotted key
+    const method_path = proto.policy.AttributePath{
+        .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }) },
+    };
+    const method_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = method_path });
+    try std.testing.expect(method_val != null);
+    try std.testing.expectEqualStrings("GET", method_val.?);
+}
+
+test "datadogFieldAccessor - nested dotted key not found returns null" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message": "test", "http.method": "GET"}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    var field_ctx = FieldAccessorContext{ .log = &log };
+
+    // Path to non-existent dotted key
+    const missing_path = proto.policy.AttributePath{
+        .path = .{ .items = @constCast(&[_][]const u8{ "http", "nonexistent" }) },
+    };
+    const val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = missing_path });
+    try std.testing.expect(val == null);
+}
+
+test "datadogFieldAccessor - multi-segment path with no matching dotted key returns null" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message": "test", "flat_field": "just-a-string"}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    var field_ctx = FieldAccessorContext{ .log = &log };
+
+    // Multi-segment path that doesn't match any dotted key
+    const bad_path = proto.policy.AttributePath{
+        .path = .{ .items = @constCast(&[_][]const u8{ "flat_field", "nested" }) },
+    };
+    const val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = bad_path });
+    try std.testing.expect(val == null);
 }
 
 test "processLogs - no policies keeps all logs in array" {
