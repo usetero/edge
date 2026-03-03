@@ -2,6 +2,17 @@ const std = @import("std");
 
 pub const ModuleId = enum(u32) { _ };
 
+pub const RouteKind = enum {
+    health,
+    datadog_logs,
+    datadog_metrics,
+    otlp_logs,
+    otlp_metrics,
+    otlp_traces,
+    prometheus_metrics,
+    passthrough,
+};
+
 pub const HttpMethod = enum {
     GET,
     POST,

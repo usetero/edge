@@ -67,6 +67,58 @@ const ServerError = struct { message: anyerror };
 var server_instance: ?*ProxyServer = null;
 var global_event_bus: ?*EventBus = null;
 
+const RouteBundle = enum {
+    datadog_logs,
+    datadog_metrics,
+    otlp,
+    prometheus,
+};
+
+const edge_bundles = [_]RouteBundle{
+    .datadog_logs,
+    .datadog_metrics,
+    .otlp,
+    .prometheus,
+};
+const datadog_bundles = [_]RouteBundle{
+    .datadog_logs,
+    .datadog_metrics,
+};
+const otlp_bundles = [_]RouteBundle{.otlp};
+const prometheus_bundles = [_]RouteBundle{.prometheus};
+
+fn supportedStagesFor(distribution: mode.Distribution) []const policy.proto.policy.PolicyStage {
+    return switch (distribution) {
+        .edge => &.{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+            .POLICY_STAGE_TRACE_SAMPLING,
+        },
+        .datadog => &.{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+        },
+        .otlp => &.{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+            .POLICY_STAGE_TRACE_SAMPLING,
+        },
+        .prometheus => &.{.POLICY_STAGE_METRIC_FILTER},
+    };
+}
+
+fn bundlesFor(distribution: mode.Distribution) []const RouteBundle {
+    return switch (distribution) {
+        .edge => &edge_bundles,
+        .datadog => &datadog_bundles,
+        .otlp => &otlp_bundles,
+        .prometheus => &prometheus_bundles,
+    };
+}
+
 fn handleShutdownSignal(sig: c_int) callconv(.c) void {
     _ = sig;
     if (global_event_bus) |bus| {
@@ -166,35 +218,12 @@ pub fn run(distribution: mode.Distribution) !void {
     const instance_id_copy = try allocator.dupe(u8, instance_id);
     defer allocator.free(instance_id_copy);
 
-    const supported_stages = switch (distribution) {
-        .edge => &.{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-            .POLICY_STAGE_TRACE_SAMPLING,
-        },
-        .datadog => &.{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-        },
-        .otlp => &.{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-            .POLICY_STAGE_TRACE_SAMPLING,
-        },
-        .prometheus => &.{
-            .POLICY_STAGE_METRIC_FILTER,
-        },
-    };
-
     const service_metadata = policy.ServiceMetadata{
         .name = config.service.name,
         .namespace = config.service.namespace,
         .version = config.service.version,
         .instance_id = instance_id_copy,
-        .supported_stages = supported_stages,
+        .supported_stages = supportedStagesFor(distribution),
     };
 
     var addr_buf: [64]u8 = undefined;
@@ -270,6 +299,7 @@ pub fn run(distribution: mode.Distribution) !void {
 
     try module_registrations.append(allocator, .{
         .module = .{ .health = &health_module },
+        .route_kind = .health,
         .routes = &health_mod.routes,
         .upstream_url = config.upstream_url,
         .max_request_body = 0,
@@ -277,83 +307,58 @@ pub fn run(distribution: mode.Distribution) !void {
         .module_data = null,
     });
 
-    switch (distribution) {
-        .edge => {
-            try module_registrations.append(allocator, .{
-                .module = .{ .datadog = &datadog_logs_module },
-                .routes = &datadog_mod.logs_routes,
-                .upstream_url = logs_upstream,
-                .max_request_body = config.max_body_size,
-                .max_response_body = config.max_body_size,
-                .module_data = @ptrCast(&datadog_config),
-            });
-            try module_registrations.append(allocator, .{
-                .module = .{ .datadog = &datadog_metrics_module },
-                .routes = &datadog_mod.metrics_routes,
-                .upstream_url = metrics_upstream,
-                .max_request_body = config.max_body_size,
-                .max_response_body = config.max_body_size,
-                .module_data = @ptrCast(&datadog_config),
-            });
-            try module_registrations.append(allocator, .{
-                .module = .{ .otlp = &otlp_module },
-                .routes = &otlp_mod.routes,
-                .upstream_url = config.upstream_url,
-                .max_request_body = config.max_body_size,
-                .max_response_body = config.max_body_size,
-                .module_data = @ptrCast(&otlp_config),
-            });
-            try module_registrations.append(allocator, .{
-                .module = .{ .prometheus = &prometheus_module },
-                .routes = &prometheus_mod.default_routes,
-                .upstream_url = metrics_upstream,
-                .max_request_body = 1024,
-                .max_response_body = config.max_body_size,
-                .module_data = @ptrCast(&prometheus_config),
-            });
-        },
-        .datadog => {
-            try module_registrations.append(allocator, .{
-                .module = .{ .datadog = &datadog_logs_module },
-                .routes = &datadog_mod.logs_routes,
-                .upstream_url = logs_upstream,
-                .max_request_body = config.max_body_size,
-                .max_response_body = config.max_body_size,
-                .module_data = @ptrCast(&datadog_config),
-            });
-            try module_registrations.append(allocator, .{
-                .module = .{ .datadog = &datadog_metrics_module },
-                .routes = &datadog_mod.metrics_routes,
-                .upstream_url = metrics_upstream,
-                .max_request_body = config.max_body_size,
-                .max_response_body = config.max_body_size,
-                .module_data = @ptrCast(&datadog_config),
-            });
-        },
-        .otlp => {
-            try module_registrations.append(allocator, .{
-                .module = .{ .otlp = &otlp_module },
-                .routes = &otlp_mod.routes,
-                .upstream_url = config.upstream_url,
-                .max_request_body = config.max_body_size,
-                .max_response_body = config.max_body_size,
-                .module_data = @ptrCast(&otlp_config),
-            });
-        },
-        .prometheus => {
-            try module_registrations.append(allocator, .{
-                .module = .{ .prometheus = &prometheus_module },
-                .routes = &prometheus_mod.default_routes,
-                .upstream_url = metrics_upstream,
-                .max_request_body = 1024,
-                .max_response_body = config.max_body_size,
-                .module_data = @ptrCast(&prometheus_config),
-            });
-        },
+    for (bundlesFor(distribution)) |bundle| {
+        switch (bundle) {
+            .datadog_logs => {
+                try module_registrations.append(allocator, .{
+                    .module = .{ .datadog = &datadog_logs_module },
+                    .route_kind = .datadog_logs,
+                    .routes = &datadog_mod.logs_routes,
+                    .upstream_url = logs_upstream,
+                    .max_request_body = config.max_body_size,
+                    .max_response_body = config.max_body_size,
+                    .module_data = @ptrCast(&datadog_config),
+                });
+            },
+            .datadog_metrics => {
+                try module_registrations.append(allocator, .{
+                    .module = .{ .datadog = &datadog_metrics_module },
+                    .route_kind = .datadog_metrics,
+                    .routes = &datadog_mod.metrics_routes,
+                    .upstream_url = metrics_upstream,
+                    .max_request_body = config.max_body_size,
+                    .max_response_body = config.max_body_size,
+                    .module_data = @ptrCast(&datadog_config),
+                });
+            },
+            .otlp => {
+                try module_registrations.append(allocator, .{
+                    .module = .{ .otlp = &otlp_module },
+                    .route_kind = .otlp_logs,
+                    .routes = &otlp_mod.routes,
+                    .upstream_url = config.upstream_url,
+                    .max_request_body = config.max_body_size,
+                    .max_response_body = config.max_body_size,
+                    .module_data = @ptrCast(&otlp_config),
+                });
+            },
+            .prometheus => {
+                try module_registrations.append(allocator, .{
+                    .module = .{ .prometheus = &prometheus_module },
+                    .route_kind = .prometheus_metrics,
+                    .routes = &prometheus_mod.default_routes,
+                    .upstream_url = metrics_upstream,
+                    .max_request_body = 1024,
+                    .max_response_body = config.max_body_size,
+                    .module_data = @ptrCast(&prometheus_config),
+                });
+            },
+        }
     }
 
     try module_registrations.append(allocator, .{
         .module = .{ .passthrough = &passthrough_module },
+        .route_kind = .passthrough,
         .routes = &passthrough_mod.default_routes,
         .upstream_url = config.upstream_url,
         .max_request_body = config.max_body_size,

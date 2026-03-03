@@ -7,6 +7,7 @@ const health_mod = @import("health_module.zig");
 const prometheus_mod = @import("prometheus_module.zig");
 
 pub const ModuleId = types.ModuleId;
+pub const RouteKind = types.RouteKind;
 pub const HttpMethod = types.HttpMethod;
 pub const MethodBitmask = types.MethodBitmask;
 pub const RoutePattern = types.RoutePattern;
@@ -61,6 +62,7 @@ pub const ProxyModule = union(enum) {
 
 pub const ModuleRegistration = struct {
     module: ProxyModule,
+    route_kind: RouteKind = .passthrough,
     routes: []const RoutePattern,
     upstream_url: []const u8,
     max_path_length: u32 = 2048,

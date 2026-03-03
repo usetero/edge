@@ -3,6 +3,8 @@ const httpz = @import("httpz");
 const proxy_module = @import("../modules/proxy_module.zig");
 const router_mod = @import("router.zig");
 const upstream_client = @import("upstream_client.zig");
+const runtime_pipeline = @import("../runtime/pipeline.zig");
+const transport_mod = @import("../io/transport.zig");
 const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 
@@ -12,10 +14,12 @@ const ModuleRequest = proxy_module.ModuleRequest;
 const ModuleStreamResult = proxy_module.ModuleStreamResult;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const ProxyModule = proxy_module.ProxyModule;
-const ResponseFilter = proxy_module.ResponseFilter;
 const HttpMethod = proxy_module.HttpMethod;
+const RouteKind = proxy_module.RouteKind;
 const Router = router_mod.Router;
 const UpstreamClientManager = upstream_client.UpstreamClientManager;
+const PrefilterDecision = runtime_pipeline.PrefilterDecision;
+const UpstreamTransport = transport_mod.UpstreamTransport;
 
 // =============================================================================
 // Observability Events
@@ -40,42 +44,6 @@ const RequestError = struct {
 };
 
 const ModuleError = struct {
-    err: []const u8,
-};
-
-const UpstreamRequest = struct {
-    method: []const u8,
-    url: []const u8,
-};
-
-const UpstreamResponse = struct {
-    status: u16,
-    bytes: usize,
-};
-
-const UpstreamStreamError = struct {
-    err: []const u8,
-    bytes_streamed: usize = 0,
-};
-
-const UpstreamConnectionError = struct {
-    err: []const u8,
-    phase: []const u8,
-    underlying_err: ?[]const u8 = null,
-};
-
-const ResponseFlushError = struct {
-    err: []const u8,
-    bytes_written: usize,
-};
-
-const ResponseTruncated = struct {
-    max_size: usize,
-};
-
-const UpstreamRetry = struct {
-    attempt: u8,
-    max_retries: u8,
     err: []const u8,
 };
 
@@ -117,6 +85,7 @@ pub const CompressionEncoding = enum {
 const ModuleEntry = struct {
     id: ModuleId,
     instance: ProxyModule,
+    route_kind: RouteKind,
     config: ModuleConfig,
 };
 
@@ -139,6 +108,36 @@ const ModuleRegistry = struct {
         self.modules.deinit(allocator);
     }
 };
+
+const RoutePlan = struct {
+    module_id: ModuleId,
+    module: ProxyModule,
+    route_kind: RouteKind,
+    module_data: ?*const anyopaque,
+    upstream: proxy_module.UpstreamConfig,
+    decision: PrefilterDecision,
+};
+
+fn classifyRoutePlan(ctx: *ServerContext, req: *httpz.Request) ?RoutePlan {
+    const http_method = toHttpMethod(req.method);
+    const match = ctx.router.route(req.url.path, http_method) orelse return null;
+    const module_entry = ctx.modules.get(match.module_id) orelse return null;
+    const upstream = ctx.upstreams.getUpstreamConfig(match.module_id);
+    const route_kind = runtime_pipeline.classifyRoute(req.url.path, http_method);
+
+    return .{
+        .module_id = match.module_id,
+        .module = module_entry.instance,
+        .route_kind = route_kind,
+        .module_data = module_entry.config.module_data,
+        .upstream = upstream,
+        .decision = runtime_pipeline.prefilter(
+            route_kind,
+            http_method,
+            req.header("content-type"),
+        ),
+    };
+}
 
 /// Server context - passed to all httpz handlers
 const ServerContext = struct {
@@ -281,6 +280,7 @@ pub const ProxyServer = struct {
             try ctx.modules.modules.append(allocator, .{
                 .id = module_id,
                 .instance = reg.module,
+                .route_kind = reg.route_kind,
                 .config = module_config,
             });
 
@@ -377,102 +377,36 @@ fn getHeaderFromHttpz(ctx: ?*const anyopaque, name: []const u8) ?[]const u8 {
     return req.header(name);
 }
 
-/// Check if header should be skipped when forwarding request
-fn shouldSkipRequestHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "host") or
-        std.ascii.eqlIgnoreCase(name, "connection") or
-        std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
-}
-
-/// Check if header should be skipped when forwarding response
-fn shouldSkipResponseHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
-}
-
-/// Build headers array in single pass
-fn buildHeadersArray(
-    req: *httpz.Request,
-    buffer: []std.http.Header,
-) ![]std.http.Header {
-    var count: usize = 0;
-    var it = req.headers.iterator();
-
-    while (it.next()) |header| {
-        if (shouldSkipRequestHeader(header.key)) continue;
-        if (count >= buffer.len) return error.TooManyHeaders;
-
-        buffer[count] = .{
-            .name = header.key,
-            .value = header.value,
-        };
-        count += 1;
-    }
-
-    return buffer[0..count];
-}
-
-/// Stream bytes from reader to writer up to max_bytes.
-/// Uses only std.Io.Reader/std.Io.Writer vtables to keep streaming paths testable.
-fn streamReaderToWriter(
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-    max_bytes: usize,
-) std.Io.Reader.StreamError!usize {
-    var total_bytes: usize = 0;
-    while (total_bytes < max_bytes) {
-        const bytes = reader.stream(
-            writer,
-            std.Io.Limit.limited(max_bytes - total_bytes),
-        ) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (bytes == 0) break;
-        total_bytes += bytes;
-    }
-    return total_bytes;
-}
-
 /// Main proxy handler - catchall for all requests
 fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, response_bytes: *usize) !void {
-    const http_method = toHttpMethod(req.method);
-
-    // Route request to appropriate module
-    const match = ctx.router.route(req.url.path, http_method) orelse {
+    const plan = classifyRoutePlan(ctx, req) orelse {
         // No module matched - return 404
         res.status = 404;
         res.body = "Not Found";
         return;
     };
 
-    const module_entry = ctx.modules.get(match.module_id) orelse {
-        res.status = 500;
-        res.body = "Internal Server Error: Module not found";
-        return;
-    };
+    const http_method = toHttpMethod(req.method);
 
-    const upstream_config = ctx.upstreams.getUpstreamConfig(match.module_id);
     const module_req = ModuleRequest{
         .method = http_method,
         .path = req.url.path,
         .query = req.url.query,
-        .upstream = &upstream_config,
-        .module_ctx = module_entry.config.module_data,
+        .upstream = &plan.upstream,
+        .module_ctx = plan.module_data,
         .headers_ctx = req,
         .get_header_fn = getHeaderFromHttpz,
     };
 
-    response_bytes.* = try proxyToUpstreamStreaming(ctx, req, res, match.module_id, module_entry.instance, module_req);
-}
-
-/// Extract underlying write error from HTTP client request
-/// The WriteFailed error is a wrapper - actual error is stored in the connection's stream_writer
-fn getUnderlyingWriteError(upstream_req: *std.http.Client.Request) ?[]const u8 {
-    const connection = upstream_req.connection orelse return null;
-    const write_err = connection.stream_writer.err orelse return null;
-    return @errorName(write_err);
+    response_bytes.* = try proxyToUpstreamStreaming(
+        ctx,
+        req,
+        res,
+        plan.module_id,
+        plan.module,
+        plan.decision,
+        module_req,
+    );
 }
 
 fn proxyToUpstreamStreaming(
@@ -481,9 +415,14 @@ fn proxyToUpstreamStreaming(
     res: *httpz.Response,
     module_id: ModuleId,
     module: ProxyModule,
+    decision: PrefilterDecision,
     module_req: ModuleRequest,
 ) !usize {
-    const prepared = try prepareOutboundBody(ctx, req, module, module_req);
+    const method = toStdHttpMethod(toHttpMethod(req.method));
+    const prepared = switch (decision) {
+        .fast_path => try prepareOutboundFastPath(req),
+        .policy_path => try prepareOutboundBody(ctx, req, module, module_req),
+    };
     switch (prepared.action) {
         .respond_immediately => {
             res.status = prepared.status;
@@ -493,46 +432,20 @@ fn proxyToUpstreamStreaming(
         .forwarded => {},
     }
 
-    const max_retries = ctx.max_upstream_retries;
-    var attempt: u8 = 0;
-
-    // https://codeberg.org/ziglang/zig/issues/30165
-    // TODO: Remove this once the bug is fixed.
-    // Retry is needed because pooled upstream connections can go stale between
-    // requests and fail on first write/read despite being selected from pool.
-    // We precompute a replayable outbound body so retries are deterministic.
-    while (attempt < max_retries) : (attempt += 1) {
-        const result = proxyToUpstreamPreparedOnce(
-            ctx,
-            req,
-            res,
-            module_id,
-            module,
-            prepared.body,
-            prepared.has_body,
-        );
-        if (result) |bytes| {
-            return bytes;
-        } else |err| {
-            const err_name = @errorName(err);
-            const is_retryable = std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
-                std.mem.eql(u8, err_name, "BrokenPipe") or
-                std.mem.eql(u8, err_name, "ConnectionTimedOut") or
-                std.mem.eql(u8, err_name, "UnexpectedReadFailure") or
-                std.mem.eql(u8, err_name, "HttpConnectionClosing") or
-                std.mem.eql(u8, err_name, "UnexpectedWriteFailure");
-
-            if (!is_retryable or attempt + 1 >= max_retries) return err;
-
-            ctx.bus.warn(UpstreamRetry{
-                .attempt = attempt + 1,
-                .max_retries = max_retries,
-                .err = err_name,
-            });
-        }
-    }
-
-    return error.NotEnoughData;
+    const transport = UpstreamTransport{ .ctx = .{
+        .upstreams = &ctx.upstreams,
+        .bus = ctx.bus,
+        .max_upstream_retries = ctx.max_upstream_retries,
+    } };
+    return transport.proxyPrepared(
+        req,
+        res,
+        method,
+        module_id,
+        module,
+        prepared.body,
+        prepared.has_body,
+    );
 }
 
 const PreparedOutbound = struct {
@@ -543,6 +456,29 @@ const PreparedOutbound = struct {
     response_body: []const u8 = &.{},
 };
 
+fn prepareOutboundFastPath(req: *httpz.Request) !PreparedOutbound {
+    const method = toStdHttpMethod(toHttpMethod(req.method));
+    if (!method.requestHasBody()) return .{ .action = .forwarded, .has_body = false };
+    if (req.body_len == 0) return .{ .action = .forwarded, .has_body = false };
+
+    var request_reader = try req.reader(30_000);
+    var captured_writer: std.Io.Writer.Allocating = .init(req.arena);
+    errdefer captured_writer.deinit();
+
+    _ = transport_mod.streamReaderToWriter(
+        &request_reader.interface,
+        &captured_writer.writer,
+        std.math.maxInt(usize),
+    ) catch {};
+
+    const body = try captured_writer.toOwnedSlice();
+    return .{
+        .action = .forwarded,
+        .body = body,
+        .has_body = true,
+    };
+}
+
 fn prepareOutboundBody(
     ctx: *ServerContext,
     req: *httpz.Request,
@@ -550,7 +486,7 @@ fn prepareOutboundBody(
     module_req: ModuleRequest,
 ) !PreparedOutbound {
     const method = toStdHttpMethod(toHttpMethod(req.method));
-    if (method.requestHasBody()) {
+    if (method.requestHasBody() and req.body_len > 0) {
         var request_reader = try req.reader(30_000);
         var captured_writer: std.Io.Writer.Allocating = .init(req.arena);
         errdefer captured_writer.deinit();
@@ -563,7 +499,7 @@ fn prepareOutboundBody(
         ) catch |err| blk: {
             // Fail open: forward original body bytes if module stream processing fails.
             ctx.bus.warn(ModuleError{ .err = @errorName(err) });
-            _ = streamReaderToWriter(&request_reader.interface, &captured_writer.writer, std.math.maxInt(usize)) catch {};
+            _ = transport_mod.streamReaderToWriter(&request_reader.interface, &captured_writer.writer, std.math.maxInt(usize)) catch {};
             break :blk ModuleStreamResult.forwarded();
         };
 
@@ -610,117 +546,6 @@ fn prepareOutboundBody(
     };
 }
 
-fn proxyToUpstreamPreparedOnce(
-    ctx: *ServerContext,
-    req: *httpz.Request,
-    res: *httpz.Response,
-    module_id: ModuleId,
-    module: ProxyModule,
-    prepared_body: []const u8,
-    has_body: bool,
-) !usize {
-    const upstream_uri_str = try ctx.upstreams.buildUpstreamUri(
-        module_id,
-        req.url.path,
-        req.url.query,
-    );
-    const uri = try std.Uri.parse(upstream_uri_str);
-    const method = toStdHttpMethod(toHttpMethod(req.method));
-
-    ctx.bus.debug(UpstreamRequest{
-        .method = @tagName(method),
-        .url = upstream_uri_str,
-    });
-
-    const client = ctx.upstreams.getHttpClient();
-    var headers_buf: [64]std.http.Header = undefined;
-    const headers = try buildHeadersArray(req, &headers_buf);
-
-    var upstream_req = client.request(method, uri, .{
-        .extra_headers = headers,
-        .headers = .{ .accept_encoding = .omit },
-    }) catch |err| {
-        ctx.bus.err(UpstreamConnectionError{
-            .err = @errorName(err),
-            .phase = "connect",
-        });
-        return err;
-    };
-    defer upstream_req.deinit();
-
-    if (has_body and method.requestHasBody()) {
-        upstream_req.transfer_encoding = .{ .content_length = prepared_body.len };
-        var request_write_buffer: [8192]u8 = undefined;
-        var request_body_writer = upstream_req.sendBodyUnflushed(&request_write_buffer) catch |err| {
-            ctx.bus.err(UpstreamConnectionError{
-                .err = @errorName(err),
-                .phase = "send_body",
-                .underlying_err = getUnderlyingWriteError(&upstream_req),
-            });
-            if (upstream_req.connection) |conn| conn.closing = true;
-            return err;
-        };
-
-        var prepared_reader = std.Io.Reader.fixed(prepared_body);
-        const bytes_streamed = streamReaderToWriter(
-            &prepared_reader,
-            &request_body_writer.writer,
-            prepared_body.len,
-        ) catch |err| {
-            ctx.bus.err(UpstreamStreamError{
-                .err = @errorName(err),
-                .bytes_streamed = prepared_reader.seek,
-            });
-            return err;
-        };
-
-        if (bytes_streamed != prepared_body.len) {
-            if (upstream_req.connection) |conn| conn.closing = true;
-            return error.UnexpectedEof;
-        }
-
-        try request_body_writer.end();
-    } else {
-        try upstream_req.sendBodiless();
-    }
-
-    var upstream_res = try upstream_req.receiveHead(&.{});
-    res.status = @intFromEnum(upstream_res.head.status);
-
-    var header_it = upstream_res.head.iterateHeaders();
-    while (header_it.next()) |header| {
-        if (shouldSkipResponseHeader(header.name)) continue;
-        const header_name = try req.arena.dupe(u8, header.name);
-        const header_value = try req.arena.dupe(u8, header.value);
-        res.header(header_name, header_value);
-    }
-
-    const max_size = ctx.upstreams.getMaxResponseBody(module_id);
-    var read_buffer: [8192]u8 = undefined;
-    const upstream_body_reader = upstream_res.reader(&read_buffer);
-    const response_writer = res.writer();
-
-    var response_filter = module.createResponseFilter(response_writer, req.arena) catch |err| blk: {
-        ctx.bus.warn(ModuleError{ .err = @errorName(err) });
-        break :blk null;
-    };
-    defer if (response_filter) |*filter| filter.destroy();
-
-    const target_writer = if (response_filter) |*filter| filter.writer() else response_writer;
-    const total_bytes = try streamReaderToWriter(
-        upstream_body_reader,
-        target_writer,
-        max_size,
-    );
-
-    var bytes_forwarded: usize = total_bytes;
-    if (response_filter) |*filter| {
-        bytes_forwarded = filter.finish() catch total_bytes;
-    }
-    try response_writer.flush();
-    return bytes_forwarded;
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -739,26 +564,26 @@ test "toHttpMethod" {
 }
 
 test "shouldSkipRequestHeader" {
-    try std.testing.expect(shouldSkipRequestHeader("host"));
-    try std.testing.expect(shouldSkipRequestHeader("Host"));
-    try std.testing.expect(shouldSkipRequestHeader("HOST"));
-    try std.testing.expect(shouldSkipRequestHeader("connection"));
-    try std.testing.expect(shouldSkipRequestHeader("Connection"));
-    try std.testing.expect(shouldSkipRequestHeader("content-length"));
-    try std.testing.expect(shouldSkipRequestHeader("Content-Length"));
-    try std.testing.expect(shouldSkipRequestHeader("transfer-encoding"));
-    try std.testing.expect(shouldSkipRequestHeader("Transfer-Encoding"));
-    try std.testing.expect(!shouldSkipRequestHeader("content-type"));
-    try std.testing.expect(!shouldSkipRequestHeader("x-custom-header"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("host"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("Host"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("HOST"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("connection"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("Connection"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("content-length"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("Content-Length"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("transfer-encoding"));
+    try std.testing.expect(transport_mod.shouldSkipRequestHeader("Transfer-Encoding"));
+    try std.testing.expect(!transport_mod.shouldSkipRequestHeader("content-type"));
+    try std.testing.expect(!transport_mod.shouldSkipRequestHeader("x-custom-header"));
 }
 
 test "shouldSkipResponseHeader" {
-    try std.testing.expect(shouldSkipResponseHeader("content-length"));
-    try std.testing.expect(shouldSkipResponseHeader("Content-Length"));
-    try std.testing.expect(shouldSkipResponseHeader("transfer-encoding"));
-    try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
-    try std.testing.expect(!shouldSkipResponseHeader("content-type"));
-    try std.testing.expect(!shouldSkipResponseHeader("x-custom-header"));
+    try std.testing.expect(transport_mod.shouldSkipResponseHeader("content-length"));
+    try std.testing.expect(transport_mod.shouldSkipResponseHeader("Content-Length"));
+    try std.testing.expect(transport_mod.shouldSkipResponseHeader("transfer-encoding"));
+    try std.testing.expect(transport_mod.shouldSkipResponseHeader("Transfer-Encoding"));
+    try std.testing.expect(!transport_mod.shouldSkipResponseHeader("content-type"));
+    try std.testing.expect(!transport_mod.shouldSkipResponseHeader("x-custom-header"));
 }
 
 test "streamReaderToWriter streams full payload" {
@@ -768,7 +593,7 @@ test "streamReaderToWriter streams full payload" {
     var out_buf: [64]u8 = undefined;
     var output_writer = std.Io.Writer.fixed(&out_buf);
 
-    const bytes = try streamReaderToWriter(
+    const bytes = try transport_mod.streamReaderToWriter(
         &input_reader,
         &output_writer,
         input.len,
@@ -785,7 +610,7 @@ test "streamReaderToWriter respects max_bytes limit" {
     var out_buf: [64]u8 = undefined;
     var output_writer = std.Io.Writer.fixed(&out_buf);
 
-    const bytes = try streamReaderToWriter(
+    const bytes = try transport_mod.streamReaderToWriter(
         &input_reader,
         &output_writer,
         3,
