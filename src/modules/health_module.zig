@@ -1,66 +1,35 @@
 const std = @import("std");
-const proxy_module = @import("./proxy_module.zig");
+const module_types = @import("./module_types.zig");
 
-const ProxyModule = proxy_module.ProxyModule;
-const ModuleConfig = proxy_module.ModuleConfig;
-const ModuleRequest = proxy_module.ModuleRequest;
-const ModuleResult = proxy_module.ModuleResult;
-const RoutePattern = proxy_module.RoutePattern;
-const MethodBitmask = proxy_module.MethodBitmask;
+const ModuleConfig = module_types.ModuleConfig;
+const ModuleRequest = module_types.ModuleRequest;
+const ModuleStreamResult = module_types.ModuleStreamResult;
+const RoutePattern = module_types.RoutePattern;
 
-/// Health check module - responds to /_health endpoint
-/// Returns 200 OK with JSON body indicating the server is healthy
 pub const HealthModule = struct {
-    pub fn asProxyModule(self: *HealthModule) ProxyModule {
-        return .{
-            .ptr = self,
-            .vtable = &vtable,
-        };
-    }
+    pub fn init(_: *HealthModule, _: std.mem.Allocator, _: ModuleConfig) !void {}
 
-    const vtable = ProxyModule.VTable{
-        .init = init,
-        .processRequest = processRequest,
-        .deinit = deinit,
-    };
-
-    fn init(
-        _: *anyopaque,
-        _: std.mem.Allocator,
-        _: ModuleConfig,
-    ) anyerror!void {
-        // Nothing to initialize
-    }
-
-    /// Health check - respond immediately with 200 OK
-    fn processRequest(
-        _: *anyopaque,
+    pub fn processRequestStream(
+        _: *HealthModule,
         _: *const ModuleRequest,
+        _: *std.Io.Reader,
+        _: *std.Io.Writer,
         _: std.mem.Allocator,
-    ) anyerror!ModuleResult {
-        return ModuleResult.respond(200, "{\"status\":\"ok\"}");
+    ) !ModuleStreamResult {
+        return ModuleStreamResult.respond(200, "{\"status\":\"ok\"}");
     }
 
-    fn deinit(_: *anyopaque) void {
-        // Nothing to cleanup
-    }
+    pub fn deinit(_: *HealthModule) void {}
 };
 
-/// Routes for health check endpoint
 pub const routes = [_]RoutePattern{
     RoutePattern.exact("/_health", .{ .get = true }),
 };
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 test "HealthModule returns 200 OK with status json" {
     var module = HealthModule{};
-    const pm = module.asProxyModule();
 
-    // Initialize (no-op)
-    try pm.init(std.testing.allocator, .{
+    try module.init(std.testing.allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -74,23 +43,22 @@ test "HealthModule returns 200 OK with status json" {
         .module_data = null,
     });
 
-    // Process request
     const req = ModuleRequest{
         .method = .GET,
         .path = "/_health",
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body = "",
         .headers_ctx = null,
         .get_header_fn = null,
     };
-
-    const result = try pm.processRequest(&req, std.testing.allocator);
-    try std.testing.expectEqual(ModuleResult.Action.respond_immediately, result.action);
+    var in_reader = std.Io.Reader.fixed(&.{});
+    var out_buf: [1]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    const result = try module.processRequestStream(&req, &in_reader, &out_writer, std.testing.allocator);
+    try std.testing.expectEqual(ModuleStreamResult.Action.respond_immediately, result.action);
     try std.testing.expectEqual(@as(u16, 200), result.status);
     try std.testing.expectEqualStrings("{\"status\":\"ok\"}", result.response_body);
 
-    // Deinit (no-op)
-    pm.deinit();
+    module.deinit();
 }

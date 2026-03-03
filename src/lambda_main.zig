@@ -272,7 +272,7 @@ pub fn main() !void {
     const module_registrations = [_]ModuleRegistration{
         // Health module - reserved /_health endpoint
         .{
-            .module = health_module.asProxyModule(),
+            .module = .{ .health = &health_module },
             .routes = &health_mod.routes,
             .upstream_url = logs_url,
             .max_request_body = 0,
@@ -281,7 +281,7 @@ pub fn main() !void {
         },
         // Datadog logs module - handles /api/v2/logs with filtering
         .{
-            .module = datadog_logs_module.asProxyModule(),
+            .module = .{ .datadog = &datadog_logs_module },
             .routes = &datadog_mod.logs_routes,
             .upstream_url = logs_url,
             .max_request_body = config.max_body_size,
@@ -290,7 +290,7 @@ pub fn main() !void {
         },
         // Datadog metrics module - handles /api/v2/series with filtering
         .{
-            .module = datadog_metrics_module.asProxyModule(),
+            .module = .{ .datadog = &datadog_metrics_module },
             .routes = &datadog_mod.metrics_routes,
             .upstream_url = metrics_url,
             .max_request_body = config.max_body_size,
@@ -299,7 +299,7 @@ pub fn main() !void {
         },
         // Passthrough module - handles all other requests
         .{
-            .module = passthrough_module.asProxyModule(),
+            .module = .{ .passthrough = &passthrough_module },
             .routes = &passthrough_mod.default_routes,
             .upstream_url = logs_url,
             .max_request_body = config.max_body_size,

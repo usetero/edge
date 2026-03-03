@@ -262,7 +262,7 @@ pub fn main() !void {
     const module_registrations = [_]ModuleRegistration{
         // Health module - reserved /_health endpoint (responds immediately, no upstream)
         .{
-            .module = health_module.asProxyModule(),
+            .module = .{ .health = &health_module },
             .routes = &health_mod.routes,
             .upstream_url = config.upstream_url,
             .max_request_body = 0,
@@ -271,7 +271,7 @@ pub fn main() !void {
         },
         // OTLP module - handles /v1/logs with filtering
         .{
-            .module = otlp_module.asProxyModule(),
+            .module = .{ .otlp = &otlp_module },
             .routes = &otlp_mod.routes,
             .upstream_url = config.upstream_url,
             .max_request_body = config.max_body_size,
@@ -280,7 +280,7 @@ pub fn main() !void {
         },
         // Passthrough module - handles all other requests
         .{
-            .module = passthrough_module.asProxyModule(),
+            .module = .{ .passthrough = &passthrough_module },
             .routes = &passthrough_mod.default_routes,
             .upstream_url = config.upstream_url,
             .max_request_body = config.max_body_size,

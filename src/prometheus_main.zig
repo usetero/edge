@@ -276,7 +276,7 @@ pub fn main() !void {
     const module_registrations = [_]ModuleRegistration{
         // Health module - reserved /_health endpoint (responds immediately, no upstream)
         .{
-            .module = health_module.asProxyModule(),
+            .module = .{ .health = &health_module },
             .routes = &health_mod.routes,
             .upstream_url = config.upstream_url,
             .max_request_body = 0,
@@ -285,7 +285,7 @@ pub fn main() !void {
         },
         // Prometheus module - handles /metrics with filtering
         .{
-            .module = prometheus_module.asProxyModule(),
+            .module = .{ .prometheus = &prometheus_module },
             .routes = &prometheus_mod.default_routes,
             .upstream_url = metrics_upstream,
             .max_request_body = 1024, // Small - GET requests only
@@ -294,7 +294,7 @@ pub fn main() !void {
         },
         // Passthrough module - handles all other requests
         .{
-            .module = passthrough_module.asProxyModule(),
+            .module = .{ .passthrough = &passthrough_module },
             .routes = &passthrough_mod.default_routes,
             .upstream_url = config.upstream_url,
             .max_request_body = config.max_body_size,

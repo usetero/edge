@@ -1,6 +1,5 @@
 const std = @import("std");
 const httpz = @import("httpz");
-const compress = @import("compress.zig");
 const proxy_module = @import("../modules/proxy_module.zig");
 const router_mod = @import("router.zig");
 const upstream_client = @import("upstream_client.zig");
@@ -10,7 +9,7 @@ const EventBus = o11y.EventBus;
 const ModuleId = proxy_module.ModuleId;
 const ModuleConfig = proxy_module.ModuleConfig;
 const ModuleRequest = proxy_module.ModuleRequest;
-const ModuleResult = proxy_module.ModuleResult;
+const ModuleStreamResult = proxy_module.ModuleStreamResult;
 const ModuleRegistration = proxy_module.ModuleRegistration;
 const ProxyModule = proxy_module.ProxyModule;
 const ResponseFilter = proxy_module.ResponseFilter;
@@ -40,15 +39,7 @@ const RequestError = struct {
     stack_trace: ?[]const u8 = null,
 };
 
-const DecompressError = struct {
-    err: []const u8,
-};
-
 const ModuleError = struct {
-    err: []const u8,
-};
-
-const CompressError = struct {
     err: []const u8,
 };
 
@@ -386,33 +377,6 @@ fn getHeaderFromHttpz(ctx: ?*const anyopaque, name: []const u8) ?[]const u8 {
     return req.header(name);
 }
 
-/// Decompress body if encoding is present
-/// Uses default max decompressed size to prevent compression bombs
-fn decompressIfNeeded(
-    allocator: std.mem.Allocator,
-    body: []const u8,
-    encoding: CompressionEncoding,
-) ![]const u8 {
-    return switch (encoding) {
-        .none => body, // Return original, no allocation
-        .gzip => try compress.decompressGzip(allocator, body, 0), // 0 = use default max
-        .zstd => try compress.decompressZstd(allocator, body, 0), // 0 = use default max
-    };
-}
-
-/// Compress body if encoding is required
-fn compressIfNeeded(
-    allocator: std.mem.Allocator,
-    body: []const u8,
-    encoding: CompressionEncoding,
-) ![]const u8 {
-    return switch (encoding) {
-        .none => body, // Return original, no allocation
-        .gzip => try compress.compressGzip(allocator, body),
-        .zstd => try compress.compressZstd(allocator, body),
-    };
-}
-
 /// Check if header should be skipped when forwarding request
 fn shouldSkipRequestHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "host") or
@@ -449,6 +413,28 @@ fn buildHeadersArray(
     return buffer[0..count];
 }
 
+/// Stream bytes from reader to writer up to max_bytes.
+/// Uses only std.Io.Reader/std.Io.Writer vtables to keep streaming paths testable.
+fn streamReaderToWriter(
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    max_bytes: usize,
+) std.Io.Reader.StreamError!usize {
+    var total_bytes: usize = 0;
+    while (total_bytes < max_bytes) {
+        const bytes = reader.stream(
+            writer,
+            std.Io.Limit.limited(max_bytes - total_bytes),
+        ) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (bytes == 0) break;
+        total_bytes += bytes;
+    }
+    return total_bytes;
+}
+
 /// Main proxy handler - catchall for all requests
 fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, response_bytes: *usize) !void {
     const http_method = toHttpMethod(req.method);
@@ -468,76 +454,17 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
     };
 
     const upstream_config = ctx.upstreams.getUpstreamConfig(match.module_id);
-
-    // Get original body
-    const original_body = req.body() orelse &[_]u8{};
-
-    // Detect compression encoding
-    const encoding = CompressionEncoding.fromHeader(req.header("content-encoding"));
-
-    // Decompress request body if needed (FAIL OPEN on error)
-    var decompressed_body: []const u8 = original_body;
-    var decompressed_allocated = false;
-
-    if (original_body.len > 0 and encoding != .none) {
-        decompressed_body = decompressIfNeeded(req.arena, original_body, encoding) catch |err| blk: {
-            ctx.bus.warn(DecompressError{ .err = @errorName(err) });
-            break :blk original_body; // Fall back to original
-        };
-        decompressed_allocated = (decompressed_body.ptr != original_body.ptr);
-    }
-    defer if (decompressed_allocated) req.arena.free(decompressed_body);
-
-    // Build module request
     const module_req = ModuleRequest{
         .method = http_method,
         .path = req.url.path,
         .query = req.url.query,
         .upstream = &upstream_config,
         .module_ctx = module_entry.config.module_data,
-        .body = decompressed_body,
         .headers_ctx = req,
         .get_header_fn = getHeaderFromHttpz,
     };
 
-    // Call module's processRequest (FAIL OPEN on error)
-    const module_result = module_entry.instance.processRequest(&module_req, req.arena) catch |err| blk: {
-        ctx.bus.warn(ModuleError{ .err = @errorName(err) });
-        break :blk ModuleResult.unchanged();
-    };
-
-    // Handle module result
-    switch (module_result.action) {
-        .respond_immediately => {
-            res.status = module_result.status;
-            res.body = module_result.response_body;
-            response_bytes.* = if (module_result.response_body.len > 0) module_result.response_body.len else 0;
-            return;
-        },
-
-        .proxy_unchanged => {
-            // Proxy original (potentially compressed) body to upstream
-            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, module_entry.instance, original_body);
-        },
-
-        .proxy_modified => {
-            // Module returned modified body (decompressed)
-            // Need to recompress if original was compressed
-            var body_to_send = module_result.modified_body;
-            var compressed_allocated = false;
-
-            if (encoding != .none) {
-                body_to_send = compressIfNeeded(req.arena, module_result.modified_body, encoding) catch |err| blk: {
-                    ctx.bus.warn(CompressError{ .err = @errorName(err) });
-                    break :blk module_result.modified_body; // Fall back to uncompressed
-                };
-                compressed_allocated = (body_to_send.ptr != module_result.modified_body.ptr);
-            }
-            defer if (compressed_allocated) req.arena.free(body_to_send);
-
-            response_bytes.* = try proxyToUpstream(ctx, req, res, match.module_id, module_entry.instance, body_to_send);
-        },
-    }
+    response_bytes.* = try proxyToUpstreamStreaming(ctx, req, res, match.module_id, module_entry.instance, module_req);
 }
 
 /// Extract underlying write error from HTTP client request
@@ -548,27 +475,45 @@ fn getUnderlyingWriteError(upstream_req: *std.http.Client.Request) ?[]const u8 {
     return @errorName(write_err);
 }
 
-/// Forward request to upstream and stream response back
-/// Returns the number of bytes in the response body
-fn proxyToUpstream(
+fn proxyToUpstreamStreaming(
     ctx: *ServerContext,
     req: *httpz.Request,
     res: *httpz.Response,
     module_id: ModuleId,
     module: ProxyModule,
-    body_to_send: []const u8,
+    module_req: ModuleRequest,
 ) !usize {
+    const prepared = try prepareOutboundBody(ctx, req, module, module_req);
+    switch (prepared.action) {
+        .respond_immediately => {
+            res.status = prepared.status;
+            res.body = prepared.response_body;
+            return prepared.response_body.len;
+        },
+        .forwarded => {},
+    }
+
     const max_retries = ctx.max_upstream_retries;
     var attempt: u8 = 0;
 
     // https://codeberg.org/ziglang/zig/issues/30165
-    // TODO: Once the above is fixed, we should re-evaluate this logic.
+    // TODO: Remove this once the bug is fixed.
+    // Retry is needed because pooled upstream connections can go stale between
+    // requests and fail on first write/read despite being selected from pool.
+    // We precompute a replayable outbound body so retries are deterministic.
     while (attempt < max_retries) : (attempt += 1) {
-        const result = proxyToUpstreamOnce(ctx, req, res, module_id, module, body_to_send);
+        const result = proxyToUpstreamPreparedOnce(
+            ctx,
+            req,
+            res,
+            module_id,
+            module,
+            prepared.body,
+            prepared.has_body,
+        );
         if (result) |bytes| {
             return bytes;
         } else |err| {
-            // Only retry on connection-related errors (stale connections from pool)
             const err_name = @errorName(err);
             const is_retryable = std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
                 std.mem.eql(u8, err_name, "BrokenPipe") or
@@ -577,9 +522,7 @@ fn proxyToUpstream(
                 std.mem.eql(u8, err_name, "HttpConnectionClosing") or
                 std.mem.eql(u8, err_name, "UnexpectedWriteFailure");
 
-            if (!is_retryable or attempt + 1 >= max_retries) {
-                return err;
-            }
+            if (!is_retryable or attempt + 1 >= max_retries) return err;
 
             ctx.bus.warn(UpstreamRetry{
                 .attempt = attempt + 1,
@@ -592,22 +535,95 @@ fn proxyToUpstream(
     return error.NotEnoughData;
 }
 
-/// Single attempt to forward request to upstream
-fn proxyToUpstreamOnce(
+const PreparedOutbound = struct {
+    action: ModuleStreamResult.Action,
+    body: []const u8 = &.{},
+    has_body: bool = false,
+    status: u16 = 200,
+    response_body: []const u8 = &.{},
+};
+
+fn prepareOutboundBody(
+    ctx: *ServerContext,
+    req: *httpz.Request,
+    module: ProxyModule,
+    module_req: ModuleRequest,
+) !PreparedOutbound {
+    const method = toStdHttpMethod(toHttpMethod(req.method));
+    if (method.requestHasBody()) {
+        var request_reader = try req.reader(30_000);
+        var captured_writer: std.Io.Writer.Allocating = .init(req.arena);
+        errdefer captured_writer.deinit();
+
+        const stream_result = module.processRequestStream(
+            &module_req,
+            &request_reader.interface,
+            &captured_writer.writer,
+            req.arena,
+        ) catch |err| blk: {
+            // Fail open: forward original body bytes if module stream processing fails.
+            ctx.bus.warn(ModuleError{ .err = @errorName(err) });
+            _ = streamReaderToWriter(&request_reader.interface, &captured_writer.writer, std.math.maxInt(usize)) catch {};
+            break :blk ModuleStreamResult.forwarded();
+        };
+
+        switch (stream_result.action) {
+            .respond_immediately => {
+                captured_writer.deinit();
+                return .{
+                    .action = .respond_immediately,
+                    .status = stream_result.status,
+                    .response_body = stream_result.response_body,
+                };
+            },
+            .forwarded => {
+                const body = try captured_writer.toOwnedSlice();
+                return .{
+                    .action = .forwarded,
+                    .body = body,
+                    .has_body = true,
+                };
+            },
+        }
+    }
+
+    var empty_reader = std.Io.Reader.fixed(&.{});
+    var discard_buffer: [64]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&discard_buffer);
+    const stream_result = module.processRequestStream(
+        &module_req,
+        &empty_reader,
+        &discarding.writer,
+        req.arena,
+    ) catch |err| {
+        ctx.bus.warn(ModuleError{ .err = @errorName(err) });
+        return .{ .action = .forwarded, .has_body = false };
+    };
+
+    return switch (stream_result.action) {
+        .forwarded => .{ .action = .forwarded, .has_body = false },
+        .respond_immediately => .{
+            .action = .respond_immediately,
+            .status = stream_result.status,
+            .response_body = stream_result.response_body,
+        },
+    };
+}
+
+fn proxyToUpstreamPreparedOnce(
     ctx: *ServerContext,
     req: *httpz.Request,
     res: *httpz.Response,
     module_id: ModuleId,
     module: ProxyModule,
-    body_to_send: []const u8,
+    prepared_body: []const u8,
+    has_body: bool,
 ) !usize {
-    // Build upstream URI using pre-allocated buffer
     const upstream_uri_str = try ctx.upstreams.buildUpstreamUri(
         module_id,
         req.url.path,
         req.url.query,
     );
-
     const uri = try std.Uri.parse(upstream_uri_str);
     const method = toStdHttpMethod(toHttpMethod(req.method));
 
@@ -616,24 +632,10 @@ fn proxyToUpstreamOnce(
         .url = upstream_uri_str,
     });
 
-    // Get shared HTTP client from upstream manager (thread-safe connection pooling)
     const client = ctx.upstreams.getHttpClient();
-
-    // Build headers array (single pass)
     var headers_buf: [64]std.http.Header = undefined;
     const headers = try buildHeadersArray(req, &headers_buf);
 
-    // Determine if we have a body to send
-    const has_body = body_to_send.len > 0 and switch (method) {
-        .POST, .PUT, .PATCH => true,
-        else => false,
-    };
-
-    // Create upstream request
-    // Note: We omit accept_encoding so we only forward the client's Accept-Encoding header
-    // (if present in extra_headers), preventing std.http.Client from adding its default
-    // "Accept-Encoding: gzip, deflate" which would cause upstream to compress when client
-    // didn't request it.
     var upstream_req = client.request(method, uri, .{
         .extra_headers = headers,
         .headers = .{ .accept_encoding = .omit },
@@ -646,118 +648,76 @@ fn proxyToUpstreamOnce(
     };
     defer upstream_req.deinit();
 
-    // Send body
-    if (has_body) {
-        upstream_req.sendBodyComplete(@constCast(body_to_send)) catch |err| {
+    if (has_body and method.requestHasBody()) {
+        upstream_req.transfer_encoding = .{ .content_length = prepared_body.len };
+        var request_write_buffer: [8192]u8 = undefined;
+        var request_body_writer = upstream_req.sendBodyUnflushed(&request_write_buffer) catch |err| {
             ctx.bus.err(UpstreamConnectionError{
                 .err = @errorName(err),
                 .phase = "send_body",
                 .underlying_err = getUnderlyingWriteError(&upstream_req),
             });
-            // https://codeberg.org/ziglang/zig/issues/30165
-            // TODO: Remove this once the bug is fixed.
             if (upstream_req.connection) |conn| conn.closing = true;
             return err;
         };
-    } else {
-        upstream_req.sendBodiless() catch |err| {
-            ctx.bus.err(UpstreamConnectionError{
+
+        var prepared_reader = std.Io.Reader.fixed(prepared_body);
+        const bytes_streamed = streamReaderToWriter(
+            &prepared_reader,
+            &request_body_writer.writer,
+            prepared_body.len,
+        ) catch |err| {
+            ctx.bus.err(UpstreamStreamError{
                 .err = @errorName(err),
-                .phase = "send_bodiless",
-                .underlying_err = getUnderlyingWriteError(&upstream_req),
+                .bytes_streamed = prepared_reader.seek,
             });
-            // https://codeberg.org/ziglang/zig/issues/30165
-            // TODO: Remove this once the bug is fixed.
-            if (upstream_req.connection) |conn| conn.closing = true;
             return err;
         };
+
+        if (bytes_streamed != prepared_body.len) {
+            if (upstream_req.connection) |conn| conn.closing = true;
+            return error.UnexpectedEof;
+        }
+
+        try request_body_writer.end();
+    } else {
+        try upstream_req.sendBodiless();
     }
 
-    // Receive response head
-    var upstream_res = upstream_req.receiveHead(&.{}) catch |err| {
-        ctx.bus.err(UpstreamConnectionError{
-            .err = @errorName(err),
-            .phase = "receive_head",
-        });
-        // https://codeberg.org/ziglang/zig/issues/30165
-        // TODO: Remove this once the bug is fixed.
-        if (upstream_req.connection) |conn| {
-            conn.closing = true;
-            conn.end() catch {};
-        }
-        return err;
-    };
-
-    // Set response status
+    var upstream_res = try upstream_req.receiveHead(&.{});
     res.status = @intFromEnum(upstream_res.head.status);
 
-    // Forward response headers (copy to arena memory)
     var header_it = upstream_res.head.iterateHeaders();
     while (header_it.next()) |header| {
         if (shouldSkipResponseHeader(header.name)) continue;
-
         const header_name = try req.arena.dupe(u8, header.name);
         const header_value = try req.arena.dupe(u8, header.value);
         res.header(header_name, header_value);
     }
 
-    // Stream response body
     const max_size = ctx.upstreams.getMaxResponseBody(module_id);
     var read_buffer: [8192]u8 = undefined;
-    var upstream_body_reader = upstream_res.reader(&read_buffer);
+    const upstream_body_reader = upstream_res.reader(&read_buffer);
     const response_writer = res.writer();
 
-    // Check if module has a response filter
     var response_filter = module.createResponseFilter(response_writer, req.arena) catch |err| blk: {
         ctx.bus.warn(ModuleError{ .err = @errorName(err) });
         break :blk null;
     };
     defer if (response_filter) |*filter| filter.destroy();
 
-    // Use filter writer if available, otherwise direct response writer
     const target_writer = if (response_filter) |*filter| filter.writer() else response_writer;
+    const total_bytes = try streamReaderToWriter(
+        upstream_body_reader,
+        target_writer,
+        max_size,
+    );
 
-    var total_bytes: usize = 0;
-    while (total_bytes < max_size) {
-        const bytes = upstream_body_reader.stream(
-            target_writer,
-            std.Io.Limit.limited(max_size - total_bytes),
-        ) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => {
-                ctx.bus.err(UpstreamStreamError{
-                    .err = @errorName(err),
-                    .bytes_streamed = total_bytes,
-                });
-                return err;
-            },
-        };
-        if (bytes == 0) break;
-        total_bytes += bytes;
-    }
-
-    if (total_bytes >= max_size) {
-        ctx.bus.warn(ResponseTruncated{ .max_size = max_size });
-    }
-
-    // Finish filter if used (this flushes filtered data to response writer)
     var bytes_forwarded: usize = total_bytes;
     if (response_filter) |*filter| {
-        bytes_forwarded = filter.finish() catch |err| blk: {
-            ctx.bus.err(ModuleError{ .err = @errorName(err) });
-            break :blk total_bytes;
-        };
+        bytes_forwarded = filter.finish() catch total_bytes;
     }
-
-    // Flush the response writer to ensure all data is sent to client
-    response_writer.flush() catch |err| {
-        ctx.bus.err(ResponseFlushError{
-            .err = @errorName(err),
-            .bytes_written = bytes_forwarded,
-        });
-        return err;
-    };
-
+    try response_writer.flush();
     return bytes_forwarded;
 }
 
@@ -799,4 +759,38 @@ test "shouldSkipResponseHeader" {
     try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
     try std.testing.expect(!shouldSkipResponseHeader("content-type"));
     try std.testing.expect(!shouldSkipResponseHeader("x-custom-header"));
+}
+
+test "streamReaderToWriter streams full payload" {
+    const input = "hello world";
+    var input_reader = std.Io.Reader.fixed(input);
+
+    var out_buf: [64]u8 = undefined;
+    var output_writer = std.Io.Writer.fixed(&out_buf);
+
+    const bytes = try streamReaderToWriter(
+        &input_reader,
+        &output_writer,
+        input.len,
+    );
+
+    try std.testing.expectEqual(input.len, bytes);
+    try std.testing.expectEqualStrings(input, out_buf[0..bytes]);
+}
+
+test "streamReaderToWriter respects max_bytes limit" {
+    const input = "abcdef";
+    var input_reader = std.Io.Reader.fixed(input);
+
+    var out_buf: [64]u8 = undefined;
+    var output_writer = std.Io.Writer.fixed(&out_buf);
+
+    const bytes = try streamReaderToWriter(
+        &input_reader,
+        &output_writer,
+        3,
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), bytes);
+    try std.testing.expectEqualStrings("abc", out_buf[0..bytes]);
 }

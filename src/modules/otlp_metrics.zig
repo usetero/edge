@@ -75,6 +75,20 @@ pub const ProcessResult = struct {
     }
 };
 
+pub const StreamProcessResult = struct {
+    was_transformed: bool = false,
+    dropped_count: usize,
+    original_count: usize,
+
+    pub fn wasModified(self: StreamProcessResult) bool {
+        return self.dropped_count > 0 or self.was_transformed;
+    }
+
+    pub fn allDropped(self: StreamProcessResult) bool {
+        return self.original_count > 0 and self.dropped_count == self.original_count;
+    }
+};
+
 /// Content format for OTLP metrics
 pub const ContentFormat = enum {
     json,
@@ -122,6 +136,57 @@ pub fn processMetrics(
         },
         .unknown => copyUnchanged(allocator, data),
     };
+}
+
+pub fn processMetricsStream(
+    allocator: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    in_reader: *std.Io.Reader,
+    out_writer: *std.Io.Writer,
+    content_type: []const u8,
+) !StreamProcessResult {
+    const format = ContentFormat.fromContentType(content_type);
+    return switch (format) {
+        .protobuf => processProtobufMetricsStream(allocator, registry, bus, in_reader, out_writer),
+        .json => blk: {
+            const data = try readAll(allocator, in_reader);
+            defer allocator.free(data);
+            const result = try processJsonMetrics(allocator, registry, bus, data);
+            defer allocator.free(result.data);
+            try out_writer.writeAll(result.data);
+            break :blk .{
+                .was_transformed = result.was_transformed,
+                .dropped_count = result.dropped_count,
+                .original_count = result.original_count,
+            };
+        },
+        .unknown => blk: {
+            try streamAll(in_reader, out_writer);
+            break :blk .{
+                .dropped_count = 0,
+                .original_count = 0,
+                .was_transformed = false,
+            };
+        },
+    };
+}
+
+fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try streamAll(reader, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+    while (true) {
+        const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+    }
 }
 
 // =============================================================================
@@ -370,6 +435,38 @@ fn processProtobufMetrics(
         .data = output,
         .dropped_count = counts.dropped_count,
         .original_count = counts.original_count,
+    };
+}
+
+fn processProtobufMetricsStream(
+    allocator: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    in_reader: *std.Io.Reader,
+    out_writer: *std.Io.Writer,
+) !StreamProcessResult {
+    const snapshot = registry.getSnapshot();
+    if (snapshot == null or snapshot.?.metric_index.isEmpty()) {
+        try streamAll(in_reader, out_writer);
+        return .{
+            .dropped_count = 0,
+            .original_count = 0,
+            .was_transformed = false,
+        };
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var metrics_data = try MetricsData.decode(in_reader, arena_alloc);
+    const counts = filterMetricsInPlace(&metrics_data, registry, bus);
+    try metrics_data.encode(out_writer, arena_alloc);
+
+    return .{
+        .dropped_count = counts.dropped_count,
+        .original_count = counts.original_count,
+        .was_transformed = false,
     };
 }
 
