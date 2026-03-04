@@ -505,6 +505,19 @@ fn processProtobufTraces(
         return error.DataLooksLikeJson;
     }
 
+    // Fast path: if no trace policies, skip decode/encode entirely.
+    const snapshot = registry.getSnapshot();
+    if (snapshot == null or snapshot.?.trace_index.isEmpty()) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = 0,
+            .was_transformed = false,
+        };
+    }
+
     // Use an arena for the protobuf decode/filter/encode cycle
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -543,28 +556,17 @@ fn processProtobufTracesStream(
     in_reader: *std.Io.Reader,
     out_writer: *std.Io.Writer,
 ) !StreamProcessResult {
-    const snapshot = registry.getSnapshot();
-    if (snapshot == null or snapshot.?.trace_index.isEmpty()) {
-        try streamAll(in_reader, out_writer);
-        return .{
-            .dropped_count = 0,
-            .original_count = 0,
-            .was_transformed = false,
-        };
-    }
+    const data = try readAll(allocator, in_reader);
+    defer allocator.free(data);
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
+    const result = try processProtobufTraces(allocator, registry, bus, data);
+    defer allocator.free(result.data);
 
-    var traces_data = try TracesData.decode(in_reader, arena_alloc);
-    const counts = filterSpansInPlace(arena_alloc, &traces_data, registry, bus);
-    try traces_data.encode(out_writer, arena_alloc);
-
+    try out_writer.writeAll(result.data);
     return .{
-        .was_transformed = counts.was_transformed,
-        .dropped_count = counts.dropped_count,
-        .original_count = counts.original_count,
+        .was_transformed = result.was_transformed,
+        .dropped_count = result.dropped_count,
+        .original_count = result.original_count,
     };
 }
 

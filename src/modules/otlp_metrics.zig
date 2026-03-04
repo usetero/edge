@@ -445,27 +445,17 @@ fn processProtobufMetricsStream(
     in_reader: *std.Io.Reader,
     out_writer: *std.Io.Writer,
 ) !StreamProcessResult {
-    const snapshot = registry.getSnapshot();
-    if (snapshot == null or snapshot.?.metric_index.isEmpty()) {
-        try streamAll(in_reader, out_writer);
-        return .{
-            .dropped_count = 0,
-            .original_count = 0,
-            .was_transformed = false,
-        };
-    }
+    const data = try readAll(allocator, in_reader);
+    defer allocator.free(data);
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
+    const result = try processProtobufMetrics(allocator, registry, bus, data);
+    defer allocator.free(result.data);
 
-    var metrics_data = try MetricsData.decode(in_reader, arena_alloc);
-    const counts = filterMetricsInPlace(&metrics_data, registry, bus);
-    try metrics_data.encode(out_writer, arena_alloc);
+    try out_writer.writeAll(result.data);
 
     return .{
-        .dropped_count = counts.dropped_count,
-        .original_count = counts.original_count,
+        .dropped_count = result.dropped_count,
+        .original_count = result.original_count,
         .was_transformed = false,
     };
 }
