@@ -64,39 +64,44 @@ pub const OtlpModule = struct {
 
         const content_type = req.getHeader("content-type") orelse "application/json";
 
-        if (std.mem.endsWith(u8, req.path, "/v1/logs")) {
-            const result = try otlp_logs.processLogsStream(
-                allocator,
-                self.registry,
-                self.bus,
-                body_reader,
-                body_writer,
-                content_type,
-            );
-            if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
-            return ModuleStreamResult.forwarded();
-        } else if (std.mem.endsWith(u8, req.path, "/v1/metrics")) {
-            const result = try otlp_metrics.processMetricsStream(
-                allocator,
-                self.registry,
-                self.bus,
-                body_reader,
-                body_writer,
-                content_type,
-            );
-            if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
-            return ModuleStreamResult.forwarded();
-        } else if (std.mem.endsWith(u8, req.path, "/v1/traces")) {
-            const result = try otlp_traces.processTracesStream(
-                allocator,
-                self.registry,
-                self.bus,
-                body_reader,
-                body_writer,
-                content_type,
-            );
-            if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
-            return ModuleStreamResult.forwarded();
+        switch (req.route_kind) {
+            .otlp_logs => {
+                const result = try otlp_logs.processLogsStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                );
+                if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
+                return ModuleStreamResult.forwarded();
+            },
+            .otlp_metrics => {
+                const result = try otlp_metrics.processMetricsStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                );
+                if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
+                return ModuleStreamResult.forwarded();
+            },
+            .otlp_traces => {
+                const result = try otlp_traces.processTracesStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                );
+                if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
+                return ModuleStreamResult.forwarded();
+            },
+            else => {},
         }
 
         try streamAll(body_reader, body_writer);
@@ -213,6 +218,7 @@ test "OtlpModule processes POST requests" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -260,6 +266,7 @@ test "OtlpModule ignores GET requests" {
     const req = ModuleRequest{
         .method = .GET,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -326,6 +333,7 @@ test "OtlpModule: DROP policy filters matching logs" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -396,6 +404,7 @@ test "OtlpModule: all logs dropped returns empty response" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -463,6 +472,7 @@ test "OtlpModule: filter logs by resource attribute" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -536,6 +546,7 @@ test "OtlpModule: DROP policy filters matching metrics" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/metrics",
+        .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -605,6 +616,7 @@ test "OtlpModule: all metrics dropped returns empty response" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/metrics",
+        .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -671,6 +683,7 @@ test "OtlpModule: filter metrics by metric type" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/metrics",
+        .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -740,6 +753,7 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/metrics",
+        .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,

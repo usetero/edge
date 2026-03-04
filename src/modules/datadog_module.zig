@@ -61,52 +61,56 @@ pub const DatadogModule = struct {
 
         const content_type = req.getHeader("content-type") orelse "application/json";
 
-        if (std.mem.eql(u8, req.path, "/api/v2/logs")) {
-            const result = logs_v2.processLogsStream(
-                allocator,
-                self.registry,
-                self.bus,
-                body_reader,
-                body_writer,
-                content_type,
-            ) catch |err| {
-                self.bus.warn(LogsProcessingFailed{ .err = @errorName(err) });
-                try streamAll(body_reader, body_writer);
+        switch (req.route_kind) {
+            .datadog_logs => {
+                const result = logs_v2.processLogsStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                ) catch |err| {
+                    self.bus.warn(LogsProcessingFailed{ .err = @errorName(err) });
+                    try streamAll(body_reader, body_writer);
+                    return ModuleStreamResult.forwarded();
+                };
+
+                self.bus.debug(LogsProcessed{
+                    .dropped = result.dropped_count,
+                    .kept = result.original_count - result.dropped_count,
+                });
+
+                if (result.allDropped()) {
+                    return ModuleStreamResult.respond(202, "{}");
+                }
                 return ModuleStreamResult.forwarded();
-            };
+            },
+            .datadog_metrics => {
+                const result = metrics_v2.processMetricsStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                ) catch |err| {
+                    self.bus.warn(MetricsProcessingFailed{ .err = @errorName(err) });
+                    try streamAll(body_reader, body_writer);
+                    return ModuleStreamResult.forwarded();
+                };
 
-            self.bus.debug(LogsProcessed{
-                .dropped = result.dropped_count,
-                .kept = result.original_count - result.dropped_count,
-            });
+                self.bus.debug(MetricsProcessed{
+                    .dropped = result.dropped_count,
+                    .kept = result.original_count - result.dropped_count,
+                });
 
-            if (result.allDropped()) {
-                return ModuleStreamResult.respond(202, "{}");
-            }
-            return ModuleStreamResult.forwarded();
-        } else if (std.mem.eql(u8, req.path, "/api/v2/series")) {
-            const result = metrics_v2.processMetricsStream(
-                allocator,
-                self.registry,
-                self.bus,
-                body_reader,
-                body_writer,
-                content_type,
-            ) catch |err| {
-                self.bus.warn(MetricsProcessingFailed{ .err = @errorName(err) });
-                try streamAll(body_reader, body_writer);
+                if (result.allDropped()) {
+                    return ModuleStreamResult.respond(202, "{\"errors\":[]}");
+                }
                 return ModuleStreamResult.forwarded();
-            };
-
-            self.bus.debug(MetricsProcessed{
-                .dropped = result.dropped_count,
-                .kept = result.original_count - result.dropped_count,
-            });
-
-            if (result.allDropped()) {
-                return ModuleStreamResult.respond(202, "{\"errors\":[]}");
-            }
-            return ModuleStreamResult.forwarded();
+            },
+            else => {},
         }
 
         try streamAll(body_reader, body_writer);
@@ -232,6 +236,7 @@ test "DatadogModule processes POST requests to /api/v2/logs" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/logs",
+        .route_kind = .datadog_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -278,6 +283,7 @@ test "DatadogModule processes POST requests to /api/v2/series" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/series",
+        .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -323,6 +329,7 @@ test "DatadogModule ignores GET requests" {
     const req = ModuleRequest{
         .method = .GET,
         .path = "/api/v2/logs",
+        .route_kind = .datadog_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -384,6 +391,7 @@ test "DatadogModule filters logs with DROP policy" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/logs",
+        .route_kind = .datadog_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -452,6 +460,7 @@ test "DatadogModule filters metrics with DROP policy" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/series",
+        .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -517,6 +526,7 @@ test "DatadogModule returns 202 when all logs dropped" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/logs",
+        .route_kind = .datadog_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -582,6 +592,7 @@ test "DatadogModule returns 202 when all metrics dropped" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/series",
+        .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,

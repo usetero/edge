@@ -390,6 +390,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
 
     const module_req = ModuleRequest{
         .method = http_method,
+        .route_kind = plan.route_kind,
         .path = req.url.path,
         .query = req.url.query,
         .upstream = &plan.upstream,

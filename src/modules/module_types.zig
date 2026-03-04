@@ -126,6 +126,7 @@ pub const ModuleConfig = struct {
 
 pub const ModuleRequest = struct {
     method: HttpMethod,
+    route_kind: RouteKind = .passthrough,
     path: []const u8,
     query: []const u8,
     upstream: *const UpstreamConfig,
