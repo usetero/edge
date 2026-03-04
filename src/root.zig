@@ -44,6 +44,8 @@ pub const lambda = @import("lambda/root.zig");
 
 /// Zonfig - comptime configuration with environment overrides
 pub const zonfig = @import("zonfig/root.zig");
+pub const runtime_pipeline = @import("runtime/pipeline.zig");
+pub const io_transport = @import("io/transport.zig");
 
 pub fn bufferedPrint() !void {
     var stdout_buffer: [1024]u8 = undefined;
@@ -79,6 +81,8 @@ test {
     _ = @import("modules/health_module.zig");
     _ = @import("prometheus/root.zig");
     _ = @import("modules/prometheus_module.zig");
+    _ = @import("runtime/pipeline.zig");
+    _ = @import("io/transport.zig");
     _ = @import("lambda/root.zig");
     _ = @import("zonfig/root.zig");
 }

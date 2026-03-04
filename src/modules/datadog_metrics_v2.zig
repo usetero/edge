@@ -43,30 +43,66 @@ pub const ProcessResult = struct {
     }
 };
 
-/// Process Datadog metrics with filter evaluation
-/// Takes decompressed JSON data and applies filter policies
-/// Returns ProcessResult with data and counts (caller owns the data slice)
-pub fn processMetrics(
+pub const StreamProcessResult = struct {
+    was_transformed: bool = false,
+    dropped_count: usize,
+    original_count: usize,
+
+    pub fn wasModified(self: StreamProcessResult) bool {
+        return self.dropped_count > 0 or self.was_transformed;
+    }
+
+    pub fn allDropped(self: StreamProcessResult) bool {
+        return self.original_count > 0 and self.dropped_count == self.original_count;
+    }
+};
+
+pub fn processMetricsStream(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
     bus: *EventBus,
-    data: []const u8,
+    in_reader: *std.Io.Reader,
+    out_writer: *std.Io.Writer,
     content_type: []const u8,
-) !ProcessResult {
-    // Process based on content type
-    if (std.mem.indexOf(u8, content_type, "application/json") != null) {
-        // Parse JSON and apply filter policies
-        return processJsonMetricsWithFilter(allocator, registry, bus, data);
+) !StreamProcessResult {
+    if (std.mem.indexOf(u8, content_type, "application/json") == null) {
+        try streamAll(in_reader, out_writer);
+        return .{
+            .dropped_count = 0,
+            .original_count = 0,
+            .was_transformed = false,
+        };
     }
 
-    // For non-JSON content types, return unchanged
-    const result = try allocator.alloc(u8, data.len);
-    @memcpy(result, data);
+    const data = try readAll(allocator, in_reader);
+    defer allocator.free(data);
+
+    const result = try processJsonMetricsWithFilter(allocator, registry, bus, data);
+    defer allocator.free(result.data);
+    try out_writer.writeAll(result.data);
+
     return .{
-        .data = result,
-        .dropped_count = 0,
-        .original_count = 0,
+        .was_transformed = result.was_transformed,
+        .dropped_count = result.dropped_count,
+        .original_count = result.original_count,
     };
+}
+
+fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try streamAll(reader, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+    while (true) {
+        const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+    }
 }
 
 /// Context for field accessor - holds the MetricSeries struct
@@ -506,7 +542,23 @@ test "processMetrics - no policies keeps all metrics" {
         \\{"series": [{"metric": "system.load.1", "type": 3, "points": [{"timestamp": 1636629071, "value": 0.7}]}]}
     ;
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expect(std.mem.indexOf(u8, result.data, "system.load.1") != null);
@@ -549,7 +601,23 @@ test "processMetrics - DROP policy filters metrics by name" {
         \\]}
     ;
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // debug.internal should be dropped, system.load.1 should remain
@@ -591,7 +659,23 @@ test "processMetrics - returns 202-compatible response when all metrics dropped"
         \\{"series": [{"metric": "system.load.1", "type": 3, "points": [{"timestamp": 1636629071, "value": 0.7}]}]}
     ;
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings("{\"errors\":[]}", result.data);
@@ -608,7 +692,23 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
 
     const malformed = "{ not valid json }";
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), malformed, "application/json");
+    var in_reader = std.Io.Reader.fixed(malformed);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(malformed, result.data);
@@ -625,7 +725,23 @@ test "processMetrics - non-JSON content type returns unchanged" {
 
     const data = "some raw metric data";
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), data, "text/plain");
+    var in_reader = std.Io.Reader.fixed(data);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "text/plain",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(data, result.data);
@@ -668,7 +784,23 @@ test "processMetrics - filter on tags" {
         \\]}
     ;
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // dev.metric should be dropped, prod.metric should remain
@@ -692,7 +824,23 @@ test "processMetrics - preserves all fields when no metrics dropped" {
         \\{"series": [{"metric": "system.load.1", "type": 3, "interval": 60, "unit": "percent", "points": [{"timestamp": 1636629071, "value": 0.7}], "tags": ["env:prod"], "resources": [{"name": "host1", "type": "host"}]}]}
     ;
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // When nothing is dropped, original data is returned unchanged
@@ -718,7 +866,23 @@ test "processMetrics - extra fields are preserved when no metrics dropped" {
         \\{"series": [{"metric": "test", "type": 3, "points": [], "extra_field": "should_be_preserved", "nested": {"key": "value"}}]}
     ;
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // When nothing is dropped, original data is returned unchanged - extra fields preserved
@@ -764,7 +928,23 @@ test "processMetrics - filter on metric type" {
         \\]}
     ;
 
-    const result = try processMetrics(allocator, &registry, noop_bus.eventBus(), metrics, "application/json");
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // count metric (type=1) should be dropped, gauge metric (type=3) should remain

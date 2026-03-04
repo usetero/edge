@@ -78,6 +78,20 @@ pub const ProcessResult = struct {
     }
 };
 
+pub const StreamProcessResult = struct {
+    was_transformed: bool = false,
+    dropped_count: usize,
+    original_count: usize,
+
+    pub fn wasModified(self: StreamProcessResult) bool {
+        return self.dropped_count > 0 or self.was_transformed;
+    }
+
+    pub fn allDropped(self: StreamProcessResult) bool {
+        return self.original_count > 0 and self.dropped_count == self.original_count;
+    }
+};
+
 /// Content format for OTLP traces
 pub const ContentFormat = enum {
     json,
@@ -99,48 +113,60 @@ pub const ContentFormat = enum {
 /// Process OTLP traces with filter evaluation
 /// Takes decompressed data (JSON or protobuf) and applies filter policies
 /// Returns ProcessResult with data and counts (caller owns the data slice)
-pub fn processTraces(
+pub fn processTracesStream(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
     bus: *EventBus,
-    data: []const u8,
+    in_reader: *std.Io.Reader,
+    out_writer: *std.Io.Writer,
     content_type: []const u8,
-) !ProcessResult {
+) !StreamProcessResult {
     const format = ContentFormat.fromContentType(content_type);
-
-    bus.debug(TracesProcessingStarted{
-        .content_type = content_type,
-        .data_len = data.len,
-        .format = @tagName(format),
-    });
-
     return switch (format) {
-        .json => processJsonTraces(allocator, registry, bus, data) catch |err| {
-            bus.err(TracesProcessingFailed{ .err = @errorName(err), .contentType = content_type });
-            return copyUnchanged(allocator, data);
+        .protobuf => processProtobufTracesStream(allocator, registry, bus, in_reader, out_writer),
+        .json => blk: {
+            const data = try readAll(allocator, in_reader);
+            defer allocator.free(data);
+            const result = try processJsonTraces(allocator, registry, bus, data);
+            defer allocator.free(result.data);
+            try out_writer.writeAll(result.data);
+            break :blk .{
+                .was_transformed = result.was_transformed,
+                .dropped_count = result.dropped_count,
+                .original_count = result.original_count,
+            };
         },
-        .protobuf => processProtobufTraces(allocator, registry, bus, data) catch |err| {
-            bus.err(TracesProcessingFailed{ .err = @errorName(err), .contentType = content_type });
-            return copyUnchanged(allocator, data);
+        .unknown => blk: {
+            try streamAll(in_reader, out_writer);
+            break :blk .{
+                .dropped_count = 0,
+                .original_count = 0,
+                .was_transformed = false,
+            };
         },
-        .unknown => copyUnchanged(allocator, data),
     };
+}
+
+fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try streamAll(reader, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+    while (true) {
+        const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+    }
 }
 
 // =============================================================================
 // Internal Implementation
 // =============================================================================
-
-/// Copy data unchanged (fail-open behavior)
-fn copyUnchanged(allocator: std.mem.Allocator, data: []const u8) !ProcessResult {
-    const result = try allocator.alloc(u8, data.len);
-    @memcpy(result, data);
-    return .{
-        .data = result,
-        .dropped_count = 0,
-        .original_count = 0,
-    };
-}
 
 /// Context for OTLP span field accessor - provides access to span plus parent context
 const OtlpSpanContext = struct {
@@ -440,6 +466,19 @@ fn processProtobufTraces(
         return error.DataLooksLikeJson;
     }
 
+    // Fast path: if no trace policies, skip decode/encode entirely.
+    const snapshot = registry.getSnapshot();
+    if (snapshot == null or snapshot.?.trace_index.isEmpty()) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = 0,
+            .was_transformed = false,
+        };
+    }
+
     // Use an arena for the protobuf decode/filter/encode cycle
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -468,6 +507,27 @@ fn processProtobufTraces(
         .dropped_count = counts.dropped_count,
         .original_count = counts.original_count,
         .was_transformed = counts.was_transformed,
+    };
+}
+
+fn processProtobufTracesStream(
+    allocator: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    in_reader: *std.Io.Reader,
+    out_writer: *std.Io.Writer,
+) !StreamProcessResult {
+    const data = try readAll(allocator, in_reader);
+    defer allocator.free(data);
+
+    const result = try processProtobufTraces(allocator, registry, bus, data);
+    defer allocator.free(result.data);
+
+    try out_writer.writeAll(result.data);
+    return .{
+        .was_transformed = result.was_transformed,
+        .dropped_count = result.dropped_count,
+        .original_count = result.original_count,
     };
 }
 
@@ -605,7 +665,23 @@ test "processTraces - parses and re-serializes JSON" {
         \\{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test-service"}}]},"scopeSpans":[{"scope":{"name":"my-tracer","version":"1.0"},"spans":[{"traceId":"0123456789abcdef0123456789abcdef","spanId":"0123456789abcdef","name":"test-span","kind":1,"startTimeUnixNano":"1000000000","endTimeUnixNano":"2000000000"}]}]}]}
     ;
 
-    const result = try processTraces(allocator, &registry, noop_bus.eventBus(), traces, "application/json");
+    var in_reader = std.Io.Reader.fixed(traces);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processTracesStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expect(std.mem.indexOf(u8, result.data, "test-span") != null);
@@ -623,7 +699,37 @@ test "processTraces - malformed JSON returns unchanged (fail-open)" {
 
     const malformed = "{ invalid json }";
 
-    const result = try processTraces(allocator, &registry, noop_bus.eventBus(), malformed, "application/json");
+    var in_reader = std.Io.Reader.fixed(malformed);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = processTracesStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    ) catch {
+        const copied = try allocator.alloc(u8, malformed.len);
+        @memcpy(copied, malformed);
+        const result = ProcessResult{
+            .data = copied,
+            .dropped_count = 0,
+            .original_count = 0,
+            .was_transformed = false,
+        };
+        defer allocator.free(result.data);
+
+        try std.testing.expectEqualStrings(malformed, result.data);
+        try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+        return;
+    };
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(malformed, result.data);
@@ -640,7 +746,23 @@ test "processTraces - unknown content type returns unchanged" {
 
     const data = "some data";
 
-    const result = try processTraces(allocator, &registry, noop_bus.eventBus(), data, "text/plain");
+    var in_reader = std.Io.Reader.fixed(data);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processTracesStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "text/plain",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(data, result.data);

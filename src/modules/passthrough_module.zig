@@ -1,67 +1,43 @@
 const std = @import("std");
-const proxy_module = @import("./proxy_module.zig");
+const module_types = @import("./module_types.zig");
 
-const ProxyModule = proxy_module.ProxyModule;
-const ModuleConfig = proxy_module.ModuleConfig;
-const ModuleRequest = proxy_module.ModuleRequest;
-const ModuleResult = proxy_module.ModuleResult;
-const RoutePattern = proxy_module.RoutePattern;
-const MethodBitmask = proxy_module.MethodBitmask;
+const ModuleConfig = module_types.ModuleConfig;
+const ModuleRequest = module_types.ModuleRequest;
+const ModuleStreamResult = module_types.ModuleStreamResult;
+const RoutePattern = module_types.RoutePattern;
+const MethodBitmask = module_types.MethodBitmask;
 
-/// Passthrough module - proxies all requests unchanged
-/// Used as a fallback/default module for unhandled routes
 pub const PassthroughModule = struct {
-    /// No state needed - completely stateless
-    pub fn asProxyModule(self: *PassthroughModule) ProxyModule {
-        return .{
-            .ptr = self,
-            .vtable = &vtable,
-        };
-    }
+    pub fn init(_: *PassthroughModule, _: std.mem.Allocator, _: ModuleConfig) !void {}
 
-    const vtable = ProxyModule.VTable{
-        .init = init,
-        .processRequest = processRequest,
-        .deinit = deinit,
-    };
-
-    fn init(
-        _: *anyopaque,
-        _: std.mem.Allocator,
-        _: ModuleConfig,
-    ) anyerror!void {
-        // Nothing to initialize
-    }
-
-    /// Passthrough - always return unchanged
-    fn processRequest(
-        _: *anyopaque,
+    pub fn processRequestStream(
+        _: *PassthroughModule,
         _: *const ModuleRequest,
+        body_reader: *std.Io.Reader,
+        body_writer: *std.Io.Writer,
         _: std.mem.Allocator,
-    ) anyerror!ModuleResult {
-        return ModuleResult.unchanged();
+    ) !ModuleStreamResult {
+        while (true) {
+            const n = body_reader.stream(body_writer, .unlimited) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+        }
+        return ModuleStreamResult.forwarded();
     }
 
-    fn deinit(_: *anyopaque) void {
-        // Nothing to cleanup
-    }
+    pub fn deinit(_: *PassthroughModule) void {}
 };
 
-/// Default routes - match everything
 pub const default_routes = [_]RoutePattern{
     RoutePattern.any(MethodBitmask.all),
 };
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 test "PassthroughModule always returns unchanged" {
     var module = PassthroughModule{};
-    const pm = module.asProxyModule();
 
-    // Initialize (no-op)
-    try pm.init(std.testing.allocator, .{
+    try module.init(std.testing.allocator, .{
         .id = @enumFromInt(0),
         .routes = &default_routes,
         .upstream = .{
@@ -75,21 +51,21 @@ test "PassthroughModule always returns unchanged" {
         .module_data = null,
     });
 
-    // Process request
     const req = ModuleRequest{
         .method = .GET,
         .path = "/any/path",
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body = "test body",
         .headers_ctx = null,
         .get_header_fn = null,
     };
+    var in_reader = std.Io.Reader.fixed("test body");
+    var out_buf: [64]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    const result = try module.processRequestStream(&req, &in_reader, &out_writer, std.testing.allocator);
+    try std.testing.expectEqual(ModuleStreamResult.Action.forwarded, result.action);
+    try std.testing.expectEqualStrings("test body", out_buf[0..out_writer.end]);
 
-    const result = try pm.processRequest(&req, std.testing.allocator);
-    try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
-
-    // Deinit (no-op)
-    pm.deinit();
+    module.deinit();
 }

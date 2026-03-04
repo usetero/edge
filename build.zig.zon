@@ -41,8 +41,8 @@
             .hash = "zimdjson-0.1.1-89pgxT5VBgBMxsGpAd90DI0e-DzHGKiRVlquliE5FivH",
         },
         .policy_zig = .{
-            .url = "git+https://github.com/usetero/policy-zig#32cf1c182401779b4d4a82a4579b17f0caebcbe2",
-            .hash = "policy_zig-0.1.7-5_dp3g9nDwBvBQaPHxiU4nuz9rmVzZVf-fVmI-_zoh70",
+            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.1.17.tar.gz",
+            .hash = "policy_zig-0.1.7-5_dp3mh0DwDRVIcv_V_LNPBOjuAQfjZhyMKp-43cfkHy",
         },
     },
     .paths = .{

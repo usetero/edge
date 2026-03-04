@@ -42,33 +42,66 @@ pub const ProcessResult = struct {
     }
 };
 
-/// Process Datadog logs with filter evaluation
-/// Takes decompressed JSON data and applies filter policies
-/// Returns ProcessResult with data and counts (caller owns the data slice)
-///
-/// This is a standalone function that doesn't depend on httpz
-pub fn processLogs(
+pub const StreamProcessResult = struct {
+    was_transformed: bool = false,
+    dropped_count: usize,
+    original_count: usize,
+
+    pub fn wasModified(self: StreamProcessResult) bool {
+        return self.dropped_count > 0 or self.was_transformed;
+    }
+
+    pub fn allDropped(self: StreamProcessResult) bool {
+        return self.original_count > 0 and self.dropped_count == self.original_count;
+    }
+};
+
+pub fn processLogsStream(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
     bus: *EventBus,
-    data: []const u8,
+    in_reader: *std.Io.Reader,
+    out_writer: *std.Io.Writer,
     content_type: []const u8,
-) !ProcessResult {
-    // Process based on content type
-    if (std.mem.indexOf(u8, content_type, "application/json") != null) {
-        // Parse JSON and apply filter policies
-        return processJsonLogsWithFilter(allocator, registry, bus, data);
+) !StreamProcessResult {
+    if (std.mem.indexOf(u8, content_type, "application/json") == null) {
+        try streamAll(in_reader, out_writer);
+        return .{
+            .dropped_count = 0,
+            .original_count = 0,
+            .was_transformed = false,
+        };
     }
 
-    // For non-JSON content types (logplex, raw), return unchanged
-    // (no filtering support for these formats yet)
-    const result = try allocator.alloc(u8, data.len);
-    @memcpy(result, data);
+    const data = try readAll(allocator, in_reader);
+    defer allocator.free(data);
+
+    const result = try processJsonLogsWithFilter(allocator, registry, bus, data);
+    defer allocator.free(result.data);
+    try out_writer.writeAll(result.data);
+
     return .{
-        .data = result,
-        .dropped_count = 0,
-        .original_count = 0, // Unknown for non-JSON
+        .was_transformed = result.was_transformed,
+        .dropped_count = result.dropped_count,
+        .original_count = result.original_count,
     };
+}
+
+fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try streamAll(reader, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+    while (true) {
+        const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+    }
 }
 
 /// Context for field accessor and mutator - holds the DatadogLog struct
@@ -641,7 +674,23 @@ test "processLogs - no policies keeps all logs in array" {
         \\[{"status": "info", "message": "test1"}, {"status": "error", "message": "test2"}]
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expect(std.mem.indexOf(u8, result.data, "test1") != null);
@@ -680,7 +729,23 @@ test "processLogs - DROP policy filters logs from array" {
         \\[{"status": "debug", "message": "debug msg"}, {"status": "error", "message": "error msg"}]
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // DEBUG log should be dropped, ERROR log should remain
@@ -719,7 +784,23 @@ test "processLogs - DROP policy drops single object" {
         \\{"status": "debug", "message": "debug msg"}
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), log, "application/json");
+    var in_reader = std.Io.Reader.fixed(log);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // Single dropped log returns empty array
@@ -737,7 +818,23 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 
     const malformed = "{ not valid json }";
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), malformed, "application/json");
+    var in_reader = std.Io.Reader.fixed(malformed);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(malformed, result.data);
@@ -754,7 +851,23 @@ test "processLogs - non-JSON content type returns unchanged" {
 
     const data = "some raw log data";
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), data, "text/plain");
+    var in_reader = std.Io.Reader.fixed(data);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "text/plain",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(data, result.data);
@@ -773,7 +886,23 @@ test "processLogs - Datadog format with ddtags and service" {
         \\[{"message": "User login", "service": "auth-service", "hostname": "web-01", "ddsource": "nodejs", "ddtags": "env:prod", "status": "info", "timestamp": 1733946000000}]
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     try std.testing.expect(std.mem.indexOf(u8, result.data, "User login") != null);
@@ -814,7 +943,23 @@ test "processLogs - filter on arbitrary custom field" {
         \\[{"message": "dev log", "environment": "development", "custom_field": "abc"}, {"message": "prod log", "environment": "production", "custom_field": "xyz"}]
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // Dev log should be dropped, prod log should remain
@@ -840,7 +985,23 @@ test "processLogs - extra fields are preserved when no logs dropped" {
         \\[{"status": "info", "message": "kept log", "extra_field": "should_be_preserved", "nested": {"key": "value"}, "array_field": [1, 2, 3]}]
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // When nothing is dropped, original data is returned unchanged - extra fields preserved
@@ -892,7 +1053,23 @@ test "processLogs - mutation triggers reserialization and removes field" {
         \\[{"message": "test log message", "service": "my-service", "status": "info"}]
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // The log should be kept (keep=all)
@@ -943,7 +1120,23 @@ test "processLogs - filter on dynamic extra field not in schema" {
         \\[{"message": "first-log-match", "trace_id": "abc123-def456"}, {"message": "second-log-nomatch", "trace_id": "xyz789-other"}, {"message": "third-log-notrace"}]
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // Check counts
@@ -990,7 +1183,23 @@ test "processLogs - filter on nested extra field with exists" {
         \\[{"message": "debug log", "debug_info": "stack trace here"}, {"message": "normal log", "service": "api"}]
     ;
 
-    const result = try processLogs(allocator, &registry, noop_bus.eventBus(), logs, "application/json");
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
     defer allocator.free(result.data);
 
     // Log with debug_info should be dropped

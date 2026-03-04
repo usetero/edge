@@ -1,16 +1,14 @@
 const std = @import("std");
-const proxy_module = @import("./proxy_module.zig");
+const module_types = @import("./module_types.zig");
 const policy = @import("policy_zig");
 const logs_v2 = @import("./datadog_logs_v2.zig");
 const metrics_v2 = @import("./datadog_metrics_v2.zig");
 const o11y = @import("o11y");
 
-const ProxyModule = proxy_module.ProxyModule;
-const ModuleConfig = proxy_module.ModuleConfig;
-const ModuleRequest = proxy_module.ModuleRequest;
-const ModuleResult = proxy_module.ModuleResult;
-const RoutePattern = proxy_module.RoutePattern;
-const MethodBitmask = proxy_module.MethodBitmask;
+const ModuleConfig = module_types.ModuleConfig;
+const ModuleRequest = module_types.ModuleRequest;
+const ModuleStreamResult = module_types.ModuleStreamResult;
+const RoutePattern = module_types.RoutePattern;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -40,25 +38,7 @@ pub const DatadogModule = struct {
     /// Event bus for observability
     bus: *EventBus = undefined,
 
-    pub fn asProxyModule(self: *DatadogModule) ProxyModule {
-        return .{
-            .ptr = self,
-            .vtable = &vtable,
-        };
-    }
-
-    const vtable = ProxyModule.VTable{
-        .init = init,
-        .processRequest = processRequest,
-        .deinit = deinit,
-    };
-
-    fn init(
-        ptr: *anyopaque,
-        _: std.mem.Allocator,
-        config: ModuleConfig,
-    ) anyerror!void {
-        const self: *DatadogModule = @ptrCast(@alignCast(ptr));
+    pub fn init(self: *DatadogModule, _: std.mem.Allocator, config: ModuleConfig) !void {
 
         // Get registry from module_data
         const dd_config: *const DatadogConfig = @ptrCast(@alignCast(config.module_data orelse
@@ -67,115 +47,87 @@ pub const DatadogModule = struct {
         self.bus = dd_config.bus;
     }
 
-    /// THREAD-SAFE: No shared mutable state, only reads from registry
-    fn processRequest(
-        ptr: *anyopaque,
+    pub fn processRequestStream(
+        self: *DatadogModule,
         req: *const ModuleRequest,
+        body_reader: *std.Io.Reader,
+        body_writer: *std.Io.Writer,
         allocator: std.mem.Allocator,
-    ) anyerror!ModuleResult {
-        const self: *DatadogModule = @ptrCast(@alignCast(ptr));
-
-        // Only process POST requests
+    ) !ModuleStreamResult {
         if (req.method != .POST) {
-            return ModuleResult.unchanged();
+            try streamAll(body_reader, body_writer);
+            return ModuleStreamResult.forwarded();
         }
 
-        // No body = nothing to process
-        if (req.body.len == 0) {
-            return ModuleResult.unchanged();
-        }
-
-        // Route to appropriate handler based on path
-        if (std.mem.eql(u8, req.path, "/api/v2/logs")) {
-            return self.processLogs(req, allocator);
-        } else if (std.mem.eql(u8, req.path, "/api/v2/series")) {
-            return self.processMetrics(req, allocator);
-        }
-
-        return ModuleResult.unchanged();
-    }
-
-    /// Process logs endpoint
-    fn processLogs(self: *DatadogModule, req: *const ModuleRequest, allocator: std.mem.Allocator) !ModuleResult {
-        // Get content type from headers
         const content_type = req.getHeader("content-type") orelse "application/json";
 
-        // Process logs through filter
-        // FAIL OPEN: If processing fails, pass original through
-        const result = logs_v2.processLogs(
-            allocator,
-            self.registry,
-            self.bus,
-            req.body,
-            content_type,
-        ) catch |err| {
-            self.bus.warn(LogsProcessingFailed{ .err = @errorName(err) });
-            return ModuleResult.unchanged();
-        };
+        switch (req.route_kind) {
+            .datadog_logs => {
+                const result = logs_v2.processLogsStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                ) catch |err| {
+                    self.bus.warn(LogsProcessingFailed{ .err = @errorName(err) });
+                    try streamAll(body_reader, body_writer);
+                    return ModuleStreamResult.forwarded();
+                };
 
-        self.bus.debug(LogsProcessed{
-            .dropped = result.dropped_count,
-            .kept = result.original_count - result.dropped_count,
-        });
+                self.bus.debug(LogsProcessed{
+                    .dropped = result.dropped_count,
+                    .kept = result.original_count - result.dropped_count,
+                });
 
-        // If all logs were dropped, return empty array with 202 (Datadog expects this)
-        if (result.allDropped()) {
-            allocator.free(result.data);
-            return ModuleResult.respond(202, "{}");
+                if (result.allDropped()) {
+                    return ModuleStreamResult.respond(202, "{}");
+                }
+                return ModuleStreamResult.forwarded();
+            },
+            .datadog_metrics => {
+                const result = metrics_v2.processMetricsStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                ) catch |err| {
+                    self.bus.warn(MetricsProcessingFailed{ .err = @errorName(err) });
+                    try streamAll(body_reader, body_writer);
+                    return ModuleStreamResult.forwarded();
+                };
+
+                self.bus.debug(MetricsProcessed{
+                    .dropped = result.dropped_count,
+                    .kept = result.original_count - result.dropped_count,
+                });
+
+                if (result.allDropped()) {
+                    return ModuleStreamResult.respond(202, "{\"errors\":[]}");
+                }
+                return ModuleStreamResult.forwarded();
+            },
+            else => {},
         }
 
-        // Check if logs were actually modified (any dropped)
-        if (!result.wasModified()) {
-            // No changes - free allocated memory and return unchanged
-            allocator.free(result.data);
-            return ModuleResult.unchanged();
-        }
-
-        // Logs were modified
-        return ModuleResult.modified(result.data);
+        try streamAll(body_reader, body_writer);
+        return ModuleStreamResult.forwarded();
     }
 
-    /// Process metrics endpoint
-    fn processMetrics(self: *DatadogModule, req: *const ModuleRequest, allocator: std.mem.Allocator) !ModuleResult {
-        // Get content type from headers
-        const content_type = req.getHeader("content-type") orelse "application/json";
-
-        // Process metrics through filter
-        // FAIL OPEN: If processing fails, pass original through
-        const result = metrics_v2.processMetrics(
-            allocator,
-            self.registry,
-            self.bus,
-            req.body,
-            content_type,
-        ) catch |err| {
-            self.bus.warn(MetricsProcessingFailed{ .err = @errorName(err) });
-            return ModuleResult.unchanged();
-        };
-
-        self.bus.debug(MetricsProcessed{
-            .dropped = result.dropped_count,
-            .kept = result.original_count - result.dropped_count,
-        });
-
-        // If all metrics were dropped, return empty series with 202 (Datadog expects this)
-        if (result.allDropped()) {
-            allocator.free(result.data);
-            return ModuleResult.respond(202, "{\"errors\":[]}");
+    fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+        while (true) {
+            const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
         }
-
-        // Check if metrics were actually modified (any dropped)
-        if (!result.wasModified()) {
-            // No changes - free allocated memory and return unchanged
-            allocator.free(result.data);
-            return ModuleResult.unchanged();
-        }
-
-        // Metrics were modified
-        return ModuleResult.modified(result.data);
     }
 
-    fn deinit(_: *anyopaque) void {
+    pub fn deinit(_: *DatadogModule) void {
         // Nothing to cleanup (stateless)
     }
 };
@@ -202,6 +154,58 @@ pub const routes = [_]RoutePattern{
 
 const proto = @import("proto");
 
+const ModuleResult = struct {
+    action: Action,
+    modified_body: []u8 = &.{},
+    status: u16 = 200,
+    response_body: []const u8 = &.{},
+
+    const Action = enum {
+        proxy_unchanged,
+        proxy_modified,
+        respond_immediately,
+    };
+};
+
+fn runModuleForTest(
+    module: anytype,
+    req: *const ModuleRequest,
+    allocator: std.mem.Allocator,
+) !ModuleResult {
+    var in_reader = std.Io.Reader.fixed(req.body);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out_writer.deinit();
+
+    const stream_result = try module.processRequestStream(
+        req,
+        &in_reader,
+        &out_writer.writer,
+        allocator,
+    );
+
+    return switch (stream_result.action) {
+        .respond_immediately => blk: {
+            out_writer.deinit();
+            break :blk .{
+                .action = .respond_immediately,
+                .status = stream_result.status,
+                .response_body = stream_result.response_body,
+            };
+        },
+        .forwarded => blk: {
+            const output = try out_writer.toOwnedSlice();
+            if (std.mem.eql(u8, output, req.body)) {
+                allocator.free(output);
+                break :blk .{ .action = .proxy_unchanged };
+            }
+            break :blk .{
+                .action = .proxy_modified,
+                .modified_body = output,
+            };
+        },
+    };
+}
+
 test "DatadogModule processes POST requests to /api/v2/logs" {
     const allocator = std.testing.allocator;
 
@@ -213,9 +217,8 @@ test "DatadogModule processes POST requests to /api/v2/logs" {
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -233,6 +236,7 @@ test "DatadogModule processes POST requests to /api/v2/logs" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/logs",
+        .route_kind = .datadog_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -241,12 +245,12 @@ test "DatadogModule processes POST requests to /api/v2/logs" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // With no policies, logs should pass through unchanged
     try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
 
-    pm.deinit();
+    module.deinit();
 }
 
 test "DatadogModule processes POST requests to /api/v2/series" {
@@ -260,9 +264,8 @@ test "DatadogModule processes POST requests to /api/v2/series" {
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -280,6 +283,7 @@ test "DatadogModule processes POST requests to /api/v2/series" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/series",
+        .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -288,12 +292,12 @@ test "DatadogModule processes POST requests to /api/v2/series" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // With no policies, metrics should pass through unchanged
     try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
 
-    pm.deinit();
+    module.deinit();
 }
 
 test "DatadogModule ignores GET requests" {
@@ -307,9 +311,8 @@ test "DatadogModule ignores GET requests" {
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -326,6 +329,7 @@ test "DatadogModule ignores GET requests" {
     const req = ModuleRequest{
         .method = .GET,
         .path = "/api/v2/logs",
+        .route_kind = .datadog_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -334,10 +338,10 @@ test "DatadogModule ignores GET requests" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
     try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
 
-    pm.deinit();
+    module.deinit();
 }
 
 test "DatadogModule filters logs with DROP policy" {
@@ -368,9 +372,8 @@ test "DatadogModule filters logs with DROP policy" {
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -388,6 +391,7 @@ test "DatadogModule filters logs with DROP policy" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/logs",
+        .route_kind = .datadog_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -396,7 +400,7 @@ test "DatadogModule filters logs with DROP policy" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // Should be modified (DEBUG filtered out)
     try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
@@ -404,7 +408,7 @@ test "DatadogModule filters logs with DROP policy" {
     try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "error") != null);
 
     allocator.free(result.modified_body);
-    pm.deinit();
+    module.deinit();
 }
 
 test "DatadogModule filters metrics with DROP policy" {
@@ -437,9 +441,8 @@ test "DatadogModule filters metrics with DROP policy" {
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -457,6 +460,7 @@ test "DatadogModule filters metrics with DROP policy" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/series",
+        .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -465,7 +469,7 @@ test "DatadogModule filters metrics with DROP policy" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // Should be modified (debug.internal filtered out)
     try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
@@ -473,7 +477,7 @@ test "DatadogModule filters metrics with DROP policy" {
     try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "system.load.1") != null);
 
     allocator.free(result.modified_body);
-    pm.deinit();
+    module.deinit();
 }
 
 test "DatadogModule returns 202 when all logs dropped" {
@@ -504,9 +508,8 @@ test "DatadogModule returns 202 when all logs dropped" {
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -523,6 +526,7 @@ test "DatadogModule returns 202 when all logs dropped" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/logs",
+        .route_kind = .datadog_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -531,13 +535,13 @@ test "DatadogModule returns 202 when all logs dropped" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // Should respond immediately with 202
     try std.testing.expectEqual(ModuleResult.Action.respond_immediately, result.action);
     try std.testing.expectEqual(@as(u16, 202), result.status);
 
-    pm.deinit();
+    module.deinit();
 }
 
 test "DatadogModule returns 202 when all metrics dropped" {
@@ -570,9 +574,8 @@ test "DatadogModule returns 202 when all metrics dropped" {
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = DatadogModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -589,6 +592,7 @@ test "DatadogModule returns 202 when all metrics dropped" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/api/v2/series",
+        .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -597,11 +601,11 @@ test "DatadogModule returns 202 when all metrics dropped" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // Should respond immediately with 202
     try std.testing.expectEqual(ModuleResult.Action.respond_immediately, result.action);
     try std.testing.expectEqual(@as(u16, 202), result.status);
 
-    pm.deinit();
+    module.deinit();
 }

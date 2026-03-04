@@ -1,17 +1,15 @@
 const std = @import("std");
-const proxy_module = @import("./proxy_module.zig");
+const module_types = @import("./module_types.zig");
 const policy = @import("policy_zig");
 const otlp_logs = @import("./otlp_logs.zig");
 const otlp_metrics = @import("./otlp_metrics.zig");
 const otlp_traces = @import("./otlp_traces.zig");
 const o11y = @import("o11y");
 
-const ProxyModule = proxy_module.ProxyModule;
-const ModuleConfig = proxy_module.ModuleConfig;
-const ModuleRequest = proxy_module.ModuleRequest;
-const ModuleResult = proxy_module.ModuleResult;
-const RoutePattern = proxy_module.RoutePattern;
-const MethodBitmask = proxy_module.MethodBitmask;
+const ModuleConfig = module_types.ModuleConfig;
+const ModuleRequest = module_types.ModuleRequest;
+const ModuleStreamResult = module_types.ModuleStreamResult;
+const RoutePattern = module_types.RoutePattern;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -43,25 +41,7 @@ pub const OtlpModule = struct {
     /// Event bus for observability
     bus: *EventBus = undefined,
 
-    pub fn asProxyModule(self: *OtlpModule) ProxyModule {
-        return .{
-            .ptr = self,
-            .vtable = &vtable,
-        };
-    }
-
-    const vtable = ProxyModule.VTable{
-        .init = init,
-        .processRequest = processRequest,
-        .deinit = deinit,
-    };
-
-    fn init(
-        ptr: *anyopaque,
-        _: std.mem.Allocator,
-        config: ModuleConfig,
-    ) anyerror!void {
-        const self: *OtlpModule = @ptrCast(@alignCast(ptr));
+    pub fn init(self: *OtlpModule, _: std.mem.Allocator, config: ModuleConfig) !void {
 
         // Get registry from module_data
         const otlp_config: *const OtlpConfig = @ptrCast(@alignCast(config.module_data orelse
@@ -70,163 +50,75 @@ pub const OtlpModule = struct {
         self.bus = otlp_config.bus;
     }
 
-    /// THREAD-SAFE: No shared mutable state, only reads from registry
-    fn processRequest(
-        ptr: *anyopaque,
+    pub fn processRequestStream(
+        self: *OtlpModule,
         req: *const ModuleRequest,
+        body_reader: *std.Io.Reader,
+        body_writer: *std.Io.Writer,
         allocator: std.mem.Allocator,
-    ) anyerror!ModuleResult {
-        const self: *OtlpModule = @ptrCast(@alignCast(ptr));
-
-        // Only process POST requests
+    ) !ModuleStreamResult {
         if (req.method != .POST) {
-            return ModuleResult.unchanged();
+            try streamAll(body_reader, body_writer);
+            return ModuleStreamResult.forwarded();
         }
 
-        // No body = nothing to process
-        if (req.body.len == 0) {
-            return ModuleResult.unchanged();
-        }
-
-        // Get content type from headers
         const content_type = req.getHeader("content-type") orelse "application/json";
 
-        // Route to appropriate processor based on path
-        if (std.mem.endsWith(u8, req.path, "/v1/logs")) {
-            return self.processLogs(allocator, req.body, content_type);
-        } else if (std.mem.endsWith(u8, req.path, "/v1/metrics")) {
-            return self.processMetrics(allocator, req.body, content_type);
-        } else if (std.mem.endsWith(u8, req.path, "/v1/traces")) {
-            return self.processTraces(allocator, req.body, content_type);
+        switch (req.route_kind) {
+            .otlp_logs => {
+                const result = try otlp_logs.processLogsStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                );
+                if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
+                return ModuleStreamResult.forwarded();
+            },
+            .otlp_metrics => {
+                const result = try otlp_metrics.processMetricsStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                );
+                if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
+                return ModuleStreamResult.forwarded();
+            },
+            .otlp_traces => {
+                const result = try otlp_traces.processTracesStream(
+                    allocator,
+                    self.registry,
+                    self.bus,
+                    body_reader,
+                    body_writer,
+                    content_type,
+                );
+                if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
+                return ModuleStreamResult.forwarded();
+            },
+            else => {},
         }
 
-        return ModuleResult.unchanged();
+        try streamAll(body_reader, body_writer);
+        return ModuleStreamResult.forwarded();
     }
 
-    fn processLogs(
-        self: *OtlpModule,
-        allocator: std.mem.Allocator,
-        body: []const u8,
-        content_type: []const u8,
-    ) !ModuleResult {
-        // Process logs through filter
-        // FAIL OPEN: If processing fails, pass original through
-        const result = otlp_logs.processLogs(
-            allocator,
-            self.registry,
-            self.bus,
-            body,
-            content_type,
-        ) catch |err| {
-            self.bus.warn(LogsProcessingFailed{ .err = @errorName(err) });
-            return ModuleResult.unchanged();
-        };
-
-        self.bus.debug(LogsProcessed{
-            .dropped = result.dropped_count,
-            .kept = result.original_count - result.dropped_count,
-        });
-
-        // If all logs were dropped, return empty response with 200 (OTLP expects this)
-        if (result.allDropped()) {
-            allocator.free(result.data);
-            return ModuleResult.respond(200, "{}");
+    fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+        while (true) {
+            const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
         }
-
-        // Check if logs were actually modified (any dropped)
-        if (!result.wasModified()) {
-            // No changes - free allocated memory and return unchanged
-            allocator.free(result.data);
-            return ModuleResult.unchanged();
-        }
-
-        // Logs were modified
-        return ModuleResult.modified(result.data);
     }
 
-    fn processMetrics(
-        self: *OtlpModule,
-        allocator: std.mem.Allocator,
-        body: []const u8,
-        content_type: []const u8,
-    ) !ModuleResult {
-        // Process metrics through filter
-        // FAIL OPEN: If processing fails, pass original through
-        const result = otlp_metrics.processMetrics(
-            allocator,
-            self.registry,
-            self.bus,
-            body,
-            content_type,
-        ) catch |err| {
-            self.bus.warn(MetricsProcessingFailed{ .err = @errorName(err) });
-            return ModuleResult.unchanged();
-        };
-
-        self.bus.debug(MetricsProcessed{
-            .dropped = result.dropped_count,
-            .kept = result.original_count - result.dropped_count,
-        });
-
-        // If all metrics were dropped, return empty response with 200 (OTLP expects this)
-        if (result.allDropped()) {
-            allocator.free(result.data);
-            return ModuleResult.respond(200, "{}");
-        }
-
-        // Check if metrics were actually modified (any dropped)
-        if (!result.wasModified()) {
-            // No changes - free allocated memory and return unchanged
-            allocator.free(result.data);
-            return ModuleResult.unchanged();
-        }
-
-        // Metrics were modified
-        return ModuleResult.modified(result.data);
-    }
-
-    fn processTraces(
-        self: *OtlpModule,
-        allocator: std.mem.Allocator,
-        body: []const u8,
-        content_type: []const u8,
-    ) !ModuleResult {
-        // Process traces through filter
-        // FAIL OPEN: If processing fails, pass original through
-        const result = otlp_traces.processTraces(
-            allocator,
-            self.registry,
-            self.bus,
-            body,
-            content_type,
-        ) catch |err| {
-            self.bus.warn(TracesProcessingFailed{ .err = @errorName(err) });
-            return ModuleResult.unchanged();
-        };
-
-        self.bus.debug(TracesProcessed{
-            .dropped = result.dropped_count,
-            .kept = result.original_count - result.dropped_count,
-        });
-
-        // If all traces were dropped, return empty response with 200 (OTLP expects this)
-        if (result.allDropped()) {
-            allocator.free(result.data);
-            return ModuleResult.respond(200, "{}");
-        }
-
-        // Check if traces were actually modified (any dropped)
-        if (!result.wasModified()) {
-            // No changes - free allocated memory and return unchanged
-            allocator.free(result.data);
-            return ModuleResult.unchanged();
-        }
-
-        // Traces were modified
-        return ModuleResult.modified(result.data);
-    }
-
-    fn deinit(_: *anyopaque) void {
+    pub fn deinit(_: *OtlpModule) void {
         // Nothing to cleanup (stateless)
     }
 };
@@ -244,6 +136,58 @@ pub const routes = [_]RoutePattern{
 
 const proto = @import("proto");
 
+const ModuleResult = struct {
+    action: Action,
+    modified_body: []u8 = &.{},
+    status: u16 = 200,
+    response_body: []const u8 = &.{},
+
+    const Action = enum {
+        proxy_unchanged,
+        proxy_modified,
+        respond_immediately,
+    };
+};
+
+fn runModuleForTest(
+    module: anytype,
+    req: *const ModuleRequest,
+    allocator: std.mem.Allocator,
+) !ModuleResult {
+    var in_reader = std.Io.Reader.fixed(req.body);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out_writer.deinit();
+
+    const stream_result = try module.processRequestStream(
+        req,
+        &in_reader,
+        &out_writer.writer,
+        allocator,
+    );
+
+    return switch (stream_result.action) {
+        .respond_immediately => blk: {
+            out_writer.deinit();
+            break :blk .{
+                .action = .respond_immediately,
+                .status = stream_result.status,
+                .response_body = stream_result.response_body,
+            };
+        },
+        .forwarded => blk: {
+            const output = try out_writer.toOwnedSlice();
+            if (std.mem.eql(u8, output, req.body)) {
+                allocator.free(output);
+                break :blk .{ .action = .proxy_unchanged };
+            }
+            break :blk .{
+                .action = .proxy_modified,
+                .modified_body = output,
+            };
+        },
+    };
+}
+
 test "OtlpModule processes POST requests" {
     const allocator = std.testing.allocator;
 
@@ -255,9 +199,8 @@ test "OtlpModule processes POST requests" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -275,6 +218,7 @@ test "OtlpModule processes POST requests" {
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -285,12 +229,12 @@ test "OtlpModule processes POST requests" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // With no policies, logs should pass through unchanged
     try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
 
-    pm.deinit();
+    module.deinit();
 }
 
 test "OtlpModule ignores GET requests" {
@@ -304,9 +248,8 @@ test "OtlpModule ignores GET requests" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -323,6 +266,7 @@ test "OtlpModule ignores GET requests" {
     const req = ModuleRequest{
         .method = .GET,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -331,10 +275,10 @@ test "OtlpModule ignores GET requests" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
     try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
 
-    pm.deinit();
+    module.deinit();
 }
 
 // =============================================================================
@@ -369,9 +313,8 @@ test "OtlpModule: DROP policy filters matching logs" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -384,12 +327,13 @@ test "OtlpModule: DROP policy filters matching logs" {
         },
         .module_data = @ptrCast(&otlp_config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     // Request with DEBUG log (should be dropped) and INFO log (should be kept)
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -400,7 +344,7 @@ test "OtlpModule: DROP policy filters matching logs" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // Should be modified (one log dropped)
     try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
@@ -441,9 +385,8 @@ test "OtlpModule: all logs dropped returns empty response" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -456,11 +399,12 @@ test "OtlpModule: all logs dropped returns empty response" {
         },
         .module_data = @ptrCast(&otlp_config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -471,9 +415,8 @@ test "OtlpModule: all logs dropped returns empty response" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
-    // Should respond with empty response (200 OK with {})
     try std.testing.expectEqual(ModuleResult.Action.respond_immediately, result.action);
     try std.testing.expectEqual(@as(u16, 200), result.status);
     try std.testing.expectEqualStrings("{}", result.response_body);
@@ -509,9 +452,8 @@ test "OtlpModule: filter logs by resource attribute" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -524,12 +466,13 @@ test "OtlpModule: filter logs by resource attribute" {
         },
         .module_data = @ptrCast(&otlp_config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     // Request with logs from test-service (should be dropped) and prod-service (should be kept)
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/logs",
+        .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -540,7 +483,7 @@ test "OtlpModule: filter logs by resource attribute" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
 
@@ -583,9 +526,8 @@ test "OtlpModule: DROP policy filters matching metrics" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -598,12 +540,13 @@ test "OtlpModule: DROP policy filters matching metrics" {
         },
         .module_data = @ptrCast(&otlp_config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     // Request with debug metric (should be dropped) and http metric (should be kept)
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/metrics",
+        .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -614,7 +557,7 @@ test "OtlpModule: DROP policy filters matching metrics" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // Should be modified (one metric dropped)
     try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
@@ -654,9 +597,8 @@ test "OtlpModule: all metrics dropped returns empty response" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -669,11 +611,12 @@ test "OtlpModule: all metrics dropped returns empty response" {
         },
         .module_data = @ptrCast(&otlp_config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/metrics",
+        .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -684,9 +627,8 @@ test "OtlpModule: all metrics dropped returns empty response" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
-    // Should respond with empty response (200 OK with {})
     try std.testing.expectEqual(ModuleResult.Action.respond_immediately, result.action);
     try std.testing.expectEqual(@as(u16, 200), result.status);
     try std.testing.expectEqualStrings("{}", result.response_body);
@@ -721,9 +663,8 @@ test "OtlpModule: filter metrics by metric type" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -736,12 +677,13 @@ test "OtlpModule: filter metrics by metric type" {
         },
         .module_data = @ptrCast(&otlp_config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     // Request with gauge metric (should be dropped) and sum metric (should be kept)
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/metrics",
+        .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -752,7 +694,7 @@ test "OtlpModule: filter metrics by metric type" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
     // Should be modified (gauge metric dropped)
     try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
@@ -792,9 +734,8 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
 
     var module = OtlpModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(allocator, .{
+    try module.init(allocator, .{
         .id = @enumFromInt(0),
         .routes = &routes,
         .upstream = .{
@@ -807,11 +748,12 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
         },
         .module_data = @ptrCast(&otlp_config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     const req = ModuleRequest{
         .method = .POST,
         .path = "/v1/metrics",
+        .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
@@ -822,8 +764,10 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, allocator);
+    const result = try runModuleForTest(&module, &req, allocator);
 
-    // Should pass through unchanged (no metrics matched the policy)
-    try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
+    // Stream JSON path may reserialize while preserving semantic content.
+    try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
+    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "http.requests") != null);
+    allocator.free(result.modified_body);
 }

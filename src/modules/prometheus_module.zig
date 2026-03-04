@@ -4,21 +4,19 @@
 //! Filters metrics in streaming fashion based on configured policies.
 
 const std = @import("std");
-const proxy_module = @import("./proxy_module.zig");
+const module_types = @import("./module_types.zig");
 const prometheus = @import("../prometheus/root.zig");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 
-const ProxyModule = proxy_module.ProxyModule;
-const ModuleConfig = proxy_module.ModuleConfig;
-const ModuleRequest = proxy_module.ModuleRequest;
-const ModuleResult = proxy_module.ModuleResult;
-const RoutePattern = proxy_module.RoutePattern;
-const ResponseFilter = proxy_module.ResponseFilter;
+const ModuleConfig = module_types.ModuleConfig;
+const ModuleRequest = module_types.ModuleRequest;
+const ModuleStreamResult = module_types.ModuleStreamResult;
+const RoutePattern = module_types.RoutePattern;
+const ResponseFilter = module_types.ResponseFilter;
 
 const PolicyStreamingFilter = prometheus.PolicyStreamingFilter;
 const FilteringWriter = prometheus.FilteringWriter;
-const FilterStats = prometheus.FilterStats;
 
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
@@ -165,36 +163,32 @@ const PrometheusResponseFilter = struct {
 pub const PrometheusModule = struct {
     config: ?*const PrometheusConfig = null,
 
-    pub fn asProxyModule(self: *PrometheusModule) ProxyModule {
-        return .{
-            .ptr = self,
-            .vtable = &vtable,
-        };
-    }
-
-    const vtable = ProxyModule.VTable{
-        .init = init,
-        .processRequest = processRequest,
-        .deinit = deinit,
-        .createResponseFilter = createResponseFilter,
-    };
-
-    fn init(ptr: *anyopaque, _: std.mem.Allocator, module_config: ModuleConfig) anyerror!void {
-        const self: *PrometheusModule = @ptrCast(@alignCast(ptr));
+    pub fn init(self: *PrometheusModule, _: std.mem.Allocator, module_config: ModuleConfig) !void {
         self.config = @ptrCast(@alignCast(module_config.module_data));
     }
 
-    fn processRequest(_: *anyopaque, _: *const ModuleRequest, _: std.mem.Allocator) anyerror!ModuleResult {
-        // Passthrough - no request modification
-        return ModuleResult.unchanged();
+    pub fn processRequestStream(
+        _: *PrometheusModule,
+        _: *const ModuleRequest,
+        body_reader: *std.Io.Reader,
+        body_writer: *std.Io.Writer,
+        _: std.mem.Allocator,
+    ) !ModuleStreamResult {
+        while (true) {
+            const n = body_reader.stream(body_writer, .unlimited) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+        }
+        return ModuleStreamResult.forwarded();
     }
 
-    fn createResponseFilter(
-        ptr: *anyopaque,
+    pub fn createResponseFilter(
+        self: *PrometheusModule,
         inner_writer: *std.Io.Writer,
         allocator: std.mem.Allocator,
-    ) anyerror!?ResponseFilter {
-        const self: *PrometheusModule = @ptrCast(@alignCast(ptr));
+    ) !?ResponseFilter {
 
         // If no config, don't filter
         const config = self.config orelse return null;
@@ -204,7 +198,7 @@ pub const PrometheusModule = struct {
         return filter.asResponseFilter();
     }
 
-    fn deinit(_: *anyopaque) void {}
+    pub fn deinit(_: *PrometheusModule) void {}
 };
 
 pub const default_routes = [_]RoutePattern{
@@ -218,11 +212,10 @@ pub const default_routes = [_]RoutePattern{
 
 const testing = std.testing;
 
-test "PrometheusModule - processRequest returns unchanged" {
+test "PrometheusModule - processRequestStream forwards body" {
     var module = PrometheusModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(testing.allocator, .{
+    try module.init(testing.allocator, .{
         .id = @enumFromInt(0),
         .routes = &default_routes,
         .upstream = .{
@@ -235,7 +228,7 @@ test "PrometheusModule - processRequest returns unchanged" {
         },
         .module_data = null,
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     const req = ModuleRequest{
         .method = .GET,
@@ -243,20 +236,22 @@ test "PrometheusModule - processRequest returns unchanged" {
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body = "",
         .headers_ctx = null,
         .get_header_fn = null,
     };
 
-    const result = try pm.processRequest(&req, testing.allocator);
-    try testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
+    var in_reader = std.Io.Reader.fixed("abc");
+    var out_buf: [16]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    const result = try module.processRequestStream(&req, &in_reader, &out_writer, testing.allocator);
+    try testing.expectEqual(ModuleStreamResult.Action.forwarded, result.action);
+    try testing.expectEqualStrings("abc", out_buf[0..out_writer.end]);
 }
 
 test "PrometheusModule - createResponseFilter returns null without config" {
     var module = PrometheusModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(testing.allocator, .{
+    try module.init(testing.allocator, .{
         .id = @enumFromInt(0),
         .routes = &default_routes,
         .upstream = .{
@@ -269,12 +264,12 @@ test "PrometheusModule - createResponseFilter returns null without config" {
         },
         .module_data = null, // No config
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     var output_buf: [1024]u8 = undefined;
     var output_writer = std.Io.Writer.fixed(&output_buf);
 
-    const filter = try pm.createResponseFilter(&output_writer, testing.allocator);
+    const filter = try module.createResponseFilter(&output_writer, testing.allocator);
     try testing.expect(filter == null);
 }
 
@@ -294,9 +289,8 @@ test "PrometheusModule - createResponseFilter with config" {
     };
 
     var module = PrometheusModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(testing.allocator, .{
+    try module.init(testing.allocator, .{
         .id = @enumFromInt(0),
         .routes = &default_routes,
         .upstream = .{
@@ -309,12 +303,12 @@ test "PrometheusModule - createResponseFilter with config" {
         },
         .module_data = @ptrCast(&config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     var output_buf: [4096]u8 = undefined;
     var output_writer = std.Io.Writer.fixed(&output_buf);
 
-    const maybe_filter = try pm.createResponseFilter(&output_writer, testing.allocator);
+    const maybe_filter = try module.createResponseFilter(&output_writer, testing.allocator);
     try testing.expect(maybe_filter != null);
 
     var filter = maybe_filter.?;
@@ -368,9 +362,8 @@ test "PrometheusModule - response filter with DROP policy" {
     };
 
     var module = PrometheusModule{};
-    const pm = module.asProxyModule();
 
-    try pm.init(testing.allocator, .{
+    try module.init(testing.allocator, .{
         .id = @enumFromInt(0),
         .routes = &default_routes,
         .upstream = .{
@@ -383,12 +376,12 @@ test "PrometheusModule - response filter with DROP policy" {
         },
         .module_data = @ptrCast(&config),
     });
-    defer pm.deinit();
+    defer module.deinit();
 
     var output_buf: [4096]u8 = undefined;
     var output_writer = std.Io.Writer.fixed(&output_buf);
 
-    const maybe_filter = try pm.createResponseFilter(&output_writer, testing.allocator);
+    const maybe_filter = try module.createResponseFilter(&output_writer, testing.allocator);
     try testing.expect(maybe_filter != null);
 
     var filter = maybe_filter.?;
