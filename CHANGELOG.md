@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.16.0](https://github.com/usetero/edge/compare/v1.15.1...v1.16.0) (2026-03-04)
+
+
+### Features
+
+* streaming approach with enums ([#145](https://github.com/usetero/edge/issues/145)) ([4ecce2d](https://github.com/usetero/edge/commit/4ecce2d661b0058a4f418f61b948c1da47919add))
+
+
+### Bug Fixes
+
+* datadog attr should try regular dots too ([#142](https://github.com/usetero/edge/issues/142)) ([1635978](https://github.com/usetero/edge/commit/16359782041f01acc18e21a93be43215ffd5ef49))
+
 ## [1.15.1](https://github.com/usetero/edge/compare/v1.15.0...v1.15.1) (2026-02-25)
 
 
