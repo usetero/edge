@@ -74,6 +74,7 @@ pub fn build(b: *std.Build) void {
         .{ "datadog", "src/datadog_main.zig", "Datadog ingestion" },
         .{ "otlp", "src/otlp_main.zig", "OpenTelemetry (OTLP) ingestion" },
         .{ "prometheus", "src/prometheus_main.zig", "Prometheus metrics scraping" },
+        .{ "tail", "src/edge_tail_main.zig", "Log tailing" },
         .{ "edge", "src/main.zig", "Full distribution (OTLP, Datadog & Prometheus)" },
         .{ "lambda", "src/lambda_main.zig", "AWS Lambda extension (Datadog)" },
     };
