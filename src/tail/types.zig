@@ -18,6 +18,21 @@ pub const FileIdentity = struct {
     fingerprint: u32,
 };
 
+pub fn identityHash(identity: FileIdentity) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(std.mem.asBytes(&identity.dev));
+    hasher.update(std.mem.asBytes(&identity.inode));
+    hasher.update(std.mem.asBytes(&identity.fingerprint));
+    return hasher.final();
+}
+
+pub fn inodeIdentityHash(identity: FileIdentity) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(std.mem.asBytes(&identity.dev));
+    hasher.update(std.mem.asBytes(&identity.inode));
+    return hasher.final();
+}
+
 pub const LineMeta = struct {
     identity: ?FileIdentity = null,
     truncated: bool = false,
@@ -58,4 +73,10 @@ test "types public API: validateConfig rejects zero limits" {
     var cfg = TailV2Config{};
     cfg.read_buf = 0;
     try testing.expectError(error.InvalidReadBuffer, validateConfig(cfg));
+}
+
+test "types public API: identity hash helpers are stable" {
+    const id = FileIdentity{ .dev = 42, .inode = 9, .fingerprint = 1234 };
+    try testing.expect(identityHash(id) != 0);
+    try testing.expect(inodeIdentityHash(id) != 0);
 }

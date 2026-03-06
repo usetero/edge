@@ -26,10 +26,8 @@ pub const Lane = struct {
     worker: ?std.Thread = null,
     interval_ns: u64,
     ttl_ns: i128,
-    offsets: std.AutoHashMap(u64, u64),
-    last_seen: std.AutoHashMap(u64, i64),
-    offsets_inode: std.AutoHashMap(u64, u64),
-    last_seen_inode: std.AutoHashMap(u64, i64),
+    by_identity: std.AutoHashMap(u64, CheckpointValue),
+    by_inode: std.AutoHashMap(u64, CheckpointValue),
     wal_file: std.fs.File,
     wal_path: []u8,
     pending_wal_sync: u32 = 0,
@@ -58,10 +56,8 @@ pub const Lane = struct {
             .queue_buf = try allocator.alloc(Update, capacity),
             .interval_ns = interval_ms * std.time.ns_per_ms,
             .ttl_ns = @as(i128, @intCast(ttl_ms)) * std.time.ns_per_ms,
-            .offsets = std.AutoHashMap(u64, u64).init(allocator),
-            .last_seen = std.AutoHashMap(u64, i64).init(allocator),
-            .offsets_inode = std.AutoHashMap(u64, u64).init(allocator),
-            .last_seen_inode = std.AutoHashMap(u64, i64).init(allocator),
+            .by_identity = std.AutoHashMap(u64, CheckpointValue).init(allocator),
+            .by_inode = std.AutoHashMap(u64, CheckpointValue).init(allocator),
             .wal_file = wal_file,
             .wal_path = wal_path,
             .last_sync_ns = std.time.nanoTimestamp(),
@@ -74,10 +70,8 @@ pub const Lane = struct {
     pub fn deinit(self: *Lane) void {
         self.stopWorker();
         self.allocator.free(self.queue_buf);
-        self.offsets.deinit();
-        self.last_seen.deinit();
-        self.offsets_inode.deinit();
-        self.last_seen_inode.deinit();
+        self.by_identity.deinit();
+        self.by_inode.deinit();
         self.wal_file.close();
         self.allocator.free(self.wal_path);
     }
@@ -108,22 +102,18 @@ pub const Lane = struct {
     }
 
     pub fn getOffset(self: *Lane, identity: types.FileIdentity) ?u64 {
-        const key = identityHash(identity);
-        const inode_key = inodeIdentityHash(identity);
+        const key = types.identityHash(identity);
+        const inode_key = types.inodeIdentityHash(identity);
         const now = std.time.nanoTimestamp();
         self.data_mutex.lock();
         defer self.data_mutex.unlock();
-        if (self.offsets.get(key)) |off| {
-            const seen = self.last_seen.get(key) orelse 0;
-            if (@as(i128, seen) + self.ttl_ns >= now) return off;
-            _ = self.offsets.remove(key);
-            _ = self.last_seen.remove(key);
+        if (self.by_identity.get(key)) |v| {
+            if (@as(i128, v.last_seen_ns) + self.ttl_ns >= now) return v.offset;
+            _ = self.by_identity.remove(key);
         }
-        if (self.offsets_inode.get(inode_key)) |off| {
-            const seen = self.last_seen_inode.get(inode_key) orelse 0;
-            if (@as(i128, seen) + self.ttl_ns >= now) return off;
-            _ = self.offsets_inode.remove(inode_key);
-            _ = self.last_seen_inode.remove(inode_key);
+        if (self.by_inode.get(inode_key)) |v| {
+            if (@as(i128, v.last_seen_ns) + self.ttl_ns >= now) return v.offset;
+            _ = self.by_inode.remove(inode_key);
         }
         return null;
     }
@@ -156,13 +146,15 @@ pub const Lane = struct {
         self.queue_len -= 1;
         self.queue_mutex.unlock();
 
-        const key = identityHash(update.identity);
-        const inode_key = inodeIdentityHash(update.identity);
+        const key = types.identityHash(update.identity);
+        const inode_key = types.inodeIdentityHash(update.identity);
         self.data_mutex.lock();
-        self.offsets.put(key, update.byte_offset) catch {};
-        self.last_seen.put(key, update.last_seen_ns) catch {};
-        self.offsets_inode.put(inode_key, update.byte_offset) catch {};
-        self.last_seen_inode.put(inode_key, update.last_seen_ns) catch {};
+        const v = CheckpointValue{
+            .offset = update.byte_offset,
+            .last_seen_ns = update.last_seen_ns,
+        };
+        self.by_identity.put(key, v) catch {};
+        self.by_inode.put(inode_key, v) catch {};
         self.data_mutex.unlock();
         self.appendWal(update) catch {};
 
@@ -207,28 +199,20 @@ pub const Lane = struct {
                 .inode = rec.inode,
                 .fingerprint = rec.fingerprint,
             };
-            try self.offsets.put(identityHash(id), rec.offset);
-            try self.last_seen.put(identityHash(id), rec.last_seen_ns);
-            try self.offsets_inode.put(inodeIdentityHash(id), rec.offset);
-            try self.last_seen_inode.put(inodeIdentityHash(id), rec.last_seen_ns);
+            const v = CheckpointValue{
+                .offset = rec.offset,
+                .last_seen_ns = rec.last_seen_ns,
+            };
+            try self.by_identity.put(types.identityHash(id), v);
+            try self.by_inode.put(types.inodeIdentityHash(id), v);
         }
     }
 };
 
-fn identityHash(identity: types.FileIdentity) u64 {
-    var hasher = std.hash.Fnv1a_64.init();
-    hasher.update(std.mem.asBytes(&identity.dev));
-    hasher.update(std.mem.asBytes(&identity.inode));
-    hasher.update(std.mem.asBytes(&identity.fingerprint));
-    return hasher.final();
-}
-
-fn inodeIdentityHash(identity: types.FileIdentity) u64 {
-    var hasher = std.hash.Fnv1a_64.init();
-    hasher.update(std.mem.asBytes(&identity.dev));
-    hasher.update(std.mem.asBytes(&identity.inode));
-    return hasher.final();
-}
+const CheckpointValue = struct {
+    offset: u64,
+    last_seen_ns: i64,
+};
 
 const WAL_MAGIC: u32 = 0x3250434b; // "KCP2"
 const WAL_VERSION: u16 = 1;

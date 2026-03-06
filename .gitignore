@@ -10,7 +10,7 @@
 # -andrewrk
 
 .zig-cache/
-.zig-global-cache/
+.zig-cache-global/
 *.pyc
 zig-out/
 /release/

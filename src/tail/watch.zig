@@ -43,7 +43,6 @@ pub const Watcher = struct {
     last_match_ns: std.ArrayList(i128),
     dirty: std.DynamicBitSetUnmanaged,
     dirty_queue: std.ArrayList(u32),
-    identity_to_idx: std.AutoHashMap(u64, u32),
 
     glob_interval_ns: i128,
     rotate_wait_ns: i128,
@@ -90,7 +89,6 @@ pub const Watcher = struct {
             .last_match_ns = .{},
             .dirty = .{},
             .dirty_queue = .{},
-            .identity_to_idx = std.AutoHashMap(u64, u32).init(allocator),
             .glob_interval_ns = @as(i128, @intCast(glob_interval_ms)) * std.time.ns_per_ms,
             .rotate_wait_ns = @as(i128, @intCast(rotate_wait_ms)) * std.time.ns_per_ms,
             .removed_expire_ns = @as(i128, @intCast(removed_expire_ms)) * std.time.ns_per_ms,
@@ -139,7 +137,6 @@ pub const Watcher = struct {
         self.last_match_ns.deinit(self.allocator);
         self.dirty.deinit(self.allocator);
         self.dirty_queue.deinit(self.allocator);
-        self.identity_to_idx.deinit();
         self.allocator.free(self.output_path);
     }
 
@@ -159,15 +156,13 @@ pub const Watcher = struct {
 
         switch (self.backend) {
             .poll => {
-                var i: usize = 0;
-                while (i < self.paths.items.len) : (i += 1) self.markDirty(@intCast(i));
+                self.collectPollDirtyCandidates();
             },
             .inotify => {
                 try self.pollInotify();
-                var i: usize = 0;
-                while (i < self.paths.items.len) : (i += 1) self.markDirty(@intCast(i));
             },
         }
+        self.markPendingDirty();
 
         var q: usize = 0;
         while (q < self.dirty_queue.items.len) : (q += 1) {
@@ -175,51 +170,7 @@ pub const Watcher = struct {
             const idx: usize = @intCast(idx_u32);
             if (idx >= self.paths.items.len) continue;
             self.dirty.unset(idx_u32);
-
-            if (self.files.items[idx] == null) {
-                try self.openTracked(idx_u32, read_from);
-                if (self.files.items[idx] == null) continue;
-            }
-            if (checkpoint_lane) |lane| {
-                self.applyCheckpointOffsetOne(idx_u32, lane);
-            }
-
-            try self.detectPathReplacement(idx_u32);
-
-            const file = self.files.items[idx].?;
-            const st = std.posix.fstat(file.handle) catch {
-                file.close();
-                self.files.items[idx] = null;
-                self.identities.items[idx] = null;
-                self.offsets.items[idx] = 0;
-                self.clearPending(idx_u32);
-                continue;
-            };
-            const size: u64 = @bitCast(st.size);
-            if (size < self.offsets.items[idx]) self.offsets.items[idx] = 0;
-            try self.maybeHandleContentRewrite(idx_u32, size);
-
-            var emitted = false;
-            if (size > self.offsets.items[idx]) {
-                try out.append(self.allocator, .{
-                    .file = &self.files.items[idx].?,
-                    .start_offset = self.offsets.items[idx],
-                    .end_offset = size,
-                    .identity = self.identities.items[idx],
-                });
-                self.offsets.items[idx] = size;
-                emitted = true;
-            }
-
-            if (!emitted) {
-                try self.maybeSwitchPending(idx_u32);
-                if (self.files.items[idx] == null) {
-                    try self.openTracked(idx_u32, read_from);
-                    if (checkpoint_lane) |lane| {
-                        self.applyCheckpointOffsetOne(idx_u32, lane);
-                    }
-                }
-            }
+            try self.processDirtyIndex(out, idx_u32, read_from, checkpoint_lane);
         }
         self.dirty_queue.clearRetainingCapacity();
     }
@@ -243,6 +194,115 @@ pub const Watcher = struct {
         }
     }
 
+    fn collectPollDirtyCandidates(self: *Watcher) void {
+        var i: usize = 0;
+        while (i < self.paths.items.len) : (i += 1) {
+            const idx: u32 = @intCast(i);
+            if (self.files.items[i] == null) {
+                self.markDirty(idx);
+                continue;
+            }
+
+            const file = self.files.items[i].?;
+            const active_st = std.posix.fstat(file.handle) catch {
+                self.markDirty(idx);
+                continue;
+            };
+            const active_size: u64 = @bitCast(active_st.size);
+            if (active_size != self.offsets.items[i]) {
+                self.markDirty(idx);
+                continue;
+            }
+
+            const path_st = std.fs.cwd().statFile(self.paths.items[i]) catch {
+                self.markDirty(idx);
+                continue;
+            };
+            if (path_st.kind != .file) {
+                self.markDirty(idx);
+                continue;
+            }
+
+            const active_inode: u64 = @intCast(active_st.ino);
+            const path_inode: u64 = @intCast(path_st.inode);
+            if (path_inode != active_inode or path_st.size != active_size) {
+                self.markDirty(idx);
+            }
+        }
+    }
+
+    fn markPendingDirty(self: *Watcher) void {
+        var i: usize = 0;
+        while (i < self.pending_files.items.len) : (i += 1) {
+            if (self.pending_files.items[i] != null) {
+                self.markDirty(@intCast(i));
+            }
+        }
+    }
+
+    fn processDirtyIndex(
+        self: *Watcher,
+        out: *std.ArrayList(Event),
+        idx: u32,
+        read_from: types.ReadFrom,
+        checkpoint_lane: ?*checkpoint_mod.Lane,
+    ) !void {
+        const i: usize = @intCast(idx);
+        if (!(try self.ensureOpenWithCheckpoint(idx, read_from, checkpoint_lane))) return;
+
+        try self.detectPathReplacement(idx);
+        const size = self.readActiveSizeOrReset(idx) orelse return;
+        if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
+        try self.maybeHandleContentRewrite(idx, size);
+
+        const emitted = try self.emitReadableRange(out, idx, size);
+        if (!emitted) {
+            try self.maybeSwitchPending(idx);
+            _ = try self.ensureOpenWithCheckpoint(idx, read_from, checkpoint_lane);
+        }
+    }
+
+    fn ensureOpenWithCheckpoint(
+        self: *Watcher,
+        idx: u32,
+        read_from: types.ReadFrom,
+        checkpoint_lane: ?*checkpoint_mod.Lane,
+    ) !bool {
+        if (self.files.items[idx] == null) {
+            try self.openTracked(idx, read_from);
+            if (self.files.items[idx] == null) return false;
+        }
+        if (checkpoint_lane) |lane| self.applyCheckpointOffsetOne(idx, lane);
+        return true;
+    }
+
+    fn readActiveSizeOrReset(self: *Watcher, idx: u32) ?u64 {
+        const i: usize = @intCast(idx);
+        const file = self.files.items[i] orelse return null;
+        const st = std.posix.fstat(file.handle) catch {
+            file.close();
+            self.files.items[i] = null;
+            self.identities.items[i] = null;
+            self.offsets.items[i] = 0;
+            self.clearPending(idx);
+            return null;
+        };
+        return @bitCast(st.size);
+    }
+
+    fn emitReadableRange(self: *Watcher, out: *std.ArrayList(Event), idx: u32, size: u64) !bool {
+        const i: usize = @intCast(idx);
+        if (size <= self.offsets.items[i]) return false;
+        try out.append(self.allocator, .{
+            .file = &self.files.items[i].?,
+            .start_offset = self.offsets.items[i],
+            .end_offset = size,
+            .identity = self.identities.items[i],
+        });
+        self.offsets.items[i] = size;
+        return true;
+    }
+
     fn refreshPaths(self: *Watcher, read_from: types.ReadFrom) !void {
         const now = std.time.nanoTimestamp();
         for (self.matched.items) |*m| m.* = false;
@@ -258,16 +318,31 @@ pub const Watcher = struct {
         for (expanded.items.items) |p| {
             if (!shouldTrackPath(self.output_path, p)) continue;
             if (self.findIndexByPath(p)) |idx| {
-                self.matched.items[idx] = true;
-                self.last_match_ns.items[idx] = now;
-                self.markDirty(@intCast(idx));
+                self.markExistingPathMatched(@intCast(idx), now);
                 continue;
             }
-            try self.appendTracked(p, now);
-            try self.openTracked(@intCast(self.paths.items.len - 1), read_from);
-            self.markDirty(@intCast(self.paths.items.len - 1));
+            try self.addNewTrackedPath(p, now, read_from);
         }
 
+        self.evictExpiredUnmatched(now);
+    }
+
+    fn markExistingPathMatched(self: *Watcher, idx: u32, now: i128) void {
+        const i: usize = @intCast(idx);
+        if (i >= self.paths.items.len) return;
+        self.matched.items[i] = true;
+        self.last_match_ns.items[i] = now;
+        self.markDirty(idx);
+    }
+
+    fn addNewTrackedPath(self: *Watcher, path: []const u8, now: i128, read_from: types.ReadFrom) !void {
+        try self.appendTracked(path, now);
+        const idx: u32 = @intCast(self.paths.items.len - 1);
+        try self.openTracked(idx, read_from);
+        self.markDirty(idx);
+    }
+
+    fn evictExpiredUnmatched(self: *Watcher, now: i128) void {
         var i: usize = self.paths.items.len;
         while (i > 0) {
             i -= 1;
@@ -348,7 +423,6 @@ pub const Watcher = struct {
             }
         }
         self.dirty_queue.clearRetainingCapacity();
-        self.identity_to_idx.clearRetainingCapacity();
         self.dirty.unsetAll();
     }
 
@@ -368,9 +442,6 @@ pub const Watcher = struct {
             .inode = @intCast(st.ino),
             .fingerprint = try computeFingerprint(file),
         };
-        if (self.identities.items[idx]) |id| {
-            self.identity_to_idx.put(identityHash(id), idx) catch {};
-        }
         self.files.items[idx] = file;
         self.initHeadPrefix(idx, size) catch {};
         self.offsets.items[idx] = if (self.seen_once.items[idx])
@@ -454,23 +525,13 @@ pub const Watcher = struct {
         if (self.pending_files.items[i] == null) return;
 
         const cur_file = self.files.items[i] orelse {
-            self.files.items[i] = self.pending_files.items[i];
-            self.identities.items[i] = self.pending_identities.items[i];
-            self.pending_files.items[i] = null;
-            self.pending_identities.items[i] = null;
-            self.pending_detected_ns.items[i] = 0;
-            self.offsets.items[i] = 0;
+            try self.switchToPending(idx);
             return;
         };
 
         const cur_st = std.posix.fstat(cur_file.handle) catch {
             cur_file.close();
-            self.files.items[i] = self.pending_files.items[i];
-            self.identities.items[i] = self.pending_identities.items[i];
-            self.pending_files.items[i] = null;
-            self.pending_identities.items[i] = null;
-            self.pending_detected_ns.items[i] = 0;
-            self.offsets.items[i] = 0;
+            try self.switchToPending(idx);
             return;
         };
         const cur_size: u64 = @bitCast(cur_st.size);
@@ -479,14 +540,21 @@ pub const Watcher = struct {
         if (now - self.pending_detected_ns.items[i] < self.rotate_wait_ns) return;
 
         cur_file.close();
-        self.files.items[i] = self.pending_files.items[i];
+        try self.switchToPending(idx);
+    }
+
+    fn switchToPending(self: *Watcher, idx: u32) !void {
+        const i: usize = @intCast(idx);
+        const next_file = self.pending_files.items[i] orelse return;
+        self.files.items[i] = next_file;
         self.identities.items[i] = self.pending_identities.items[i];
         self.pending_files.items[i] = null;
         self.pending_identities.items[i] = null;
         self.pending_detected_ns.items[i] = 0;
         self.offsets.items[i] = 0;
-        const st = try std.posix.fstat(self.files.items[i].?.handle);
-        self.initHeadPrefix(idx, @bitCast(st.size)) catch {};
+
+        const st = try std.posix.fstat(next_file.handle);
+        try self.initHeadPrefix(idx, @bitCast(st.size));
     }
 
     fn clearPending(self: *Watcher, idx: u32) void {
@@ -567,14 +635,6 @@ fn prefixHash(file: std.fs.File, len: u64) !u64 {
     const n = try std.posix.pread(file.handle, buf[0..want], 0);
     var hasher = std.hash.Fnv1a_64.init();
     hasher.update(buf[0..n]);
-    return hasher.final();
-}
-
-fn identityHash(identity: types.FileIdentity) u64 {
-    var hasher = std.hash.Fnv1a_64.init();
-    hasher.update(std.mem.asBytes(&identity.dev));
-    hasher.update(std.mem.asBytes(&identity.inode));
-    hasher.update(std.mem.asBytes(&identity.fingerprint));
     return hasher.final();
 }
 

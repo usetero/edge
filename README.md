@@ -228,6 +228,127 @@ AWS Lambda extension distribution for Datadog telemetry processing.
 
 Build: `zig build lambda` Run: Deployed as a Lambda layer
 
+## Edge Tail Binary (`edge-tail`)
+
+`edge-tail` is a file/stream tailer distribution focused on line-oriented log
+copying with checkpointed resume semantics.
+
+Build: `zig build tail`  
+Run: `./zig-out/bin/edge-tail [options] [PATH ...]`
+
+### Runtime Modes
+
+At startup, `edge-tail` resolves mode from inputs:
+
+- No inputs, or a single `-`: stdin mode (`runStdinToOutput`)
+- One or more file paths/globs: file mode (`runFilesToOutput`)
+
+Watcher backend selection in file mode:
+
+- `--io-engine inotify` -> inotify backend (Linux)
+- `--io-engine poll` -> polling backend
+- `--io-engine auto` -> inotify on Linux, otherwise poll
+
+### Mode: stdin -> output
+
+Reads bytes from stdin, frames by newline, writes to output (`stdout` or file).
+No watcher/glob/rotation/checkpoint path is used in this mode.
+
+```mermaid
+flowchart LR
+  A[stdin Reader] --> B[LineFramer pump]
+  B --> C[Output Writer]
+  C --> D[flush]
+```
+
+### Mode: poll + glob file tailing
+
+File mode with polling backend and periodic glob refresh.
+
+```mermaid
+flowchart TD
+  A[Tick loop poll_ms] --> B[refreshPaths every glob_interval_ms]
+  B --> C[expand glob patterns]
+  C --> D[track new paths / expire removed]
+  D --> E[collectPollDirtyCandidates]
+  E --> F[processDirtyIndex per dirty file]
+  F --> G[LineFramer.readRange start_offset..end_offset]
+  G --> H[Output Writer buffer]
+  H --> I[flush by interval/threshold]
+  F --> J[checkpoint enqueue end_offset]
+  J --> K[checkpoint worker WAL + in-memory index]
+```
+
+Poll dirty candidate rules:
+
+- unopened file path
+- active fd stat failure
+- active file size changed
+- path inode changed vs active fd inode
+- path size changed vs active fd size
+- pending rotation file exists
+
+### Mode: inotify file tailing
+
+File mode with Linux inotify event triggering. Dirty indices come from watch
+events, then the same per-file processing pipeline is used.
+
+```mermaid
+flowchart TD
+  A[inotify fd readable] --> B[pollInotify parse events]
+  B --> C[markDirty idx from wd map]
+  C --> D[processDirtyIndex]
+  D --> E[detectPathReplacement]
+  D --> F[readRange + line framing]
+  F --> G[Output Writer]
+  D --> H[checkpoint enqueue]
+  H --> I[WAL writer thread]
+```
+
+### Rotation and copytruncate handling
+
+For each tracked path, watcher keeps active and optional pending file handles.
+
+```mermaid
+flowchart LR
+  A[active file] --> B{path inode changed?}
+  B -- no --> C[continue on active]
+  B -- yes --> D[open pending file at path]
+  D --> E[drain active until rotate_wait and no growth]
+  E --> F[switchToPending reset offset]
+```
+
+Copytruncate/rewrite behavior:
+
+- If file shrinks below current offset: offset resets to `0`
+- If leading prefix hash changes unexpectedly: treat as rewrite, reset offset
+
+### Checkpoint/Resume behavior
+
+Checkpoint lane runs in a background thread and persists updates to
+`checkpoint.v2.wal` in `--state-dir`.
+
+```mermaid
+flowchart LR
+  A[file event end_offset] --> B[enqueue Update]
+  B --> C[worker pop]
+  C --> D[append WAL record]
+  C --> E[update in-memory maps]
+  E --> F[getOffset on startup/collect]
+```
+
+Resume key behavior:
+
+- Primary lookup: `(dev, inode, fingerprint)` hash
+- Fallback lookup: `(dev, inode)` hash
+- TTL enforced from `last_seen_ns` (`--checkpoint-ttl-ms`)
+
+### File output behavior
+
+- `-o -` writes to stdout
+- otherwise opens file in append mode and writes line output
+- flushes on `--flush-interval-ms` or `--flush-lines`
+
 ## Building
 
 ```bash
