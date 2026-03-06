@@ -57,9 +57,7 @@ def test_per_file_ordering_with_interleaved_inputs(
     assert b_lines == ["b1", "b2"]
 
 
-def test_output_file_is_recreated_on_restart(
-    edge_tail_bin: Path, tmp_path: Path
-) -> None:
+def test_output_file_appends_on_restart(edge_tail_bin: Path, tmp_path: Path) -> None:
     in_path = tmp_path / "recreate.log"
     out_path = tmp_path / "recreate.out"
     in_path.write_text("")
@@ -78,7 +76,7 @@ def test_output_file_is_recreated_on_restart(
     finally:
         proc.stop()
 
-    assert read_lines(out_path) == ["new"]
+    assert read_lines(out_path) == ["old", "new"]
 
 
 def test_events_are_flushed_while_process_is_running(

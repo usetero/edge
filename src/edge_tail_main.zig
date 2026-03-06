@@ -1,12 +1,8 @@
 const std = @import("std");
 const zonfig = @import("zonfig/root.zig");
-const glob_mod = @import("tail/glob.zig");
-const watcher_mod = @import("tail/watcher.zig");
-const reader_mod = @import("tail/reader.zig");
-const checkpoint_store_mod = @import("tail/checkpoint/store.zig");
-const checkpoint_types = @import("tail/checkpoint/types.zig");
+const tail_mod = @import("tail/mod.zig");
 
-const ReadFrom = watcher_mod.ReadFrom;
+const ReadFrom = tail_mod.types.ReadFrom;
 const InputFormat = enum { raw, json, logfmt };
 const IoEngine = enum { auto, uring, epoll, kqueue };
 
@@ -26,6 +22,9 @@ const TailConfig = struct {
     state_dir: []const u8 = ".tero",
     read_buf: usize = 64 * 1024,
     max_line: usize = 256 * 1024,
+    write_buf: usize = 64 * 1024,
+    flush_interval_ms: u64 = 100,
+    flush_line_threshold: usize = 1024,
 };
 
 const CliOptions = struct {
@@ -45,21 +44,22 @@ const CliOptions = struct {
     state_dir_override: ?[]const u8 = null,
     read_buf_override: ?usize = null,
     max_line_override: ?usize = null,
+    write_buf_override: ?usize = null,
+    flush_interval_ms_override: ?u64 = null,
+    flush_line_threshold_override: ?usize = null,
     inputs: std.ArrayList([]const u8),
 
     fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
         if (self.config_path) |path| allocator.free(path);
         if (self.output_override) |path| allocator.free(path);
         if (self.state_dir_override) |path| allocator.free(path);
-        for (self.inputs.items) |input| {
-            allocator.free(input);
-        }
+        for (self.inputs.items) |input| allocator.free(input);
         self.inputs.deinit(allocator);
     }
 };
 
 fn printUsage() !void {
-    var stderr_buf: [2048]u8 = undefined;
+    var stderr_buf: [2300]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_writer.interface;
 
@@ -82,6 +82,9 @@ fn printUsage() !void {
         \\      --state-dir <PATH>      Checkpoint state directory
         \\      --read-buf <BYTES>   Read buffer size in bytes
         \\      --max-line <BYTES>   Max line length in bytes
+        \\      --write-buf <BYTES>  Write buffer size in bytes
+        \\      --flush-interval-ms <MS> Writer flush cadence in milliseconds
+        \\      --flush-lines <N>     Flush writer after this many processed events
         \\      PATH                 Input file path(s), or '-' for stdin
         \\  -v, --verbose            Increase startup verbosity
         \\  -h, --help               Show this help
@@ -138,7 +141,6 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             opts.config_path = try allocator.dupe(u8, args[i]);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
@@ -146,82 +148,70 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             opts.output_override = try allocator.dupe(u8, args[i]);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--read-from")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.read_from_override = try parseReadFrom(args[i]);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--format")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.format_override = try parseInputFormat(args[i]);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--io-engine")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.io_engine_override = try parseIoEngine(args[i]);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             if (opts.verbose_increment < std.math.maxInt(u8)) opts.verbose_increment += 1;
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--poll-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.poll_ms_override = try std.fmt.parseInt(u64, args[i], 10);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--glob-interval-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.glob_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--rotate-wait-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.rotate_wait_ms_override = try std.fmt.parseInt(u64, args[i], 10);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--removed-expire-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.removed_expire_ms_override = try std.fmt.parseInt(u64, args[i], 10);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--checkpoint-interval-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.checkpoint_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--checkpoint-ttl-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.checkpoint_ttl_ms_override = try std.fmt.parseInt(u64, args[i], 10);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--checkpoint-max-slots")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.checkpoint_max_slots_override = try std.fmt.parseInt(usize, args[i], 10);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--state-dir")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
@@ -229,18 +219,34 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             opts.state_dir_override = try allocator.dupe(u8, args[i]);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--read-buf")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.read_buf_override = try std.fmt.parseInt(usize, args[i], 10);
             continue;
         }
-
         if (std.mem.eql(u8, arg, "--max-line")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.max_line_override = try std.fmt.parseInt(usize, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--write-buf")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.write_buf_override = try std.fmt.parseInt(usize, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--flush-interval-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.flush_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--flush-lines")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.flush_line_threshold_override = try std.fmt.parseInt(usize, args[i], 10);
             continue;
         }
 
@@ -248,10 +254,7 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             try opts.inputs.append(allocator, try allocator.dupe(u8, arg));
             continue;
         }
-
-        if (std.mem.startsWith(u8, arg, "-")) {
-            return error.UnknownOption;
-        }
+        if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
 
         try opts.inputs.append(allocator, try allocator.dupe(u8, arg));
     }
@@ -265,37 +268,37 @@ fn useStdinMode(inputs: []const []const u8) bool {
 }
 
 fn validate(opts: CliOptions, cfg: TailConfig) !void {
-    if (cfg.read_buf == 0 or cfg.max_line == 0 or cfg.poll_ms == 0 or cfg.glob_interval_ms == 0) {
-        return error.InvalidValue;
-    }
-
     if (opts.inputs.items.len > 1) {
         for (opts.inputs.items) |input| {
             if (std.mem.eql(u8, input, "-")) return error.InvalidInputCombination;
         }
     }
+
+    try tail_mod.types.validateConfig(toTailV2Config(cfg));
 }
 
-fn runStdinLoop(allocator: std.mem.Allocator, reader: *reader_mod.LineReader, stdin_reader: *std.Io.Reader, output_writer: *std.Io.Writer, read_limit: usize) !void {
-    while (true) {
-        var chunk_writer: std.Io.Writer.Allocating = .init(allocator);
-        defer chunk_writer.deinit();
-
-        const n = stdin_reader.stream(&chunk_writer.writer, std.Io.Limit.limited(read_limit)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) break;
-        try reader.ingestChunk(chunk_writer.written(), output_writer);
-        try output_writer.flush();
-    }
-    try reader.finish(output_writer);
-    try output_writer.flush();
-}
-
-fn shouldTrackPath(output_path: []const u8, candidate_path: []const u8) bool {
-    if (std.mem.eql(u8, output_path, "-")) return true;
-    return !std.mem.eql(u8, output_path, candidate_path);
+fn toTailV2Config(cfg: TailConfig) tail_mod.types.TailV2Config {
+    return .{
+        .output_path = cfg.output_path,
+        .read_from = cfg.read_from,
+        .poll_ms = cfg.poll_ms,
+        .glob_interval_ms = cfg.glob_interval_ms,
+        .rotate_wait_ms = cfg.rotate_wait_ms,
+        .removed_expire_ms = cfg.removed_expire_ms,
+        .checkpoint_interval_ms = cfg.checkpoint_interval_ms,
+        .checkpoint_ttl_ms = cfg.checkpoint_ttl_ms,
+        .checkpoint_max_slots = cfg.checkpoint_max_slots,
+        .state_dir = cfg.state_dir,
+        .read_buf = cfg.read_buf,
+        .max_line = cfg.max_line,
+        .write_buf = cfg.write_buf,
+        .flush_interval_ms = cfg.flush_interval_ms,
+        .flush_line_threshold = cfg.flush_line_threshold,
+        .io_engine = switch (cfg.io_engine) {
+            .auto => .auto,
+            .uring, .epoll, .kqueue => .poll,
+        },
+    };
 }
 
 pub fn main() !void {
@@ -335,6 +338,9 @@ pub fn main() !void {
     if (opts.state_dir_override) |v| cfg.state_dir = v;
     if (opts.read_buf_override) |v| cfg.read_buf = v;
     if (opts.max_line_override) |v| cfg.max_line = v;
+    if (opts.write_buf_override) |v| cfg.write_buf = v;
+    if (opts.flush_interval_ms_override) |v| cfg.flush_interval_ms = v;
+    if (opts.flush_line_threshold_override) |v| cfg.flush_line_threshold = v;
 
     try validate(opts, cfg);
 
@@ -343,142 +349,18 @@ pub fn main() !void {
         var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
         const stderr = &stderr_writer.interface;
         try stderr.print(
-            "edge-tail start: read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s}\n",
+            "edge-tail(v2): read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s}\n",
             .{ @tagName(cfg.read_from), @tagName(cfg.format), @tagName(cfg.io_engine), cfg.poll_ms, cfg.glob_interval_ms, cfg.state_dir },
         );
         try stderr.flush();
     }
 
-    var output_buf: [64 * 1024]u8 = undefined;
-    var output_file: ?std.fs.File = null;
-    defer if (output_file) |file| file.close();
-
-    var output_writer = blk: {
-        if (std.mem.eql(u8, cfg.output_path, "-")) {
-            break :blk std.fs.File.stdout().writer(&output_buf);
-        }
-        const file = try std.fs.cwd().createFile(cfg.output_path, .{});
-        output_file = file;
-        break :blk file.writer(&output_buf);
-    };
-    defer output_writer.interface.flush() catch {};
-
-    var reader = try reader_mod.LineReader.init(allocator, cfg.read_buf, cfg.max_line);
-    defer reader.deinit();
+    const v2_cfg = toTailV2Config(cfg);
 
     if (useStdinMode(opts.inputs.items)) {
-        const stdin_buf = try allocator.alloc(u8, cfg.read_buf);
-        defer allocator.free(stdin_buf);
-        var stdin_file_reader = std.fs.File.stdin().reader(stdin_buf);
-        try runStdinLoop(allocator, &reader, &stdin_file_reader.interface, &output_writer.interface, cfg.read_buf);
+        try tail_mod.runtime.runStdinToOutput(allocator, v2_cfg);
         return;
     }
 
-    var expanded = try glob_mod.expandPatterns(allocator, opts.inputs.items);
-    defer expanded.deinit();
-
-    var path_count: usize = 0;
-    for (expanded.items.items) |p| {
-        if (shouldTrackPath(cfg.output_path, p)) path_count += 1;
-    }
-
-    var init_paths = try allocator.alloc([]const u8, path_count);
-    defer allocator.free(init_paths);
-    var init_idx: usize = 0;
-    for (expanded.items.items) |p| {
-        if (!shouldTrackPath(cfg.output_path, p)) continue;
-        init_paths[init_idx] = p;
-        init_idx += 1;
-    }
-
-    var watcher = try watcher_mod.Watcher.init(allocator, init_paths, cfg.read_from, cfg.rotate_wait_ms);
-    defer watcher.deinit();
-
-    var checkpoint_store = try checkpoint_store_mod.CheckpointStore.init(allocator, .{
-        .state_dir = cfg.state_dir,
-        .max_slots = cfg.checkpoint_max_slots,
-        .checkpoint_interval_ms = cfg.checkpoint_interval_ms,
-        .checkpoint_ttl_ms = cfg.checkpoint_ttl_ms,
-    });
-    defer checkpoint_store.deinit();
-    try checkpoint_store.start();
-
-    if (cfg.read_from == .checkpoint) {
-        var i: usize = 0;
-        while (i < watcher.fileCount()) : (i += 1) {
-            const id = watcher.identityAt(i) orelse continue;
-            const lookup = checkpoint_types.FileIdentity{
-                .dev = id.dev,
-                .inode = id.inode,
-                .fingerprint = id.fingerprint,
-            };
-            if (checkpoint_store.getOffset(lookup)) |off| {
-                watcher.setOffsetAt(i, off);
-            }
-        }
-    }
-
-    const sleep_ns = cfg.poll_ms * std.time.ns_per_ms;
-    const glob_interval_ns: i128 = @as(i128, @intCast(cfg.glob_interval_ms)) * std.time.ns_per_ms;
-    const removed_expire_ns: i128 = @as(i128, @intCast(cfg.removed_expire_ms)) * std.time.ns_per_ms;
-    var next_glob_refresh_ns: i128 = std.time.nanoTimestamp() + glob_interval_ns;
-
-    while (true) {
-        const now_ns = std.time.nanoTimestamp();
-        if (now_ns >= next_glob_refresh_ns) {
-            var rescan = try glob_mod.expandPatterns(allocator, opts.inputs.items);
-            defer rescan.deinit();
-            var rescan_paths: std.ArrayList([]const u8) = .{};
-            defer rescan_paths.deinit(allocator);
-            for (rescan.items.items) |p| {
-                if (!shouldTrackPath(cfg.output_path, p)) continue;
-                try rescan_paths.append(allocator, p);
-            }
-            try watcher.reconcilePaths(rescan_paths.items, cfg.read_from, removed_expire_ns);
-
-            if (cfg.read_from == .checkpoint) {
-                var i: usize = 0;
-                while (i < watcher.fileCount()) : (i += 1) {
-                    const id = watcher.identityAt(i) orelse continue;
-                    const lookup = checkpoint_types.FileIdentity{
-                        .dev = id.dev,
-                        .inode = id.inode,
-                        .fingerprint = id.fingerprint,
-                    };
-                    if (checkpoint_store.getOffset(lookup)) |off| {
-                        watcher.setOffsetAt(i, off);
-                    }
-                }
-            }
-            next_glob_refresh_ns = now_ns + glob_interval_ns;
-        }
-
-        const events = try watcher.poll(cfg.read_from);
-        var had_events = false;
-
-        for (events) |event| {
-            had_events = true;
-            const file = watcher.fileForEvent(event);
-            try reader.readRange(file, event.start_offset, event.end_offset, &output_writer.interface);
-
-            if (watcher.identityForEvent(event)) |id| {
-                _ = checkpoint_store.enqueue(.{
-                    .identity = .{
-                        .dev = id.dev,
-                        .inode = id.inode,
-                        .fingerprint = id.fingerprint,
-                    },
-                    .byte_offset = event.end_offset,
-                    .last_seen_size = event.end_offset,
-                    .last_seen_ns = @intCast(std.time.nanoTimestamp()),
-                }) catch false;
-            }
-        }
-
-        if (had_events) {
-            try output_writer.interface.flush();
-        }
-
-        std.Thread.sleep(sleep_ns);
-    }
+    try tail_mod.runtime.runFilesToOutput(allocator, v2_cfg, opts.inputs.items);
 }

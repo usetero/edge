@@ -29,6 +29,7 @@ uv run --project bench/logging pytest bench/logging/tests
 - `test_error_handling.py`: invalid args and permission failures
 - `test_concurrency_stress.py`: concurrent writers, bursts, tiny writes, short
   soak rotation
+- `test_perf_guards.py`: burst latency and multi-file throughput guardrails
 
 ## Notes
 
