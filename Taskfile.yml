@@ -147,6 +147,12 @@ tasks:
     cmds:
       - ./bench/run.sh --skip-build
 
+  benchmark:logging:
+    desc: "Run edge-tail logging integration tests"
+    aliases: [bench-logging, bml]
+    cmds:
+      - ./bench/logging/run.sh
+
   benchmark:history:
     desc: "Run benchmarks and save to dated history folder"
     aliases: [bench-history, bmh]

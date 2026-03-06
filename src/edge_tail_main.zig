@@ -3,16 +3,27 @@ const zonfig = @import("zonfig/root.zig");
 const glob_mod = @import("tail/glob.zig");
 const watcher_mod = @import("tail/watcher.zig");
 const reader_mod = @import("tail/reader.zig");
+const checkpoint_store_mod = @import("tail/checkpoint/store.zig");
+const checkpoint_types = @import("tail/checkpoint/types.zig");
 
 const ReadFrom = watcher_mod.ReadFrom;
+const InputFormat = enum { raw, json, logfmt };
+const IoEngine = enum { auto, uring, epoll, kqueue };
 
 const TailConfig = struct {
     output_path: []const u8 = "-",
     read_from: ReadFrom = .tail,
+    format: InputFormat = .raw,
+    io_engine: IoEngine = .auto,
+    verbose: u8 = 0,
     poll_ms: u64 = 200,
     glob_interval_ms: u64 = 5_000,
     rotate_wait_ms: u64 = 5_000,
     removed_expire_ms: u64 = 60_000,
+    checkpoint_interval_ms: u64 = 5_000,
+    checkpoint_ttl_ms: u64 = 72 * 60 * 60 * 1000,
+    checkpoint_max_slots: usize = 256,
+    state_dir: []const u8 = ".tero",
     read_buf: usize = 64 * 1024,
     max_line: usize = 256 * 1024,
 };
@@ -21,10 +32,17 @@ const CliOptions = struct {
     config_path: ?[]const u8 = null,
     output_override: ?[]const u8 = null,
     read_from_override: ?ReadFrom = null,
+    format_override: ?InputFormat = null,
+    io_engine_override: ?IoEngine = null,
+    verbose_increment: u8 = 0,
     poll_ms_override: ?u64 = null,
     glob_interval_ms_override: ?u64 = null,
     rotate_wait_ms_override: ?u64 = null,
     removed_expire_ms_override: ?u64 = null,
+    checkpoint_interval_ms_override: ?u64 = null,
+    checkpoint_ttl_ms_override: ?u64 = null,
+    checkpoint_max_slots_override: ?usize = null,
+    state_dir_override: ?[]const u8 = null,
     read_buf_override: ?usize = null,
     max_line_override: ?usize = null,
     inputs: std.ArrayList([]const u8),
@@ -32,6 +50,7 @@ const CliOptions = struct {
     fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
         if (self.config_path) |path| allocator.free(path);
         if (self.output_override) |path| allocator.free(path);
+        if (self.state_dir_override) |path| allocator.free(path);
         for (self.inputs.items) |input| {
             allocator.free(input);
         }
@@ -50,17 +69,24 @@ fn printUsage() !void {
         \\Options:
         \\  -c, --config <PATH>      Config JSON path (zonfig)
         \\  -o, --output <PATH>      Output path ('-' for stdout)
-        \\      --read-from <MODE>   head|tail
+        \\      --read-from <MODE>   head|tail|checkpoint
+        \\  -f, --format <FMT>       raw|json|logfmt
+        \\      --io-engine <ENG>    auto|uring|epoll|kqueue
         \\      --poll-ms <MS>       Poll interval in milliseconds
         \\      --glob-interval-ms <MS>  Glob re-evaluation interval
         \\      --rotate-wait-ms <MS>  Drain old fd before switching on rotation
         \\      --removed-expire-ms <MS>  Expire unmatched tracked files after grace
+        \\      --checkpoint-interval-ms <MS>  Background checkpoint flush cadence
+        \\      --checkpoint-ttl-ms <MS>   Expire stale checkpoint entries after age
+        \\      --checkpoint-max-slots <N> Max tracked checkpoint slots
+        \\      --state-dir <PATH>      Checkpoint state directory
         \\      --read-buf <BYTES>   Read buffer size in bytes
         \\      --max-line <BYTES>   Max line length in bytes
         \\      PATH                 Input file path(s), or '-' for stdin
+        \\  -v, --verbose            Increase startup verbosity
         \\  -h, --help               Show this help
         \\
-        \\Config precedence: CLI > env (TERO_TAIL_*) > config file > defaults
+        \\Config precedence: CLI > env (TERO_*) > config file > defaults
         \\
     );
 
@@ -70,7 +96,23 @@ fn printUsage() !void {
 fn parseReadFrom(value: []const u8) !ReadFrom {
     if (std.mem.eql(u8, value, "head")) return .head;
     if (std.mem.eql(u8, value, "tail")) return .tail;
+    if (std.mem.eql(u8, value, "checkpoint")) return .checkpoint;
     return error.InvalidReadFrom;
+}
+
+fn parseInputFormat(value: []const u8) !InputFormat {
+    if (std.mem.eql(u8, value, "raw")) return .raw;
+    if (std.mem.eql(u8, value, "json")) return .json;
+    if (std.mem.eql(u8, value, "logfmt")) return .logfmt;
+    return error.InvalidFormat;
+}
+
+fn parseIoEngine(value: []const u8) !IoEngine {
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    if (std.mem.eql(u8, value, "uring")) return .uring;
+    if (std.mem.eql(u8, value, "epoll")) return .epoll;
+    if (std.mem.eql(u8, value, "kqueue")) return .kqueue;
+    return error.InvalidIoEngine;
 }
 
 fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
@@ -112,6 +154,25 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--format")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.format_override = try parseInputFormat(args[i]);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--io-engine")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.io_engine_override = try parseIoEngine(args[i]);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            if (opts.verbose_increment < std.math.maxInt(u8)) opts.verbose_increment += 1;
+            continue;
+        }
+
         if (std.mem.eql(u8, arg, "--poll-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
@@ -137,6 +198,35 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.removed_expire_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--checkpoint-interval-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.checkpoint_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--checkpoint-ttl-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.checkpoint_ttl_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--checkpoint-max-slots")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.checkpoint_max_slots_override = try std.fmt.parseInt(usize, args[i], 10);
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--state-dir")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            if (opts.state_dir_override) |old| allocator.free(old);
+            opts.state_dir_override = try allocator.dupe(u8, args[i]);
             continue;
         }
 
@@ -232,14 +322,32 @@ pub fn main() !void {
     var cfg = loaded_cfg.*;
     if (opts.output_override) |v| cfg.output_path = v;
     if (opts.read_from_override) |v| cfg.read_from = v;
+    if (opts.format_override) |v| cfg.format = v;
+    if (opts.io_engine_override) |v| cfg.io_engine = v;
+    cfg.verbose +|= opts.verbose_increment;
     if (opts.poll_ms_override) |v| cfg.poll_ms = v;
     if (opts.glob_interval_ms_override) |v| cfg.glob_interval_ms = v;
     if (opts.rotate_wait_ms_override) |v| cfg.rotate_wait_ms = v;
     if (opts.removed_expire_ms_override) |v| cfg.removed_expire_ms = v;
+    if (opts.checkpoint_interval_ms_override) |v| cfg.checkpoint_interval_ms = v;
+    if (opts.checkpoint_ttl_ms_override) |v| cfg.checkpoint_ttl_ms = v;
+    if (opts.checkpoint_max_slots_override) |v| cfg.checkpoint_max_slots = v;
+    if (opts.state_dir_override) |v| cfg.state_dir = v;
     if (opts.read_buf_override) |v| cfg.read_buf = v;
     if (opts.max_line_override) |v| cfg.max_line = v;
 
     try validate(opts, cfg);
+
+    if (cfg.verbose > 0) {
+        var stderr_buf: [1024]u8 = undefined;
+        var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+        const stderr = &stderr_writer.interface;
+        try stderr.print(
+            "edge-tail start: read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s}\n",
+            .{ @tagName(cfg.read_from), @tagName(cfg.format), @tagName(cfg.io_engine), cfg.poll_ms, cfg.glob_interval_ms, cfg.state_dir },
+        );
+        try stderr.flush();
+    }
 
     var output_buf: [64 * 1024]u8 = undefined;
     var output_file: ?std.fs.File = null;
@@ -286,6 +394,30 @@ pub fn main() !void {
     var watcher = try watcher_mod.Watcher.init(allocator, init_paths, cfg.read_from, cfg.rotate_wait_ms);
     defer watcher.deinit();
 
+    var checkpoint_store = try checkpoint_store_mod.CheckpointStore.init(allocator, .{
+        .state_dir = cfg.state_dir,
+        .max_slots = cfg.checkpoint_max_slots,
+        .checkpoint_interval_ms = cfg.checkpoint_interval_ms,
+        .checkpoint_ttl_ms = cfg.checkpoint_ttl_ms,
+    });
+    defer checkpoint_store.deinit();
+    try checkpoint_store.start();
+
+    if (cfg.read_from == .checkpoint) {
+        var i: usize = 0;
+        while (i < watcher.fileCount()) : (i += 1) {
+            const id = watcher.identityAt(i) orelse continue;
+            const lookup = checkpoint_types.FileIdentity{
+                .dev = id.dev,
+                .inode = id.inode,
+                .fingerprint = id.fingerprint,
+            };
+            if (checkpoint_store.getOffset(lookup)) |off| {
+                watcher.setOffsetAt(i, off);
+            }
+        }
+    }
+
     const sleep_ns = cfg.poll_ms * std.time.ns_per_ms;
     const glob_interval_ns: i128 = @as(i128, @intCast(cfg.glob_interval_ms)) * std.time.ns_per_ms;
     const removed_expire_ns: i128 = @as(i128, @intCast(cfg.removed_expire_ms)) * std.time.ns_per_ms;
@@ -303,6 +435,21 @@ pub fn main() !void {
                 try rescan_paths.append(allocator, p);
             }
             try watcher.reconcilePaths(rescan_paths.items, cfg.read_from, removed_expire_ns);
+
+            if (cfg.read_from == .checkpoint) {
+                var i: usize = 0;
+                while (i < watcher.fileCount()) : (i += 1) {
+                    const id = watcher.identityAt(i) orelse continue;
+                    const lookup = checkpoint_types.FileIdentity{
+                        .dev = id.dev,
+                        .inode = id.inode,
+                        .fingerprint = id.fingerprint,
+                    };
+                    if (checkpoint_store.getOffset(lookup)) |off| {
+                        watcher.setOffsetAt(i, off);
+                    }
+                }
+            }
             next_glob_refresh_ns = now_ns + glob_interval_ns;
         }
 
@@ -313,6 +460,19 @@ pub fn main() !void {
             had_events = true;
             const file = watcher.fileForEvent(event);
             try reader.readRange(file, event.start_offset, event.end_offset, &output_writer.interface);
+
+            if (watcher.identityForEvent(event)) |id| {
+                _ = checkpoint_store.enqueue(.{
+                    .identity = .{
+                        .dev = id.dev,
+                        .inode = id.inode,
+                        .fingerprint = id.fingerprint,
+                    },
+                    .byte_offset = event.end_offset,
+                    .last_seen_size = event.end_offset,
+                    .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+                }) catch false;
+            }
         }
 
         if (had_events) {

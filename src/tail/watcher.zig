@@ -3,12 +3,19 @@ const std = @import("std");
 pub const ReadFrom = enum {
     head,
     tail,
+    checkpoint,
 };
 
 pub const FileEvent = struct {
     index: usize,
     start_offset: u64,
     end_offset: u64,
+};
+
+pub const CheckpointIdentity = struct {
+    dev: u64,
+    inode: u64,
+    fingerprint: u32,
 };
 
 const FileIdentity = struct {
@@ -186,6 +193,26 @@ pub const Watcher = struct {
         return &self.files.items[event.index].file.?;
     }
 
+    pub fn identityForEvent(self: *Watcher, event: FileEvent) ?CheckpointIdentity {
+        const id = self.files.items[event.index].identity orelse return null;
+        return .{ .dev = id.dev, .inode = id.inode, .fingerprint = id.fingerprint };
+    }
+
+    pub fn fileCount(self: *Watcher) usize {
+        return self.files.items.len;
+    }
+
+    pub fn identityAt(self: *Watcher, idx: usize) ?CheckpointIdentity {
+        if (idx >= self.files.items.len) return null;
+        const id = self.files.items[idx].identity orelse return null;
+        return .{ .dev = id.dev, .inode = id.inode, .fingerprint = id.fingerprint };
+    }
+
+    pub fn setOffsetAt(self: *Watcher, idx: usize, offset: u64) void {
+        if (idx >= self.files.items.len) return;
+        self.files.items[idx].offset = offset;
+    }
+
     fn openTrackedFile(self: *Watcher, tracked: *TrackedFile, read_from: ReadFrom) !void {
         if (tracked.file != null) return;
 
@@ -199,6 +226,7 @@ pub const Watcher = struct {
         else switch (read_from) {
             .head => 0,
             .tail => opened.size,
+            .checkpoint => 0,
         };
         tracked.seen_once = true;
     }
@@ -465,4 +493,27 @@ test "Watcher public API: reconcilePaths expires removed paths after grace" {
     try testing.expectEqual(@as(usize, 1), watcher.files.items.len);
     try watcher.reconcilePaths(&.{}, .head, 0);
     try testing.expectEqual(@as(usize, 0), watcher.files.items.len);
+}
+
+test "Watcher public API: identityAt/setOffsetAt/identityForEvent work" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try truncateAndWrite(tmp_dir.dir, "tail.log", "seed\n");
+    const path = try tmp_dir.dir.realpathAlloc(testing.allocator, "tail.log");
+    defer testing.allocator.free(path);
+
+    var watcher = try Watcher.init(testing.allocator, &.{path}, .tail, 0);
+    defer watcher.deinit();
+
+    try testing.expectEqual(@as(usize, 1), watcher.fileCount());
+    const id0 = watcher.identityAt(0);
+    try testing.expect(id0 != null);
+
+    watcher.setOffsetAt(0, 0);
+    const events = try watcher.poll(.tail);
+    try testing.expectEqual(@as(usize, 1), events.len);
+    const evt_id = watcher.identityForEvent(events[0]);
+    try testing.expect(evt_id != null);
+    try testing.expectEqual(id0.?.inode, evt_id.?.inode);
 }
