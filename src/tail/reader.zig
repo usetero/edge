@@ -107,3 +107,58 @@ pub const LineReader = struct {
         try writer.writeByte('\n');
     }
 };
+
+const testing = std.testing;
+
+test "LineReader public API: ingestChunk + finish frames across chunk boundaries" {
+    var reader = try LineReader.init(testing.allocator, 8, 1024);
+    defer reader.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try reader.ingestChunk("a\nb", &out.writer);
+    try reader.ingestChunk("c\n", &out.writer);
+    try reader.finish(&out.writer);
+
+    try testing.expectEqualStrings("a\nbc\n", out.written());
+}
+
+test "LineReader public API: ingestChunk enforces max_line cap" {
+    var reader = try LineReader.init(testing.allocator, 32, 4);
+    defer reader.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try reader.ingestChunk("123456\nok\n", &out.writer);
+    try reader.finish(&out.writer);
+
+    try testing.expectEqualStrings("1234\nok\n", out.written());
+}
+
+test "LineReader public API: readRange emits lines from file range" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    {
+        const file = try tmp_dir.dir.createFile("input.log", .{});
+        defer file.close();
+        try file.writeAll("hello\nworld\n");
+    }
+
+    const file = try tmp_dir.dir.openFile("input.log", .{ .mode = .read_only });
+    defer file.close();
+
+    const size = (try file.stat()).size;
+    var reader = try LineReader.init(testing.allocator, 5, 1024);
+    defer reader.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try reader.readRange(&file, 0, size, &out.writer);
+    try reader.finish(&out.writer);
+
+    try testing.expectEqualStrings("hello\nworld\n", out.written());
+}
