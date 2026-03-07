@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const ReadFrom = enum {
     head,
@@ -9,7 +10,10 @@ pub const ReadFrom = enum {
 pub const IoEngine = enum {
     auto,
     poll,
-    inotify,
+    uring,
+    kqueue,
+    inotify, // compatibility alias for Linux uring watcher
+    epoll, // compatibility alias for poll watcher
 };
 
 pub const InputFormat = enum {
@@ -73,6 +77,23 @@ pub fn validateConfig(cfg: TailConfig) !void {
     if (cfg.write_buf == 0) return error.InvalidWriteBuffer;
     if (cfg.flush_interval_ms == 0) return error.InvalidFlushInterval;
     if (cfg.flush_line_threshold == 0) return error.InvalidFlushThreshold;
+}
+
+pub const NativeIoEngine: IoEngine = switch (builtin.os.tag) {
+    .linux => .uring,
+    .macos => .kqueue,
+    else => .poll,
+};
+
+pub fn normalizeIoEngine(engine: IoEngine) IoEngine {
+    return switch (engine) {
+        .auto => NativeIoEngine,
+        .inotify => if (builtin.os.tag == .linux) .uring else .poll,
+        .epoll => .poll,
+        .uring => if (builtin.os.tag == .linux) .uring else .poll,
+        .kqueue => if (builtin.os.tag == .macos) .kqueue else .poll,
+        .poll => .poll,
+    };
 }
 
 const testing = std.testing;

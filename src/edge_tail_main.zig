@@ -2,31 +2,10 @@ const std = @import("std");
 const zonfig = @import("zonfig/root.zig");
 const tail_mod = @import("tail/mod.zig");
 
+const RuntimeTailConfig = tail_mod.types.TailConfig;
 const ReadFrom = tail_mod.types.ReadFrom;
 const InputFormat = tail_mod.types.InputFormat;
-const IoEngine = enum { auto, uring, epoll, kqueue };
-
-const TailConfig = struct {
-    output_path: []const u8 = "-",
-    read_from: ReadFrom = .tail,
-    format: InputFormat = .raw,
-    policy_path: ?[]const u8 = null,
-    io_engine: IoEngine = .auto,
-    verbose: u8 = 0,
-    poll_ms: u64 = 200,
-    glob_interval_ms: u64 = 5_000,
-    rotate_wait_ms: u64 = 5_000,
-    removed_expire_ms: u64 = 60_000,
-    checkpoint_interval_ms: u64 = 5_000,
-    checkpoint_ttl_ms: u64 = 72 * 60 * 60 * 1000,
-    checkpoint_max_slots: usize = 256,
-    state_dir: []const u8 = ".tero",
-    read_buf: usize = 64 * 1024,
-    max_line: usize = 256 * 1024,
-    write_buf: usize = 64 * 1024,
-    flush_interval_ms: u64 = 100,
-    flush_line_threshold: usize = 1024,
-};
+const IoEngine = tail_mod.types.IoEngine;
 
 const CliOptions = struct {
     config_path: ?[]const u8 = null,
@@ -75,7 +54,7 @@ fn printUsage() !void {
         \\      --read-from <MODE>   head|tail|checkpoint
         \\  -f, --format <FMT>       raw|json|logfmt
         \\  -p, --policy <PATH>      Policy JSON file path
-        \\      --io-engine <ENG>    auto|uring|epoll|kqueue
+        \\      --io-engine <ENG>    auto|uring|kqueue|poll|inotify|epoll
         \\      --poll-ms <MS>       Poll interval in milliseconds
         \\      --glob-interval-ms <MS>  Glob re-evaluation interval
         \\      --rotate-wait-ms <MS>  Drain old fd before switching on rotation
@@ -117,8 +96,10 @@ fn parseInputFormat(value: []const u8) !InputFormat {
 fn parseIoEngine(value: []const u8) !IoEngine {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "uring")) return .uring;
-    if (std.mem.eql(u8, value, "epoll")) return .epoll;
     if (std.mem.eql(u8, value, "kqueue")) return .kqueue;
+    if (std.mem.eql(u8, value, "poll")) return .poll;
+    if (std.mem.eql(u8, value, "inotify")) return .inotify;
+    if (std.mem.eql(u8, value, "epoll")) return .epoll;
     return error.InvalidIoEngine;
 }
 
@@ -278,40 +259,14 @@ fn useStdinMode(inputs: []const []const u8) bool {
     return inputs.len == 1 and std.mem.eql(u8, inputs[0], "-");
 }
 
-fn validate(opts: CliOptions, cfg: TailConfig) !void {
+fn validate(opts: CliOptions, cfg: RuntimeTailConfig) !void {
     if (opts.inputs.items.len > 1) {
         for (opts.inputs.items) |input| {
             if (std.mem.eql(u8, input, "-")) return error.InvalidInputCombination;
         }
     }
 
-    try tail_mod.types.validateConfig(toTailConfig(cfg));
-}
-
-fn toTailConfig(cfg: TailConfig) tail_mod.types.TailConfig {
-    return .{
-        .output_path = cfg.output_path,
-        .read_from = cfg.read_from,
-        .input_format = cfg.format,
-        .policy_path = cfg.policy_path,
-        .poll_ms = cfg.poll_ms,
-        .glob_interval_ms = cfg.glob_interval_ms,
-        .rotate_wait_ms = cfg.rotate_wait_ms,
-        .removed_expire_ms = cfg.removed_expire_ms,
-        .checkpoint_interval_ms = cfg.checkpoint_interval_ms,
-        .checkpoint_ttl_ms = cfg.checkpoint_ttl_ms,
-        .checkpoint_max_slots = cfg.checkpoint_max_slots,
-        .state_dir = cfg.state_dir,
-        .read_buf = cfg.read_buf,
-        .max_line = cfg.max_line,
-        .write_buf = cfg.write_buf,
-        .flush_interval_ms = cfg.flush_interval_ms,
-        .flush_line_threshold = cfg.flush_line_threshold,
-        .io_engine = switch (cfg.io_engine) {
-            .auto => .auto,
-            .uring, .epoll, .kqueue => .poll,
-        },
-    };
+    try tail_mod.types.validateConfig(cfg);
 }
 
 pub fn main() !void {
@@ -325,7 +280,7 @@ pub fn main() !void {
     };
     defer opts.deinit(allocator);
 
-    const loaded_cfg = zonfig.load(TailConfig, allocator, .{
+    const loaded_cfg = zonfig.load(RuntimeTailConfig, allocator, .{
         .json_path = opts.config_path,
         .env_prefix = "TERO",
         .allow_env_only = opts.config_path == null,
@@ -333,15 +288,14 @@ pub fn main() !void {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
-    defer zonfig.deinit(TailConfig, allocator, loaded_cfg);
+    defer zonfig.deinit(RuntimeTailConfig, allocator, loaded_cfg);
 
     var cfg = loaded_cfg.*;
     if (opts.output_override) |v| cfg.output_path = v;
     if (opts.read_from_override) |v| cfg.read_from = v;
-    if (opts.format_override) |v| cfg.format = v;
+    if (opts.format_override) |v| cfg.input_format = v;
     if (opts.policy_path_override) |v| cfg.policy_path = v;
     if (opts.io_engine_override) |v| cfg.io_engine = v;
-    cfg.verbose +|= opts.verbose_increment;
     if (opts.poll_ms_override) |v| cfg.poll_ms = v;
     if (opts.glob_interval_ms_override) |v| cfg.glob_interval_ms = v;
     if (opts.rotate_wait_ms_override) |v| cfg.rotate_wait_ms = v;
@@ -355,10 +309,11 @@ pub fn main() !void {
     if (opts.write_buf_override) |v| cfg.write_buf = v;
     if (opts.flush_interval_ms_override) |v| cfg.flush_interval_ms = v;
     if (opts.flush_line_threshold_override) |v| cfg.flush_line_threshold = v;
+    cfg.io_engine = tail_mod.types.normalizeIoEngine(cfg.io_engine);
 
     try validate(opts, cfg);
 
-    if (cfg.verbose > 0) {
+    if (opts.verbose_increment > 0) {
         var stderr_buf: [1024]u8 = undefined;
         var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
         const stderr = &stderr_writer.interface;
@@ -366,7 +321,7 @@ pub fn main() !void {
             "edge-tail: read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s} policy={s}\n",
             .{
                 @tagName(cfg.read_from),
-                @tagName(cfg.format),
+                @tagName(cfg.input_format),
                 @tagName(cfg.io_engine),
                 cfg.poll_ms,
                 cfg.glob_interval_ms,
@@ -377,12 +332,10 @@ pub fn main() !void {
         try stderr.flush();
     }
 
-    const tail_cfg = toTailConfig(cfg);
-
     if (useStdinMode(opts.inputs.items)) {
-        try tail_mod.runtime.runStdinToOutput(allocator, tail_cfg);
+        try tail_mod.runtime.runStdinToOutput(allocator, cfg);
         return;
     }
 
-    try tail_mod.runtime.runFilesToOutput(allocator, tail_cfg, opts.inputs.items);
+    try tail_mod.runtime.runFilesToOutput(allocator, cfg, opts.inputs.items);
 }

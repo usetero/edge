@@ -1,183 +1,245 @@
 # tail
 
-`tail/` contains the `edge-tail` implementation used by
-`src/edge_tail_main.zig`.
+`tail/` is the file/stdin log tailing runtime used by `src/edge_tail_main.zig`.
 
-## Module layout
+This document describes the current architecture, where the hot path is
+platform-specialized at compile time:
 
-- `types.zig`: config/types (`ReadFrom`, `IoEngine`, identity hash helpers)
-- `io.zig`: `std.Io.Reader` / `std.Io.Writer` wrappers for stdin/file/stdout
-- `watch.zig`: watcher/discovery/rotation state machine (`poll` or `inotify`)
-- `read_scheduler.zig`: batched event execution into framer
-- `framer.zig`: `pread`-based range reader + newline framing + max line cap
-- `eval_stream.zig`: line-level policy evaluation (`policy_zig`) and filtering
-- `checkpoint.zig`: async checkpoint lane + WAL recovery (`checkpoint.wal`)
-- `runtime.zig`: main loop orchestration and flush/checkpoint integration
+- Linux: `io_uring` watcher + batched read scheduler (+ fixed resources when
+  available)
+- macOS: `kqueue` watcher + scalar read fallback
+- other targets: poll watcher + scalar read fallback
 
-## Runtime mode selection
+## Architectural Overview
 
-- stdin mode: no file arguments, or single `-`
-- file mode: one or more paths/globs
-- watcher backend:
-  - `IoEngine.inotify` (Linux)
-  - `IoEngine.poll`
-  - `IoEngine.auto` -> inotify on Linux, else poll
+### Main Modules
+
+- `types.zig`: shared config/types, identity hashes, IO engine normalization
+- `runtime.zig`: mode selection, loop orchestration, flush + checkpoint
+  integration
+- `watch.zig`: discovery/watch/rotation/rewrite state machine (`poll`, `uring`,
+  `kqueue`)
+- `read_scheduler.zig`: batched read execution (`uring` on Linux, scalar
+  fallback elsewhere)
+- `framer.zig`: chunk framing + policy handoff, SIMD newline scan in
+  `ingestChunk`
+- `eval_stream.zig`: policy evaluation/filtering
+- `checkpoint.zig`: async checkpoint lane, WAL append/recovery, TTL lookups
+- `io.zig`: stdin/file input and stdout/file output wrappers
+
+### High-Level Dataflow
 
 ```mermaid
 flowchart LR
-  A[CLI config] --> B{inputs}
-  B -- none / '-' --> C[stdin mode]
-  B -- paths/globs --> D[file mode]
-  D --> E{io_engine}
-  E -- auto linux --> F[inotify backend]
-  E -- auto non-linux --> G[poll backend]
-  E -- inotify --> F
-  E -- poll --> G
+  A[Input source] --> B[Watcher / Stream Reader]
+  B --> C[ReadScheduler]
+  C --> D[LineFramer]
+  D --> E[StreamEvaluator]
+  E --> F[Output]
+  C --> G[Checkpoint enqueue]
+  G --> H[Checkpoint worker + WAL]
 ```
 
-## Stdin mode
+## IO Engine and Backend Selection
 
-`runtime.runStream` path:
+`types.normalizeIoEngine` resolves `auto` and compatibility aliases once for the
+target:
+
+- `auto` -> `uring` on Linux, `kqueue` on macOS, else `poll`
+- `inotify` alias -> `uring` on Linux (else `poll`)
+- `epoll` alias -> `poll`
+
+This keeps backend branching centralized and prevents duplicated engine logic.
+
+## Core Runtime Functions
+
+## `runtime.runStream` (stdin mode)
+
+Used when no file inputs are provided (or input is `-`).
 
 ```mermaid
 flowchart LR
   A[Input.stdin Reader] --> B[LineFramer.pump]
-  B --> C[StreamEvaluator.evalLine]
-  C --> D{decision}
-  D -- keep/unset --> E[Output Writer]
-  D -- drop --> F[skip line]
-  E --> G[flush]
-```
-
-## File mode (shared pipeline)
-
-`runtime.runFilesLoop` path:
-
-```mermaid
-flowchart TD
-  A[Watcher.collect events] --> B[ReadScheduler.processBatch]
-  B --> C[LineFramer.readRange per event]
+  B --> C[SIMD newline split in ingestChunk]
   C --> D[StreamEvaluator.evalLine]
-  D --> E{decision}
-  E -- keep/unset --> F[Output writer buffer]
-  E -- drop --> G[discard line]
-  F --> H[flush on timer or line threshold]
-  A --> I[checkpoint enqueue end_offset]
-  I --> J[checkpoint worker]
+  D --> E{keep/drop}
+  E -- keep --> F[Output writer]
+  E -- drop --> G[discard]
+  F --> H[flush]
 ```
 
-Policy source:
+Key property:
 
-- `--policy <path>` loads the same `policies.json` schema used in other
-  distributions via `policy_zig.parser.parsePoliciesFile`.
+- No watcher/discovery/checkpoint path in stdin mode.
 
-## Poll + glob mode
+## `runtime.runFilesLoop` (file mode)
 
-Poll backend is event-driven from metadata deltas plus periodic glob refresh.
+Main tail loop for files/globs.
 
 ```mermaid
 flowchart TD
-  A[loop tick poll_ms] --> B[refreshPaths every glob_interval]
-  B --> C[expand glob]
-  C --> D[mark existing / add new / evict expired]
-  A --> E[collectPollDirtyCandidates]
-  E --> F[dirty queue]
-  F --> G[processDirtyIndex]
+  A[Watcher.collect] --> B[ReadScheduler.processBatch]
+  B --> C[LineFramer.ingestChunk/readRange]
+  C --> D[StreamEvaluator.evalLine]
+  D --> E{keep/drop}
+  E -- keep --> F[Output buffered write]
+  E -- drop --> G[discard]
+  B --> H[checkpoint enqueue end_offset]
+  H --> I[Checkpoint worker]
+  F --> J[flush by timer/threshold]
 ```
 
-Dirty candidates in poll mode:
+Key properties:
 
-- unopened file slot
-- active fd `fstat` failure
-- active size differs from tracked offset
-- path inode differs from active inode
-- path size differs from active size
-- pending rotation slot present
+- Persistent `ReadScheduler` object for reuse across loop ticks
+- Buffered output with dual flush triggers:
+  - time-based (`flush_interval_ms`)
+  - line-threshold (`flush_line_threshold`)
 
-## Inotify mode
+## `watch.collect`
 
-Linux inotify marks only watched indices as dirty, then runs the same
-`processDirtyIndex` flow.
+`Watcher.collect` does three stages:
+
+1. refresh paths by glob interval
+2. gather dirty candidates from backend
+3. process dirty queue (`open/replace/rewrite/range emit`)
 
 ```mermaid
 flowchart TD
-  A[inotify fd readable] --> B[pollInotify]
-  B --> C[wd -> tracked idx]
-  C --> D[markDirty]
-  D --> E[processDirtyIndex]
-  E --> F[readRange + frame + write]
+  A[collect()] --> B{glob refresh due}
+  B -- yes --> C[refreshPaths]
+  B -- no --> D[skip]
+  C --> E[collectBackendDirtyCandidates]
+  D --> E
+  E --> F[markPendingDirty]
+  F --> G[dirty queue drain]
+  G --> H[processDirtyIndex]
+  H --> I[emit Event file,start,end,identity]
 ```
 
-## Rotation and rewrite handling
+### Backend behavior differences
 
-Tracked slot keeps active fd and optional pending replacement fd.
+- `poll`: metadata checks (`fstat/stat`) detect dirty candidates
+- `uring` (Linux): persistent inotify `POLL_ADD` + `READ` SQEs; `collect()`
+  drains CQEs and re-arms
+- `kqueue` (macOS): non-blocking `kevent` drain to map fd -> tracked index
+
+## `read_scheduler.processBatch`
+
+`ReadScheduler` takes watcher `Event`s and executes reads in a single pass.
+
+### Linux `uring` path
+
+```mermaid
+flowchart TD
+  A[events batch] --> B[prepare fixed resources]
+  B --> C{fixed enabled}
+  C -- yes --> D[register_files_update + read_fixed SQEs + IOSQE_FIXED_FILE]
+  C -- no --> E[read SQEs]
+  D --> F[submit_and_wait]
+  E --> F
+  F --> G[drain CQEs]
+  G --> H[framer.ingestChunk]
+  H --> I[scalar tail read for remaining bytes]
+```
+
+### Non-Linux / fallback path
 
 ```mermaid
 flowchart LR
-  A[active fd] --> B{path inode changed}
+  A[events batch] --> B[for each event readRange]
+  B --> C[framer]
+```
+
+Key properties:
+
+- Linux path batches SQEs/CQEs per loop tick
+- Fixed resources are opportunistic: if registration/update fails, scheduler
+  degrades safely to non-fixed/scalar behavior
+
+## `framer.ingestChunk`
+
+`ingestChunk` is the line-splitting hot path.
+
+```mermaid
+flowchart TD
+  A[chunk bytes] --> B[SIMD vector compare with '\\n']
+  B --> C[bitmask extraction]
+  C --> D[ctz walk of newline bits]
+  D --> E[emitSegment per newline]
+  E --> F[remainder/truncation logic]
+  F --> G[emitLine -> evaluator]
+  D --> H[tail bytes without newline]
+  H --> I[append to remainder]
+```
+
+Key properties:
+
+- SIMD scan finds all newline positions in each vector block
+- Existing truncation semantics are preserved by routing through `emitSegment`
+- Remainder bytes carry across chunks and flush on `finish()`
+
+## `checkpoint.Lane`
+
+Checkpointing is asynchronous with WAL persistence.
+
+```mermaid
+flowchart TD
+  A[runtime enqueue identity,end_offset] --> B[bounded queue]
+  B --> C[worker flushOne]
+  C --> D[update in-memory maps]
+  C --> E[append checkpoint.wal record]
+  E --> F[batched fsync]
+  G[startup recover] --> H[rebuild maps from WAL]
+  H --> I[getOffset lookup]
+```
+
+Lookup order:
+
+1. full identity `(dev,inode,fingerprint)`
+2. inode fallback `(dev,inode)`
+
+TTL:
+
+- stale entries are evicted on lookup (`checkpoint_ttl_ms`)
+
+Durability model:
+
+- at-least-once semantics (async enqueue + batched sync can replay some data on
+  crash)
+
+## Rotation and Rewrite Handling
+
+The watcher tracks both active and pending file handles per path.
+
+```mermaid
+flowchart LR
+  A[active file] --> B{path replaced?}
   B -- no --> C[continue]
-  B -- yes --> D[open pending fd]
+  B -- yes --> D[open pending]
   D --> E[wait rotate_wait + active drained]
   E --> F[switchToPending]
-  F --> G[offset=0, init prefix hash]
+  F --> G[offset reset + prefix init]
 ```
 
-Rewrite/copytruncate guards:
+Rewrite guards:
 
-- if `size < offset`: reset offset to `0`
-- if file head prefix hash changes unexpectedly: treat as rewrite and reset
+- `size < offset` -> reset offset
+- head-prefix hash changed unexpectedly -> treat as rewrite and reset
 
-## Checkpoint lane
+## Current Performance-Oriented Design Choices
 
-Checkpoint updates are non-blocking on hot path (bounded queue), processed in a
-worker thread.
+- compile-time backend specialization by target
+- event-driven watcher backends (`uring`/`kqueue`) with `poll` fallback
+- batched Linux reads via `io_uring`
+- opportunistic fixed resources (`register_buffers`, `register_files`)
+- SIMD newline scanning for chunk splitting
+- bounded, non-blocking checkpoint enqueue on hot path
+- buffered writes with explicit flush cadence/threshold
 
-```mermaid
-flowchart LR
-  A[event end_offset] --> B[enqueue Update]
-  B --> C[worker flushOne]
-  C --> D[append checkpoint.wal]
-  C --> E[update in-memory indexes]
-  E --> F[getOffset during collect/startup]
-```
+## Future Optimization Queue
 
-Recovery and lookup:
-
-- startup scans WAL and reconstructs map state
-- lookup order:
-  1. full identity hash `(dev,inode,fingerprint)`
-  2. inode fallback `(dev,inode)`
-- TTL (`checkpoint_ttl_ms`) evicts stale entries on read
-
-## Performance properties
-
-- no vtable polymorphism in tail runtime path
-- SoA watcher state for tracked file fields
-- dirty dedupe (`DynamicBitSet` + queue)
-- no per-iteration allocation in framer pump
-- flush by timer (`flush_interval_ms`) or processed line threshold
-
-## Performance Gap Matrix
-
-| Area                   | Current State                                                                                   | Target (Plan)                                                        | Risk                      | Next Step                                                                            |
-| ---------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------ |
-| Watch loop (`poll`)    | Scans tracked files each loop to derive dirty candidates                                        | Event-first lifecycle with minimal full scans                        | High at large file counts | Add slow safety sweep, but drive normal updates from directory/file events only      |
-| Watch loop (`inotify`) | Event-driven dirty marking, but still mixed with path replacement checks in per-file processing | Pure event-triggered path with bounded fallback checks               | Medium                    | Split rotation checks into event-cued path and periodic low-frequency reconciliation |
-| Rotation detection     | Uses per-file path open/stat/fingerprint checks during processing                               | Rotation state machine triggered by specific lifecycle signals       | Medium/High               | Cache path metadata and only open path when replacement is suspected                 |
-| Read execution         | Per-event `pread` via framer (`readRange`)                                                      | Batched read submission (`io_uring`)                                 | High                      | Introduce engine boundary that accepts a batch and returns completions               |
-| Syscall amortization   | One read/write flow per event; buffered flush                                                   | writev/splice-style batching where possible                          | Medium                    | Add write batching surface in output module before splice fast-path                  |
-| Checkpoint store       | WAL + in-memory maps + TTL on lookup                                                            | mmap slot array + WAL + seqlock + compaction pipeline                | High (durability/perf)    | Introduce fixed-slot map file and recovery/compaction phases from Step 5             |
-| Checkpoint sync model  | Worker thread, mutex-protected maps                                                             | Lower-contention state application with deterministic slot ownership | Medium                    | Move to slot-indexed writes and reduce lock scope to queue pop only                  |
-| Glob refresh           | Periodic full pattern expansion                                                                 | Incremental directory-driven discovery with timed reconciliation     | Medium                    | Track parent dirs and reconcile only changed directories + periodic audit            |
-| Parallelism            | Single-threaded read/frame/write loop                                                           | File-level parallelizable processing units                           | Medium                    | Keep per-file state isolated and add optional worker lanes for read/frame            |
-| Observability for perf | Basic tests, no detailed hot-path counters in runtime                                           | Built-in counters for syscall/dirty/read/flush/checkpoint pressure   | High (regression risk)    | Add counters and expose in benchmark harness assertions                              |
-
-### Priority Order
-
-1. Read batching boundary + backend abstraction (`pread` batch now, `io_uring`
-   next)
-2. Checkpoint slot-map architecture (durability + lower contention)
-3. Watcher lifecycle refinement (event-first rotation/discovery, less path
-   churn)
-4. Output batching upgrades (`writev`, then selective splice)
-5. Perf counters + guardrail thresholds in `bench/logging`
+1. `fadvise`/`readahead` tuning
+2. optional SQPOLL mode with guarded fallback
+3. zero-copy forwarding mode (`splice` / linked SQEs) for no-policy paths
+4. richer hot-path counters for benchmark guardrails

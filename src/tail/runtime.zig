@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const o11y = @import("o11y");
 const types = @import("types.zig");
 const io_mod = @import("io.zig");
@@ -46,10 +45,11 @@ pub const Runtime = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: types.TailConfig) !Runtime {
         try types.validateConfig(cfg);
-        const backend: watch_mod.BackendKind = switch (cfg.io_engine) {
+        const backend: watch_mod.BackendKind = switch (types.normalizeIoEngine(cfg.io_engine)) {
             .poll => .poll,
-            .inotify => .inotify,
-            .auto => if (builtin.os.tag == .linux) .inotify else .poll,
+            .uring => .uring,
+            .kqueue => .kqueue,
+            .auto, .inotify, .epoll => unreachable,
         };
         return .{
             .allocator = allocator,
@@ -103,6 +103,8 @@ pub const Runtime = struct {
             stdio_bus.eventBus(),
         );
         defer evaluator.deinit();
+        var scheduler = try read_scheduler.ReadScheduler.init(self.allocator, self.cfg.io_engine);
+        defer scheduler.deinit();
 
         var watcher = try watch_mod.Watcher.init(
             self.allocator,
@@ -139,7 +141,7 @@ pub const Runtime = struct {
         while (true) {
             if (stop_requested.load(.acquire)) break;
             try watcher.collect(&events, self.cfg.read_from, if (self.cfg.read_from == .checkpoint) &checkpoint else null);
-            const processed = try read_scheduler.ReadScheduler.processBatch(
+            const processed = try scheduler.processBatch(
                 &framer,
                 output.writer(),
                 events.items,
