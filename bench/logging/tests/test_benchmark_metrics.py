@@ -7,16 +7,64 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from tqdm import tqdm
 
 from .helpers import start_tail, wait_for
 
 RUN_ID = time.strftime("%Y-%m-%dT%H-%M-%S")
+LineBuilder = Callable[[int, int], str]
+LineDecoder = Callable[[str], tuple[int, int]]
 
 
 def _write_policy_file(path: Path, payload: str) -> None:
     path.write_text(payload + "\n")
+
+
+def _build_raw_line(line_id: int, sent_ns: int) -> str:
+    return f"{line_id}:{sent_ns}\n"
+
+
+def _decode_raw_line(raw: str) -> tuple[int, int]:
+    left, right = raw.split(":", 1)
+    return int(left), int(right)
+
+
+def _build_json_line(line_id: int, sent_ns: int) -> str:
+    route = "drop" if (line_id % 2) == 0 else "keep"
+    return (
+        json.dumps(
+            {
+                "id": line_id,
+                "sent_ns": sent_ns,
+                "route": route,
+                "message": f"msg-{line_id}",
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def _decode_json_line(raw: str) -> tuple[int, int]:
+    obj = json.loads(raw)
+    return int(obj["id"]), int(obj["sent_ns"])
+
+
+def _build_logfmt_line(line_id: int, sent_ns: int) -> str:
+    route = "drop" if (line_id % 2) == 0 else "keep"
+    return f"id={line_id} sent_ns={sent_ns} route={route} msg=msg-{line_id}\n"
+
+
+def _decode_logfmt_line(raw: str) -> tuple[int, int]:
+    fields: dict[str, str] = {}
+    for part in raw.split():
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        fields[key] = value
+    return int(fields["id"]), int(fields["sent_ns"])
 
 
 def _count_lines(path: Path) -> int:
@@ -177,7 +225,7 @@ def _write_metrics_report(
 
 
 class OutputTracker:
-    def __init__(self, out_path: Path):
+    def __init__(self, out_path: Path, line_decoder: LineDecoder):
         self.out_path = out_path
         self.offset = 0
         self.partial = b""
@@ -185,6 +233,7 @@ class OutputTracker:
         self.latencies_ms: list[float] = []
         self.duplicate_count = 0
         self.bad_line_count = 0
+        self._line_decoder = line_decoder
 
     def poll(self) -> None:
         if not self.out_path.exists():
@@ -203,9 +252,7 @@ class OutputTracker:
             if not raw:
                 continue
             try:
-                left, right = raw.decode("utf-8").split(":", 1)
-                line_id = int(left)
-                sent_ns = int(right)
+                line_id, sent_ns = self._line_decoder(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 self.bad_line_count += 1
                 continue
@@ -228,6 +275,8 @@ def _run_sustained_profile(
     extra_tail_args: list[str] | None = None,
     expected_output_ratio: float = 1.0,
     output_count_tolerance: int = 0,
+    line_builder: LineBuilder | None = None,
+    line_decoder: LineDecoder | None = None,
 ) -> dict[str, float | int | str | dict[str, float]]:
     out_path = tmp_path / f"{profile_name}.out"
     files = [tmp_path / f"{profile_name}-{i}.log" for i in range(file_count)]
@@ -253,8 +302,9 @@ def _run_sustained_profile(
     proc = start_tail(edge_tail_bin, tmp_path / f"{profile_name}.err", tail_args)
 
     rss_sampler = RssSampler(proc.proc.pid)
-    tracker = OutputTracker(out_path)
+    tracker = OutputTracker(out_path, line_decoder or _decode_raw_line)
     rss_sampler.start()
+    emit_line = line_builder or _build_raw_line
 
     cpu_start = _read_cpu_time_s(proc.proc.pid)
     wall_start = time.monotonic()
@@ -283,7 +333,7 @@ def _run_sustained_profile(
                 for _ in range(lines_per_tick):
                     file_idx = next_line_id % len(handles)
                     now_ns = time.monotonic_ns()
-                    handles[file_idx].write(f"{next_line_id}:{now_ns}\n")
+                    handles[file_idx].write(emit_line(next_line_id, now_ns))
                     next_line_id += 1
                     sent_total += 1
                 for h in handles:
@@ -429,6 +479,82 @@ def test_benchmark_metrics_sustained_policy_drop_50pct(
         extra_tail_args=["--policy", str(policy_path), "-f", "raw"],
         expected_output_ratio=0.5,
         output_count_tolerance=1,
+    )
+
+
+def test_benchmark_metrics_sustained_policy_drop_50pct_json_attrs(
+    edge_tail_bin: Path, tmp_path: Path, project_root: Path
+) -> None:
+    policy_path = tmp_path / "drop-50pct-json-policy.json"
+    _write_policy_file(
+        policy_path,
+        """
+{
+  "policies": [
+    {
+      "id": "drop-route-json",
+      "name": "drop-route-json",
+      "log": {
+        "match": [{ "log_attribute": "route", "regex": "^drop$" }],
+        "keep": "none"
+      }
+    }
+  ]
+}
+""".strip(),
+    )
+
+    _run_sustained_profile(
+        edge_tail_bin=edge_tail_bin,
+        tmp_path=tmp_path,
+        project_root=project_root,
+        profile_name="sustained_policy_drop_50pct_json",
+        file_count=1,
+        duration_s=12.0,
+        target_lps=10_000,
+        extra_tail_args=["--policy", str(policy_path), "-f", "json"],
+        expected_output_ratio=0.5,
+        output_count_tolerance=1,
+        line_builder=_build_json_line,
+        line_decoder=_decode_json_line,
+    )
+
+
+def test_benchmark_metrics_sustained_policy_drop_50pct_logfmt_attrs(
+    edge_tail_bin: Path, tmp_path: Path, project_root: Path
+) -> None:
+    policy_path = tmp_path / "drop-50pct-logfmt-policy.json"
+    _write_policy_file(
+        policy_path,
+        """
+{
+  "policies": [
+    {
+      "id": "drop-route-logfmt",
+      "name": "drop-route-logfmt",
+      "log": {
+        "match": [{ "log_attribute": "route", "regex": "^drop$" }],
+        "keep": "none"
+      }
+    }
+  ]
+}
+""".strip(),
+    )
+
+    _run_sustained_profile(
+        edge_tail_bin=edge_tail_bin,
+        tmp_path=tmp_path,
+        project_root=project_root,
+        profile_name="sustained_policy_drop_50pct_logfmt",
+        file_count=1,
+        duration_s=12.0,
+        target_lps=10_000,
+        extra_tail_args=["--policy", str(policy_path), "-f", "logfmt"],
+        expected_output_ratio=0.5,
+        output_count_tolerance=1,
+        line_builder=_build_logfmt_line,
+        line_decoder=_decode_logfmt_line,
     )
 
 
