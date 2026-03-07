@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const o11y = @import("o11y");
 const types = @import("types.zig");
 const io_mod = @import("io.zig");
 const framer_mod = @import("framer.zig");
@@ -9,6 +10,13 @@ const read_scheduler = @import("read_scheduler.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 
 var stop_requested = std.atomic.Value(bool).init(false);
+
+fn initEventBus() o11y.StdioEventBus {
+    var stdio_bus: o11y.StdioEventBus = undefined;
+    stdio_bus.init();
+    stdio_bus.eventBus().setLevel(o11y.Level.parseFromEnv("TERO_LOG_LEVEL", .warn));
+    return stdio_bus;
+}
 
 fn handleSignal(_: c_int) callconv(.c) void {
     stop_requested.store(true, .release);
@@ -26,17 +34,17 @@ fn installSignalHandlers() void {
     }
 }
 
-/// Runtime scaffold for tail_v2.
+/// Runtime scaffold for edge-tail.
 ///
 /// This first implementation is intentionally narrow and IO-interface focused:
 /// Reader endpoint -> framer -> Writer endpoint.
 /// Watch/discovery/checkpoint modules will plug in as the next step.
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
-    cfg: types.TailV2Config,
+    cfg: types.TailConfig,
     watch_backend: watch_mod.BackendKind = .poll,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: types.TailV2Config) !Runtime {
+    pub fn init(allocator: std.mem.Allocator, cfg: types.TailConfig) !Runtime {
         try types.validateConfig(cfg);
         const backend: watch_mod.BackendKind = switch (cfg.io_engine) {
             .poll => .poll,
@@ -57,10 +65,12 @@ pub const Runtime = struct {
     }
 
     pub fn runStream(self: *Runtime, input: *io_mod.Input, output: *io_mod.Output) !void {
+        var stdio_bus = initEventBus();
         var evaluator = try eval_stream.StreamEvaluator.init(
             self.allocator,
             self.cfg.input_format,
             self.cfg.policy_path,
+            stdio_bus.eventBus(),
         );
         defer evaluator.deinit();
 
@@ -83,12 +93,14 @@ pub const Runtime = struct {
         stop_requested.store(false, .release);
         installSignalHandlers();
 
+        var stdio_bus = initEventBus();
         var framer = try framer_mod.LineFramer.init(self.allocator, self.cfg.read_buf, self.cfg.max_line);
         defer framer.deinit();
         var evaluator = try eval_stream.StreamEvaluator.init(
             self.allocator,
             self.cfg.input_format,
             self.cfg.policy_path,
+            stdio_bus.eventBus(),
         );
         defer evaluator.deinit();
 
@@ -163,7 +175,7 @@ pub const Runtime = struct {
     }
 };
 
-pub fn runStdinToOutput(allocator: std.mem.Allocator, cfg: types.TailV2Config) !void {
+pub fn runStdinToOutput(allocator: std.mem.Allocator, cfg: types.TailConfig) !void {
     var runtime = try Runtime.init(allocator, cfg);
 
     var input = try io_mod.Input.init(allocator, .stdin, cfg.read_buf);
@@ -180,7 +192,7 @@ pub fn runStdinToOutput(allocator: std.mem.Allocator, cfg: types.TailV2Config) !
     try runtime.runStream(&input, &output);
 }
 
-pub fn runFilesToOutput(allocator: std.mem.Allocator, cfg: types.TailV2Config, inputs: []const []const u8) !void {
+pub fn runFilesToOutput(allocator: std.mem.Allocator, cfg: types.TailConfig, inputs: []const []const u8) !void {
     var runtime = try Runtime.init(allocator, cfg);
 
     const out_target: io_mod.OutputTarget = if (std.mem.eql(u8, cfg.output_path, "-"))
@@ -215,7 +227,7 @@ test "runtime public API: runStream copies framed bytes" {
     const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
     defer testing.allocator.free(abs_out);
 
-    const cfg = types.TailV2Config{
+    const cfg = types.TailConfig{
         .output_path = abs_out,
         .read_buf = 16,
         .max_line = 1024,
@@ -233,4 +245,66 @@ test "runtime public API: runStream copies framed bytes" {
     const got = try tmp.dir.readFileAlloc(testing.allocator, out_path, 1024);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("a\nb\n", got);
+}
+
+test "runtime public API: runStream applies policy drops" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const in_path = "in.log";
+    const out_path = "out.log";
+    const policy_path = "policies.json";
+    {
+        const f = try tmp.dir.createFile(in_path, .{});
+        defer f.close();
+        try f.writeAll("ok\ndebug line\nnext\n");
+    }
+    {
+        const f = try tmp.dir.createFile(policy_path, .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "policies": [
+            \\    {
+            \\      "id": "drop-debug",
+            \\      "name": "drop-debug",
+            \\      "log": {
+            \\        "match": [{ "log_field": "body", "regex": "debug" }],
+            \\        "keep": "none"
+            \\      }
+            \\    }
+            \\  ]
+            \\}
+        );
+    }
+
+    const abs_in = try tmp.dir.realpathAlloc(testing.allocator, in_path);
+    defer testing.allocator.free(abs_in);
+    const abs_policy = try tmp.dir.realpathAlloc(testing.allocator, policy_path);
+    defer testing.allocator.free(abs_policy);
+    const cwd_abs = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(cwd_abs);
+    const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
+    defer testing.allocator.free(abs_out);
+
+    const cfg = types.TailConfig{
+        .output_path = abs_out,
+        .policy_path = abs_policy,
+        .input_format = .raw,
+        .read_buf = 32,
+        .max_line = 1024,
+        .write_buf = 32,
+    };
+    var runtime = try Runtime.init(testing.allocator, cfg);
+
+    var input = try io_mod.Input.init(testing.allocator, .{ .file = abs_in }, cfg.read_buf);
+    defer input.deinit();
+    var output = try io_mod.Output.init(testing.allocator, .{ .file_append = abs_out }, cfg.write_buf);
+    defer output.deinit();
+
+    try runtime.runStream(&input, &output);
+
+    const got = try tmp.dir.readFileAlloc(testing.allocator, out_path, 1024);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("ok\nnext\n", got);
 }

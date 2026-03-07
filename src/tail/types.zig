@@ -44,7 +44,7 @@ pub const LineMeta = struct {
     truncated: bool = false,
 };
 
-pub const TailV2Config = struct {
+pub const TailConfig = struct {
     output_path: []const u8 = "-",
     read_from: ReadFrom = .tail,
     input_format: InputFormat = .raw,
@@ -65,7 +65,7 @@ pub const TailV2Config = struct {
     flush_line_threshold: usize = 1024,
 };
 
-pub fn validateConfig(cfg: TailV2Config) !void {
+pub fn validateConfig(cfg: TailConfig) !void {
     if (cfg.poll_ms == 0) return error.InvalidPollInterval;
     if (cfg.glob_interval_ms == 0) return error.InvalidGlobInterval;
     if (cfg.read_buf == 0) return error.InvalidReadBuffer;
@@ -78,7 +78,7 @@ pub fn validateConfig(cfg: TailV2Config) !void {
 const testing = std.testing;
 
 test "types public API: validateConfig rejects zero limits" {
-    var cfg = TailV2Config{};
+    var cfg = TailConfig{};
     cfg.read_buf = 0;
     try testing.expectError(error.InvalidReadBuffer, validateConfig(cfg));
 }

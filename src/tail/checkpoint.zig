@@ -41,7 +41,7 @@ pub const Lane = struct {
         ttl_ms: u64,
     ) !Lane {
         try std.fs.cwd().makePath(state_dir);
-        const wal_path = try std.fs.path.join(allocator, &.{ state_dir, "checkpoint.v2.wal" });
+        const wal_path = try std.fs.path.join(allocator, &.{ state_dir, "checkpoint.wal" });
         errdefer allocator.free(wal_path);
         const wal_file = std.fs.cwd().openFile(wal_path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try std.fs.cwd().createFile(wal_path, .{ .read = true, .truncate = false }),

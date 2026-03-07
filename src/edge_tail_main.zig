@@ -285,10 +285,10 @@ fn validate(opts: CliOptions, cfg: TailConfig) !void {
         }
     }
 
-    try tail_mod.types.validateConfig(toTailV2Config(cfg));
+    try tail_mod.types.validateConfig(toTailConfig(cfg));
 }
 
-fn toTailV2Config(cfg: TailConfig) tail_mod.types.TailV2Config {
+fn toTailConfig(cfg: TailConfig) tail_mod.types.TailConfig {
     return .{
         .output_path = cfg.output_path,
         .read_from = cfg.read_from,
@@ -363,7 +363,7 @@ pub fn main() !void {
         var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
         const stderr = &stderr_writer.interface;
         try stderr.print(
-            "edge-tail(v2): read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s} policy={s}\n",
+            "edge-tail: read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s} policy={s}\n",
             .{
                 @tagName(cfg.read_from),
                 @tagName(cfg.format),
@@ -377,12 +377,12 @@ pub fn main() !void {
         try stderr.flush();
     }
 
-    const v2_cfg = toTailV2Config(cfg);
+    const tail_cfg = toTailConfig(cfg);
 
     if (useStdinMode(opts.inputs.items)) {
-        try tail_mod.runtime.runStdinToOutput(allocator, v2_cfg);
+        try tail_mod.runtime.runStdinToOutput(allocator, tail_cfg);
         return;
     }
 
-    try tail_mod.runtime.runFilesToOutput(allocator, v2_cfg, opts.inputs.items);
+    try tail_mod.runtime.runFilesToOutput(allocator, tail_cfg, opts.inputs.items);
 }

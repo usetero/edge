@@ -11,7 +11,7 @@
 - `read_scheduler.zig`: batched event execution into framer
 - `framer.zig`: `pread`-based range reader + newline framing + max line cap
 - `eval_stream.zig`: line-level policy evaluation (`policy_zig`) and filtering
-- `checkpoint.zig`: async checkpoint lane + WAL recovery (`checkpoint.v2.wal`)
+- `checkpoint.zig`: async checkpoint lane + WAL recovery (`checkpoint.wal`)
 - `runtime.zig`: main loop orchestration and flush/checkpoint integration
 
 ## Runtime mode selection
@@ -136,7 +136,7 @@ worker thread.
 flowchart LR
   A[event end_offset] --> B[enqueue Update]
   B --> C[worker flushOne]
-  C --> D[append checkpoint.v2.wal]
+  C --> D[append checkpoint.wal]
   C --> E[update in-memory indexes]
   E --> F[getOffset during collect/startup]
 ```
@@ -164,7 +164,7 @@ Recovery and lookup:
 | Watch loop (`poll`)    | Scans tracked files each loop to derive dirty candidates                                        | Event-first lifecycle with minimal full scans                        | High at large file counts | Add slow safety sweep, but drive normal updates from directory/file events only      |
 | Watch loop (`inotify`) | Event-driven dirty marking, but still mixed with path replacement checks in per-file processing | Pure event-triggered path with bounded fallback checks               | Medium                    | Split rotation checks into event-cued path and periodic low-frequency reconciliation |
 | Rotation detection     | Uses per-file path open/stat/fingerprint checks during processing                               | Rotation state machine triggered by specific lifecycle signals       | Medium/High               | Cache path metadata and only open path when replacement is suspected                 |
-| Read execution         | Per-event `pread` via framer (`readRange`)                                                      | Batched read submission (`io_uring` in v2)                           | High                      | Introduce engine boundary that accepts a batch and returns completions               |
+| Read execution         | Per-event `pread` via framer (`readRange`)                                                      | Batched read submission (`io_uring`)                                 | High                      | Introduce engine boundary that accepts a batch and returns completions               |
 | Syscall amortization   | One read/write flow per event; buffered flush                                                   | writev/splice-style batching where possible                          | Medium                    | Add write batching surface in output module before splice fast-path                  |
 | Checkpoint store       | WAL + in-memory maps + TTL on lookup                                                            | mmap slot array + WAL + seqlock + compaction pipeline                | High (durability/perf)    | Introduce fixed-slot map file and recovery/compaction phases from Step 5             |
 | Checkpoint sync model  | Worker thread, mutex-protected maps                                                             | Lower-contention state application with deterministic slot ownership | Medium                    | Move to slot-indexed writes and reduce lock scope to queue pop only                  |
@@ -179,5 +179,5 @@ Recovery and lookup:
 2. Checkpoint slot-map architecture (durability + lower contention)
 3. Watcher lifecycle refinement (event-first rotation/discovery, less path
    churn)
-4. Output batching upgrades (`writev`, then selective splice in v2)
+4. Output batching upgrades (`writev`, then selective splice)
 5. Perf counters + guardrail thresholds in `bench/logging`

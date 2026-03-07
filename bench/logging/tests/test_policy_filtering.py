@@ -226,16 +226,16 @@ def test_metric_only_policy_does_not_filter_logs(
         policy_path,
         """
 {
-  "policies": [
-    {
-      "id": "drop-metric",
-      "name": "drop-metric",
-      "metric": {
-        "match": [{ "metric_field": "name", "regex": "^cpu\\." }],
-        "keep": false
-      }
-    }
-  ]
+      "policies": [
+        {
+          "id": "drop-metric",
+          "name": "drop-metric",
+          "metric": {
+            "match": [{ "metric_field": "name", "regex": "^cpu\\\\." }],
+            "keep": false
+          }
+        }
+      ]
 }
 """.strip(),
     )

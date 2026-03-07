@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 
-/// Incremental newline framer used by tail_v2.
+/// Incremental newline framer used by edge-tail.
 ///
 /// This module is intentionally IO-interface based so it can be reused for:
 /// - stdin streaming

@@ -326,7 +326,7 @@ Copytruncate/rewrite behavior:
 ### Checkpoint/Resume behavior
 
 Checkpoint lane runs in a background thread and persists updates to
-`checkpoint.v2.wal` in `--state-dir`.
+`checkpoint.wal` in `--state-dir`.
 
 ```mermaid
 flowchart LR

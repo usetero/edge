@@ -10,7 +10,7 @@ pub const OutputTarget = union(enum) {
     file_append: []const u8,
 };
 
-/// Reader endpoint wrapper for tail_v2.
+/// Reader endpoint wrapper for edge-tail.
 ///
 /// It exposes a stable `*std.Io.Reader` interface regardless of whether the
 /// source is stdin or a file on disk.
@@ -68,7 +68,7 @@ pub const Input = struct {
     }
 };
 
-/// Writer endpoint wrapper for tail_v2.
+/// Writer endpoint wrapper for edge-tail.
 ///
 /// This enforces append-safe file behavior while still exposing
 /// `*std.Io.Writer` so callers can stay interface-driven.
