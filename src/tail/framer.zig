@@ -29,20 +29,28 @@ pub const LineFramer = struct {
         self.remainder.deinit(self.allocator);
     }
 
-    pub fn ingestChunk(self: *LineFramer, chunk: []const u8, writer: *std.Io.Writer) !void {
+    pub const LineFilterFn = fn (ctx: *anyopaque, line: []const u8, meta: types.LineMeta) anyerror!bool;
+
+    pub fn ingestChunk(
+        self: *LineFramer,
+        chunk: []const u8,
+        writer: *std.Io.Writer,
+        filter_ctx: *anyopaque,
+        filter_fn: *const LineFilterFn,
+    ) !void {
         var start: usize = 0;
         while (std.mem.indexOfScalarPos(u8, chunk, start, '\n')) |newline_idx| {
             const segment = chunk[start..newline_idx];
 
             if (self.remainder.items.len > 0 or self.remainder_truncated) {
                 try self.appendCapped(segment);
-                try emitLine(writer, self.remainder.items, .{ .truncated = self.remainder_truncated });
+                try emitLine(writer, self.remainder.items, .{ .truncated = self.remainder_truncated }, filter_ctx, filter_fn);
                 self.remainder.clearRetainingCapacity();
                 self.remainder_truncated = false;
             } else if (segment.len > self.max_line) {
-                try emitLine(writer, segment[0..self.max_line], .{ .truncated = true });
+                try emitLine(writer, segment[0..self.max_line], .{ .truncated = true }, filter_ctx, filter_fn);
             } else {
-                try emitLine(writer, segment, .{});
+                try emitLine(writer, segment, .{}, filter_ctx, filter_fn);
             }
 
             start = newline_idx + 1;
@@ -53,30 +61,51 @@ pub const LineFramer = struct {
         }
     }
 
-    pub fn finish(self: *LineFramer, writer: *std.Io.Writer) !void {
+    pub fn finish(
+        self: *LineFramer,
+        writer: *std.Io.Writer,
+        filter_ctx: *anyopaque,
+        filter_fn: *const LineFilterFn,
+    ) !void {
         if (self.remainder.items.len == 0 and !self.remainder_truncated) return;
-        try emitLine(writer, self.remainder.items, .{ .truncated = self.remainder_truncated });
+        try emitLine(writer, self.remainder.items, .{ .truncated = self.remainder_truncated }, filter_ctx, filter_fn);
         self.remainder.clearRetainingCapacity();
         self.remainder_truncated = false;
     }
 
     /// Pumps from any Reader endpoint into this framer with no per-iteration
     /// allocations by reading directly into the reusable `read_buf`.
-    pub fn pump(self: *LineFramer, allocator: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer, read_limit: usize) !void {
+    pub fn pump(
+        self: *LineFramer,
+        allocator: std.mem.Allocator,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        read_limit: usize,
+        filter_ctx: *anyopaque,
+        filter_fn: *const LineFilterFn,
+    ) !void {
         _ = allocator;
         const max_chunk = @min(read_limit, self.read_buf.len);
         while (true) {
             const n = try reader.readSliceShort(self.read_buf[0..max_chunk]);
             if (n == 0) break;
-            try self.ingestChunk(self.read_buf[0..n], writer);
+            try self.ingestChunk(self.read_buf[0..n], writer, filter_ctx, filter_fn);
         }
 
-        try self.finish(writer);
+        try self.finish(writer, filter_ctx, filter_fn);
     }
 
     /// Reads `[start_offset, end_offset)` from `file` using pread and frames
     /// newline-delimited lines to the writer.
-    pub fn readRange(self: *LineFramer, file: *const std.fs.File, start_offset: u64, end_offset: u64, writer: *std.Io.Writer) !void {
+    pub fn readRange(
+        self: *LineFramer,
+        file: *const std.fs.File,
+        start_offset: u64,
+        end_offset: u64,
+        writer: *std.Io.Writer,
+        filter_ctx: *anyopaque,
+        filter_fn: *const LineFilterFn,
+    ) !void {
         var offset = start_offset;
         while (offset < end_offset) {
             const remaining = end_offset - offset;
@@ -84,7 +113,7 @@ pub const LineFramer = struct {
             const n = try std.posix.pread(file.handle, self.read_buf[0..to_read], @intCast(offset));
             if (n == 0) break;
 
-            try self.ingestChunk(self.read_buf[0..n], writer);
+            try self.ingestChunk(self.read_buf[0..n], writer, filter_ctx, filter_fn);
             offset += n;
         }
     }
@@ -102,14 +131,25 @@ pub const LineFramer = struct {
         if (copy_len < bytes.len) self.remainder_truncated = true;
     }
 
-    fn emitLine(writer: *std.Io.Writer, line: []const u8, meta: types.LineMeta) !void {
-        _ = meta;
+    fn emitLine(
+        writer: *std.Io.Writer,
+        line: []const u8,
+        meta: types.LineMeta,
+        filter_ctx: *anyopaque,
+        filter_fn: *const LineFilterFn,
+    ) !void {
+        const keep = try filter_fn(filter_ctx, line, meta);
+        if (!keep) return;
         try writer.writeAll(line);
         try writer.writeByte('\n');
     }
 };
 
 const testing = std.testing;
+
+fn keepAll(_: *anyopaque, _: []const u8, _: types.LineMeta) !bool {
+    return true;
+}
 
 test "framer public API: frames lines across chunk boundaries" {
     var framer = try LineFramer.init(testing.allocator, 8, 1024);
@@ -118,9 +158,10 @@ test "framer public API: frames lines across chunk boundaries" {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
 
-    try framer.ingestChunk("a\nb", &out.writer);
-    try framer.ingestChunk("c\n", &out.writer);
-    try framer.finish(&out.writer);
+    var ctx: u8 = 0;
+    try framer.ingestChunk("a\nb", &out.writer, &ctx, keepAll);
+    try framer.ingestChunk("c\n", &out.writer, &ctx, keepAll);
+    try framer.finish(&out.writer, &ctx, keepAll);
 
     try testing.expectEqualStrings("a\nbc\n", out.written());
 }
@@ -132,8 +173,9 @@ test "framer public API: enforces max line cap" {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
 
-    try framer.ingestChunk("123456\nok\n", &out.writer);
-    try framer.finish(&out.writer);
+    var ctx: u8 = 0;
+    try framer.ingestChunk("123456\nok\n", &out.writer, &ctx, keepAll);
+    try framer.finish(&out.writer, &ctx, keepAll);
 
     try testing.expectEqualStrings("1234\nok\n", out.written());
 }
@@ -160,7 +202,8 @@ test "framer public API: readRange emits file bytes as lines" {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
 
-    try framer.readRange(&file, 0, size, &out.writer);
-    try framer.finish(&out.writer);
+    var ctx: u8 = 0;
+    try framer.readRange(&file, 0, size, &out.writer, &ctx, keepAll);
+    try framer.finish(&out.writer, &ctx, keepAll);
     try testing.expectEqualStrings("x\ny\n", out.written());
 }

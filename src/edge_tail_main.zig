@@ -3,13 +3,14 @@ const zonfig = @import("zonfig/root.zig");
 const tail_mod = @import("tail/mod.zig");
 
 const ReadFrom = tail_mod.types.ReadFrom;
-const InputFormat = enum { raw, json, logfmt };
+const InputFormat = tail_mod.types.InputFormat;
 const IoEngine = enum { auto, uring, epoll, kqueue };
 
 const TailConfig = struct {
     output_path: []const u8 = "-",
     read_from: ReadFrom = .tail,
     format: InputFormat = .raw,
+    policy_path: ?[]const u8 = null,
     io_engine: IoEngine = .auto,
     verbose: u8 = 0,
     poll_ms: u64 = 200,
@@ -32,6 +33,7 @@ const CliOptions = struct {
     output_override: ?[]const u8 = null,
     read_from_override: ?ReadFrom = null,
     format_override: ?InputFormat = null,
+    policy_path_override: ?[]const u8 = null,
     io_engine_override: ?IoEngine = null,
     verbose_increment: u8 = 0,
     poll_ms_override: ?u64 = null,
@@ -52,6 +54,7 @@ const CliOptions = struct {
     fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
         if (self.config_path) |path| allocator.free(path);
         if (self.output_override) |path| allocator.free(path);
+        if (self.policy_path_override) |path| allocator.free(path);
         if (self.state_dir_override) |path| allocator.free(path);
         for (self.inputs.items) |input| allocator.free(input);
         self.inputs.deinit(allocator);
@@ -71,6 +74,7 @@ fn printUsage() !void {
         \\  -o, --output <PATH>      Output path ('-' for stdout)
         \\      --read-from <MODE>   head|tail|checkpoint
         \\  -f, --format <FMT>       raw|json|logfmt
+        \\  -p, --policy <PATH>      Policy JSON file path
         \\      --io-engine <ENG>    auto|uring|epoll|kqueue
         \\      --poll-ms <MS>       Poll interval in milliseconds
         \\      --glob-interval-ms <MS>  Glob re-evaluation interval
@@ -158,6 +162,13 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
             opts.format_override = try parseInputFormat(args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--policy")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            if (opts.policy_path_override) |old| allocator.free(old);
+            opts.policy_path_override = try allocator.dupe(u8, args[i]);
             continue;
         }
         if (std.mem.eql(u8, arg, "--io-engine")) {
@@ -281,6 +292,8 @@ fn toTailV2Config(cfg: TailConfig) tail_mod.types.TailV2Config {
     return .{
         .output_path = cfg.output_path,
         .read_from = cfg.read_from,
+        .input_format = cfg.format,
+        .policy_path = cfg.policy_path,
         .poll_ms = cfg.poll_ms,
         .glob_interval_ms = cfg.glob_interval_ms,
         .rotate_wait_ms = cfg.rotate_wait_ms,
@@ -326,6 +339,7 @@ pub fn main() !void {
     if (opts.output_override) |v| cfg.output_path = v;
     if (opts.read_from_override) |v| cfg.read_from = v;
     if (opts.format_override) |v| cfg.format = v;
+    if (opts.policy_path_override) |v| cfg.policy_path = v;
     if (opts.io_engine_override) |v| cfg.io_engine = v;
     cfg.verbose +|= opts.verbose_increment;
     if (opts.poll_ms_override) |v| cfg.poll_ms = v;
@@ -349,8 +363,16 @@ pub fn main() !void {
         var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
         const stderr = &stderr_writer.interface;
         try stderr.print(
-            "edge-tail(v2): read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s}\n",
-            .{ @tagName(cfg.read_from), @tagName(cfg.format), @tagName(cfg.io_engine), cfg.poll_ms, cfg.glob_interval_ms, cfg.state_dir },
+            "edge-tail(v2): read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s} policy={s}\n",
+            .{
+                @tagName(cfg.read_from),
+                @tagName(cfg.format),
+                @tagName(cfg.io_engine),
+                cfg.poll_ms,
+                cfg.glob_interval_ms,
+                cfg.state_dir,
+                cfg.policy_path orelse "(none)",
+            },
         );
         try stderr.flush();
     }

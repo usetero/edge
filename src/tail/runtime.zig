@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const types = @import("types.zig");
 const io_mod = @import("io.zig");
 const framer_mod = @import("framer.zig");
+const eval_stream = @import("eval_stream.zig");
 const watch_mod = @import("watch.zig");
 const read_scheduler = @import("read_scheduler.zig");
 const checkpoint_mod = @import("checkpoint.zig");
@@ -49,11 +50,31 @@ pub const Runtime = struct {
         };
     }
 
+    fn evalLineFilter(ctx: *anyopaque, line: []const u8, meta: types.LineMeta) anyerror!bool {
+        _ = meta;
+        const evaluator: *eval_stream.StreamEvaluator = @ptrCast(@alignCast(ctx));
+        return evaluator.evalLine(line);
+    }
+
     pub fn runStream(self: *Runtime, input: *io_mod.Input, output: *io_mod.Output) !void {
+        var evaluator = try eval_stream.StreamEvaluator.init(
+            self.allocator,
+            self.cfg.input_format,
+            self.cfg.policy_path,
+        );
+        defer evaluator.deinit();
+
         var framer = try framer_mod.LineFramer.init(self.allocator, self.cfg.read_buf, self.cfg.max_line);
         defer framer.deinit();
 
-        try framer.pump(self.allocator, input.reader(), output.writer(), self.cfg.read_buf);
+        try framer.pump(
+            self.allocator,
+            input.reader(),
+            output.writer(),
+            self.cfg.read_buf,
+            &evaluator,
+            evalLineFilter,
+        );
         try output.flush();
     }
 
@@ -64,6 +85,12 @@ pub const Runtime = struct {
 
         var framer = try framer_mod.LineFramer.init(self.allocator, self.cfg.read_buf, self.cfg.max_line);
         defer framer.deinit();
+        var evaluator = try eval_stream.StreamEvaluator.init(
+            self.allocator,
+            self.cfg.input_format,
+            self.cfg.policy_path,
+        );
+        defer evaluator.deinit();
 
         var watcher = try watch_mod.Watcher.init(
             self.allocator,
@@ -100,7 +127,13 @@ pub const Runtime = struct {
         while (true) {
             if (stop_requested.load(.acquire)) break;
             try watcher.collect(&events, self.cfg.read_from, if (self.cfg.read_from == .checkpoint) &checkpoint else null);
-            const processed = try read_scheduler.ReadScheduler.processBatch(&framer, output.writer(), events.items);
+            const processed = try read_scheduler.ReadScheduler.processBatch(
+                &framer,
+                output.writer(),
+                events.items,
+                &evaluator,
+                evalLineFilter,
+            );
 
             if (processed > 0) {
                 for (events.items) |evt| {

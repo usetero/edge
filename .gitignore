@@ -21,6 +21,8 @@ zig-out/
 bench/debug
 bench/*/results
 bench/bin
+.tero
+*/.tero
 
 # lambda ignores
 *.zip

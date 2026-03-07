@@ -10,6 +10,7 @@
 - `watch.zig`: watcher/discovery/rotation state machine (`poll` or `inotify`)
 - `read_scheduler.zig`: batched event execution into framer
 - `framer.zig`: `pread`-based range reader + newline framing + max line cap
+- `eval_stream.zig`: line-level policy evaluation (`policy_zig`) and filtering
 - `checkpoint.zig`: async checkpoint lane + WAL recovery (`checkpoint.v2.wal`)
 - `runtime.zig`: main loop orchestration and flush/checkpoint integration
 
@@ -41,8 +42,11 @@ flowchart LR
 ```mermaid
 flowchart LR
   A[Input.stdin Reader] --> B[LineFramer.pump]
-  B --> C[Output Writer]
-  C --> D[flush]
+  B --> C[StreamEvaluator.evalLine]
+  C --> D{decision}
+  D -- keep/unset --> E[Output Writer]
+  D -- drop --> F[skip line]
+  E --> G[flush]
 ```
 
 ## File mode (shared pipeline)
@@ -53,11 +57,19 @@ flowchart LR
 flowchart TD
   A[Watcher.collect events] --> B[ReadScheduler.processBatch]
   B --> C[LineFramer.readRange per event]
-  C --> D[Output writer buffer]
-  D --> E[flush on timer or line threshold]
-  A --> F[checkpoint enqueue end_offset]
-  F --> G[checkpoint worker]
+  C --> D[StreamEvaluator.evalLine]
+  D --> E{decision}
+  E -- keep/unset --> F[Output writer buffer]
+  E -- drop --> G[discard line]
+  F --> H[flush on timer or line threshold]
+  A --> I[checkpoint enqueue end_offset]
+  I --> J[checkpoint worker]
 ```
+
+Policy source:
+
+- `--policy <path>` loads the same `policies.json` schema used in other
+  distributions via `policy_zig.parser.parsePoliciesFile`.
 
 ## Poll + glob mode
 

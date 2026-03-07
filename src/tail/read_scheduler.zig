@@ -12,10 +12,12 @@ pub const ReadScheduler = struct {
         framer: *framer_mod.LineFramer,
         writer: *std.Io.Writer,
         events: []const watch_mod.Event,
+        filter_ctx: *anyopaque,
+        filter_fn: *const framer_mod.LineFramer.LineFilterFn,
     ) !usize {
         var processed: usize = 0;
         for (events) |evt| {
-            try framer.readRange(evt.file, evt.start_offset, evt.end_offset, writer);
+            try framer.readRange(evt.file, evt.start_offset, evt.end_offset, writer, filter_ctx, filter_fn);
             processed += 1;
         }
         return processed;
@@ -23,6 +25,10 @@ pub const ReadScheduler = struct {
 };
 
 const testing = std.testing;
+
+fn keepAll(_: *anyopaque, _: []const u8, _: @import("types.zig").LineMeta) !bool {
+    return true;
+}
 
 test "read scheduler public API: processes event batch" {
     var tmp = testing.tmpDir(.{});
@@ -45,8 +51,8 @@ test "read scheduler public API: processes event batch" {
 
     const n = try ReadScheduler.processBatch(&framer, &out.writer, &.{
         .{ .file = &file, .start_offset = 0, .end_offset = 2, .identity = null },
-    });
-    try framer.finish(&out.writer);
+    }, &framer, keepAll);
+    try framer.finish(&out.writer, &framer, keepAll);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a\n", out.written());
 }

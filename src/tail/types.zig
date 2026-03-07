@@ -12,6 +12,12 @@ pub const IoEngine = enum {
     inotify,
 };
 
+pub const InputFormat = enum {
+    raw,
+    json,
+    logfmt,
+};
+
 pub const FileIdentity = struct {
     dev: u64,
     inode: u64,
@@ -41,6 +47,8 @@ pub const LineMeta = struct {
 pub const TailV2Config = struct {
     output_path: []const u8 = "-",
     read_from: ReadFrom = .tail,
+    input_format: InputFormat = .raw,
+    policy_path: ?[]const u8 = null,
     io_engine: IoEngine = .auto,
     poll_ms: u64 = 200,
     glob_interval_ms: u64 = 5_000,
