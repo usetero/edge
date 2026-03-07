@@ -39,6 +39,10 @@ pub const otlp_distribution = @import("otlp_main.zig");
 /// Prometheus distribution - focused edge proxy for Prometheus metrics scraping
 pub const prometheus_distribution = @import("prometheus_main.zig");
 
+/// Tail distribution - focused file log tailing
+pub const tail_distribution = @import("edge_tail_main.zig");
+pub const tail = @import("tail/mod.zig");
+
 /// Lambda module - for Lambda extension distribution
 pub const lambda = @import("lambda/root.zig");
 
@@ -85,4 +89,5 @@ test {
     _ = @import("io/transport.zig");
     _ = @import("lambda/root.zig");
     _ = @import("zonfig/root.zig");
+    _ = @import("tail/mod.zig");
 }

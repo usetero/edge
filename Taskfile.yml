@@ -147,6 +147,20 @@ tasks:
     cmds:
       - ./bench/run.sh --skip-build
 
+  benchmark:logging:
+    desc: "Run edge-tail logging integration tests"
+    aliases: [bench-logging, bml]
+    cmds:
+      - ./bench/logging/run.sh
+
+  benchmark:logging:metrics:
+    desc: "Run edge-tail logging benchmark metric profiles (logs/sec, CPU, RSS)"
+    aliases: [bench-logging-metrics, bmlm]
+    vars:
+      BENCH_LINES: 50000000
+    cmds:
+      - EDGE_TAIL_STDIN_LINES={{.BENCH_LINES}} ./bench/logging/run.sh -s tests/test_benchmark_metrics.py
+
   benchmark:history:
     desc: "Run benchmarks and save to dated history folder"
     aliases: [bench-history, bmh]
