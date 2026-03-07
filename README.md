@@ -29,6 +29,9 @@ processor Policy implementation.
    `/metrics` scrapes with streaming policy-based metric filtering, and forwards
    filtered metrics to Prometheus.
 
+5. **Tail distribution** - Tails files/stdin, applies include/exclude/filter
+   rules, and forwards or writes line-oriented output.
+
 ## Repository Structure
 
 ```
@@ -37,6 +40,7 @@ src/
 ├── datadog_main.zig      # Datadog-focused distribution entry point
 ├── otlp_main.zig         # OTLP-focused distribution entry point
 ├── prometheus_main.zig   # Prometheus-focused distribution entry point
+├── edge_tail_main.zig    # Tail-focused distribution entry point
 ├── lambda_main.zig       # AWS Lambda extension entry point
 ├── root.zig              # Library root (public API exports)
 │
@@ -228,6 +232,127 @@ AWS Lambda extension distribution for Datadog telemetry processing.
 
 Build: `zig build lambda` Run: Deployed as a Lambda layer
 
+## Edge Tail Binary (`edge-tail`)
+
+`edge-tail` is a file/stream tailer distribution focused on line-oriented log
+copying with checkpointed resume semantics.
+
+Build: `zig build tail`  
+Run: `./zig-out/bin/edge-tail [options] [PATH ...]`
+
+### Runtime Modes
+
+At startup, `edge-tail` resolves mode from inputs:
+
+- No inputs, or a single `-`: stdin mode (`runStdinToOutput`)
+- One or more file paths/globs: file mode (`runFilesToOutput`)
+
+Watcher backend selection in file mode:
+
+- `--io-engine inotify` -> inotify backend (Linux)
+- `--io-engine poll` -> polling backend
+- `--io-engine auto` -> inotify on Linux, otherwise poll
+
+### Mode: stdin -> output
+
+Reads bytes from stdin, frames by newline, writes to output (`stdout` or file).
+No watcher/glob/rotation/checkpoint path is used in this mode.
+
+```mermaid
+flowchart LR
+  A[stdin Reader] --> B[LineFramer pump]
+  B --> C[Output Writer]
+  C --> D[flush]
+```
+
+### Mode: poll + glob file tailing
+
+File mode with polling backend and periodic glob refresh.
+
+```mermaid
+flowchart TD
+  A[Tick loop poll_ms] --> B[refreshPaths every glob_interval_ms]
+  B --> C[expand glob patterns]
+  C --> D[track new paths / expire removed]
+  D --> E[collectPollDirtyCandidates]
+  E --> F[processDirtyIndex per dirty file]
+  F --> G[LineFramer.readRange start_offset..end_offset]
+  G --> H[Output Writer buffer]
+  H --> I[flush by interval/threshold]
+  F --> J[checkpoint enqueue end_offset]
+  J --> K[checkpoint worker WAL + in-memory index]
+```
+
+Poll dirty candidate rules:
+
+- unopened file path
+- active fd stat failure
+- active file size changed
+- path inode changed vs active fd inode
+- path size changed vs active fd size
+- pending rotation file exists
+
+### Mode: inotify file tailing
+
+File mode with Linux inotify event triggering. Dirty indices come from watch
+events, then the same per-file processing pipeline is used.
+
+```mermaid
+flowchart TD
+  A[inotify fd readable] --> B[pollInotify parse events]
+  B --> C[markDirty idx from wd map]
+  C --> D[processDirtyIndex]
+  D --> E[detectPathReplacement]
+  D --> F[readRange + line framing]
+  F --> G[Output Writer]
+  D --> H[checkpoint enqueue]
+  H --> I[WAL writer thread]
+```
+
+### Rotation and copytruncate handling
+
+For each tracked path, watcher keeps active and optional pending file handles.
+
+```mermaid
+flowchart LR
+  A[active file] --> B{path inode changed?}
+  B -- no --> C[continue on active]
+  B -- yes --> D[open pending file at path]
+  D --> E[drain active until rotate_wait and no growth]
+  E --> F[switchToPending reset offset]
+```
+
+Copytruncate/rewrite behavior:
+
+- If file shrinks below current offset: offset resets to `0`
+- If leading prefix hash changes unexpectedly: treat as rewrite, reset offset
+
+### Checkpoint/Resume behavior
+
+Checkpoint lane runs in a background thread and persists updates to
+`checkpoint.wal` in `--state-dir`.
+
+```mermaid
+flowchart LR
+  A[file event end_offset] --> B[enqueue Update]
+  B --> C[worker pop]
+  C --> D[append WAL record]
+  C --> E[update in-memory maps]
+  E --> F[getOffset on startup/collect]
+```
+
+Resume key behavior:
+
+- Primary lookup: `(dev, inode, fingerprint)` hash
+- Fallback lookup: `(dev, inode)` hash
+- TTL enforced from `last_seen_ns` (`--checkpoint-ttl-ms`)
+
+### File output behavior
+
+- `-o -` writes to stdout
+- otherwise opens file in append mode and writes line output
+- flushes on `--flush-interval-ms` or `--flush-lines`
+
 ## Building
 
 ```bash
@@ -242,6 +367,7 @@ zig build edge        # Full distribution (Datadog + OTLP + Prometheus)
 zig build datadog     # Datadog-only distribution
 zig build otlp        # OTLP-only distribution
 zig build prometheus  # Prometheus-only distribution
+zig build tail        # Tail-only distribution
 zig build lambda      # Lambda extension distribution
 
 # Run specific distribution
@@ -249,6 +375,7 @@ zig build run-edge
 zig build run-datadog
 zig build run-otlp
 zig build run-prometheus
+zig build run-tail
 ```
 
 ## Installation
@@ -264,8 +391,8 @@ Download the latest release for your platform from the
 | Linux ARM64                 | `edge-linux-arm64`  |
 | macOS ARM64 (Apple Silicon) | `edge-darwin-arm64` |
 
-For Datadog-only or OTLP-only distributions, use `edge-datadog-*` or
-`edge-otlp-*` binaries.
+For focused distributions, use `edge-datadog-*`, `edge-otlp-*`,
+`edge-prometheus-*`, or `edge-tail-*` binaries.
 
 ```bash
 # Download and run (example for Linux x86_64)
@@ -288,6 +415,12 @@ docker build --build-arg DISTRIBUTION=datadog -t edge-datadog .
 # Build OTLP-only distribution
 docker build --build-arg DISTRIBUTION=otlp -t edge-otlp .
 
+# Build Prometheus-only distribution
+docker build --build-arg DISTRIBUTION=prometheus -t edge-prometheus .
+
+# Build Tail-only distribution
+docker build --build-arg DISTRIBUTION=tail -t edge-tail .
+
 # Run with a config file
 docker run -v $(pwd)/config.json:/app/config.json -p 8080:8080 edge
 ```
@@ -303,9 +436,15 @@ docker pull ghcr.io/<org>/edge-datadog:latest
 
 # Pull OTLP-only distribution
 docker pull ghcr.io/<org>/edge-otlp:latest
+
+# Pull Prometheus-only distribution
+docker pull ghcr.io/<org>/edge-prometheus:latest
+
+# Pull Tail-only distribution
+docker pull ghcr.io/<org>/edge-tail:latest
 ```
 
-Available distributions: `edge`, `datadog`, `otlp`
+Available distributions: `edge`, `datadog`, `otlp`, `prometheus`, `tail`
 
 ## Configuration
 

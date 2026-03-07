@@ -23,6 +23,7 @@ on:
           - datadog
           - otlp
           - prometheus
+          - tail
 
 env:
   REGISTRY: ghcr.io
@@ -45,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp", "prometheus"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp", "prometheus", "tail"]') }}
         arch:
           - runner: ubuntu-24.04
             suffix: linux-amd64
@@ -107,7 +108,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp", "prometheus"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp", "prometheus", "tail"]') }}
     runs-on: macos-15 # Apple Silicon runner
     timeout-minutes: 45
     steps:
@@ -187,7 +188,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp", "prometheus"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp", "prometheus", "tail"]') }}
         arch:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -261,7 +262,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp", "prometheus"]') }}
+        distribution: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.distribution)) || fromJson('["edge", "datadog", "otlp", "prometheus", "tail"]') }}
     steps:
       - name: Prepare
         run: |

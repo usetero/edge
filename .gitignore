@@ -10,6 +10,8 @@
 # -andrewrk
 
 .zig-cache/
+.zig-cache-global/
+*.pyc
 zig-out/
 /release/
 /debug/
@@ -17,8 +19,10 @@ zig-out/
 /build-*/
 /docgen_tmp/
 bench/debug
-bench/results
+bench/*/results
 bench/bin
+.tero
+*/.tero
 
 # lambda ignores
 *.zip
