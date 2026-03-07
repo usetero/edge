@@ -29,6 +29,9 @@ processor Policy implementation.
    `/metrics` scrapes with streaming policy-based metric filtering, and forwards
    filtered metrics to Prometheus.
 
+5. **Tail distribution** - Tails files/stdin, applies include/exclude/filter
+   rules, and forwards or writes line-oriented output.
+
 ## Repository Structure
 
 ```
@@ -37,6 +40,7 @@ src/
 ├── datadog_main.zig      # Datadog-focused distribution entry point
 ├── otlp_main.zig         # OTLP-focused distribution entry point
 ├── prometheus_main.zig   # Prometheus-focused distribution entry point
+├── edge_tail_main.zig    # Tail-focused distribution entry point
 ├── lambda_main.zig       # AWS Lambda extension entry point
 ├── root.zig              # Library root (public API exports)
 │
@@ -363,6 +367,7 @@ zig build edge        # Full distribution (Datadog + OTLP + Prometheus)
 zig build datadog     # Datadog-only distribution
 zig build otlp        # OTLP-only distribution
 zig build prometheus  # Prometheus-only distribution
+zig build tail        # Tail-only distribution
 zig build lambda      # Lambda extension distribution
 
 # Run specific distribution
@@ -370,6 +375,7 @@ zig build run-edge
 zig build run-datadog
 zig build run-otlp
 zig build run-prometheus
+zig build run-tail
 ```
 
 ## Installation
@@ -385,8 +391,8 @@ Download the latest release for your platform from the
 | Linux ARM64                 | `edge-linux-arm64`  |
 | macOS ARM64 (Apple Silicon) | `edge-darwin-arm64` |
 
-For Datadog-only or OTLP-only distributions, use `edge-datadog-*` or
-`edge-otlp-*` binaries.
+For focused distributions, use `edge-datadog-*`, `edge-otlp-*`,
+`edge-prometheus-*`, or `edge-tail-*` binaries.
 
 ```bash
 # Download and run (example for Linux x86_64)
@@ -409,6 +415,12 @@ docker build --build-arg DISTRIBUTION=datadog -t edge-datadog .
 # Build OTLP-only distribution
 docker build --build-arg DISTRIBUTION=otlp -t edge-otlp .
 
+# Build Prometheus-only distribution
+docker build --build-arg DISTRIBUTION=prometheus -t edge-prometheus .
+
+# Build Tail-only distribution
+docker build --build-arg DISTRIBUTION=tail -t edge-tail .
+
 # Run with a config file
 docker run -v $(pwd)/config.json:/app/config.json -p 8080:8080 edge
 ```
@@ -424,9 +436,15 @@ docker pull ghcr.io/<org>/edge-datadog:latest
 
 # Pull OTLP-only distribution
 docker pull ghcr.io/<org>/edge-otlp:latest
+
+# Pull Prometheus-only distribution
+docker pull ghcr.io/<org>/edge-prometheus:latest
+
+# Pull Tail-only distribution
+docker pull ghcr.io/<org>/edge-tail:latest
 ```
 
-Available distributions: `edge`, `datadog`, `otlp`
+Available distributions: `edge`, `datadog`, `otlp`, `prometheus`, `tail`
 
 ## Configuration
 

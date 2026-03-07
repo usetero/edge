@@ -289,7 +289,7 @@ tasks:
   # =============================================================================
 
   build:container:
-    desc: "🐳 Build container for a distribution (DIST=datadog|otlp|full)"
+    desc: "🐳 Build container for a distribution (DIST=edge|datadog|otlp|prometheus|tail)"
     dir: "{{.TASKFILE_DIR}}"
     vars:
       DIST: '{{.DIST | default "datadog"}}'
@@ -322,12 +322,18 @@ tasks:
     desc: "🐳 Build all distribution containers"
     cmds:
       - task: build:container
+        vars: { DIST: "edge" }
+      - task: build:container
         vars: { DIST: "datadog" }
       - task: build:container
         vars: { DIST: "otlp" }
+      - task: build:container
+        vars: { DIST: "prometheus" }
+      - task: build:container
+        vars: { DIST: "tail" }
 
   push:container:
-    desc: "🚀 Push container to GCP Artifact Registry (DIST=datadog|otlp|full)"
+    desc: "🚀 Push container to GCP Artifact Registry (DIST=edge|datadog|otlp|prometheus|tail)"
     dir: "{{.TASKFILE_DIR}}"
     vars:
       DIST: '{{.DIST | default "datadog"}}'
@@ -357,9 +363,15 @@ tasks:
     desc: "🚀 Push all distribution containers to GCP"
     cmds:
       - task: push:container
+        vars: { DIST: "edge" }
+      - task: push:container
         vars: { DIST: "datadog" }
       - task: push:container
         vars: { DIST: "otlp" }
+      - task: push:container
+        vars: { DIST: "prometheus" }
+      - task: push:container
+        vars: { DIST: "tail" }
 
   release:
     desc: "🎯 Build and push all containers (for CI)"
@@ -368,7 +380,7 @@ tasks:
       - task: push:containers
 
   release:container:
-    desc: "🎯 Build and push a specific distribution (DIST=datadog|otlp|full)"
+    desc: "🎯 Build and push a specific distribution (DIST=edge|datadog|otlp|prometheus|tail)"
     vars:
       DIST: '{{.DIST | default "datadog"}}'
     cmds:

@@ -1,10 +1,12 @@
 # Multi-stage Dockerfile for Tero Edge distributions
-# Available distributions: edge, datadog, otlp
+# Available distributions: edge, datadog, otlp, prometheus, tail
 #
 # Examples:
 #   docker build --build-arg DISTRIBUTION=edge -t edge .
 #   docker build --build-arg DISTRIBUTION=datadog -t edge-datadog .
 #   docker build --build-arg DISTRIBUTION=otlp -t edge-otlp .
+#   docker build --build-arg DISTRIBUTION=prometheus -t edge-prometheus .
+#   docker build --build-arg DISTRIBUTION=tail -t edge-tail .
 #
 # =============================================================================
 # Build stage
