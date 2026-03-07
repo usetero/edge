@@ -15,6 +15,10 @@ from .helpers import start_tail, wait_for
 RUN_ID = time.strftime("%Y-%m-%dT%H-%M-%S")
 
 
+def _write_policy_file(path: Path, payload: str) -> None:
+    path.write_text(payload + "\n")
+
+
 def _count_lines(path: Path) -> int:
     if not path.exists():
         return 0
@@ -221,29 +225,32 @@ def _run_sustained_profile(
     file_count: int,
     duration_s: float,
     target_lps: int,
+    extra_tail_args: list[str] | None = None,
+    expected_output_ratio: float = 1.0,
+    output_count_tolerance: int = 0,
 ) -> dict[str, float | int | str | dict[str, float]]:
     out_path = tmp_path / f"{profile_name}.out"
     files = [tmp_path / f"{profile_name}-{i}.log" for i in range(file_count)]
     for f in files:
         f.write_text("")
 
-    proc = start_tail(
-        edge_tail_bin,
-        tmp_path / f"{profile_name}.err",
-        [
-            "-o",
-            str(out_path),
-            "--read-from",
-            "head",
-            "--poll-ms",
-            "10",
-            "--flush-interval-ms",
-            "25",
-            "--flush-lines",
-            "512",
-            *[str(f) for f in files],
-        ],
-    )
+    tail_args = [
+        "-o",
+        str(out_path),
+        "--read-from",
+        "head",
+        "--poll-ms",
+        "10",
+        "--flush-interval-ms",
+        "25",
+        "--flush-lines",
+        "512",
+    ]
+    if extra_tail_args:
+        tail_args.extend(extra_tail_args)
+    tail_args.extend([str(f) for f in files])
+
+    proc = start_tail(edge_tail_bin, tmp_path / f"{profile_name}.err", tail_args)
 
     rss_sampler = RssSampler(proc.proc.pid)
     tracker = OutputTracker(out_path)
@@ -303,11 +310,13 @@ def _run_sustained_profile(
         for h in handles:
             h.flush()
 
+        expected_out_total = int(round(sent_total * expected_output_ratio))
+
         def drained() -> bool:
             tracker.poll()
-            return len(tracker.seen_ids) >= sent_total
+            return len(tracker.seen_ids) >= expected_out_total
 
-        drain_timeout_s = max(30.0, sent_total / 2000.0)
+        drain_timeout_s = max(30.0, expected_out_total / 2000.0)
         wait_for(drained, timeout_s=drain_timeout_s, poll_s=0.1)
         tracker.poll()
         wall_elapsed_s = time.monotonic() - wall_start
@@ -336,6 +345,7 @@ def _run_sustained_profile(
         "target_logs_per_sec": target_lps,
         "lines_in_total": sent_total,
         "lines_out_total": len(tracker.seen_ids),
+        "lines_out_expected": expected_out_total,
         "duplicates_out": tracker.duplicate_count,
         "bad_lines_out": tracker.bad_line_count,
         "elapsed_s": wall_elapsed_s,
@@ -350,7 +360,9 @@ def _run_sustained_profile(
     # Data integrity checks.
     assert tracker.bad_line_count == 0, f"bad output lines: {summary}"
     assert tracker.duplicate_count == 0, f"duplicate output lines: {summary}"
-    assert len(tracker.seen_ids) == sent_total, f"line loss detected: {summary}"
+    assert abs(len(tracker.seen_ids) - expected_out_total) <= output_count_tolerance, (
+        f"unexpected output count: {summary}"
+    )
     # Conservative throughput guardrail.
     assert (sent_total / wall_elapsed_s) > 2_000, f"throughput too low: {summary}"
     return summary
@@ -381,6 +393,42 @@ def test_benchmark_metrics_sustained_multi_file(
         file_count=12,
         duration_s=12.0,
         target_lps=18_000,
+    )
+
+
+def test_benchmark_metrics_sustained_policy_drop_50pct(
+    edge_tail_bin: Path, tmp_path: Path, project_root: Path
+) -> None:
+    policy_path = tmp_path / "drop-50pct-policy.json"
+    _write_policy_file(
+        policy_path,
+        """
+{
+  "policies": [
+    {
+      "id": "drop-even-line-ids",
+      "name": "drop-even-line-ids",
+      "log": {
+        "match": [{ "log_field": "body", "regex": "^[0-9]*[02468]:" }],
+        "keep": "none"
+      }
+    }
+  ]
+}
+""".strip(),
+    )
+
+    _run_sustained_profile(
+        edge_tail_bin=edge_tail_bin,
+        tmp_path=tmp_path,
+        project_root=project_root,
+        profile_name="sustained_policy_drop_50pct",
+        file_count=1,
+        duration_s=12.0,
+        target_lps=12_000,
+        extra_tail_args=["--policy", str(policy_path), "-f", "raw"],
+        expected_output_ratio=0.5,
+        output_count_tolerance=1,
     )
 
 
