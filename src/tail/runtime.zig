@@ -6,7 +6,7 @@ const framer_mod = @import("framer.zig");
 const eval_stream = @import("eval_stream.zig");
 const watch_mod = @import("watch.zig");
 const read_scheduler = @import("read_scheduler.zig");
-const checkpoint_mod = @import("checkpoint.zig");
+const checkpoint_mod = @import("checkpoint/mod.zig");
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -138,6 +138,8 @@ pub const Runtime = struct {
             self.cfg.checkpoint_max_slots,
             self.cfg.checkpoint_interval_ms,
             self.cfg.checkpoint_ttl_ms,
+            self.cfg.checkpoint_sync_batch,
+            self.cfg.checkpoint_snapshot_interval_ms,
         );
         defer checkpoint.deinit();
         try checkpoint.start();

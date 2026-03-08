@@ -24,7 +24,8 @@ platform-specialized at compile time:
 - `framer.zig`: chunk framing + policy handoff, SIMD newline scan in
   `ingestChunk`
 - `eval_stream.zig`: policy evaluation/filtering
-- `checkpoint.zig`: async checkpoint lane, WAL append/recovery, TTL lookups
+- `checkpoint/`: async checkpoint lane split into queue/store/WAL/snapshot
+  modules
 - `io.zig`: stdin/file input and stdout/file output wrappers
 
 ### High-Level Dataflow

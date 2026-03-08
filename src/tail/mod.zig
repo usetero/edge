@@ -6,5 +6,5 @@ pub const eval_parse = @import("eval_parse.zig");
 pub const eval_stream = @import("eval_stream.zig");
 pub const watch = @import("watch.zig");
 pub const read_scheduler = @import("read_scheduler.zig");
-pub const checkpoint = @import("checkpoint.zig");
+pub const checkpoint = @import("checkpoint/mod.zig");
 pub const runtime = @import("runtime.zig");

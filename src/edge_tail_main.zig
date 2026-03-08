@@ -20,6 +20,8 @@ const CliOptions = struct {
     rotate_wait_ms_override: ?u64 = null,
     removed_expire_ms_override: ?u64 = null,
     checkpoint_interval_ms_override: ?u64 = null,
+    checkpoint_sync_batch_override: ?u32 = null,
+    checkpoint_snapshot_interval_ms_override: ?u64 = null,
     checkpoint_ttl_ms_override: ?u64 = null,
     checkpoint_max_slots_override: ?usize = null,
     state_dir_override: ?[]const u8 = null,
@@ -60,6 +62,8 @@ fn printUsage() !void {
         \\      --rotate-wait-ms <MS>  Drain old fd before switching on rotation
         \\      --removed-expire-ms <MS>  Expire unmatched tracked files after grace
         \\      --checkpoint-interval-ms <MS>  Background checkpoint flush cadence
+        \\      --checkpoint-sync-batch <N>    WAL records before sync
+        \\      --checkpoint-snapshot-interval-ms <MS>  Snapshot rewrite cadence
         \\      --checkpoint-ttl-ms <MS>   Expire stale checkpoint entries after age
         \\      --checkpoint-max-slots <N> Max tracked checkpoint slots
         \\      --state-dir <PATH>      Checkpoint state directory
@@ -192,6 +196,18 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             opts.checkpoint_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--checkpoint-sync-batch")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.checkpoint_sync_batch_override = try std.fmt.parseInt(u32, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--checkpoint-snapshot-interval-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOptionValue;
+            opts.checkpoint_snapshot_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--checkpoint-ttl-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingOptionValue;
@@ -301,6 +317,8 @@ pub fn main() !void {
     if (opts.rotate_wait_ms_override) |v| cfg.rotate_wait_ms = v;
     if (opts.removed_expire_ms_override) |v| cfg.removed_expire_ms = v;
     if (opts.checkpoint_interval_ms_override) |v| cfg.checkpoint_interval_ms = v;
+    if (opts.checkpoint_sync_batch_override) |v| cfg.checkpoint_sync_batch = v;
+    if (opts.checkpoint_snapshot_interval_ms_override) |v| cfg.checkpoint_snapshot_interval_ms = v;
     if (opts.checkpoint_ttl_ms_override) |v| cfg.checkpoint_ttl_ms = v;
     if (opts.checkpoint_max_slots_override) |v| cfg.checkpoint_max_slots = v;
     if (opts.state_dir_override) |v| cfg.state_dir = v;
