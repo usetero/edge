@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.16.0](https://github.com/usetero/edge/compare/v1.15.1...v1.16.0) (2026-03-08)
+
+
+### Features
+
+* edge distro for log tailing ([#147](https://github.com/usetero/edge/issues/147)) ([e0b2c51](https://github.com/usetero/edge/commit/e0b2c51351098497d2d07d83856d0d1b8f221935))
+* io uring zero copy optimization pass for log tailing agent ([#148](https://github.com/usetero/edge/issues/148)) ([a32652c](https://github.com/usetero/edge/commit/a32652c100a93a86f47059fc621017cade7e5726))
+* streaming approach with enums ([#145](https://github.com/usetero/edge/issues/145)) ([4ecce2d](https://github.com/usetero/edge/commit/4ecce2d661b0058a4f418f61b948c1da47919add))
+
+
+### Bug Fixes
+
+* datadog attr should try regular dots too ([#142](https://github.com/usetero/edge/issues/142)) ([1635978](https://github.com/usetero/edge/commit/16359782041f01acc18e21a93be43215ffd5ef49))
+
 ## [1.15.1](https://github.com/usetero/edge/compare/v1.15.0...v1.15.1) (2026-02-25)
 
 
