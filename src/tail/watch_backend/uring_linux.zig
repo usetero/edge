@@ -6,8 +6,11 @@ const URING_UD_POLL: u64 = 0xED6E_1001;
 const URING_UD_READ: u64 = 0xED6E_1002;
 
 pub const State = struct {
+    allocator: std.mem.Allocator,
     fd: std.posix.fd_t,
-    wd_to_idx: std.AutoHashMap(i32, u32),
+    file_wd_to_idx: std.AutoHashMap(i32, u32),
+    dir_path_to_wd: std.StringHashMap(i32),
+    dir_wd_to_path: std.AutoHashMap(i32, []const u8),
     ring: std.os.linux.IoUring,
     read_buf: [4096]u8,
     poll_armed: bool = false,
@@ -23,8 +26,11 @@ pub fn init(allocator: std.mem.Allocator) !State {
     errdefer ring.deinit();
 
     var s = State{
+        .allocator = allocator,
         .fd = fd,
-        .wd_to_idx = std.AutoHashMap(i32, u32).init(allocator),
+        .file_wd_to_idx = std.AutoHashMap(i32, u32).init(allocator),
+        .dir_path_to_wd = std.StringHashMap(i32).init(allocator),
+        .dir_wd_to_path = std.AutoHashMap(i32, []const u8).init(allocator),
         .ring = ring,
         .read_buf = undefined,
     };
@@ -33,9 +39,26 @@ pub fn init(allocator: std.mem.Allocator) !State {
 }
 
 pub fn deinit(s: *State) void {
-    s.wd_to_idx.deinit();
-    s.ring.deinit();
-    std.posix.close(s.fd);
+    if (comptime builtin.os.tag == .linux) {
+        var file_it = s.file_wd_to_idx.iterator();
+        while (file_it.next()) |kv| std.posix.inotify_rm_watch(s.fd, kv.key_ptr.*);
+    }
+    s.file_wd_to_idx.deinit();
+
+    if (comptime builtin.os.tag == .linux) {
+        var dir_it = s.dir_wd_to_path.iterator();
+        while (dir_it.next()) |kv| std.posix.inotify_rm_watch(s.fd, kv.key_ptr.*);
+    }
+    s.dir_wd_to_path.deinit();
+
+    var path_it = s.dir_path_to_wd.iterator();
+    while (path_it.next()) |kv| s.allocator.free(@constCast(kv.key_ptr.*));
+    s.dir_path_to_wd.deinit();
+
+    if (comptime builtin.os.tag == .linux) {
+        s.ring.deinit();
+        std.posix.close(s.fd);
+    }
 }
 
 fn armInitial(u: anytype) !void {
@@ -68,7 +91,7 @@ pub fn collectDirty(self: anytype) !void {
                     u.read_armed = false;
                     if (cqe.res > 0) {
                         const n: usize = @intCast(cqe.res);
-                        self.parseInotifyEvents(&u.wd_to_idx, u.read_buf[0..n]);
+                        parseInotifyEvents(self, u, u.read_buf[0..n]);
                         queueRead(u) catch {};
                     } else {
                         queuePoll(u) catch {};
@@ -90,18 +113,19 @@ pub fn collectDirty(self: anytype) !void {
 pub fn trackOpenFile(self: anytype, idx: u32, path: []const u8) !void {
     if (builtin.os.tag != .linux) return;
     const u = &self.backend_state.uring;
+    try ensureDirectoryWatch(u, path);
     const wd = std.posix.inotify_add_watch(u.fd, path, INOTIFY_MASK) catch return;
-    try u.wd_to_idx.put(wd, idx);
+    try u.file_wd_to_idx.put(wd, idx);
 }
 
 pub fn removeTracked(self: anytype, idx: u32) void {
     if (builtin.os.tag != .linux) return;
     const u = &self.backend_state.uring;
-    var it = u.wd_to_idx.iterator();
+    var it = u.file_wd_to_idx.iterator();
     while (it.next()) |kv| {
         if (kv.value_ptr.* == idx) {
             std.posix.inotify_rm_watch(u.fd, kv.key_ptr.*);
-            _ = u.wd_to_idx.remove(kv.key_ptr.*);
+            _ = u.file_wd_to_idx.remove(kv.key_ptr.*);
             break;
         }
     }
@@ -110,16 +134,17 @@ pub fn removeTracked(self: anytype, idx: u32) void {
 pub fn rebuildIndexes(self: anytype) void {
     if (builtin.os.tag != .linux) return;
     const u = &self.backend_state.uring;
-    var old = u.wd_to_idx.iterator();
+    var old = u.file_wd_to_idx.iterator();
     while (old.next()) |kv| std.posix.inotify_rm_watch(u.fd, kv.key_ptr.*);
-    u.wd_to_idx.clearRetainingCapacity();
+    u.file_wd_to_idx.clearRetainingCapacity();
 
     var i: usize = 0;
     while (i < self.paths.items.len) : (i += 1) {
+        ensureDirectoryWatch(u, self.paths.items[i]) catch {};
         const file = self.files.items[i] orelse continue;
         _ = file;
         const wd = std.posix.inotify_add_watch(u.fd, self.paths.items[i], INOTIFY_MASK) catch continue;
-        u.wd_to_idx.put(wd, @intCast(i)) catch {};
+        u.file_wd_to_idx.put(wd, @intCast(i)) catch {};
     }
 }
 
@@ -133,4 +158,43 @@ fn queueRead(u: anytype) !void {
     if (u.read_armed) return;
     _ = try u.ring.read(URING_UD_READ, u.fd, .{ .buffer = u.read_buf[0..] }, std.math.maxInt(u64));
     u.read_armed = true;
+}
+
+fn ensureDirectoryWatch(u: *State, path: []const u8) !void {
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    if (u.dir_path_to_wd.contains(dir_path)) return;
+
+    const owned_dir_path = try u.allocator.dupe(u8, dir_path);
+    errdefer u.allocator.free(owned_dir_path);
+
+    const wd = std.posix.inotify_add_watch(u.fd, owned_dir_path, INOTIFY_MASK) catch return;
+    errdefer std.posix.inotify_rm_watch(u.fd, wd);
+
+    try u.dir_path_to_wd.put(owned_dir_path, wd);
+    errdefer _ = u.dir_path_to_wd.remove(owned_dir_path);
+
+    try u.dir_wd_to_path.put(wd, owned_dir_path);
+}
+
+fn parseInotifyEvents(self: anytype, u: *State, buf: []const u8) void {
+    var off: usize = 0;
+    while (off + @sizeOf(std.os.linux.inotify_event) <= buf.len) {
+        const ev = std.mem.bytesAsValue(std.os.linux.inotify_event, buf[off .. off + @sizeOf(std.os.linux.inotify_event)]);
+        if (u.file_wd_to_idx.get(ev.wd)) |idx| {
+            self.markDirty(idx);
+        } else if (u.dir_wd_to_path.get(ev.wd)) |dir_path| {
+            markTrackedInDirDirty(self, dir_path);
+        }
+        off += @sizeOf(std.os.linux.inotify_event) + ev.len;
+    }
+}
+
+fn markTrackedInDirDirty(self: anytype, dir_path: []const u8) void {
+    var i: usize = 0;
+    while (i < self.paths.items.len) : (i += 1) {
+        const tracked_dir = std.fs.path.dirname(self.paths.items[i]) orelse ".";
+        if (std.mem.eql(u8, tracked_dir, dir_path)) {
+            self.markDirty(@intCast(i));
+        }
+    }
 }

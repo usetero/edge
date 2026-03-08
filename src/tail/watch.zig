@@ -202,16 +202,8 @@ pub const Watcher = struct {
     fn collectBackendDirtyCandidates(self: *Watcher) !void {
         switch (self.backend) {
             .poll => poll_backend.collectDirty(self),
-            .uring => {
-                try uring_backend.collectDirty(self);
-                // Keep path/inode transition checks in sync with poll semantics.
-                poll_backend.collectDirty(self);
-            },
-            .kqueue => {
-                try kqueue_backend.collectDirty(self);
-                // kqueue is fd-event driven; this catches recreate/rebind cases.
-                poll_backend.collectDirty(self);
-            },
+            .uring => try uring_backend.collectDirty(self),
+            .kqueue => try kqueue_backend.collectDirty(self),
         }
     }
 
@@ -484,12 +476,14 @@ pub const Watcher = struct {
 
         const cur_file = self.files.items[i] orelse {
             try self.switchToPending(idx);
+            self.markDirty(idx);
             return;
         };
 
         const cur_st = std.posix.fstat(cur_file.handle) catch {
             cur_file.close();
             try self.switchToPending(idx);
+            self.markDirty(idx);
             return;
         };
         const cur_size: u64 = @bitCast(cur_st.size);
@@ -499,6 +493,7 @@ pub const Watcher = struct {
 
         cur_file.close();
         try self.switchToPending(idx);
+        self.markDirty(idx);
     }
 
     fn switchToPending(self: *Watcher, idx: u32) !void {
@@ -543,7 +538,7 @@ pub const Watcher = struct {
         switch (self.backend) {
             .poll => {},
             .uring => try uring_backend.trackOpenFile(self, idx, path),
-            .kqueue => try kqueue_backend.trackOpenFile(self, idx, fd),
+            .kqueue => try kqueue_backend.trackOpenFile(self, idx, path, fd),
         }
     }
 
