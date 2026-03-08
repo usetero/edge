@@ -90,6 +90,19 @@ pub const Runtime = struct {
 
     /// File tail loop using the concrete watcher backend.
     pub fn runFilesLoop(self: *Runtime, inputs: []const []const u8, output: *io_mod.Output) !void {
+        switch (self.watch_backend) {
+            .poll => try self.runFilesLoopBackend(.poll, inputs, output),
+            .uring => try self.runFilesLoopBackend(.uring, inputs, output),
+            .kqueue => try self.runFilesLoopBackend(.kqueue, inputs, output),
+        }
+    }
+
+    fn runFilesLoopBackend(
+        self: *Runtime,
+        comptime backend: watch_mod.BackendKind,
+        inputs: []const []const u8,
+        output: *io_mod.Output,
+    ) !void {
         stop_requested.store(false, .release);
         installSignalHandlers();
 
@@ -103,12 +116,12 @@ pub const Runtime = struct {
             stdio_bus.eventBus(),
         );
         defer evaluator.deinit();
-        var scheduler = try read_scheduler.ReadScheduler.init(self.allocator, self.cfg.io_engine);
+        var scheduler = try read_scheduler.EngineScheduler.init(self.allocator, self.cfg.io_engine);
         defer scheduler.deinit();
 
         var watcher = try watch_mod.Watcher.init(
             self.allocator,
-            self.watch_backend,
+            backend,
             inputs,
             self.cfg.output_path,
             self.cfg.read_from,
@@ -127,9 +140,8 @@ pub const Runtime = struct {
         );
         defer checkpoint.deinit();
         try checkpoint.start();
-        if (self.cfg.read_from == .checkpoint) {
-            watcher.applyCheckpointLane(&checkpoint);
-        }
+        const checkpoint_lane: ?*checkpoint_mod.Lane = if (self.cfg.read_from == .checkpoint) &checkpoint else null;
+        if (checkpoint_lane) |lane| watcher.applyCheckpointLane(lane);
 
         var events: std.ArrayList(watch_mod.Event) = .{};
         defer events.deinit(self.allocator);
@@ -140,7 +152,7 @@ pub const Runtime = struct {
         var buffered_lines: usize = 0;
         while (true) {
             if (stop_requested.load(.acquire)) break;
-            try watcher.collect(&events, self.cfg.read_from, if (self.cfg.read_from == .checkpoint) &checkpoint else null);
+            try watcher.collect(&events, self.cfg.read_from, checkpoint_lane);
             const processed = try scheduler.processBatch(
                 &framer,
                 output.writer(),

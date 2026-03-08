@@ -74,3 +74,32 @@ Report includes per-profile:
 - `rss_mib_dist` (`avg/p50/p95/p99/min/max`)
 - `lines_in_total` vs `lines_out_total`
 - `duplicates_out`, `bad_lines_out`
+
+## Persistent workload for Instruments (macOS)
+
+Use this when you want a long-running steady workload and manually attach Apple
+Instruments CPU Profiler.
+
+```bash
+task benchmark:logging:persistent
+```
+
+Common overrides:
+
+```bash
+task benchmark:logging:persistent FILES=1 TARGET_LPS=12000 FORMAT=raw IO_ENGINE=kqueue
+task benchmark:logging:persistent FILES=12 TARGET_LPS=18000 FORMAT=raw IO_ENGINE=auto
+task benchmark:logging:persistent FILES=1 TARGET_LPS=10000 FORMAT=json DROP_50PCT=1
+```
+
+The runner prints:
+
+- `pid` for `edge-tail` (attach this in Instruments)
+- `work_dir` with generated input files and `persistent.err`
+- rolling sent-line counters and average LPS
+
+Optional finite run:
+
+```bash
+task benchmark:logging:persistent DURATION_S=120
+```

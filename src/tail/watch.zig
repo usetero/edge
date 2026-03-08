@@ -1,7 +1,9 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const types = @import("types.zig");
 const checkpoint_mod = @import("checkpoint.zig");
+const poll_backend = @import("watch_backend/poll.zig");
+const uring_backend = @import("watch_backend/uring_linux.zig");
+const kqueue_backend = @import("watch_backend/kqueue_macos.zig");
 
 pub const BackendKind = enum {
     poll,
@@ -16,24 +18,10 @@ pub const Event = struct {
     identity: ?types.FileIdentity,
 };
 
-const UringInotify = struct {
-    fd: std.posix.fd_t,
-    wd_to_idx: std.AutoHashMap(i32, u32),
-    ring: std.os.linux.IoUring,
-    read_buf: [4096]u8,
-    poll_armed: bool = false,
-    read_armed: bool = false,
-};
-
-const Kqueue = struct {
-    fd: std.posix.fd_t,
-    fd_to_idx: std.AutoHashMap(std.posix.fd_t, u32),
-};
-
 const Backend = union(BackendKind) {
     poll: void,
-    uring: UringInotify,
-    kqueue: Kqueue,
+    uring: uring_backend.State,
+    kqueue: kqueue_backend.State,
 };
 
 /// Data-oriented watcher state:
@@ -151,54 +139,16 @@ pub const Watcher = struct {
     fn initBackend(self: *Watcher) !void {
         self.backend_state = switch (self.backend) {
             .poll => .{ .poll = {} },
-            .uring => blk: {
-                if (builtin.os.tag != .linux) return error.UnsupportedWatcherBackend;
-                const ino_flags: u32 = @bitCast(std.posix.O{ .NONBLOCK = true, .CLOEXEC = true });
-                const fd = try std.posix.inotify_init1(ino_flags);
-                errdefer std.posix.close(fd);
-                var ring = try std.os.linux.IoUring.init(64, 0);
-                errdefer ring.deinit();
-                var backend = UringInotify{
-                    .fd = fd,
-                    .wd_to_idx = std.AutoHashMap(i32, u32).init(self.allocator),
-                    .ring = ring,
-                    .read_buf = undefined,
-                };
-                try self.uringQueuePoll(&backend);
-                if (backend.ring.sq_ready() > 0) {
-                    _ = try backend.ring.submit();
-                }
-                break :blk .{
-                    .uring = backend,
-                };
-            },
-            .kqueue => blk: {
-                if (comptime builtin.os.tag == .macos) {
-                    const kq = try std.posix.kqueue();
-                    break :blk .{
-                        .kqueue = .{
-                            .fd = kq,
-                            .fd_to_idx = std.AutoHashMap(std.posix.fd_t, u32).init(self.allocator),
-                        },
-                    };
-                }
-                return error.UnsupportedWatcherBackend;
-            },
+            .uring => .{ .uring = try uring_backend.init(self.allocator) },
+            .kqueue => .{ .kqueue = try kqueue_backend.init(self.allocator) },
         };
     }
 
     fn deinitBackend(self: *Watcher) void {
         switch (self.backend_state) {
             .poll => {},
-            .uring => |*u| {
-                u.wd_to_idx.deinit();
-                u.ring.deinit();
-                std.posix.close(u.fd);
-            },
-            .kqueue => |*kq| {
-                kq.fd_to_idx.deinit();
-                std.posix.close(kq.fd);
-            },
+            .uring => |*u| uring_backend.deinit(u),
+            .kqueue => |*kq| kqueue_backend.deinit(kq),
         }
     }
 
@@ -249,48 +199,19 @@ pub const Watcher = struct {
         }
     }
 
-    fn collectPollDirtyCandidates(self: *Watcher) void {
-        var i: usize = 0;
-        while (i < self.paths.items.len) : (i += 1) {
-            const idx: u32 = @intCast(i);
-            if (self.files.items[i] == null) {
-                self.markDirty(idx);
-                continue;
-            }
-
-            const file = self.files.items[i].?;
-            const active_st = std.posix.fstat(file.handle) catch {
-                self.markDirty(idx);
-                continue;
-            };
-            const active_size: u64 = @bitCast(active_st.size);
-            if (active_size != self.offsets.items[i]) {
-                self.markDirty(idx);
-                continue;
-            }
-
-            const path_st = std.fs.cwd().statFile(self.paths.items[i]) catch {
-                self.markDirty(idx);
-                continue;
-            };
-            if (path_st.kind != .file) {
-                self.markDirty(idx);
-                continue;
-            }
-
-            const active_inode: u64 = @intCast(active_st.ino);
-            const path_inode: u64 = @intCast(path_st.inode);
-            if (path_inode != active_inode or path_st.size != active_size) {
-                self.markDirty(idx);
-            }
-        }
-    }
-
     fn collectBackendDirtyCandidates(self: *Watcher) !void {
         switch (self.backend) {
-            .poll => self.collectPollDirtyCandidates(),
-            .uring => try self.collectUringDirtyCandidates(),
-            .kqueue => try self.collectKqueueDirtyCandidates(),
+            .poll => poll_backend.collectDirty(self),
+            .uring => {
+                try uring_backend.collectDirty(self);
+                // Keep path/inode transition checks in sync with poll semantics.
+                poll_backend.collectDirty(self);
+            },
+            .kqueue => {
+                try kqueue_backend.collectDirty(self);
+                // kqueue is fd-event driven; this catches recreate/rebind cases.
+                poll_backend.collectDirty(self);
+            },
         }
     }
 
@@ -602,92 +523,14 @@ pub const Watcher = struct {
         self.pending_detected_ns.items[i] = 0;
     }
 
-    fn markDirty(self: *Watcher, idx: u32) void {
+    pub fn markDirty(self: *Watcher, idx: u32) void {
         if (idx >= self.paths.items.len) return;
         if (self.dirty.isSet(idx)) return;
         self.dirty.set(idx);
         self.dirty_queue.append(self.allocator, idx) catch {};
     }
 
-    fn collectUringDirtyCandidates(self: *Watcher) !void {
-        if (builtin.os.tag != .linux) return;
-        if (self.backend != .uring) return;
-        const u = &self.backend_state.uring;
-
-        var cqes: [16]std.os.linux.io_uring_cqe = undefined;
-        while (true) {
-            const count = u.ring.copy_cqes(&cqes, 0) catch break;
-            if (count == 0) break;
-
-            var i: usize = 0;
-            while (i < count) : (i += 1) {
-                const cqe = cqes[i];
-                switch (cqe.user_data) {
-                    URING_UD_POLL => {
-                        u.poll_armed = false;
-                        if (cqe.res > 0) {
-                            self.uringQueueRead(u) catch {};
-                        } else {
-                            self.uringQueuePoll(u) catch {};
-                        }
-                    },
-                    URING_UD_READ => {
-                        u.read_armed = false;
-                        if (cqe.res > 0) {
-                            const n: usize = @intCast(cqe.res);
-                            self.parseInotifyEvents(&u.wd_to_idx, u.read_buf[0..n]);
-                            self.uringQueueRead(u) catch {};
-                        } else {
-                            self.uringQueuePoll(u) catch {};
-                        }
-                    },
-                    else => {},
-                }
-            }
-        }
-
-        if (!u.poll_armed and !u.read_armed) {
-            self.uringQueuePoll(u) catch {};
-        }
-        if (u.ring.sq_ready() > 0) {
-            _ = u.ring.submit() catch {};
-        }
-    }
-
-    fn uringQueuePoll(self: *Watcher, u: *UringInotify) !void {
-        _ = self;
-        if (u.poll_armed) return;
-        _ = try u.ring.poll_add(URING_UD_POLL, u.fd, std.os.linux.POLL.IN);
-        u.poll_armed = true;
-    }
-
-    fn uringQueueRead(self: *Watcher, u: *UringInotify) !void {
-        _ = self;
-        if (u.read_armed) return;
-        _ = try u.ring.read(URING_UD_READ, u.fd, .{ .buffer = u.read_buf[0..] }, std.math.maxInt(u64));
-        u.read_armed = true;
-    }
-
-    fn collectKqueueDirtyCandidates(self: *Watcher) !void {
-        if (comptime builtin.os.tag == .macos) {
-            if (self.backend != .kqueue) return;
-            const kq = &self.backend_state.kqueue;
-
-            var out_events: [64]std.posix.Kevent = undefined;
-            var timeout = std.posix.timespec{ .sec = 0, .nsec = 0 };
-            const n = std.posix.kevent(kq.fd, &.{}, out_events[0..], &timeout) catch return;
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                const ev = out_events[i];
-                const fd: std.posix.fd_t = @intCast(ev.ident);
-                if (kq.fd_to_idx.get(fd)) |idx| {
-                    self.markDirty(idx);
-                }
-            }
-        }
-    }
-
-    fn parseInotifyEvents(self: *Watcher, wd_to_idx: *const std.AutoHashMap(i32, u32), buf: []const u8) void {
+    pub fn parseInotifyEvents(self: *Watcher, wd_to_idx: *const std.AutoHashMap(i32, u32), buf: []const u8) void {
         var off: usize = 0;
         while (off + @sizeOf(std.os.linux.inotify_event) <= buf.len) {
             const ev = std.mem.bytesAsValue(std.os.linux.inotify_event, buf[off .. off + @sizeOf(std.os.linux.inotify_event)]);
@@ -697,92 +540,26 @@ pub const Watcher = struct {
     }
 
     fn backendTrackOpenFile(self: *Watcher, idx: u32, path: []const u8, fd: std.posix.fd_t) !void {
-        switch (self.backend_state) {
+        switch (self.backend) {
             .poll => {},
-            .uring => |*u| {
-                if (builtin.os.tag != .linux) return;
-                const wd = std.posix.inotify_add_watch(u.fd, path, INOTIFY_MASK) catch return;
-                try u.wd_to_idx.put(wd, idx);
-            },
-            .kqueue => |*kq| {
-                if (comptime builtin.os.tag == .macos) {
-                    var changes = [_]std.posix.Kevent{.{
-                        .ident = @intCast(fd),
-                        .filter = KQUEUE_FILTER_VNODE,
-                        .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
-                        .fflags = KQUEUE_VNODE_MASK,
-                        .data = 0,
-                        .udata = 0,
-                    }};
-                    _ = std.posix.kevent(kq.fd, changes[0..], &.{}, null) catch return;
-                    try kq.fd_to_idx.put(fd, idx);
-                }
-            },
+            .uring => try uring_backend.trackOpenFile(self, idx, path),
+            .kqueue => try kqueue_backend.trackOpenFile(self, idx, fd),
         }
     }
 
     fn backendRemoveTracked(self: *Watcher, idx: u32) void {
-        switch (self.backend_state) {
+        switch (self.backend) {
             .poll => {},
-            .uring => |*u| {
-                if (builtin.os.tag != .linux) return;
-                var it = u.wd_to_idx.iterator();
-                while (it.next()) |kv| {
-                    if (kv.value_ptr.* == idx) {
-                        std.posix.inotify_rm_watch(u.fd, kv.key_ptr.*);
-                        _ = u.wd_to_idx.remove(kv.key_ptr.*);
-                        break;
-                    }
-                }
-            },
-            .kqueue => |*kq| {
-                var it = kq.fd_to_idx.iterator();
-                while (it.next()) |kv| {
-                    if (kv.value_ptr.* == idx) {
-                        _ = kq.fd_to_idx.remove(kv.key_ptr.*);
-                        break;
-                    }
-                }
-            },
+            .uring => uring_backend.removeTracked(self, idx),
+            .kqueue => kqueue_backend.removeTracked(self, idx),
         }
     }
 
     fn backendRebuildIndexes(self: *Watcher) void {
-        switch (self.backend_state) {
+        switch (self.backend) {
             .poll => {},
-            .uring => |*u| {
-                if (builtin.os.tag != .linux) return;
-                var old = u.wd_to_idx.iterator();
-                while (old.next()) |kv| std.posix.inotify_rm_watch(u.fd, kv.key_ptr.*);
-                u.wd_to_idx.clearRetainingCapacity();
-
-                var i: usize = 0;
-                while (i < self.paths.items.len) : (i += 1) {
-                    const file = self.files.items[i] orelse continue;
-                    _ = file;
-                    const wd = std.posix.inotify_add_watch(u.fd, self.paths.items[i], INOTIFY_MASK) catch continue;
-                    u.wd_to_idx.put(wd, @intCast(i)) catch {};
-                }
-            },
-            .kqueue => |*kq| {
-                if (comptime builtin.os.tag != .macos) return;
-                kq.fd_to_idx.clearRetainingCapacity();
-
-                var i: usize = 0;
-                while (i < self.paths.items.len) : (i += 1) {
-                    const file = self.files.items[i] orelse continue;
-                    var changes = [_]std.posix.Kevent{.{
-                        .ident = @intCast(file.handle),
-                        .filter = KQUEUE_FILTER_VNODE,
-                        .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
-                        .fflags = KQUEUE_VNODE_MASK,
-                        .data = 0,
-                        .udata = 0,
-                    }};
-                    _ = std.posix.kevent(kq.fd, changes[0..], &.{}, null) catch continue;
-                    kq.fd_to_idx.put(file.handle, @intCast(i)) catch {};
-                }
-            },
+            .uring => uring_backend.rebuildIndexes(self),
+            .kqueue => kqueue_backend.rebuildIndexes(self),
         }
     }
 
@@ -806,15 +583,6 @@ pub const Watcher = struct {
         self.head_prefix_hashes.items[idx] = try prefixHash(self.files.items[idx].?, len);
     }
 };
-
-const INOTIFY_MASK: u32 = 0x00000002 | 0x00000004 | 0x00000080 | 0x00000100 | 0x00000400 | 0x00000800;
-const URING_UD_POLL: u64 = 0xED6E_1001;
-const URING_UD_READ: u64 = 0xED6E_1002;
-const KQUEUE_FILTER_VNODE: i16 = -4;
-const KQUEUE_EV_ADD: u16 = 0x0001;
-const KQUEUE_EV_ENABLE: u16 = 0x0004;
-const KQUEUE_EV_CLEAR: u16 = 0x0020;
-const KQUEUE_VNODE_MASK: u32 = 0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 | 0x00000020 | 0x00000040;
 
 fn shouldTrackPath(output_path: []const u8, candidate_path: []const u8) bool {
     if (std.mem.eql(u8, output_path, "-")) return true;
