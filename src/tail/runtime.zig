@@ -135,6 +135,7 @@ pub const Runtime = struct {
             self.allocator,
             self.cfg.state_dir,
             4096,
+            self.cfg.checkpoint_max_slots,
             self.cfg.checkpoint_interval_ms,
             self.cfg.checkpoint_ttl_ms,
         );
