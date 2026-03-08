@@ -39,7 +39,6 @@ WORKDIR /build
 # Copy source code
 COPY build.zig build.zig.zon ./
 COPY src/ src/
-COPY proto/ proto/
 
 # Build argument for distribution selection
 ARG DISTRIBUTION=datadog

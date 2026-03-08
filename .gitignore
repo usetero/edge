@@ -20,6 +20,7 @@ zig-out/
 /docgen_tmp/
 bench/debug
 bench/*/results
+bench/logging/.pytest-tmp
 bench/bin
 .tero
 */.tero

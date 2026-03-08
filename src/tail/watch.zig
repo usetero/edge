@@ -1,11 +1,14 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const types = @import("types.zig");
 const checkpoint_mod = @import("checkpoint.zig");
+const poll_backend = @import("watch_backend/poll.zig");
+const uring_backend = @import("watch_backend/uring_linux.zig");
+const kqueue_backend = @import("watch_backend/kqueue_macos.zig");
 
 pub const BackendKind = enum {
     poll,
-    inotify,
+    uring,
+    kqueue,
 };
 
 pub const Event = struct {
@@ -15,9 +18,10 @@ pub const Event = struct {
     identity: ?types.FileIdentity,
 };
 
-const Inotify = struct {
-    fd: std.posix.fd_t,
-    wd_to_idx: std.AutoHashMap(i32, u32),
+const Backend = union(BackendKind) {
+    poll: void,
+    uring: uring_backend.State,
+    kqueue: kqueue_backend.State,
 };
 
 /// Data-oriented watcher state:
@@ -49,7 +53,7 @@ pub const Watcher = struct {
     removed_expire_ns: i128,
     next_glob_refresh_ns: i128,
 
-    inotify: ?Inotify = null,
+    backend_state: Backend = .{ .poll = {} },
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -93,26 +97,18 @@ pub const Watcher = struct {
             .rotate_wait_ns = @as(i128, @intCast(rotate_wait_ms)) * std.time.ns_per_ms,
             .removed_expire_ns = @as(i128, @intCast(removed_expire_ms)) * std.time.ns_per_ms,
             .next_glob_refresh_ns = std.time.nanoTimestamp(),
+            .backend_state = .{ .poll = {} },
         };
         errdefer self.deinit();
 
-        if (kind == .inotify and builtin.os.tag == .linux) {
-            const fd = try std.posix.inotify_init1(0);
-            self.inotify = .{
-                .fd = fd,
-                .wd_to_idx = std.AutoHashMap(i32, u32).init(allocator),
-            };
-        }
+        try self.initBackend();
 
         try self.refreshPaths(read_from);
         return self;
     }
 
     pub fn deinit(self: *Watcher) void {
-        if (self.inotify) |*ino| {
-            ino.wd_to_idx.deinit();
-            std.posix.close(ino.fd);
-        }
+        self.deinitBackend();
 
         for (self.inputs.items) |p| self.allocator.free(p);
         self.inputs.deinit(self.allocator);
@@ -140,6 +136,22 @@ pub const Watcher = struct {
         self.allocator.free(self.output_path);
     }
 
+    fn initBackend(self: *Watcher) !void {
+        self.backend_state = switch (self.backend) {
+            .poll => .{ .poll = {} },
+            .uring => .{ .uring = try uring_backend.init(self.allocator) },
+            .kqueue => .{ .kqueue = try kqueue_backend.init(self.allocator) },
+        };
+    }
+
+    fn deinitBackend(self: *Watcher) void {
+        switch (self.backend_state) {
+            .poll => {},
+            .uring => |*u| uring_backend.deinit(u),
+            .kqueue => |*kq| kqueue_backend.deinit(kq),
+        }
+    }
+
     pub fn collect(
         self: *Watcher,
         out: *std.ArrayList(Event),
@@ -154,14 +166,7 @@ pub const Watcher = struct {
             self.next_glob_refresh_ns = now + self.glob_interval_ns;
         }
 
-        switch (self.backend) {
-            .poll => {
-                self.collectPollDirtyCandidates();
-            },
-            .inotify => {
-                try self.pollInotify();
-            },
-        }
+        try self.collectBackendDirtyCandidates();
         self.markPendingDirty();
 
         var q: usize = 0;
@@ -194,40 +199,11 @@ pub const Watcher = struct {
         }
     }
 
-    fn collectPollDirtyCandidates(self: *Watcher) void {
-        var i: usize = 0;
-        while (i < self.paths.items.len) : (i += 1) {
-            const idx: u32 = @intCast(i);
-            if (self.files.items[i] == null) {
-                self.markDirty(idx);
-                continue;
-            }
-
-            const file = self.files.items[i].?;
-            const active_st = std.posix.fstat(file.handle) catch {
-                self.markDirty(idx);
-                continue;
-            };
-            const active_size: u64 = @bitCast(active_st.size);
-            if (active_size != self.offsets.items[i]) {
-                self.markDirty(idx);
-                continue;
-            }
-
-            const path_st = std.fs.cwd().statFile(self.paths.items[i]) catch {
-                self.markDirty(idx);
-                continue;
-            };
-            if (path_st.kind != .file) {
-                self.markDirty(idx);
-                continue;
-            }
-
-            const active_inode: u64 = @intCast(active_st.ino);
-            const path_inode: u64 = @intCast(path_st.inode);
-            if (path_inode != active_inode or path_st.size != active_size) {
-                self.markDirty(idx);
-            }
+    fn collectBackendDirtyCandidates(self: *Watcher) !void {
+        switch (self.backend) {
+            .poll => poll_backend.collectDirty(self),
+            .uring => try uring_backend.collectDirty(self),
+            .kqueue => try kqueue_backend.collectDirty(self),
         }
     }
 
@@ -380,18 +356,7 @@ pub const Watcher = struct {
     fn removeTracked(self: *Watcher, idx: usize) void {
         if (self.files.items[idx]) |f| f.close();
         self.clearPending(@intCast(idx));
-        if (self.inotify) |*ino| {
-            var it = ino.wd_to_idx.iterator();
-            while (it.next()) |kv| {
-                if (kv.value_ptr.* == idx) {
-                    if (builtin.os.tag == .linux) {
-                        std.posix.inotify_rm_watch(ino.fd, kv.key_ptr.*);
-                    }
-                    _ = ino.wd_to_idx.remove(kv.key_ptr.*);
-                    break;
-                }
-            }
-        }
+        self.backendRemoveTracked(@intCast(idx));
 
         self.allocator.free(self.paths.items[idx]);
         _ = self.paths.swapRemove(idx);
@@ -407,21 +372,11 @@ pub const Watcher = struct {
         _ = self.matched.swapRemove(idx);
         _ = self.last_match_ns.swapRemove(idx);
 
-        self.rebuildIndexesAfterSwap();
+        self.rebuildBackendIndexesAfterSwap();
     }
 
-    fn rebuildIndexesAfterSwap(self: *Watcher) void {
-        if (self.inotify) |*ino| {
-            ino.wd_to_idx.clearRetainingCapacity();
-            var i: usize = 0;
-            while (i < self.paths.items.len) : (i += 1) {
-                if (self.files.items[i] == null) continue;
-                if (builtin.os.tag == .linux) {
-                    const wd = std.posix.inotify_add_watch(ino.fd, self.paths.items[i], INOTIFY_MASK) catch continue;
-                    ino.wd_to_idx.put(wd, @intCast(i)) catch {};
-                }
-            }
-        }
+    fn rebuildBackendIndexesAfterSwap(self: *Watcher) void {
+        self.backendRebuildIndexes();
         self.dirty_queue.clearRetainingCapacity();
         self.dirty.unsetAll();
     }
@@ -453,12 +408,7 @@ pub const Watcher = struct {
         };
         self.seen_once.items[idx] = true;
 
-        if (self.inotify) |*ino| {
-            if (builtin.os.tag == .linux) {
-                const wd = std.posix.inotify_add_watch(ino.fd, self.paths.items[idx], INOTIFY_MASK) catch return;
-                try ino.wd_to_idx.put(wd, idx);
-            }
-        }
+        try self.backendTrackOpenFile(idx, self.paths.items[idx], file.handle);
     }
 
     fn detectPathReplacement(self: *Watcher, idx: u32) !void {
@@ -526,12 +476,14 @@ pub const Watcher = struct {
 
         const cur_file = self.files.items[i] orelse {
             try self.switchToPending(idx);
+            self.markDirty(idx);
             return;
         };
 
         const cur_st = std.posix.fstat(cur_file.handle) catch {
             cur_file.close();
             try self.switchToPending(idx);
+            self.markDirty(idx);
             return;
         };
         const cur_size: u64 = @bitCast(cur_st.size);
@@ -541,6 +493,7 @@ pub const Watcher = struct {
 
         cur_file.close();
         try self.switchToPending(idx);
+        self.markDirty(idx);
     }
 
     fn switchToPending(self: *Watcher, idx: u32) !void {
@@ -565,32 +518,43 @@ pub const Watcher = struct {
         self.pending_detected_ns.items[i] = 0;
     }
 
-    fn markDirty(self: *Watcher, idx: u32) void {
+    pub fn markDirty(self: *Watcher, idx: u32) void {
         if (idx >= self.paths.items.len) return;
         if (self.dirty.isSet(idx)) return;
         self.dirty.set(idx);
         self.dirty_queue.append(self.allocator, idx) catch {};
     }
 
-    fn pollInotify(self: *Watcher) !void {
-        if (builtin.os.tag != .linux) return;
-        if (self.inotify == null) return;
-        const ino = &self.inotify.?;
-        var pfd = [_]std.posix.pollfd{
-            .{ .fd = ino.fd, .events = std.posix.POLL.IN, .revents = 0 },
-        };
-        const nready = try std.posix.poll(&pfd, 0);
-        if (nready == 0) return;
-
-        var buf: [4096]u8 = undefined;
-        const n = std.posix.read(ino.fd, &buf) catch return;
+    pub fn parseInotifyEvents(self: *Watcher, wd_to_idx: *const std.AutoHashMap(i32, u32), buf: []const u8) void {
         var off: usize = 0;
-        while (off + @sizeOf(std.os.linux.inotify_event) <= n) {
+        while (off + @sizeOf(std.os.linux.inotify_event) <= buf.len) {
             const ev = std.mem.bytesAsValue(std.os.linux.inotify_event, buf[off .. off + @sizeOf(std.os.linux.inotify_event)]);
-            if (ino.wd_to_idx.get(ev.wd)) |idx| {
-                self.markDirty(idx);
-            }
+            if (wd_to_idx.get(ev.wd)) |idx| self.markDirty(idx);
             off += @sizeOf(std.os.linux.inotify_event) + ev.len;
+        }
+    }
+
+    fn backendTrackOpenFile(self: *Watcher, idx: u32, path: []const u8, fd: std.posix.fd_t) !void {
+        switch (self.backend) {
+            .poll => {},
+            .uring => try uring_backend.trackOpenFile(self, idx, path),
+            .kqueue => try kqueue_backend.trackOpenFile(self, idx, path, fd),
+        }
+    }
+
+    fn backendRemoveTracked(self: *Watcher, idx: u32) void {
+        switch (self.backend) {
+            .poll => {},
+            .uring => uring_backend.removeTracked(self, idx),
+            .kqueue => kqueue_backend.removeTracked(self, idx),
+        }
+    }
+
+    fn backendRebuildIndexes(self: *Watcher) void {
+        switch (self.backend) {
+            .poll => {},
+            .uring => uring_backend.rebuildIndexes(self),
+            .kqueue => kqueue_backend.rebuildIndexes(self),
         }
     }
 
@@ -614,8 +578,6 @@ pub const Watcher = struct {
         self.head_prefix_hashes.items[idx] = try prefixHash(self.files.items[idx].?, len);
     }
 };
-
-const INOTIFY_MASK: u32 = 0x00000002 | 0x00000004 | 0x00000080 | 0x00000100 | 0x00000400 | 0x00000800;
 
 fn shouldTrackPath(output_path: []const u8, candidate_path: []const u8) bool {
     if (std.mem.eql(u8, output_path, "-")) return true;

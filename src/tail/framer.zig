@@ -31,6 +31,15 @@ pub const LineFramer = struct {
 
     pub const LineFilterFn = fn (ctx: *anyopaque, line: []const u8, meta: types.LineMeta) anyerror!bool;
 
+    /// Ingests a byte chunk and emits complete newline-delimited segments.
+    ///
+    /// Fast path uses SIMD blocks (16-byte vectors): compare each lane to `'\n'`,
+    /// bit-cast the boolean vector to a bitmask, then walk set bits via `ctz`.
+    /// Each set bit yields one newline index. We then route each segment through
+    /// `emitSegment`, which keeps all existing truncation/remainder semantics.
+    ///
+    /// Tail bytes that do not end with a newline are appended to `remainder` and
+    /// will be completed by a later chunk or `finish()`.
     pub fn ingestChunk(
         self: *LineFramer,
         chunk: []const u8,
@@ -39,21 +48,30 @@ pub const LineFramer = struct {
         filter_fn: *const LineFilterFn,
     ) !void {
         var start: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, chunk, start, '\n')) |newline_idx| {
-            const segment = chunk[start..newline_idx];
+        var i: usize = 0;
+        const Lanes = 16;
+        const V = @Vector(Lanes, u8);
+        const M = @Vector(Lanes, bool);
+        const Bits = std.meta.Int(.unsigned, Lanes);
+        const needle: V = @splat('\n');
 
-            if (self.remainder.items.len > 0 or self.remainder_truncated) {
-                try self.appendCapped(segment);
-                try emitLine(writer, self.remainder.items, .{ .truncated = self.remainder_truncated }, filter_ctx, filter_fn);
-                self.remainder.clearRetainingCapacity();
-                self.remainder_truncated = false;
-            } else if (segment.len > self.max_line) {
-                try emitLine(writer, segment[0..self.max_line], .{ .truncated = true }, filter_ctx, filter_fn);
-            } else {
-                try emitLine(writer, segment, .{}, filter_ctx, filter_fn);
+        while (i + Lanes <= chunk.len) : (i += Lanes) {
+            const vec_ptr: *align(1) const V = @ptrCast(chunk[i .. i + Lanes].ptr);
+            const mask: M = vec_ptr.* == needle;
+            var bits: Bits = @bitCast(mask);
+            while (bits != 0) {
+                const rel: usize = @intCast(@ctz(bits));
+                const newline_idx = i + rel;
+                try self.emitSegment(chunk[start..newline_idx], writer, filter_ctx, filter_fn);
+                start = newline_idx + 1;
+                bits &= bits - 1;
             }
+        }
 
-            start = newline_idx + 1;
+        while (i < chunk.len) : (i += 1) {
+            if (chunk[i] != '\n') continue;
+            try self.emitSegment(chunk[start..i], writer, filter_ctx, filter_fn);
+            start = i + 1;
         }
 
         if (start < chunk.len) {
@@ -131,6 +149,27 @@ pub const LineFramer = struct {
         if (copy_len < bytes.len) self.remainder_truncated = true;
     }
 
+    fn emitSegment(
+        self: *LineFramer,
+        segment: []const u8,
+        writer: *std.Io.Writer,
+        filter_ctx: *anyopaque,
+        filter_fn: *const LineFilterFn,
+    ) !void {
+        if (self.remainder.items.len > 0 or self.remainder_truncated) {
+            try self.appendCapped(segment);
+            try emitLine(writer, self.remainder.items, .{ .truncated = self.remainder_truncated }, filter_ctx, filter_fn);
+            self.remainder.clearRetainingCapacity();
+            self.remainder_truncated = false;
+            return;
+        }
+        if (segment.len > self.max_line) {
+            try emitLine(writer, segment[0..self.max_line], .{ .truncated = true }, filter_ctx, filter_fn);
+            return;
+        }
+        try emitLine(writer, segment, .{}, filter_ctx, filter_fn);
+    }
+
     fn emitLine(
         writer: *std.Io.Writer,
         line: []const u8,
@@ -178,6 +217,20 @@ test "framer public API: enforces max line cap" {
     try framer.finish(&out.writer, &ctx, keepAll);
 
     try testing.expectEqualStrings("1234\nok\n", out.written());
+}
+
+test "framer public API: simd scanner handles multiple newlines in one vector" {
+    var framer = try LineFramer.init(testing.allocator, 64, 1024);
+    defer framer.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    var ctx: u8 = 0;
+    try framer.ingestChunk("a\nb\nc\nd\ne\nf\ng\nh\n", &out.writer, &ctx, keepAll);
+    try framer.finish(&out.writer, &ctx, keepAll);
+
+    try testing.expectEqualStrings("a\nb\nc\nd\ne\nf\ng\nh\n", out.written());
 }
 
 test "framer public API: readRange emits file bytes as lines" {

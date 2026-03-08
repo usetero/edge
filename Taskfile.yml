@@ -161,6 +161,34 @@ tasks:
     cmds:
       - EDGE_TAIL_STDIN_LINES={{.BENCH_LINES}} ./bench/logging/run.sh -s tests/test_benchmark_metrics.py
 
+  benchmark:logging:persistent:
+    desc: "Run persistent edge-tail logging workload for Instruments profiling"
+    aliases: [bench-logging-persistent, bmlp]
+    vars:
+      FILES: '{{.FILES | default "12"}}'
+      TARGET_LPS: '{{.TARGET_LPS | default "18000"}}'
+      FORMAT: '{{.FORMAT | default "raw"}}'
+      IO_ENGINE: '{{.IO_ENGINE | default "auto"}}'
+      DROP_50PCT: '{{.DROP_50PCT | default "0"}}'
+      DURATION_S: '{{.DURATION_S | default "0"}}'
+    cmds:
+      - zig build tail -Doptimize=Debug
+      - |
+        ARGS=""
+        if [ "{{.DROP_50PCT}}" = "1" ]; then
+          ARGS="$ARGS --drop-50pct"
+        fi
+        if [ "{{.DURATION_S}}" != "0" ]; then
+          ARGS="$ARGS --duration-s {{.DURATION_S}}"
+        fi
+        uv run --project bench/logging python bench/logging/persistent_benchmark.py \
+          --edge-tail-bin zig-out/bin/edge-tail \
+          --files {{.FILES}} \
+          --target-lps {{.TARGET_LPS}} \
+          --format {{.FORMAT}} \
+          --io-engine {{.IO_ENGINE}} \
+          $ARGS
+
   benchmark:history:
     desc: "Run benchmarks and save to dated history folder"
     aliases: [bench-history, bmh]
