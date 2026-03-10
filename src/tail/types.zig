@@ -59,6 +59,8 @@ pub const TailConfig = struct {
     rotate_wait_ms: u64 = 5_000,
     removed_expire_ms: u64 = 60_000,
     checkpoint_interval_ms: u64 = 5_000,
+    checkpoint_sync_batch: u32 = 64,
+    checkpoint_snapshot_interval_ms: u64 = 60_000,
     checkpoint_ttl_ms: u64 = 72 * 60 * 60 * 1000,
     checkpoint_max_slots: usize = 256,
     state_dir: []const u8 = ".tero",
@@ -77,6 +79,8 @@ pub fn validateConfig(cfg: TailConfig) !void {
     if (cfg.write_buf == 0) return error.InvalidWriteBuffer;
     if (cfg.flush_interval_ms == 0) return error.InvalidFlushInterval;
     if (cfg.flush_line_threshold == 0) return error.InvalidFlushThreshold;
+    if (cfg.checkpoint_sync_batch == 0) return error.InvalidCheckpointSyncBatch;
+    if (cfg.checkpoint_snapshot_interval_ms == 0) return error.InvalidCheckpointSnapshotInterval;
 }
 
 pub const NativeIoEngine: IoEngine = switch (builtin.os.tag) {

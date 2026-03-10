@@ -1,6 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
-const checkpoint_mod = @import("checkpoint.zig");
+const checkpoint_mod = @import("checkpoint/mod.zig");
 const poll_backend = @import("watch_backend/poll.zig");
 const uring_backend = @import("watch_backend/uring_linux.zig");
 const kqueue_backend = @import("watch_backend/kqueue_macos.zig");
