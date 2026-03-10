@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.16.1](https://github.com/usetero/edge/compare/v1.16.0...v1.16.1) (2026-03-10)
+
+
+### Bug Fixes
+
+* improved wal approach ([#149](https://github.com/usetero/edge/issues/149)) ([3ec318d](https://github.com/usetero/edge/commit/3ec318d3e0215538951551623b1eaf2f9f4b405e))
+
 ## [1.16.0](https://github.com/usetero/edge/compare/v1.15.1...v1.16.0) (2026-03-08)
 
 
