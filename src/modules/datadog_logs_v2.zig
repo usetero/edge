@@ -135,10 +135,8 @@ fn lookupLogAttribute(log: *DatadogLog, path: []const []const u8) ?[]const u8 {
     }
 
     // Check extra fields (supports nested dotted-key paths)
-    return findExtraField(&log.extra, path);
+    return DatadogLog.findExtraString(&log.extra, path);
 }
-
-const findExtraField = otlp_attr.findExtraField;
 
 /// Field accessor for Datadog JSON log format
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
@@ -513,13 +511,7 @@ test "datadogFieldAccessor - extra field lookup" {
 
     const doc = try parser.parseFromSlice(allocator, json);
     var log = try DatadogLog.parse(allocator, doc.asValue());
-    defer {
-        var it = log.extra.keyIterator();
-        while (it.next()) |key| {
-            allocator.free(key.*);
-        }
-        log.extra.deinit(allocator);
-    }
+    defer log.deinit(allocator);
 
     // Verify the extra field was parsed
     try std.testing.expectEqual(@as(usize, 1), log.extra.count());
@@ -636,6 +628,37 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
     };
     const val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = missing_path });
     try std.testing.expect(val == null);
+}
+
+test "datadogFieldAccessor - nested object fallback via path segments" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"test","http":{"status_code":"200","meta":{"region":"us-east-1"}}}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    var field_ctx = FieldAccessorContext{ .log = &log };
+
+    const status_path = proto.policy.AttributePath{
+        .path = .{ .items = @constCast(&[_][]const u8{ "http", "status_code" }) },
+    };
+    const status_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = status_path });
+    try std.testing.expect(status_val != null);
+    try std.testing.expectEqualStrings("200", status_val.?);
+
+    const region_path = proto.policy.AttributePath{
+        .path = .{ .items = @constCast(&[_][]const u8{ "http", "meta", "region" }) },
+    };
+    const region_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = region_path });
+    try std.testing.expect(region_val != null);
+    try std.testing.expectEqualStrings("us-east-1", region_val.?);
 }
 
 test "datadogFieldAccessor - multi-segment path with no matching dotted key returns null" {
@@ -1012,6 +1035,67 @@ test "processLogs - extra fields are preserved when no logs dropped" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "array_field") != null);
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 1), result.original_count);
+}
+
+test "processLogs - nested extra fields are preserved when reserializing after drop" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Drop DEBUG logs so remaining logs are reserialized.
+    var drop_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "drop-debug"),
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .regex = try allocator.dupe(u8, "^debug$") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test", .file);
+
+    const logs =
+        \\[
+        \\  {"status":"debug","message":"drop me"},
+        \\  {"status":"info","message":"keep me","nested":{"status_code":"200","inner":{"ok":true}}}
+        \\]
+    ;
+
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "drop me") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "keep me") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"nested\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"status_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"inner\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"ok\":true") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
 }
 
 test "processLogs - mutation triggers reserialization and removes field" {
