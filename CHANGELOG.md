@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.16.2](https://github.com/usetero/edge/compare/v1.16.1...v1.16.2) (2026-03-17)
+
+
+### Bug Fixes
+
+* datadog logs should deserialize all fields and check nested ([#154](https://github.com/usetero/edge/issues/154)) ([d463689](https://github.com/usetero/edge/commit/d463689a80c7414d6efd2b35cf00590a10000ced))
+
 ## [1.16.1](https://github.com/usetero/edge/compare/v1.16.0...v1.16.1) (2026-03-10)
 
 
