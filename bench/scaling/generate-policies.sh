@@ -123,7 +123,7 @@ generate_edge_policies() {
     }
 EOF
 )")
-        ((idx++))
+        idx=$((idx + 1))
     done
 
     # Log transform policies (keep all + add attribute)
@@ -143,7 +143,7 @@ EOF
     }
 EOF
 )")
-        ((idx++))
+        idx=$((idx + 1))
     done
 
     # Metric drop policies (no transform support for metrics yet)
@@ -160,7 +160,7 @@ EOF
     }
 EOF
 )")
-        ((idx++))
+        idx=$((idx + 1))
     done
 
     # Trace sampling policies - vary sampling percentages
@@ -184,7 +184,7 @@ EOF
     }
 EOF
 )")
-        ((idx++))
+        idx=$((idx + 1))
     done
 
     # Output JSON
