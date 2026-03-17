@@ -20,6 +20,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const metrics_dep = b.dependency("metrics", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Shared modules from policy-zig ensure type identity across boundaries.
     const proto_mod = policy_dep.module("proto");
@@ -37,6 +41,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zimdjson", .module = zimdjson.module("zimdjson") },
             .{ .name = "policy_zig", .module = policy_dep.module("policy_zig") },
             .{ .name = "o11y", .module = o11y_mod },
+            .{ .name = "metrics_zig", .module = metrics_dep.module("metrics") },
         },
     });
 
@@ -60,6 +65,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
     exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
     exe.root_module.addImport("o11y", o11y_mod);
+    exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("z", .{});
     exe.root_module.linkSystemLibrary("zstd", .{});
@@ -97,6 +103,7 @@ pub fn build(b: *std.Build) void {
         dist_exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
         dist_exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
         dist_exe.root_module.addImport("o11y", o11y_mod);
+        dist_exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
         dist_exe.root_module.link_libc = true;
         dist_exe.root_module.linkSystemLibrary("z", .{});
         dist_exe.root_module.linkSystemLibrary("zstd", .{});
@@ -135,6 +142,7 @@ pub fn build(b: *std.Build) void {
     mod_tests.root_module.link_libc = true;
     mod_tests.root_module.linkSystemLibrary("z", .{});
     mod_tests.root_module.linkSystemLibrary("zstd", .{});
+    mod_tests.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");

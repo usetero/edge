@@ -7,6 +7,7 @@ const edge = @import("../root.zig");
 const config_types = edge.config_types;
 const zonfig = edge.zonfig;
 const server_mod = edge.server;
+const runtime_metrics_mod = @import("runtime_metrics.zig");
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough_module;
 const datadog_mod = edge.datadog_module;
@@ -32,6 +33,7 @@ const OtlpConfig = otlp_mod.OtlpConfig;
 const PrometheusModule = prometheus_mod.PrometheusModule;
 const PrometheusConfig = prometheus_mod.PrometheusConfig;
 const HealthModule = health_mod.HealthModule;
+const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -116,6 +118,15 @@ fn bundlesFor(distribution: mode.Distribution) []const RouteBundle {
         .datadog => &datadog_bundles,
         .otlp => &otlp_bundles,
         .prometheus => &prometheus_bundles,
+    };
+}
+
+fn distributionLabel(distribution: mode.Distribution) runtime_metrics_mod.DistributionLabel {
+    return switch (distribution) {
+        .edge => .edge,
+        .datadog => .datadog,
+        .otlp => .otlp,
+        .prometheus => .prometheus,
     };
 }
 
@@ -252,6 +263,9 @@ pub fn run(distribution: mode.Distribution) !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
+    var runtime_metrics = try RuntimeMetrics.init(allocator, distributionLabel(distribution));
+    defer runtime_metrics.deinit();
+
     var loader = try policy.Loader.init(
         allocator,
         bus,
@@ -270,16 +284,19 @@ pub fn run(distribution: mode.Distribution) !void {
     var datadog_config = DatadogConfig{
         .registry = &registry,
         .bus = bus,
+        .metrics = &runtime_metrics,
     };
 
     var otlp_config = OtlpConfig{
         .registry = &registry,
         .bus = bus,
+        .metrics = &runtime_metrics,
     };
 
     var prometheus_config = PrometheusConfig{
         .registry = &registry,
         .bus = bus,
+        .metrics = &runtime_metrics,
         .max_input_bytes_per_scrape = config.prometheus.max_input_bytes_per_scrape,
         .max_output_bytes_per_scrape = config.prometheus.max_output_bytes_per_scrape,
     };
@@ -369,6 +386,7 @@ pub fn run(distribution: mode.Distribution) !void {
     var proxy = try ProxyServer.init(
         server_allocator,
         bus,
+        &runtime_metrics,
         config.listen_address,
         config.listen_port,
         config.max_upstream_retries,

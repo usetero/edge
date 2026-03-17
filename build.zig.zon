@@ -44,6 +44,10 @@
             .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.1.17.tar.gz",
             .hash = "policy_zig-0.1.7-5_dp3mh0DwDRVIcv_V_LNPBOjuAQfjZhyMKp-43cfkHy",
         },
+        .metrics = .{
+            .url = "git+https://github.com/karlseguin/metrics.zig#28cf547974144d827b5f85c07af7f9ec72c302dc",
+            .hash = "metrics-0.0.0-W7G4ePy_AQBozb1s8-avLxHOd4thMO92zKXDW84tmAhf",
+        },
     },
     .paths = .{
         "build.zig",
