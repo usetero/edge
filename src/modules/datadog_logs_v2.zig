@@ -1099,6 +1099,70 @@ test "processLogs - nested extra fields are preserved when reserializing after d
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
 }
 
+test "processLogs - nested extra transform is ignored and payload is unchanged" {
+    // TODO: Note this test should be updated after this behavior is supported
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var transform = proto.policy.LogTransform{};
+    var nested_attr_path = proto.policy.AttributePath{};
+    try nested_attr_path.path.append(allocator, try allocator.dupe(u8, "nested"));
+    try nested_attr_path.path.append(allocator, try allocator.dupe(u8, "status_code"));
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_attribute = nested_attr_path },
+    });
+
+    var test_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "remove-nested"),
+        .name = try allocator.dupe(u8, "remove-nested"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try test_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "keep me") },
+    });
+    defer test_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{test_policy}, "test", .file);
+
+    const logs =
+        \\[{"status":"info","message":"keep me","nested":{"status_code":"200","inner":{"ok":true}}}]
+    ;
+
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+    try std.testing.expectEqual(false, result.was_transformed);
+    try std.testing.expectEqualStrings(logs, result.data);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"status_code\":\"200\"") != null);
+}
+
 test "processLogs - mutation triggers reserialization and removes field" {
     const allocator = std.testing.allocator;
 
