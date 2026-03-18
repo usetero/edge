@@ -21,7 +21,6 @@ pub const DatadogLog = struct {
 
     extra: std.StringHashMapUnmanaged(AnyValue) = .empty,
     extra_raw_json: std.StringHashMapUnmanaged([]const u8) = .empty,
-    extra_string_paths: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     /// Free extra field keys allocated during parsing
     pub fn deinit(self: *DatadogLog, allocator: std.mem.Allocator) void {
@@ -36,16 +35,6 @@ pub const DatadogLog = struct {
             allocator.free(raw.*);
         }
         self.extra_raw_json.deinit(allocator);
-
-        var path_it = self.extra_string_paths.keyIterator();
-        while (path_it.next()) |key| {
-            allocator.free(key.*);
-        }
-        var path_val_it = self.extra_string_paths.valueIterator();
-        while (path_val_it.next()) |value| {
-            allocator.free(value.*);
-        }
-        self.extra_string_paths.deinit(allocator);
     }
 
     /// Parse a DatadogLog from a zimdjson Value (object)
@@ -83,9 +72,13 @@ pub const DatadogLog = struct {
                 const key_copy = try allocator.dupe(u8, key);
                 const any = try field.value.asAny();
                 try log.extra.put(allocator, key_copy, any);
-                const raw_json = try stringifyAnyValue(allocator, any);
-                try log.extra_raw_json.put(allocator, key_copy, raw_json);
-                try indexExtraStringPathsFromRaw(allocator, &log.extra_string_paths, key, raw_json);
+                switch (any) {
+                    .object, .array => {
+                        const raw_json = try stringifyAnyValue(allocator, any);
+                        try log.extra_raw_json.put(allocator, key_copy, raw_json);
+                    },
+                    else => {},
+                }
             }
         }
 
@@ -146,7 +139,7 @@ pub const DatadogLog = struct {
                 try jws.writer.writeAll(raw_json);
                 jws.endWriteRaw();
             } else {
-                try jws.write(null);
+                try writeAnyValue(jws, entry.value_ptr.*);
             }
         }
 
@@ -154,11 +147,14 @@ pub const DatadogLog = struct {
     }
 
     /// Look up a string extra field value by single or dotted multi-segment path.
-    pub fn findExtraString(self: *const DatadogLog, path: []const []const u8) ?[]const u8 {
+    pub fn findExtraString(self: *const DatadogLog, allocator: std.mem.Allocator, path: []const []const u8) ?[]const u8 {
         if (path.len == 0) return null;
 
-        if (path.len == 1) {
-            return self.extra_string_paths.get(path[0]);
+        if (self.extra.get(path[0])) |value| {
+            if (path.len == 1) {
+                if (value == .string) return value.string.get() catch null;
+                return null;
+            }
         }
 
         if (path.len > 1) {
@@ -174,53 +170,34 @@ pub const DatadogLog = struct {
                 @memcpy(buf[pos .. pos + segment.len], segment);
                 pos += segment.len;
             }
-            return self.extra_string_paths.get(buf[0..pos]);
+            if (self.extra.get(buf[0..pos])) |value| {
+                if (value == .string) return value.string.get() catch null;
+            }
+            if (self.extra_raw_json.get(path[0])) |raw_json| {
+                return findNestedStringInRaw(allocator, raw_json, path[1..]);
+            }
         }
 
         return null;
     }
 
-    fn indexExtraStringPathsFromRaw(
-        allocator: std.mem.Allocator,
-        out: *std.StringHashMapUnmanaged([]const u8),
-        prefix: []const u8,
-        raw_json: []const u8,
-    ) !void {
+    fn findNestedStringInRaw(allocator: std.mem.Allocator, raw_json: []const u8, remaining: []const []const u8) ?[]const u8 {
+        if (remaining.len == 0) return null;
+
         const Parsed = std.json.Parsed(std.json.Value);
-        var parsed: Parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+        const parsed: Parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return null;
         defer parsed.deinit();
-        try indexJsonStringPaths(allocator, out, prefix, parsed.value);
-    }
-
-    fn indexJsonStringPaths(
-        allocator: std.mem.Allocator,
-        out: *std.StringHashMapUnmanaged([]const u8),
-        prefix: []const u8,
-        value: std.json.Value,
-    ) !void {
-        switch (value) {
-            .string => |s| {
-                const key_copy = try allocator.dupe(u8, prefix);
-                const value_copy = try allocator.dupe(u8, s);
-                try out.put(allocator, key_copy, value_copy);
-            },
-            .object => |obj| {
-                var it = obj.iterator();
-                while (it.next()) |field| {
-                    const key = field.key_ptr.*;
-                    const child = field.value_ptr.*;
-
-                    var buf: [512]u8 = undefined;
-                    const needed = prefix.len + 1 + key.len;
-                    if (needed > buf.len) continue;
-                    @memcpy(buf[0..prefix.len], prefix);
-                    buf[prefix.len] = '.';
-                    @memcpy(buf[prefix.len + 1 .. needed], key);
-                    try indexJsonStringPaths(allocator, out, buf[0..needed], child);
-                }
-            },
-            else => {},
+        var current = parsed.value;
+        for (remaining) |segment| {
+            current = switch (current) {
+                .object => |obj| obj.get(segment) orelse return null,
+                else => return null,
+            };
         }
+        return switch (current) {
+            .string => |s| s,
+            else => null,
+        };
     }
 
     fn stringifyAnyValue(allocator: std.mem.Allocator, value: AnyValue) ![]u8 {
