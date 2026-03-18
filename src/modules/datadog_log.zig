@@ -5,43 +5,6 @@ pub const Parser = zimdjson.ondemand.FullParser(.default);
 pub const Value = Parser.Value;
 pub const AnyValue = Parser.AnyValue;
 
-const ExtraArray = std.ArrayListUnmanaged(ExtraValue);
-const ExtraObject = std.StringHashMapUnmanaged(ExtraValue);
-
-pub const ExtraNumber = union(enum) {
-    unsigned: u64,
-    signed: i64,
-    double: f64,
-};
-
-pub const ExtraValue = union(enum) {
-    null,
-    bool: bool,
-    number: ExtraNumber,
-    string: []const u8,
-    array: ExtraArray,
-    object: ExtraObject,
-
-    pub fn deinit(self: *ExtraValue, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .string => |s| allocator.free(s),
-            .array => |*arr| {
-                for (arr.items) |*item| item.deinit(allocator);
-                arr.deinit(allocator);
-            },
-            .object => |*obj| {
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    entry.value_ptr.deinit(allocator);
-                }
-                obj.deinit(allocator);
-            },
-            else => {},
-        }
-    }
-};
-
 /// Datadog log schema for parsing and serialization
 /// Uses zimdjson ondemand parser for efficient deserialization
 pub const DatadogLog = struct {
@@ -56,21 +19,28 @@ pub const DatadogLog = struct {
     environment: ?[]const u8 = null,
     custom_field: ?[]const u8 = null,
 
-    extra: std.StringHashMapUnmanaged(ExtraValue) = .empty,
+    extra: std.StringHashMapUnmanaged(AnyValue) = .empty,
+    extra_raw_json: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     /// Free extra field keys allocated during parsing
     pub fn deinit(self: *DatadogLog, allocator: std.mem.Allocator) void {
-        var it = self.extra.iterator();
+        var it = self.extra.keyIterator();
         while (it.next()) |key| {
-            allocator.free(key.key_ptr.*);
-            key.value_ptr.deinit(allocator);
+            allocator.free(key.*);
         }
         self.extra.deinit(allocator);
+
+        var raw_it = self.extra_raw_json.valueIterator();
+        while (raw_it.next()) |raw| {
+            allocator.free(raw.*);
+        }
+        self.extra_raw_json.deinit(allocator);
     }
 
     /// Parse a DatadogLog from a zimdjson Value (object)
     pub fn parse(allocator: std.mem.Allocator, value: Value) !DatadogLog {
         var log = DatadogLog{};
+        errdefer log.deinit(allocator);
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -98,20 +68,25 @@ pub const DatadogLog = struct {
             } else if (std.mem.eql(u8, key, "custom_field")) {
                 log.custom_field = try field.value.asString();
             } else {
-                // Store unknown fields in extra map - duplicate key/value so they survive reserialization.
+                // Store unknown fields in extra map - need to dupe the key since it's from the parser buffer.
                 const key_copy = try allocator.dupe(u8, key);
-                const owned = cloneAnyValue(allocator, try field.value.asAny()) catch |err| {
-                    allocator.free(key_copy);
-                    return err;
-                };
-                try log.extra.put(allocator, key_copy, owned);
+                const any = try field.value.asAny();
+                try log.extra.put(allocator, key_copy, any);
+                switch (any) {
+                    .object, .array => {
+                        const raw_json = try stringifyAnyValue(allocator, any);
+                        try log.extra_raw_json.put(allocator, key_copy, raw_json);
+                    },
+                    else => {},
+                }
             }
         }
 
         return log;
     }
 
-    /// Custom JSON serialization for known fields and owned extra fields.
+    /// Custom JSON serialization for known fields only.
+    /// Note: Extra fields are serialized via AnyValue while parser data is alive.
     pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
         try jws.beginObject();
 
@@ -159,22 +134,26 @@ pub const DatadogLog = struct {
         var it = self.extra.iterator();
         while (it.next()) |entry| {
             try jws.objectField(entry.key_ptr.*);
-            try writeExtraValue(jws, entry.value_ptr.*);
+            if (self.extra_raw_json.get(entry.key_ptr.*)) |raw_json| {
+                try jws.beginWriteRaw();
+                try jws.writer.writeAll(raw_json);
+                jws.endWriteRaw();
+            } else {
+                try writeAnyValue(jws, entry.value_ptr.*);
+            }
         }
 
         try jws.endObject();
     }
 
     /// Look up a string extra field value by single or dotted multi-segment path.
-    pub fn findExtraString(extra: *const std.StringHashMapUnmanaged(ExtraValue), path: []const []const u8) ?[]const u8 {
+    pub fn findExtraString(self: *const DatadogLog, allocator: std.mem.Allocator, path: []const []const u8) ?[]const u8 {
         if (path.len == 0) return null;
 
-        if (extra.get(path[0])) |value| {
+        if (self.extra.get(path[0])) |value| {
             if (path.len == 1) {
-                return switch (value) {
-                    .string => |s| s,
-                    else => null,
-                };
+                if (value == .string) return value.string.get() catch null;
+                return null;
             }
         }
 
@@ -191,102 +170,49 @@ pub const DatadogLog = struct {
                 @memcpy(buf[pos .. pos + segment.len], segment);
                 pos += segment.len;
             }
-            if (extra.get(buf[0..pos])) |value| {
-                return switch (value) {
-                    .string => |s| s,
-                    else => null,
-                };
+            if (self.extra.get(buf[0..pos])) |value| {
+                if (value == .string) return value.string.get() catch null;
             }
-
-            // Fallback to true nested object traversal when dotted key does not exist.
-            if (extra.get(path[0])) |value| {
-                return findNestedExtraString(value, path[1..]);
+            if (self.extra_raw_json.get(path[0])) |raw_json| {
+                return findNestedStringInRaw(allocator, raw_json, path[1..]);
             }
         }
 
         return null;
     }
 
-    fn findNestedExtraString(value: ExtraValue, remaining: []const []const u8) ?[]const u8 {
-        if (remaining.len == 0) {
-            return switch (value) {
-                .string => |s| s,
-                else => null,
+    fn findNestedStringInRaw(allocator: std.mem.Allocator, raw_json: []const u8, remaining: []const []const u8) ?[]const u8 {
+        if (remaining.len == 0) return null;
+
+        const Parsed = std.json.Parsed(std.json.Value);
+        const parsed: Parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return null;
+        defer parsed.deinit();
+        var current = parsed.value;
+        for (remaining) |segment| {
+            current = switch (current) {
+                .object => |obj| obj.get(segment) orelse return null,
+                else => return null,
             };
         }
-
-        return switch (value) {
-            .object => |obj| blk: {
-                const next = obj.get(remaining[0]) orelse break :blk null;
-                break :blk findNestedExtraString(next, remaining[1..]);
-            },
+        return switch (current) {
+            .string => |s| s,
             else => null,
         };
     }
 
-    fn cloneAnyValue(allocator: std.mem.Allocator, value: AnyValue) !ExtraValue {
-        return switch (value) {
-            .null => .null,
-            .bool => |v| .{ .bool = v },
-            .number => |n| .{ .number = switch (n) {
-                .unsigned => |v| .{ .unsigned = v },
-                .signed => |v| .{ .signed = v },
-                .double => |v| .{ .double = v },
-            } },
-            .string => |v| .{ .string = try allocator.dupe(u8, v.get() catch "") },
-            .array => |arr| blk: {
-                var out: ExtraArray = .empty;
-                var arr_it = arr.iterator();
-                while (arr_it.next() catch null) |item| {
-                    const cloned = cloneAnyValue(allocator, item.asAny() catch continue) catch |err| {
-                        for (out.items) |*it| it.deinit(allocator);
-                        out.deinit(allocator);
-                        return err;
-                    };
-                    out.append(allocator, cloned) catch |err| {
-                        var tmp = cloned;
-                        tmp.deinit(allocator);
-                        for (out.items) |*it| it.deinit(allocator);
-                        out.deinit(allocator);
-                        return err;
-                    };
-                }
-                break :blk .{ .array = out };
-            },
-            .object => |obj| blk: {
-                var out: ExtraObject = .empty;
-                var obj_it = obj.iterator();
-                while (obj_it.next() catch null) |field| {
-                    const k = try allocator.dupe(u8, field.key.get() catch continue);
-                    const cloned = cloneAnyValue(allocator, field.value.asAny() catch continue) catch |err| {
-                        allocator.free(k);
-                        var it = out.iterator();
-                        while (it.next()) |entry| {
-                            allocator.free(entry.key_ptr.*);
-                            entry.value_ptr.deinit(allocator);
-                        }
-                        out.deinit(allocator);
-                        return err;
-                    };
-                    out.put(allocator, k, cloned) catch |err| {
-                        allocator.free(k);
-                        var tmp = cloned;
-                        tmp.deinit(allocator);
-                        var it = out.iterator();
-                        while (it.next()) |entry| {
-                            allocator.free(entry.key_ptr.*);
-                            entry.value_ptr.deinit(allocator);
-                        }
-                        out.deinit(allocator);
-                        return err;
-                    };
-                }
-                break :blk .{ .object = out };
-            },
+    fn stringifyAnyValue(allocator: std.mem.Allocator, value: AnyValue) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        var jws: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{},
         };
+        try writeAnyValue(&jws, value);
+        return try out.toOwnedSlice();
     }
 
-    fn writeExtraValue(jws: anytype, value: ExtraValue) !void {
+    /// Write a zimdjson AnyValue to a JSON writer
+    fn writeAnyValue(jws: anytype, value: AnyValue) !void {
         switch (value) {
             .null => try jws.write(null),
             .bool => |v| try jws.write(v),
@@ -295,20 +221,21 @@ pub const DatadogLog = struct {
                 .signed => |v| try jws.write(v),
                 .double => |v| try jws.write(v),
             },
-            .string => |v| try jws.write(v),
+            .string => |v| try jws.write(v.get() catch ""),
             .array => |arr| {
                 try jws.beginArray();
-                for (arr.items) |item| {
-                    try writeExtraValue(jws, item);
+                var arr_it = arr.iterator();
+                while (arr_it.next() catch null) |item| {
+                    try writeAnyValue(jws, item.asAny() catch continue);
                 }
                 try jws.endArray();
             },
             .object => |obj| {
                 try jws.beginObject();
                 var obj_it = obj.iterator();
-                while (obj_it.next()) |field| {
-                    try jws.objectField(field.key_ptr.*);
-                    try writeExtraValue(jws, field.value_ptr.*);
+                while (obj_it.next() catch null) |field| {
+                    try jws.objectField(field.key.get() catch continue);
+                    try writeAnyValue(jws, field.value.asAny() catch continue);
                 }
                 try jws.endObject();
             },

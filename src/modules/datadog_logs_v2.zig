@@ -107,6 +107,7 @@ fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
 /// Context for field accessor and mutator - holds the DatadogLog struct
 const FieldAccessorContext = struct {
     log: *DatadogLog,
+    allocator: std.mem.Allocator,
 };
 
 const MutateOp = policy.MutateOp;
@@ -120,7 +121,7 @@ const getFirstPathSegment = otlp_attr.getFirstPathSegment;
 /// Searches known fields, ddtags, and extra HashMap (with nested support).
 /// Since Datadog has no resource/scope distinction, all attribute types
 /// search the same flat namespace.
-fn lookupLogAttribute(log: *DatadogLog, path: []const []const u8) ?[]const u8 {
+fn lookupLogAttribute(log: *DatadogLog, allocator: std.mem.Allocator, path: []const []const u8) ?[]const u8 {
     if (path.len == 0) return null;
     const key = path[0];
 
@@ -135,7 +136,7 @@ fn lookupLogAttribute(log: *DatadogLog, path: []const []const u8) ?[]const u8 {
     }
 
     // Check extra fields (supports nested dotted-key paths)
-    return DatadogLog.findExtraString(&log.extra, path);
+    return log.findExtraString(allocator, path);
 }
 
 /// Field accessor for Datadog JSON log format
@@ -154,7 +155,7 @@ fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             else => null,
         },
         // All attribute types search the same Datadog flat namespace
-        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| lookupLogAttribute(log, attr_path.path.items),
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| lookupLogAttribute(log, field_ctx.allocator, attr_path.path.items),
     };
 }
 
@@ -334,8 +335,8 @@ const FilterLogResult = struct {
 
 /// Evaluate a single log against policies, applying transforms if matched.
 /// Returns whether to keep the log and whether it was mutated.
-fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, policy_id_buf: [][]const u8) FilterLogResult {
-    var field_ctx = FieldAccessorContext{ .log = log };
+fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, allocator: std.mem.Allocator, policy_id_buf: [][]const u8) FilterLogResult {
+    var field_ctx = FieldAccessorContext{ .log = log, .allocator = allocator };
     const result = engine.evaluate(.log, &field_ctx, datadogFieldAccessor, datadogFieldMutator, policy_id_buf);
     return .{
         .keep = result.decision.shouldContinue(),
@@ -455,7 +456,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
                 };
 
                 state.original_count += 1;
-                const filter_result = filterLog(&engine, &log_obj, &policy_id_buf);
+                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf);
                 if (filter_result.mutated) state.mutated = true;
                 if (filter_result.keep) {
                     try state.kept.append(arena, log_obj);
@@ -472,7 +473,7 @@ fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const Poli
             };
 
             state.original_count = 1;
-            const filter_result = filterLog(&engine, &log_obj, &policy_id_buf);
+            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf);
             if (filter_result.mutated) state.mutated = true;
             if (filter_result.keep) {
                 try state.kept.append(arena, log_obj);
@@ -518,7 +519,7 @@ test "datadogFieldAccessor - extra field lookup" {
     try std.testing.expect(log.extra.contains("trace_id"));
 
     // Test the accessor directly
-    var field_ctx = FieldAccessorContext{ .log = &log };
+    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // Test known field
     const message_val = datadogFieldAccessor(&field_ctx, .{ .log_field = .LOG_FIELD_BODY });
@@ -545,7 +546,7 @@ test "datadogFieldAccessor - resource_attribute searches log attributes" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log };
+    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // resource_attribute should find known fields
     const svc_val = datadogFieldAccessor(&field_ctx, .{ .resource_attribute = testAttrPath("service") });
@@ -572,7 +573,7 @@ test "datadogFieldAccessor - scope_attribute searches log attributes" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log };
+    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // scope_attribute should find known fields
     const host_val = datadogFieldAccessor(&field_ctx, .{ .scope_attribute = testAttrPath("hostname") });
@@ -595,7 +596,7 @@ test "datadogFieldAccessor - nested extra field access via dotted key" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log };
+    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // Two-segment path should be joined with '.' to match dotted key
     const method_path = proto.policy.AttributePath{
@@ -620,7 +621,7 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log };
+    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // Path to non-existent dotted key
     const missing_path = proto.policy.AttributePath{
@@ -644,7 +645,7 @@ test "datadogFieldAccessor - nested object fallback via path segments" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log };
+    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     const status_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "status_code" }) },
@@ -675,7 +676,7 @@ test "datadogFieldAccessor - multi-segment path with no matching dotted key retu
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log };
+    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // Multi-segment path that doesn't match any dotted key
     const bad_path = proto.policy.AttributePath{
@@ -1096,6 +1097,70 @@ test "processLogs - nested extra fields are preserved when reserializing after d
     try std.testing.expect(std.mem.indexOf(u8, result.data, "\"ok\":true") != null);
     try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
+}
+
+test "processLogs - nested extra transform is ignored and payload is unchanged" {
+    // TODO: Note this test should be updated after this behavior is supported
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init();
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var transform = proto.policy.LogTransform{};
+    var nested_attr_path = proto.policy.AttributePath{};
+    try nested_attr_path.path.append(allocator, try allocator.dupe(u8, "nested"));
+    try nested_attr_path.path.append(allocator, try allocator.dupe(u8, "status_code"));
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_attribute = nested_attr_path },
+    });
+
+    var test_policy = proto.policy.Policy{
+        .id = try allocator.dupe(u8, "remove-nested"),
+        .name = try allocator.dupe(u8, "remove-nested"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try test_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "keep me") },
+    });
+    defer test_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{test_policy}, "test", .file);
+
+    const logs =
+        \\[{"status":"info","message":"keep me","nested":{"status_code":"200","inner":{"ok":true}}}]
+    ;
+
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result = ProcessResult{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+    try std.testing.expectEqual(false, result.was_transformed);
+    try std.testing.expectEqualStrings(logs, result.data);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"status_code\":\"200\"") != null);
 }
 
 test "processLogs - mutation triggers reserialization and removes field" {
