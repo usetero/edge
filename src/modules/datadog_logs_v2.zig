@@ -135,7 +135,7 @@ fn lookupLogAttribute(log: *DatadogLog, path: []const []const u8) ?[]const u8 {
     }
 
     // Check extra fields (supports nested dotted-key paths)
-    return DatadogLog.findExtraString(&log.extra, path);
+    return log.findExtraString(path);
 }
 
 /// Field accessor for Datadog JSON log format
