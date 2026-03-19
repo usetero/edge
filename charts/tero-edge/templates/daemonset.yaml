@@ -1,0 +1,93 @@
+{{- include "tero-edge.validateTeroAuth" . }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "tero-edge.fullname" . }}
+  labels:
+    {{- include "tero-edge.labels" . | nindent 4 }}
+spec:
+  updateStrategy:
+    {{- toYaml .Values.daemonset.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "tero-edge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "tero-edge.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "tero-edge.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: tero-edge
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- toYaml .Values.container.args | nindent 12 }}
+          {{- if or .Values.tero.url .Values.extraEnv }}
+          env:
+            {{- if .Values.tero.url }}
+            - name: TERO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tero-edge.apiKeySecretName" . }}
+                  key: {{ .Values.tero.existingSecret.key | default "api-key" }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.container.port }}
+              {{- if .Values.container.hostPort.enabled }}
+              hostPort: {{ .Values.container.hostPort.port }}
+              {{- end }}
+              protocol: TCP
+          livenessProbe:
+            {{- toYaml .Values.container.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.container.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tero-edge-config
+              mountPath: /etc/tero
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tero-edge-config
+          configMap:
+            name: {{ include "tero-edge.fullname" . }}-config
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

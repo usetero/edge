@@ -1,0 +1,17 @@
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "tero-edge.fullname" . }}-test-connection"
+  labels:
+    {{- include "tero-edge.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox
+      command: ['wget']
+      args: ['{{ include "tero-edge.fullname" . }}:{{ .Values.service.port }}']
+  restartPolicy: Never
+{{- end }}

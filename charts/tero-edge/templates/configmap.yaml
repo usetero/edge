@@ -1,0 +1,58 @@
+{{- include "tero-edge.validateTeroAuth" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tero-edge.fullname" . }}-config
+  labels:
+    {{- include "tero-edge.labels" . | nindent 4 }}
+data:
+  config.json: |
+    {
+      "listen_address": {{ .Values.config.listenAddress | quote }},
+      "listen_port": {{ int .Values.config.listenPort }},
+      "upstream_url": {{ .Values.config.upstreamUrl | quote }},
+      "metrics_url": {{ .Values.config.metricsUrl | quote }},
+      "log_level": {{ .Values.config.logLevel | quote }},
+      "max_body_size": {{ int .Values.config.maxBodySize }},
+      "max_upstream_retries": {{ int .Values.config.maxUpstreamRetries }},
+      "policy_providers": [
+        {{- $first := true -}}
+        {{- if .Values.config.fileProvider.enabled }}
+        {{- $first = false -}}
+        {
+          "id": {{ .Values.config.fileProvider.id | quote }},
+          "type": "file",
+          "path": {{ .Values.config.fileProvider.path | quote }}
+        }
+        {{- end }}
+        {{- if .Values.tero.url }}
+        {{- if not $first }},{{ end }}
+        {{- $first = false -}}
+        {
+          "id": "http",
+          "type": "http",
+          "url": {{ printf "%s%s" (trimSuffix "/" .Values.tero.url) "/v1/policy/sync" | quote }},
+          "headers": [
+            {
+              "name": "Authorization",
+              "value": "Bearer ${TERO_API_KEY}"
+            }
+          ]
+        }
+        {{- end }}
+        {{- range $idx, $provider := .Values.config.extraPolicyProviders }}
+        {{- if not $first }},{{ end }}
+        {{- $first = false -}}
+{{ toJson $provider | nindent 8 }}
+        {{- end }}
+      ]
+    }
+  policies.json: |
+    {
+      "policies": [
+        {{- range $idx, $policy := .Values.policiesJSON }}
+        {{- if $idx }},{{ end }}
+{{- $policy | trim | nindent 8 }}
+        {{- end }}
+      ]
+    }

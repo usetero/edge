@@ -1,0 +1,3 @@
+{{- if .Values.autoscaling.enabled }}
+{{- fail "autoscaling is not supported for DaemonSet deployments" }}
+{{- end }}

@@ -46,6 +46,97 @@ jobs:
           owner: ${{ github.repository_owner }}
 
       - uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.4.0
+        id: release_please
         with:
           token: ${{ steps.generate-token.outputs.token }}
-          release-type: simple
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Resolve root release PR
+        id: resolve_pr
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          pr_number=""
+          pr_branch=""
+
+          prs_json='${{ steps.release_please.outputs.prs }}'
+          pr_json='${{ steps.release_please.outputs.pr }}'
+
+          if [ -n "${prs_json}" ] && [ "${prs_json}" != "[]" ]; then
+            pr_number="$(echo "${prs_json}" | jq -r '.[] | select((.title // "") | startswith("chore(master): release ")) | .number' | head -n1 || true)"
+          fi
+
+          if [ -z "${pr_number}" ] && [ -n "${pr_json}" ] && [ "${pr_json}" != "null" ]; then
+            title="$(echo "${pr_json}" | jq -r '.title // ""')"
+            if [[ "${title}" == chore\(master\):\ release\ * ]]; then
+              pr_number="$(echo "${pr_json}" | jq -r '.number // empty')"
+            fi
+          fi
+
+          if [ -z "${pr_number}" ]; then
+            pr_number="$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=master&head=${GITHUB_REPOSITORY_OWNER}:release-please--branches--master" --jq '.[0].number // empty' || true)"
+          fi
+
+          if [ -n "${pr_number}" ]; then
+            pr_branch="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.head.ref')"
+          fi
+
+          echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+          echo "pr_branch=${pr_branch}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check if chart already changed in release PR
+        id: chart_changed
+        if: ${{ steps.resolve_pr.outputs.pr_number != '' }}
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          pr_number='${{ steps.resolve_pr.outputs.pr_number }}'
+          if gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/files" --paginate --jq '.[].filename' | grep -qx 'charts/tero-edge/Chart.yaml'; then
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Checkout release PR branch
+        if: ${{ steps.resolve_pr.outputs.pr_branch != '' && steps.chart_changed.outputs.changed != 'true' }}
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.resolve_pr.outputs.pr_branch }}
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Bump chart version for app release PR
+        if: ${{ steps.resolve_pr.outputs.pr_branch != '' && steps.chart_changed.outputs.changed != 'true' }}
+        env:
+          PR_BRANCH: ${{ steps.resolve_pr.outputs.pr_branch }}
+        run: |
+          set -euo pipefail
+
+          chart_file="charts/tero-edge/Chart.yaml"
+          current_version="$(awk '/^version:[[:space:]]*/ {print $2; exit}' "${chart_file}")"
+          if ! [[ "${current_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported chart version format: ${current_version}" >&2
+            exit 1
+          fi
+
+          IFS='.' read -r major minor patch <<< "${current_version}"
+          new_version="${major}.${minor}.$((patch + 1))"
+
+          awk -v v="${new_version}" '
+            /^version:[[:space:]]*/ && !done { print "version: " v; done=1; next }
+            { print }
+          ' "${chart_file}" > "${chart_file}.tmp"
+          mv "${chart_file}.tmp" "${chart_file}"
+
+          if git diff --quiet -- "${chart_file}"; then
+            exit 0
+          fi
+
+          git config user.name "tero-bot[bot]"
+          git config user.email "tero-bot[bot]@users.noreply.github.com"
+          git add "${chart_file}"
+          git commit -m "chore(charts/tero-edge): bump chart version for app release"
+          git push origin "HEAD:${PR_BRANCH}"

@@ -1,0 +1,13 @@
+Tero Edge DaemonSet installed.
+
+Check rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status daemonset/{{ include "tero-edge.fullname" . }}
+
+Inspect rendered config:
+  kubectl -n {{ .Release.Namespace }} get configmap {{ include "tero-edge.fullname" . }}-config -o yaml
+
+{{- if .Values.service.enabled }}
+Service is enabled as {{ .Values.service.type }} on port {{ .Values.service.port }}.
+{{- else }}
+Service is disabled. Traffic is expected via hostPort {{ .Values.container.hostPort.port }}.
+{{- end }}
