@@ -103,7 +103,7 @@ jobs:
 
       - name: Checkout release PR branch
         if: ${{ steps.resolve_pr.outputs.pr_branch != '' && steps.chart_changed.outputs.changed != 'true' }}
-        uses: actions/checkout@v5
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ steps.resolve_pr.outputs.pr_branch }}
           token: ${{ steps.generate-token.outputs.token }}
@@ -116,6 +116,7 @@ jobs:
           set -euo pipefail
 
           chart_file="charts/tero-edge/Chart.yaml"
+          manifest_file=".release-please-manifest.json"
           current_version="$(awk '/^version:[[:space:]]*/ {print $2; exit}' "${chart_file}")"
           if ! [[ "${current_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Unsupported chart version format: ${current_version}" >&2
@@ -131,12 +132,16 @@ jobs:
           ' "${chart_file}" > "${chart_file}.tmp"
           mv "${chart_file}.tmp" "${chart_file}"
 
-          if git diff --quiet -- "${chart_file}"; then
+          tmp_manifest="$(mktemp)"
+          jq --arg v "${new_version}" '.["charts/tero-edge"] = $v' "${manifest_file}" > "${tmp_manifest}"
+          mv "${tmp_manifest}" "${manifest_file}"
+
+          if git diff --quiet -- "${chart_file}" "${manifest_file}"; then
             exit 0
           fi
 
           git config user.name "tero-bot[bot]"
           git config user.email "tero-bot[bot]@users.noreply.github.com"
-          git add "${chart_file}"
+          git add "${chart_file}" "${manifest_file}"
           git commit -m "chore(charts/tero-edge): bump chart version for app release"
           git push origin "HEAD:${PR_BRANCH}"

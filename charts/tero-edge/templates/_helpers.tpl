@@ -73,6 +73,13 @@ Resolve API key secret name.
 {{- end }}
 
 {{/*
+Resolve API key secret key.
+*/}}
+{{- define "tero-edge.apiKeySecretKey" -}}
+{{- .Values.tero.existingSecret.key | default "api-key" -}}
+{{- end }}
+
+{{/*
 Validate top-level Tero auth config.
 */}}
 {{- define "tero-edge.validateTeroAuth" -}}

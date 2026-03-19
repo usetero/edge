@@ -46,7 +46,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "tero-edge.apiKeySecretName" . }}
-                  key: {{ .Values.tero.existingSecret.key | default "api-key" }}
+                  key: {{ include "tero-edge.apiKeySecretKey" . }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

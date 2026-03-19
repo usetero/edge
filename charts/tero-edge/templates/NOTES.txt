@@ -8,6 +8,8 @@ Inspect rendered config:
 
 {{- if .Values.service.enabled }}
 Service is enabled as {{ .Values.service.type }} on port {{ .Values.service.port }}.
-{{- else }}
+{{- else if .Values.container.hostPort.enabled }}
 Service is disabled. Traffic is expected via hostPort {{ .Values.container.hostPort.port }}.
+{{- else }}
+Service and hostPort are both disabled. Create a Service or enable hostPort to route traffic to tero-edge.
 {{- end }}
