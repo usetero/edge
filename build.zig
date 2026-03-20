@@ -3,6 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
+    const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    build_options.addOption([]const u8, "commit", commit);
 
     // ==========================================================================
     // Dependencies
@@ -44,6 +50,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "metrics_zig", .module = metrics_dep.module("metrics") },
         },
     });
+    mod.addOptions("build_options", build_options);
 
     // ==========================================================================
     // Main Executable
@@ -66,6 +73,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
     exe.root_module.addImport("o11y", o11y_mod);
     exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
+    exe.root_module.addOptions("build_options", build_options);
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("z", .{});
     exe.root_module.linkSystemLibrary("zstd", .{});
@@ -104,6 +112,7 @@ pub fn build(b: *std.Build) void {
         dist_exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
         dist_exe.root_module.addImport("o11y", o11y_mod);
         dist_exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
+        dist_exe.root_module.addOptions("build_options", build_options);
         dist_exe.root_module.link_libc = true;
         dist_exe.root_module.linkSystemLibrary("z", .{});
         dist_exe.root_module.linkSystemLibrary("zstd", .{});
@@ -143,6 +152,7 @@ pub fn build(b: *std.Build) void {
     mod_tests.root_module.linkSystemLibrary("z", .{});
     mod_tests.root_module.linkSystemLibrary("zstd", .{});
     mod_tests.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
+    mod_tests.root_module.addOptions("build_options", build_options);
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");

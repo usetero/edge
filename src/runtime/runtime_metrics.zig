@@ -73,40 +73,32 @@ pub const PolicyTelemetryLabel = enum {
 };
 
 const RequestLabels = struct {
-    distribution: DistributionLabel,
     method: MethodLabel,
     known_path: KnownPathLabel,
-    route_kind: RouteKindLabel,
 };
 
-const DurationLabels = struct {
-    distribution: DistributionLabel,
-    known_path: KnownPathLabel,
-    route_kind: RouteKindLabel,
-};
+const DurationLabels = struct { known_path: KnownPathLabel };
 
-const ResponseLabels = struct {
-    distribution: DistributionLabel,
-    known_path: KnownPathLabel,
-    route_kind: RouteKindLabel,
-    status_class: StatusClassLabel,
-};
+const ResponseLabels = struct { known_path: KnownPathLabel, status_class: StatusClassLabel };
 
 const PrefilterLabels = struct {
-    distribution: DistributionLabel,
     route_kind: RouteKindLabel,
     decision: PrefilterDecisionLabel,
 };
 
 const ErrorLabels = struct {
-    distribution: DistributionLabel,
     known_path: KnownPathLabel,
     class: ErrorClassLabel,
 };
 
 const PolicyLabels = struct {
-    distribution: DistributionLabel,
     telemetry: PolicyTelemetryLabel,
+};
+
+const BuildInfoLabels = struct {
+    version: []const u8,
+    commit: []const u8,
+    distribution: DistributionLabel,
 };
 
 const InternalMetrics = struct {
@@ -118,6 +110,7 @@ const InternalMetrics = struct {
     edge_policy_records_evaluated_total: PolicyRecordsEvaluatedTotal,
     edge_policy_records_kept_total: PolicyRecordsKeptTotal,
     edge_policy_records_dropped_total: PolicyRecordsDroppedTotal,
+    edge_build_info: BuildInfo,
 
     const RequestsTotal = m.CounterVec(u64, RequestLabels);
     const RequestDurationSeconds = m.HistogramVec(
@@ -131,6 +124,7 @@ const InternalMetrics = struct {
     const PolicyRecordsEvaluatedTotal = m.CounterVec(u64, PolicyLabels);
     const PolicyRecordsKeptTotal = m.CounterVec(u64, PolicyLabels);
     const PolicyRecordsDroppedTotal = m.CounterVec(u64, PolicyLabels);
+    const BuildInfo = m.GaugeVec(u64, BuildInfoLabels);
 };
 
 pub const RuntimeMetrics = struct {
@@ -139,7 +133,7 @@ pub const RuntimeMetrics = struct {
     internal: InternalMetrics = m.initializeNoop(InternalMetrics),
 
     pub fn init(allocator: std.mem.Allocator, distribution: DistributionLabel) !RuntimeMetrics {
-        return .{
+        var metrics = RuntimeMetrics{
             .allocator = allocator,
             .distribution = distribution,
             .internal = .{
@@ -191,8 +185,57 @@ pub const RuntimeMetrics = struct {
                     .{ .help = "Total number of telemetry records dropped after policy evaluation." },
                     .{},
                 ),
+                .edge_build_info = try InternalMetrics.BuildInfo.init(
+                    allocator,
+                    "edge_build_info",
+                    .{ .help = "Build metadata for this edge process." },
+                    .{},
+                ),
             },
         };
+        try metrics.initializeStaticSeries();
+        return metrics;
+    }
+
+    fn initializeStaticSeries(self: *RuntimeMetrics) !void {
+        inline for (std.meta.tags(MethodLabel)) |method| {
+            inline for (std.meta.tags(KnownPathLabel)) |known_path| {
+                try self.internal.edge_requests_total.incrBy(.{
+                    .method = method,
+                    .known_path = known_path,
+                }, 0);
+            }
+        }
+
+        inline for (std.meta.tags(KnownPathLabel)) |known_path| {
+            inline for (std.meta.tags(StatusClassLabel)) |status_class| {
+                try self.internal.edge_responses_total.incrBy(.{
+                    .known_path = known_path,
+                    .status_class = status_class,
+                }, 0);
+            }
+            inline for (std.meta.tags(ErrorClassLabel)) |class| {
+                try self.internal.edge_request_errors_total.incrBy(.{
+                    .known_path = known_path,
+                    .class = class,
+                }, 0);
+            }
+        }
+
+        inline for (std.meta.tags(RouteKindLabel)) |route_kind| {
+            inline for (std.meta.tags(PrefilterDecisionLabel)) |decision| {
+                try self.internal.edge_prefilter_decisions_total.incrBy(.{
+                    .route_kind = route_kind,
+                    .decision = decision,
+                }, 0);
+            }
+        }
+
+        inline for (std.meta.tags(PolicyTelemetryLabel)) |telemetry| {
+            try self.internal.edge_policy_records_evaluated_total.incrBy(.{ .telemetry = telemetry }, 0);
+            try self.internal.edge_policy_records_kept_total.incrBy(.{ .telemetry = telemetry }, 0);
+            try self.internal.edge_policy_records_dropped_total.incrBy(.{ .telemetry = telemetry }, 0);
+        }
     }
 
     pub fn deinit(self: *RuntimeMetrics) void {
@@ -210,39 +253,30 @@ pub const RuntimeMetrics = struct {
         self: *RuntimeMetrics,
         method: MethodLabel,
         known_path: KnownPathLabel,
-        route_kind: RouteKindLabel,
     ) void {
         self.internal.edge_requests_total.incr(.{
-            .distribution = self.distribution,
             .method = method,
             .known_path = known_path,
-            .route_kind = route_kind,
         }) catch {};
     }
 
     pub fn recordRequestDuration(
         self: *RuntimeMetrics,
         known_path: KnownPathLabel,
-        route_kind: RouteKindLabel,
         duration_seconds: f64,
     ) void {
         self.internal.edge_request_duration_seconds.observe(.{
-            .distribution = self.distribution,
             .known_path = known_path,
-            .route_kind = route_kind,
         }, duration_seconds) catch {};
     }
 
     pub fn recordResponse(
         self: *RuntimeMetrics,
         known_path: KnownPathLabel,
-        route_kind: RouteKindLabel,
         status_class: StatusClassLabel,
     ) void {
         self.internal.edge_responses_total.incr(.{
-            .distribution = self.distribution,
             .known_path = known_path,
-            .route_kind = route_kind,
             .status_class = status_class,
         }) catch {};
     }
@@ -253,7 +287,6 @@ pub const RuntimeMetrics = struct {
         decision: PrefilterDecisionLabel,
     ) void {
         self.internal.edge_prefilter_decisions_total.incr(.{
-            .distribution = self.distribution,
             .route_kind = route_kind,
             .decision = decision,
         }) catch {};
@@ -265,7 +298,6 @@ pub const RuntimeMetrics = struct {
         class: ErrorClassLabel,
     ) void {
         self.internal.edge_request_errors_total.incr(.{
-            .distribution = self.distribution,
             .known_path = known_path,
             .class = class,
         }) catch {};
@@ -279,17 +311,22 @@ pub const RuntimeMetrics = struct {
     ) void {
         const kept_count = evaluated_count -| dropped_count;
         self.internal.edge_policy_records_evaluated_total.incrBy(.{
-            .distribution = self.distribution,
             .telemetry = telemetry,
         }, evaluated_count) catch {};
         self.internal.edge_policy_records_kept_total.incrBy(.{
-            .distribution = self.distribution,
             .telemetry = telemetry,
         }, kept_count) catch {};
         self.internal.edge_policy_records_dropped_total.incrBy(.{
-            .distribution = self.distribution,
             .telemetry = telemetry,
         }, dropped_count) catch {};
+    }
+
+    pub fn setBuildInfo(self: *RuntimeMetrics, version: []const u8, commit: []const u8) void {
+        self.internal.edge_build_info.set(.{
+            .version = version,
+            .commit = commit,
+            .distribution = self.distribution,
+        }, 1) catch {};
     }
 };
 

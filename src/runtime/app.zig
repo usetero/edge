@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const mode = @import("mode.zig");
 const edge = @import("../root.zig");
@@ -359,6 +360,7 @@ pub fn run(distribution: mode.Distribution) !void {
 
     var runtime_metrics = try RuntimeMetrics.init(allocator, distributionLabel(distribution));
     defer runtime_metrics.deinit();
+    runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
     var loader = try policy.Loader.init(
         allocator,

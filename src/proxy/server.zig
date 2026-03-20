@@ -206,12 +206,10 @@ const ServerContext = struct {
         self.metrics.recordRequest(
             toMethodLabel(toHttpMethod(req.method)),
             metric_ctx.known_path,
-            metric_ctx.route_kind,
         );
-        self.metrics.recordRequestDuration(metric_ctx.known_path, metric_ctx.route_kind, elapsed_s);
+        self.metrics.recordRequestDuration(metric_ctx.known_path, elapsed_s);
         self.metrics.recordResponse(
             metric_ctx.known_path,
-            metric_ctx.route_kind,
             runtime_metrics.statusClass(res.status),
         );
 

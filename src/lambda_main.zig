@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const edge = @import("root.zig");
 const server_mod = edge.server;
@@ -203,6 +204,7 @@ pub fn main() !void {
 
     var runtime_metrics = try RuntimeMetrics.init(allocator, .lambda);
     defer runtime_metrics.deinit();
+    runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
     // Load static policies from environment variable (TERO_POLICY_STATIC)
     if (config.policy.static) |static_json| {

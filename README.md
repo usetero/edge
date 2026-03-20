@@ -494,6 +494,27 @@ OTLP distribution.
 
 - `TERO_LOG_LEVEL` - Override log level (trace, debug, info, warn, err)
 
+## Prometheus Metrics
+
+Runtime metrics are exposed at `GET /_edge/metrics` in Prometheus text format.
+
+Core HTTP metrics:
+
+- `edge_requests_total{method,known_path}`
+- `edge_request_duration_seconds{known_path}` (histogram)
+- `edge_responses_total{known_path,status_class}`
+- `edge_request_errors_total{known_path,class}`
+- `edge_prefilter_decisions_total{route_kind,decision}`
+
+Policy throughput metrics:
+
+- `edge_policy_records_evaluated_total{telemetry}`
+- `edge_policy_records_kept_total{telemetry}`
+- `edge_policy_records_dropped_total{telemetry}`
+- `edge_build_info{version,commit,distribution}` (gauge; always `1`)
+
+Request latency buckets are tuned for low-latency traffic from `0.1ms` to `5s`.
+
 ## Design Principles
 
 1. **Data-Oriented Design** - Optimize for cache coherency and memory access
