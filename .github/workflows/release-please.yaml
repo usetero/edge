@@ -65,13 +65,20 @@ jobs:
           prs_json='${{ steps.release_please.outputs.prs }}'
           pr_json='${{ steps.release_please.outputs.pr }}'
 
+          # Prefer the release PR for the repository root package (path ".").
           if [ -n "${prs_json}" ] && [ "${prs_json}" != "[]" ]; then
+            pr_number="$(echo "${prs_json}" | jq -r '.[] | select((.path // "") == ".") | .number' | head -n1 || true)"
+          fi
+
+          # Backward-compatible fallback for older output shapes/titles.
+          if [ -z "${pr_number}" ] && [ -n "${prs_json}" ] && [ "${prs_json}" != "[]" ]; then
             pr_number="$(echo "${prs_json}" | jq -r '.[] | select((.title // "") | startswith("chore(master): release ")) | .number' | head -n1 || true)"
           fi
 
           if [ -z "${pr_number}" ] && [ -n "${pr_json}" ] && [ "${pr_json}" != "null" ]; then
+            pr_path="$(echo "${pr_json}" | jq -r '.path // ""')"
             title="$(echo "${pr_json}" | jq -r '.title // ""')"
-            if [[ "${title}" == chore\(master\):\ release\ * ]]; then
+            if [ "${pr_path}" = "." ] || [[ "${title}" == chore\(master\):\ release\ * ]]; then
               pr_number="$(echo "${pr_json}" | jq -r '.number // empty')"
             fi
           fi
@@ -95,7 +102,9 @@ jobs:
         run: |
           set -euo pipefail
           pr_number='${{ steps.resolve_pr.outputs.pr_number }}'
-          if gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/files" --paginate --jq '.[].filename' | grep -qx 'charts/tero-edge/Chart.yaml'; then
+          changed_files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/files" --paginate --jq '.[].filename')"
+          if echo "${changed_files}" | grep -qx 'charts/tero-edge/Chart.yaml' || \
+             echo "${changed_files}" | grep -qx '.release-please-manifest.json'; then
             echo "changed=true" >> "${GITHUB_OUTPUT}"
           else
             echo "changed=false" >> "${GITHUB_OUTPUT}"
@@ -123,8 +132,42 @@ jobs:
             exit 1
           fi
 
-          IFS='.' read -r major minor patch <<< "${current_version}"
-          new_version="${major}.${minor}.$((patch + 1))"
+          git fetch origin master --depth=1
+
+          # Determine root app bump type by comparing manifest versions:
+          # - origin/master: previous app version
+          # - release PR branch: new app version
+          app_version_new="$(jq -r '.["."] // empty' "${manifest_file}")"
+          app_version_old=""
+          if git cat-file -e "origin/master:${manifest_file}" 2>/dev/null; then
+            app_version_old="$(git show "origin/master:${manifest_file}" | jq -r '.["."] // empty' || true)"
+          fi
+
+          bump_kind="patch"
+          if [[ "${app_version_new}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "${app_version_old}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            IFS='.' read -r app_old_major app_old_minor app_old_patch <<< "${app_version_old}"
+            IFS='.' read -r app_new_major app_new_minor app_new_patch <<< "${app_version_new}"
+            if [ "${app_new_major}" -gt "${app_old_major}" ]; then
+              bump_kind="major"
+            elif [ "${app_new_minor}" -gt "${app_old_minor}" ]; then
+              bump_kind="minor"
+            else
+              bump_kind="patch"
+            fi
+          fi
+
+          IFS='.' read -r chart_major chart_minor chart_patch <<< "${current_version}"
+          case "${bump_kind}" in
+            major)
+              new_version="$((chart_major + 1)).0.0"
+              ;;
+            minor)
+              new_version="${chart_major}.$((chart_minor + 1)).0"
+              ;;
+            *)
+              new_version="${chart_major}.${chart_minor}.$((chart_patch + 1))"
+              ;;
+          esac
 
           awk -v v="${new_version}" '
             /^version:[[:space:]]*/ && !done { print "version: " v; done=1; next }
