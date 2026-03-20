@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.17.0](https://github.com/usetero/edge/compare/v1.16.3...v1.17.0) (2026-03-20)
+
+
+### Features
+
+* record metrics in edge ([#161](https://github.com/usetero/edge/issues/161)) ([278ebf7](https://github.com/usetero/edge/commit/278ebf7828a598389910e744a5592ee568b96030))
+
+
+### Bug Fixes
+
+* care if we changed the version already ([#165](https://github.com/usetero/edge/issues/165)) ([6a5c0b6](https://github.com/usetero/edge/commit/6a5c0b64f24c649c9ccf6470dfa0e322bd44c66b))
+* chart release ([#163](https://github.com/usetero/edge/issues/163)) ([316aafa](https://github.com/usetero/edge/commit/316aafa3ded8f3ce76efab5625d0068c944c03e1))
+
 ## [1.16.3](https://github.com/usetero/edge/compare/v1.16.2...v1.16.3) (2026-03-18)
 
 
