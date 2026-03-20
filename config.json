@@ -1,7 +1,8 @@
 {
   "listen_address": "127.0.0.1",
   "listen_port": 8080,
-  "upstream_url": "http://127.0.0.1:9999",
+  "upstream_url": "https://agent-http-intake.logs.${TERO_DD_REGION}.datadoghq.com",
+  "metrics_url": "https://api.${TERO_DD_REGION}.datadoghq.com",
   "log_level": "info",
   "max_body_size": 1048576,
   "policy_providers": [
@@ -9,6 +10,17 @@
       "id": "file",
       "type": "file",
       "path": "policies.json"
+    },
+    {
+      "id": "http",
+      "type": "http",
+      "url": "${TERO_CONTROL_PLANE_URL}/v1/policy/sync",
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer ${TERO_API_TOKEN}"
+        }
+      ]
     }
   ]
 }
