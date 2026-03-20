@@ -5,6 +5,10 @@ version: "3"
 vars:
   PROJECT_NAME: edge
   BUILD_DIR: zig-out
+  HELM_CHART_DIR: charts/tero-edge
+  HELM_CHART_NAME: tero-edge
+  HELM_NAMESPACE: tero-system
+  HELM_RELEASE: tero-edge
 
 tasks:
   default:
@@ -463,3 +467,78 @@ tasks:
         fi
 
         echo "✅ CI setup complete"
+
+  # =============================================================================
+  # Helm Chart
+  # =============================================================================
+
+  helm:lint:
+    desc: "⛵ Lint the tero-edge Helm chart"
+    cmds:
+      - helm lint {{.HELM_CHART_DIR}}
+
+  helm:template:
+    desc: "⛵ Render Helm templates locally (VALUES=<file>)"
+    cmds:
+      - |
+        if [ -n "{{.VALUES}}" ]; then
+          helm template {{.HELM_RELEASE}} {{.HELM_CHART_DIR}} -f {{.VALUES}}
+        else
+          helm template {{.HELM_RELEASE}} {{.HELM_CHART_DIR}}
+        fi
+
+  helm:package:
+    desc: "⛵ Package chart into dist/ (VERSION=<semver> optional)"
+    cmds:
+      - mkdir -p dist
+      - |
+        if [ -n "{{.VERSION}}" ]; then
+          helm package {{.HELM_CHART_DIR}} --version {{.VERSION}} --destination dist
+        else
+          helm package {{.HELM_CHART_DIR}} --destination dist
+        fi
+
+  helm:install:
+    desc: "⛵ Install/upgrade chart in cluster (VALUES=<file> optional)"
+    cmds:
+      - |
+        if [ -n "{{.VALUES}}" ]; then
+          helm upgrade --install {{.HELM_RELEASE}} {{.HELM_CHART_DIR}} -n {{.HELM_NAMESPACE}} --create-namespace -f {{.VALUES}}
+        else
+          helm upgrade --install {{.HELM_RELEASE}} {{.HELM_CHART_DIR}} -n {{.HELM_NAMESPACE}} --create-namespace
+        fi
+
+  helm:uninstall:
+    desc: "⛵ Uninstall chart from cluster"
+    cmds:
+      - helm uninstall {{.HELM_RELEASE}} -n {{.HELM_NAMESPACE}}
+
+  helm:publish:oci:
+    desc: "⛵ Publish packaged chart to OCI (REGISTRY=oci://... VERSION=<semver>)"
+    cmds:
+      - |
+        if [ -z "{{.REGISTRY}}" ]; then
+          echo "Usage: task helm:publish:oci REGISTRY=oci://ghcr.io/<owner>/charts VERSION=<semver>"
+          exit 1
+        fi
+        if [ -z "{{.VERSION}}" ]; then
+          echo "Usage: task helm:publish:oci REGISTRY=oci://ghcr.io/<owner>/charts VERSION=<semver>"
+          exit 1
+        fi
+        task helm:package VERSION={{.VERSION}}
+        helm push dist/{{.HELM_CHART_NAME}}-{{.VERSION}}.tgz {{.REGISTRY}}
+
+  helm:repo:index:
+    desc: "⛵ Generate/merge Helm repo index in dist/ (REPO_URL required)"
+    cmds:
+      - |
+        if [ -z "{{.REPO_URL}}" ]; then
+          echo "Usage: task helm:repo:index REPO_URL=https://<org>.github.io/<repo>/"
+          exit 1
+        fi
+        mkdir -p dist
+        if [ -f dist/index.yaml ]; then
+          helm repo index dist --url {{.REPO_URL}} --merge dist/index.yaml
+        else
+          helm repo index dist --url {{.REPO_URL}}
+        fi

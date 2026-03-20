@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.16.3](https://github.com/usetero/edge/compare/v1.16.2...v1.16.3) (2026-03-18)
+
+
+### Bug Fixes
+
+* extra value caused segfault, different nested approach re-serialization approach ([#156](https://github.com/usetero/edge/issues/156)) ([82cff8a](https://github.com/usetero/edge/commit/82cff8a218a6c5f3a5f862717aafdde24659e479))
+
 ## [1.16.2](https://github.com/usetero/edge/compare/v1.16.1...v1.16.2) (2026-03-17)
 
 

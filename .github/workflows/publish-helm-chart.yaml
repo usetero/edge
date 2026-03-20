@@ -1,0 +1,95 @@
+name: Publish Helm Chart
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "tero-edge-chart-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+
+      - name: Package chart
+        id: chart
+        run: |
+          set -euo pipefail
+          chart_file="charts/tero-edge/Chart.yaml"
+          chart_name="$(awk '/^name:[[:space:]]*/ {print $2; exit}' "${chart_file}")"
+          chart_version="$(awk '/^version:[[:space:]]*/ {print $2; exit}' "${chart_file}")"
+          mkdir -p dist
+          helm package charts/tero-edge --destination dist
+          echo "name=${chart_name}" >> "${GITHUB_OUTPUT}"
+          echo "version=${chart_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish to OCI (GHCR)
+        env:
+          HELM_EXPERIMENTAL_OCI: "1"
+        run: |
+          set -euo pipefail
+          chart_name='${{ steps.chart.outputs.name }}'
+          chart_version='${{ steps.chart.outputs.version }}'
+          repo_owner_lc="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          oci_ref="oci://ghcr.io/${repo_owner_lc}/charts/${chart_name}"
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+          if helm show chart "${oci_ref}" --version "${chart_version}" >/dev/null 2>&1; then
+            echo "Chart ${chart_name}:${chart_version} already exists in OCI registry, skipping push."
+            exit 0
+          fi
+
+          helm push "dist/${chart_name}-${chart_version}.tgz" "oci://ghcr.io/${repo_owner_lc}/charts"
+
+      - name: Publish Helm repository (gh-pages)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          chart_name='${{ steps.chart.outputs.name }}'
+          chart_version='${{ steps.chart.outputs.version }}'
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          pages_url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${repo_name}/"
+
+          rm -rf gh-pages-repo
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages-repo
+          cd gh-pages-repo
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git checkout gh-pages
+          else
+            git checkout --orphan gh-pages
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          cp "../dist/${chart_name}-${chart_version}.tgz" .
+          touch .nojekyll
+
+          if [ -f index.yaml ]; then
+            helm repo index . --url "${pages_url}" --merge index.yaml
+          else
+            helm repo index . --url "${pages_url}"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${chart_name}-${chart_version}.tgz" index.yaml .nojekyll
+          if git diff --cached --quiet; then
+            echo "No gh-pages changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(charts): publish ${chart_name}-${chart_version}"
+          git push origin gh-pages
