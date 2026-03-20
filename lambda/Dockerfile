@@ -31,6 +31,10 @@ COPY build.zig build.zig.zon ./
 COPY src/ src/
 COPY proto/ proto/
 
+# Build metadata args
+ARG VERSION=dev
+ARG COMMIT=unknown
+
 # Fetch dependencies
 RUN for i in 1 2 3 4 5; do \
     zig build --fetch && break || \
@@ -38,7 +42,8 @@ RUN for i in 1 2 3 4 5; do \
     done
 
 # Build the Lambda extension with baseline CPU for broad compatibility
-RUN zig build lambda -Dcpu=baseline -Doptimize=ReleaseSafe
+RUN zig build lambda -Dcpu=baseline -Doptimize=ReleaseSafe \
+    -Dversion=${VERSION} -Dcommit=${COMMIT}
 
 # Detect architecture for library paths
 # IMPORTANT: Only files in /extensions/ are treated as extensions by Lambda.

@@ -327,6 +327,15 @@ tasks:
       DIST: '{{.DIST | default "datadog"}}'
       GIT_SHA:
         sh: git rev-parse --short HEAD
+      GIT_SHA_FULL:
+        sh: git rev-parse HEAD
+      VERSION:
+        sh: |
+          if git describe --tags --always --dirty >/dev/null 2>&1; then
+            git describe --tags --always --dirty
+          else
+            echo dev
+          fi
     cmds:
       - |
         echo "🐳 Building edge-{{.DIST}} container..."
@@ -334,6 +343,8 @@ tasks:
           # CI: Use buildx with GitHub Actions cache
           docker buildx build \
             --build-arg DISTRIBUTION={{.DIST}} \
+            --build-arg VERSION={{.VERSION}} \
+            --build-arg COMMIT={{.GIT_SHA_FULL}} \
             --cache-from type=gha,scope=edge-{{.DIST}} \
             --cache-to type=gha,mode=max,scope=edge-{{.DIST}} \
             -t edge-{{.DIST}}:sha-{{.GIT_SHA}} \
@@ -344,6 +355,8 @@ tasks:
           # Local: Standard build
           DOCKER_BUILDKIT=1 docker build \
             --build-arg DISTRIBUTION={{.DIST}} \
+            --build-arg VERSION={{.VERSION}} \
+            --build-arg COMMIT={{.GIT_SHA_FULL}} \
             -t edge-{{.DIST}}:sha-{{.GIT_SHA}} \
             -t edge-{{.DIST}}:local \
             .
