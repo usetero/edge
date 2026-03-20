@@ -88,7 +88,8 @@ jobs:
 
       - name: Build
         run: |
-          zig build ${{ matrix.distribution }} -Dcpu=baseline -Doptimize=ReleaseSafe
+          zig build ${{ matrix.distribution }} -Dcpu=baseline -Doptimize=ReleaseSafe \
+            -Dversion="${{ github.ref_name }}" -Dcommit="${{ github.sha }}"
 
       - name: Prepare artifact
         run: |
@@ -133,7 +134,8 @@ jobs:
 
       - name: Build
         run: |
-          zig build ${{ matrix.distribution }} -Dcpu=baseline -Doptimize=ReleaseSafe
+          zig build ${{ matrix.distribution }} -Dcpu=baseline -Doptimize=ReleaseSafe \
+            -Dversion="${{ github.ref_name }}" -Dcommit="${{ github.sha }}"
 
       - name: Prepare artifact
         run: |
@@ -235,6 +237,8 @@ jobs:
           platforms: ${{ matrix.arch.platform }}
           build-args: |
             DISTRIBUTION=${{ matrix.distribution }}
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ env.REGISTRY_IMAGE }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true

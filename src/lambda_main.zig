@@ -15,9 +15,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const edge = @import("root.zig");
 const server_mod = edge.server;
+const runtime_metrics_mod = @import("runtime/runtime_metrics.zig");
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough_module;
 const datadog_mod = edge.datadog_module;
@@ -39,6 +41,7 @@ const PassthroughModule = passthrough_mod.PassthroughModule;
 const DatadogModule = datadog_mod.DatadogModule;
 const DatadogConfig = datadog_mod.DatadogConfig;
 const HealthModule = health_mod.HealthModule;
+const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
 
 // =============================================================================
 // Lambda Configuration
@@ -199,6 +202,10 @@ pub fn main() !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
+    var runtime_metrics = try RuntimeMetrics.init(allocator, .lambda);
+    defer runtime_metrics.deinit();
+    runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
+
     // Load static policies from environment variable (TERO_POLICY_STATIC)
     if (config.policy.static) |static_json| {
         bus.info(StaticPoliciesLoading{});
@@ -260,6 +267,7 @@ pub fn main() !void {
     var datadog_config = DatadogConfig{
         .registry = &registry,
         .bus = bus,
+        .metrics = &runtime_metrics,
     };
 
     // Create modules
@@ -312,6 +320,7 @@ pub fn main() !void {
     var proxy = try ProxyServer.init(
         allocator,
         bus,
+        &runtime_metrics,
         config.listen_address,
         config.listen_port,
         config.max_upstream_retries,

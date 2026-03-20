@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const mode = @import("mode.zig");
 const edge = @import("../root.zig");
@@ -7,6 +8,7 @@ const edge = @import("../root.zig");
 const config_types = edge.config_types;
 const zonfig = edge.zonfig;
 const server_mod = edge.server;
+const runtime_metrics_mod = @import("runtime_metrics.zig");
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough_module;
 const datadog_mod = edge.datadog_module;
@@ -32,14 +34,20 @@ const OtlpConfig = otlp_mod.OtlpConfig;
 const PrometheusModule = prometheus_mod.PrometheusModule;
 const PrometheusConfig = prometheus_mod.PrometheusConfig;
 const HealthModule = health_mod.HealthModule;
+const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
     .logFn = StdLogAdapter.logFn,
 };
 
-const ShutdownSignalReceived = struct {};
-const SignalHandlersInstalled = struct {};
+const ShutdownSignalReceived = struct { signal: []const u8, count: u32 };
+const ShutdownForceExit = struct { signal: []const u8, count: u32 };
+const ShutdownStateTransition = struct {
+    from: []const u8,
+    to: []const u8,
+    reason: []const u8,
+};
 const SignalHandlingNotSupported = struct { platform: []const u8 };
 
 const ServerStarting = struct {};
@@ -62,10 +70,6 @@ const ServiceConfigured = struct {
 const ServerReady = struct {};
 const ShutdownHint = struct { pid: c_int };
 const ServerStopped = struct {};
-const ServerError = struct { message: anyerror };
-
-var server_instance: ?*ProxyServer = null;
-var global_event_bus: ?*EventBus = null;
 
 const RouteBundle = enum {
     datadog_logs,
@@ -86,6 +90,34 @@ const datadog_bundles = [_]RouteBundle{
 };
 const otlp_bundles = [_]RouteBundle{.otlp};
 const prometheus_bundles = [_]RouteBundle{.prometheus};
+
+const ShutdownState = enum(u8) {
+    running,
+    shutdown_requested,
+    stopping,
+    stopped,
+    force_exit,
+};
+
+const SignalWaiterContext = struct {
+    bus: *EventBus,
+    server: *ProxyServer,
+    signal_count: *std.atomic.Value(u32),
+    shutdown_state: *std.atomic.Value(u8),
+    shutdown_waiter: *std.atomic.Value(bool),
+    signal_set: std.posix.sigset_t,
+};
+
+const SignalWaiterHandle = struct {
+    thread: std.Thread,
+    previous_mask: std.posix.sigset_t,
+};
+
+const StopWorkerContext = struct {
+    bus: *EventBus,
+    server: *ProxyServer,
+    shutdown_state: *std.atomic.Value(u8),
+};
 
 fn supportedStagesFor(distribution: mode.Distribution) []const policy.proto.policy.PolicyStage {
     return switch (distribution) {
@@ -119,16 +151,109 @@ fn bundlesFor(distribution: mode.Distribution) []const RouteBundle {
     };
 }
 
-fn handleShutdownSignal(sig: c_int) callconv(.c) void {
-    _ = sig;
-    if (global_event_bus) |bus| {
-        bus.info(ShutdownSignalReceived{});
+fn distributionLabel(distribution: mode.Distribution) runtime_metrics_mod.DistributionLabel {
+    return switch (distribution) {
+        .edge => .edge,
+        .datadog => .datadog,
+        .otlp => .otlp,
+        .prometheus => .prometheus,
+    };
+}
+
+fn stateName(state: ShutdownState) []const u8 {
+    return @tagName(state);
+}
+
+fn loadShutdownState(state: *const std.atomic.Value(u8)) ShutdownState {
+    return @enumFromInt(state.load(.acquire));
+}
+
+fn setShutdownState(
+    bus: *EventBus,
+    state: *std.atomic.Value(u8),
+    next: ShutdownState,
+    reason: []const u8,
+) void {
+    const previous: ShutdownState = @enumFromInt(state.swap(@intFromEnum(next), .acq_rel));
+    if (previous == next) return;
+
+    bus.info(ShutdownStateTransition{
+        .from = stateName(previous),
+        .to = stateName(next),
+        .reason = reason,
+    });
+}
+
+fn installSignalWaiter(
+    bus: *EventBus,
+    server: *ProxyServer,
+    signal_count: *std.atomic.Value(u32),
+    shutdown_state: *std.atomic.Value(u8),
+    shutdown_waiter: *std.atomic.Value(bool),
+) anyerror!SignalWaiterHandle {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+        bus.warn(SignalHandlingNotSupported{ .platform = @tagName(builtin.os.tag) });
+        return error.UnsupportedPlatform;
     }
 
-    if (server_instance) |server| {
-        server_instance = null;
-        server.server.stop();
+    var signal_set = std.posix.sigemptyset();
+    std.posix.sigaddset(&signal_set, std.posix.SIG.INT);
+    std.posix.sigaddset(&signal_set, std.posix.SIG.TERM);
+    std.posix.sigaddset(&signal_set, std.posix.SIG.USR1);
+    var previous_mask = std.posix.sigemptyset();
+    std.posix.sigprocmask(std.posix.SIG.BLOCK, &signal_set, &previous_mask);
+
+    const waiter = try std.Thread.spawn(.{}, signalWaiterThread, .{SignalWaiterContext{
+        .bus = bus,
+        .server = server,
+        .signal_count = signal_count,
+        .shutdown_state = shutdown_state,
+        .shutdown_waiter = shutdown_waiter,
+        .signal_set = signal_set,
+    }});
+    return .{
+        .thread = waiter,
+        .previous_mask = previous_mask,
+    };
+}
+
+fn signalWaiterThread(ctx: SignalWaiterContext) void {
+    while (true) {
+        var sig: c_int = 0;
+        if (std.c.sigwait(@constCast(&ctx.signal_set), &sig) != 0) continue;
+        if (sig == std.posix.SIG.USR1 and ctx.shutdown_waiter.load(.acquire)) return;
+
+        const signal_name = if (sig == std.posix.SIG.INT) "SIGINT" else "SIGTERM";
+        const count = ctx.signal_count.fetchAdd(1, .acq_rel) + 1;
+
+        if (count == 1) {
+            ctx.bus.info(ShutdownSignalReceived{
+                .signal = signal_name,
+                .count = count,
+            });
+            setShutdownState(ctx.bus, ctx.shutdown_state, .shutdown_requested, "signal.received");
+
+            const stop_worker = std.Thread.spawn(.{}, stopWorkerThread, .{StopWorkerContext{
+                .bus = ctx.bus,
+                .server = ctx.server,
+                .shutdown_state = ctx.shutdown_state,
+            }}) catch continue;
+            stop_worker.detach();
+            continue;
+        }
+
+        ctx.bus.info(ShutdownForceExit{
+            .signal = signal_name,
+            .count = count,
+        });
+        setShutdownState(ctx.bus, ctx.shutdown_state, .force_exit, "second.signal");
+        std.posix.exit(1);
     }
+}
+
+fn stopWorkerThread(ctx: StopWorkerContext) void {
+    setShutdownState(ctx.bus, ctx.shutdown_state, .stopping, "server.stop.begin");
+    ctx.server.server.stop();
 }
 
 fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
@@ -150,20 +275,8 @@ fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyop
     std.posix.abort();
 }
 
-fn installShutdownHandlers(bus: *EventBus) void {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
-        bus.warn(SignalHandlingNotSupported{ .platform = @tagName(builtin.os.tag) });
-        return;
-    }
-
-    const act = std.posix.Sigaction{
-        .handler = .{ .handler = handleShutdownSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+fn installSegfaultHandler() void {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
 
     const segv_act = std.posix.Sigaction{
         .handler = .{ .sigaction = handleSegfault },
@@ -171,14 +284,10 @@ fn installShutdownHandlers(bus: *EventBus) void {
         .flags = std.posix.SA.SIGINFO,
     };
     std.posix.sigaction(std.posix.SIG.SEGV, &segv_act, null);
-
-    bus.debug(SignalHandlersInstalled{});
 }
 
 pub fn run(distribution: mode.Distribution) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.smp_allocator;
 
     var stdio_bus: o11y.StdioEventBus = undefined;
     stdio_bus.init();
@@ -188,9 +297,6 @@ pub fn run(distribution: mode.Distribution) !void {
 
     StdLogAdapter.init(bus);
     defer StdLogAdapter.deinit();
-
-    global_event_bus = bus;
-    defer global_event_bus = null;
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -252,6 +358,10 @@ pub fn run(distribution: mode.Distribution) !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
+    var runtime_metrics = try RuntimeMetrics.init(allocator, distributionLabel(distribution));
+    defer runtime_metrics.deinit();
+    runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
+
     var loader = try policy.Loader.init(
         allocator,
         bus,
@@ -262,24 +372,26 @@ pub fn run(distribution: mode.Distribution) !void {
     defer loader.deinit();
 
     try loader.startAsync();
-
-    installShutdownHandlers(bus);
+    installSegfaultHandler();
 
     const server_allocator = allocator;
 
     var datadog_config = DatadogConfig{
         .registry = &registry,
         .bus = bus,
+        .metrics = &runtime_metrics,
     };
 
     var otlp_config = OtlpConfig{
         .registry = &registry,
         .bus = bus,
+        .metrics = &runtime_metrics,
     };
 
     var prometheus_config = PrometheusConfig{
         .registry = &registry,
         .bus = bus,
+        .metrics = &runtime_metrics,
         .max_input_bytes_per_scrape = config.prometheus.max_input_bytes_per_scrape,
         .max_output_bytes_per_scrape = config.prometheus.max_output_bytes_per_scrape,
     };
@@ -369,6 +481,7 @@ pub fn run(distribution: mode.Distribution) !void {
     var proxy = try ProxyServer.init(
         server_allocator,
         bus,
+        &runtime_metrics,
         config.listen_address,
         config.listen_port,
         config.max_upstream_retries,
@@ -377,17 +490,33 @@ pub fn run(distribution: mode.Distribution) !void {
     );
     defer proxy.deinit();
 
-    server_instance = &proxy;
-    defer server_instance = null;
+    var signal_count = std.atomic.Value(u32).init(0);
+    var shutdown_state = std.atomic.Value(u8).init(@intFromEnum(ShutdownState.running));
+    var shutdown_waiter = std.atomic.Value(bool).init(false);
+    var signal_waiter: ?SignalWaiterHandle = null;
+    if (installSignalWaiter(bus, &proxy, &signal_count, &shutdown_state, &shutdown_waiter)) |waiter| {
+        signal_waiter = waiter;
+    } else |err| switch (err) {
+        error.UnsupportedPlatform => {},
+        else => return err,
+    }
 
     bus.info(ServerReady{});
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
         bus.info(ShutdownHint{ .pid = std.c.getpid() });
     }
 
-    proxy.listen() catch |err| {
-        bus.err(ServerError{ .message = err });
-    };
+    const listen_thread = try proxy.listenInNewThread();
+    listen_thread.join();
+
+    setShutdownState(bus, &shutdown_state, .stopped, "listen.returned");
+
+    if (signal_waiter) |waiter| {
+        shutdown_waiter.store(true, .release);
+        std.posix.kill(std.c.getpid(), std.posix.SIG.USR1) catch {};
+        waiter.thread.join();
+        std.posix.sigprocmask(std.posix.SIG.SETMASK, &waiter.previous_mask, null);
+    }
 
     bus.info(ServerStopped{});
 }

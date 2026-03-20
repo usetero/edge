@@ -145,6 +145,8 @@ jobs:
             --progress plain \
             --platform ${{ matrix.platform }} \
             -f lambda/Dockerfile \
+            --build-arg VERSION=${{ github.ref_name }} \
+            --build-arg COMMIT=${{ github.sha }} \
             --output type=local,dest=.layers/layer-${{ matrix.arch }} \
             .
 

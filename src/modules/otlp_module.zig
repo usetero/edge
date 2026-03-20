@@ -4,6 +4,7 @@ const policy = @import("policy_zig");
 const otlp_logs = @import("./otlp_logs.zig");
 const otlp_metrics = @import("./otlp_metrics.zig");
 const otlp_traces = @import("./otlp_traces.zig");
+const runtime_metrics = @import("../runtime/runtime_metrics.zig");
 const o11y = @import("o11y");
 
 const ModuleConfig = module_types.ModuleConfig;
@@ -13,6 +14,7 @@ const RoutePattern = module_types.RoutePattern;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
+const RuntimeMetrics = runtime_metrics.RuntimeMetrics;
 
 // =============================================================================
 // Observability Events
@@ -31,6 +33,8 @@ pub const OtlpConfig = struct {
     registry: *const PolicyRegistry,
     /// Event bus for observability
     bus: *EventBus,
+    /// Optional runtime metrics sink
+    metrics: ?*RuntimeMetrics = null,
 };
 
 /// OTLP module - handles OpenTelemetry log ingestion with filtering
@@ -40,6 +44,7 @@ pub const OtlpModule = struct {
     registry: *const PolicyRegistry = undefined,
     /// Event bus for observability
     bus: *EventBus = undefined,
+    metrics: ?*RuntimeMetrics = null,
 
     pub fn init(self: *OtlpModule, _: std.mem.Allocator, config: ModuleConfig) !void {
 
@@ -48,6 +53,7 @@ pub const OtlpModule = struct {
             return error.MissingOtlpConfig));
         self.registry = otlp_config.registry;
         self.bus = otlp_config.bus;
+        self.metrics = otlp_config.metrics;
     }
 
     pub fn processRequestStream(
@@ -74,6 +80,9 @@ pub const OtlpModule = struct {
                     body_writer,
                     content_type,
                 );
+                if (self.metrics) |metrics| {
+                    metrics.recordPolicyBatch(.otlp_logs, result.original_count, result.dropped_count);
+                }
                 if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
                 return ModuleStreamResult.forwarded();
             },
@@ -86,6 +95,9 @@ pub const OtlpModule = struct {
                     body_writer,
                     content_type,
                 );
+                if (self.metrics) |metrics| {
+                    metrics.recordPolicyBatch(.otlp_metrics, result.original_count, result.dropped_count);
+                }
                 if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
                 return ModuleStreamResult.forwarded();
             },
@@ -98,6 +110,9 @@ pub const OtlpModule = struct {
                     body_writer,
                     content_type,
                 );
+                if (self.metrics) |metrics| {
+                    metrics.recordPolicyBatch(.otlp_traces, result.original_count, result.dropped_count);
+                }
                 if (result.allDropped()) return ModuleStreamResult.respond(200, "{}");
                 return ModuleStreamResult.forwarded();
             },

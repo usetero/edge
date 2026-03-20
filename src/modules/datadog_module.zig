@@ -3,6 +3,7 @@ const module_types = @import("./module_types.zig");
 const policy = @import("policy_zig");
 const logs_v2 = @import("./datadog_logs_v2.zig");
 const metrics_v2 = @import("./datadog_metrics_v2.zig");
+const runtime_metrics = @import("../runtime/runtime_metrics.zig");
 const o11y = @import("o11y");
 
 const ModuleConfig = module_types.ModuleConfig;
@@ -12,6 +13,7 @@ const RoutePattern = module_types.RoutePattern;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
+const RuntimeMetrics = runtime_metrics.RuntimeMetrics;
 
 // =============================================================================
 // Observability Events
@@ -28,6 +30,8 @@ pub const DatadogConfig = struct {
     registry: *const PolicyRegistry,
     /// Event bus for observability
     bus: *EventBus,
+    /// Optional runtime metrics sink
+    metrics: ?*RuntimeMetrics = null,
 };
 
 /// Datadog module - handles Datadog log and metric ingestion with filtering
@@ -37,6 +41,7 @@ pub const DatadogModule = struct {
     registry: *const PolicyRegistry = undefined,
     /// Event bus for observability
     bus: *EventBus = undefined,
+    metrics: ?*RuntimeMetrics = null,
 
     pub fn init(self: *DatadogModule, _: std.mem.Allocator, config: ModuleConfig) !void {
 
@@ -45,6 +50,7 @@ pub const DatadogModule = struct {
             return error.MissingDatadogConfig));
         self.registry = dd_config.registry;
         self.bus = dd_config.bus;
+        self.metrics = dd_config.metrics;
     }
 
     pub fn processRequestStream(
@@ -80,6 +86,9 @@ pub const DatadogModule = struct {
                     .dropped = result.dropped_count,
                     .kept = result.original_count - result.dropped_count,
                 });
+                if (self.metrics) |metrics| {
+                    metrics.recordPolicyBatch(.datadog_logs, result.original_count, result.dropped_count);
+                }
 
                 if (result.allDropped()) {
                     return ModuleStreamResult.respond(202, "{}");
@@ -104,6 +113,9 @@ pub const DatadogModule = struct {
                     .dropped = result.dropped_count,
                     .kept = result.original_count - result.dropped_count,
                 });
+                if (self.metrics) |metrics| {
+                    metrics.recordPolicyBatch(.datadog_metrics, result.original_count, result.dropped_count);
+                }
 
                 if (result.allDropped()) {
                     return ModuleStreamResult.respond(202, "{\"errors\":[]}");

@@ -42,6 +42,8 @@ COPY src/ src/
 
 # Build argument for distribution selection
 ARG DISTRIBUTION=datadog
+ARG VERSION=dev
+ARG COMMIT=unknown
 
 RUN for i in 1 2 3 4 5; do \
     zig build --fetch && break || \
@@ -50,7 +52,8 @@ RUN for i in 1 2 3 4 5; do \
 
 # Build the selected distribution with baseline CPU to ensure cross-ARM64 compatibility
 # (GitHub ARM runners use Neoverse-N1, Apple Silicon uses different feature sets)
-RUN zig build ${DISTRIBUTION} -Dcpu=baseline -Doptimize=ReleaseSafe
+RUN zig build ${DISTRIBUTION} -Dcpu=baseline -Doptimize=ReleaseSafe \
+    -Dversion=${VERSION} -Dcommit=${COMMIT}
 
 # =============================================================================
 # Runtime stage - minimal Alpine image

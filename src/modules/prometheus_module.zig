@@ -7,6 +7,7 @@ const std = @import("std");
 const module_types = @import("./module_types.zig");
 const prometheus = @import("../prometheus/root.zig");
 const policy = @import("policy_zig");
+const runtime_metrics = @import("../runtime/runtime_metrics.zig");
 const o11y = @import("o11y");
 
 const ModuleConfig = module_types.ModuleConfig;
@@ -20,6 +21,7 @@ const FilteringWriter = prometheus.FilteringWriter;
 
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
+const RuntimeMetrics = runtime_metrics.RuntimeMetrics;
 
 // =============================================================================
 // Observability Events
@@ -41,6 +43,7 @@ const PrometheusFilterStats = struct {
 pub const PrometheusConfig = struct {
     registry: *PolicyRegistry,
     bus: *EventBus,
+    metrics: ?*RuntimeMetrics = null,
     max_input_bytes_per_scrape: usize = 10 * 1024 * 1024,
     max_output_bytes_per_scrape: usize = 10 * 1024 * 1024,
 };
@@ -60,6 +63,7 @@ const PrometheusResponseFilter = struct {
 
     /// Event bus for logging stats
     bus: *EventBus,
+    metrics: ?*RuntimeMetrics,
 
     /// Allocator used for this filter (arena)
     allocator: std.mem.Allocator,
@@ -79,6 +83,7 @@ const PrometheusResponseFilter = struct {
         const self = try allocator.create(Self);
 
         self.bus = config.bus;
+        self.metrics = config.metrics;
         self.allocator = allocator;
 
         // Initialize the policy streaming filter
@@ -118,6 +123,9 @@ const PrometheusResponseFilter = struct {
             .lines_kept = stats.lines_kept,
             .scrape_truncated = stats.scrape_truncated,
         });
+        if (self.metrics) |metrics| {
+            metrics.recordPolicyBatch(.prometheus_metrics, stats.lines_processed, stats.lines_dropped);
+        }
 
         return stats.bytes_forwarded;
     }

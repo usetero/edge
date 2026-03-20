@@ -4,6 +4,7 @@ const proxy_module = @import("../modules/proxy_module.zig");
 const router_mod = @import("router.zig");
 const upstream_client = @import("upstream_client.zig");
 const runtime_pipeline = @import("../runtime/pipeline.zig");
+const runtime_metrics = @import("../runtime/runtime_metrics.zig");
 const transport_mod = @import("../io/transport.zig");
 const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
@@ -20,6 +21,11 @@ const Router = router_mod.Router;
 const UpstreamClientManager = upstream_client.UpstreamClientManager;
 const PrefilterDecision = runtime_pipeline.PrefilterDecision;
 const UpstreamTransport = transport_mod.UpstreamTransport;
+const RuntimeMetrics = runtime_metrics.RuntimeMetrics;
+const MethodLabel = runtime_metrics.MethodLabel;
+const RouteKindLabel = runtime_metrics.RouteKindLabel;
+const KnownPathLabel = runtime_metrics.KnownPathLabel;
+const PrefilterDecisionLabel = runtime_metrics.PrefilterDecisionLabel;
 
 // =============================================================================
 // Observability Events
@@ -118,6 +124,12 @@ const RoutePlan = struct {
     decision: PrefilterDecision,
 };
 
+const RequestMetricContext = struct {
+    known_path: KnownPathLabel = .other,
+    route_kind: RouteKindLabel = .passthrough,
+    prefilter: PrefilterDecisionLabel = .none,
+};
+
 fn classifyRoutePlan(ctx: *ServerContext, req: *httpz.Request) ?RoutePlan {
     const http_method = toHttpMethod(req.method);
     const match = ctx.router.route(req.url.path, http_method) orelse return null;
@@ -162,10 +174,20 @@ const ServerContext = struct {
     /// Event bus for observability
     bus: *EventBus,
 
+    /// Runtime Prometheus metrics registry
+    metrics: *RuntimeMetrics,
+
     allocator: std.mem.Allocator,
 
     /// Handle all requests directly - we do our own routing
     pub fn handle(self: *ServerContext, req: *httpz.Request, res: *httpz.Response) void {
+        const start_ns = std.time.nanoTimestamp();
+        var metric_ctx = RequestMetricContext{
+            .known_path = classifyKnownPath(req.url.path, toHttpMethod(req.method)),
+            .route_kind = .passthrough,
+            .prefilter = .none,
+        };
+
         // Start request span
         var span = self.bus.started(.debug, RequestStarted{
             .method = @tagName(req.method),
@@ -175,9 +197,21 @@ const ServerContext = struct {
 
         // Call handler
         var response_bytes: usize = 0;
-        proxyHandler(self, req, res, &response_bytes) catch |err| {
-            self.uncaughtError(req, res, err);
+        proxyHandler(self, req, res, &response_bytes, &metric_ctx) catch |err| {
+            self.uncaughtError(req, res, err, &metric_ctx);
         };
+
+        const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+        const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+        self.metrics.recordRequest(
+            toMethodLabel(toHttpMethod(req.method)),
+            metric_ctx.known_path,
+        );
+        self.metrics.recordRequestDuration(metric_ctx.known_path, elapsed_s);
+        self.metrics.recordResponse(
+            metric_ctx.known_path,
+            runtime_metrics.statusClass(res.status),
+        );
 
         // Complete span with response info
         span.completed(RequestCompleted{
@@ -191,6 +225,7 @@ const ServerContext = struct {
         req: *httpz.Request,
         res: *httpz.Response,
         err: anyerror,
+        metric_ctx: *const RequestMetricContext,
     ) void {
         // Format stack trace addresses if available
         var stack_buf: [2048]u8 = undefined;
@@ -212,6 +247,7 @@ const ServerContext = struct {
             .err = @errorName(err),
             .stack_trace = stack_trace_str,
         });
+        self.metrics.recordRequestError(metric_ctx.known_path, .uncaught);
         res.status = 500;
         res.body = "Internal Server Error";
     }
@@ -231,6 +267,7 @@ pub const ProxyServer = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         bus: *EventBus,
+        metrics: *RuntimeMetrics,
         listen_address: [4]u8,
         listen_port: u16,
         max_upstream_retries: u8,
@@ -242,6 +279,7 @@ pub const ProxyServer = struct {
 
         ctx.allocator = allocator;
         ctx.bus = bus;
+        ctx.metrics = metrics;
         ctx.max_upstream_retries = max_upstream_retries;
         ctx.upstreams = UpstreamClientManager.init(allocator);
         errdefer ctx.upstreams.deinit();
@@ -301,8 +339,10 @@ pub const ProxyServer = struct {
         const server = try allocator.create(httpz.Server(*ServerContext));
         errdefer allocator.destroy(server);
         server.* = try httpz.Server(*ServerContext).init(allocator, .{
-            .address = ctx.listen_address,
-            .port = listen_port,
+            .address = .{ .ip = .{
+                .host = ctx.listen_address,
+                .port = listen_port,
+            } },
             .request = .{
                 .max_body_size = max_body_size,
             },
@@ -333,6 +373,14 @@ pub const ProxyServer = struct {
         try self.server.listen();
     }
 
+    pub fn listenInNewThread(self: *ProxyServer) !std.Thread {
+        self.context.bus.info(ServerListening{
+            .address = self.context.listen_address,
+            .port = self.context.listen_port,
+        });
+        return self.server.listenInNewThread();
+    }
+
     fn formatAddress(allocator: std.mem.Allocator, addr: [4]u8) ![]const u8 {
         return try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
             addr[0],
@@ -357,6 +405,51 @@ fn toHttpMethod(method: httpz.Method) HttpMethod {
     };
 }
 
+fn toMethodLabel(method: HttpMethod) MethodLabel {
+    return switch (method) {
+        .GET => .get,
+        .POST => .post,
+        .PUT => .put,
+        .DELETE => .delete,
+        .PATCH => .patch,
+        .HEAD => .head,
+        .OPTIONS => .options,
+        .OTHER => .other,
+    };
+}
+
+fn toRouteKindLabel(kind: RouteKind) RouteKindLabel {
+    return switch (kind) {
+        .datadog_logs => .datadog_logs,
+        .datadog_metrics => .datadog_metrics,
+        .otlp_logs => .otlp_logs,
+        .otlp_metrics => .otlp_metrics,
+        .otlp_traces => .otlp_traces,
+        .prometheus_metrics => .prometheus_metrics,
+        .health => .health,
+        .passthrough => .passthrough,
+    };
+}
+
+fn toPrefilterDecisionLabel(decision: PrefilterDecision) PrefilterDecisionLabel {
+    return switch (decision) {
+        .policy_path => .policy_path,
+        .fast_path => .fast_path,
+    };
+}
+
+fn classifyKnownPath(path: []const u8, method: HttpMethod) KnownPathLabel {
+    if (method == .POST and std.mem.eql(u8, path, "/api/v2/logs")) return .api_v2_logs;
+    if (method == .POST and std.mem.eql(u8, path, "/api/v2/series")) return .api_v2_series;
+    if (method == .POST and std.mem.endsWith(u8, path, "/v1/logs")) return .v1_logs;
+    if (method == .POST and std.mem.endsWith(u8, path, "/v1/metrics")) return .v1_metrics;
+    if (method == .POST and std.mem.endsWith(u8, path, "/v1/traces")) return .v1_traces;
+    if (method == .GET and (std.mem.eql(u8, path, "/metrics") or std.mem.startsWith(u8, path, "/metrics/"))) return .metrics;
+    if (method == .GET and std.mem.eql(u8, path, "/_health")) return .health;
+    if (method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) return .edge_metrics;
+    return .other;
+}
+
 /// Convert our HttpMethod to std.http.Method
 fn toStdHttpMethod(method: HttpMethod) std.http.Method {
     return switch (method) {
@@ -378,13 +471,39 @@ fn getHeaderFromHttpz(ctx: ?*const anyopaque, name: []const u8) ?[]const u8 {
 }
 
 /// Main proxy handler - catchall for all requests
-fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, response_bytes: *usize) !void {
+fn proxyHandler(
+    ctx: *ServerContext,
+    req: *httpz.Request,
+    res: *httpz.Response,
+    response_bytes: *usize,
+    metric_ctx: *RequestMetricContext,
+) !void {
+    if (req.method == .GET and std.mem.eql(u8, req.url.path, "/_edge/metrics")) {
+        var out: std.Io.Writer.Allocating = .init(req.arena);
+        try ctx.metrics.writePrometheus(&out.writer);
+        res.status = 200;
+        res.body = try out.toOwnedSlice();
+        response_bytes.* = res.body.len;
+        metric_ctx.known_path = .edge_metrics;
+        metric_ctx.route_kind = .passthrough;
+        metric_ctx.prefilter = .none;
+        return;
+    }
+
     const plan = classifyRoutePlan(ctx, req) orelse {
         // No module matched - return 404
         res.status = 404;
         res.body = "Not Found";
+        metric_ctx.known_path = classifyKnownPath(req.url.path, toHttpMethod(req.method));
+        metric_ctx.route_kind = .passthrough;
+        metric_ctx.prefilter = .none;
         return;
     };
+
+    metric_ctx.known_path = classifyKnownPath(req.url.path, toHttpMethod(req.method));
+    metric_ctx.route_kind = toRouteKindLabel(plan.route_kind);
+    metric_ctx.prefilter = toPrefilterDecisionLabel(plan.decision);
+    ctx.metrics.recordPrefilterDecision(metric_ctx.route_kind, metric_ctx.prefilter);
 
     const http_method = toHttpMethod(req.method);
 
@@ -407,6 +526,7 @@ fn proxyHandler(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response, 
         plan.module,
         plan.decision,
         module_req,
+        metric_ctx,
     );
 }
 
@@ -418,11 +538,12 @@ fn proxyToUpstreamStreaming(
     module: ProxyModule,
     decision: PrefilterDecision,
     module_req: ModuleRequest,
+    metric_ctx: *const RequestMetricContext,
 ) !usize {
     const method = toStdHttpMethod(toHttpMethod(req.method));
     const prepared = switch (decision) {
         .fast_path => try prepareOutboundFastPath(req),
-        .policy_path => try prepareOutboundBody(ctx, req, module, module_req),
+        .policy_path => try prepareOutboundBody(ctx, req, module, module_req, metric_ctx),
     };
     switch (prepared.action) {
         .respond_immediately => {
@@ -485,6 +606,7 @@ fn prepareOutboundBody(
     req: *httpz.Request,
     module: ProxyModule,
     module_req: ModuleRequest,
+    metric_ctx: *const RequestMetricContext,
 ) !PreparedOutbound {
     const method = toStdHttpMethod(toHttpMethod(req.method));
     if (method.requestHasBody() and req.body_len > 0) {
@@ -500,6 +622,7 @@ fn prepareOutboundBody(
         ) catch |err| blk: {
             // Fail open: forward original body bytes if module stream processing fails.
             ctx.bus.warn(ModuleError{ .err = @errorName(err) });
+            ctx.metrics.recordRequestError(metric_ctx.known_path, .module);
             _ = transport_mod.streamReaderToWriter(&request_reader.interface, &captured_writer.writer, std.math.maxInt(usize)) catch {};
             break :blk ModuleStreamResult.forwarded();
         };
@@ -534,6 +657,7 @@ fn prepareOutboundBody(
         req.arena,
     ) catch |err| {
         ctx.bus.warn(ModuleError{ .err = @errorName(err) });
+        ctx.metrics.recordRequestError(metric_ctx.known_path, .module);
         return .{ .action = .forwarded, .has_body = false };
     };
 
