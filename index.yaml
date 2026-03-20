@@ -1,0 +1,15 @@
+apiVersion: v1
+entries:
+  tero-edge:
+  - apiVersion: v2
+    appVersion: 1.17.0
+    created: "2026-03-20T20:56:37.956851157Z"
+    description: A Helm chart for Kubernetes
+    digest: 6edc7c0a80ceeba9615feb3cf71adff6801469b15f33a6929a0ff4c996202e3e
+    icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
+    name: tero-edge
+    type: application
+    urls:
+    - https://usetero.github.io/edge/tero-edge-0.2.0.tgz
+    version: 0.2.0
+generated: "2026-03-20T20:56:37.956117504Z"
