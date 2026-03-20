@@ -1,0 +1,119 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/usetero/edge
+  pullPolicy: IfNotPresent
+  tag: ""
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 64Mi
+
+nodeSelector: {}
+tolerations:
+  - operator: Exists
+affinity: {}
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
+service:
+  enabled: false
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
+
+autoscaling:
+  enabled: false
+
+daemonset:
+  updateStrategy:
+    type: RollingUpdate
+
+container:
+  port: 8080
+  hostPort:
+    enabled: true
+    port: 8080
+  args:
+    - /etc/tero/config.json
+  livenessProbe:
+    httpGet:
+      path: /_health
+      port: 8080
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readinessProbe:
+    httpGet:
+      path: /_health
+      port: 8080
+    initialDelaySeconds: 2
+    periodSeconds: 5
+
+tero:
+  # Control plane base URL used to build the HTTP policy provider endpoint.
+  # Example: https://control-plane.example.com
+  url: ""
+  # Provide inline API key (chart will create a secret) OR use existingSecret below.
+  apiKey: ""
+  existingSecret:
+    name: ""
+    key: api-key
+
+config:
+  listenAddress: "0.0.0.0"
+  listenPort: 8080
+  upstreamUrl: "https://agent-http-intake.logs.datadoghq.com"
+  metricsUrl: "https://api.datadoghq.com"
+  logLevel: "info"
+  maxBodySize: 1048576
+  maxUpstreamRetries: 10
+
+  fileProvider:
+    enabled: true
+    id: file
+    path: /etc/tero/policies.json
+
+  # Optional additional providers appended to policy_providers as raw JSON objects.
+  extraPolicyProviders: []
+
+# Rendered into /etc/tero/policies.json for the file provider.
+# Each list item must be a valid JSON object string (not YAML object).
+policiesJSON: []
+# Example:
+# policiesJSON:
+#   - |
+#     {
+#       "id": "drop-debug-logs",
+#       "name": "drop-debug-logs",
+#       "enabled": true,
+#       "log": {
+#         "match": [{ "log_field": "severity_text", "regex": "DEBUG" }],
+#         "keep": "none"
+#       }
+#     }

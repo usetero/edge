@@ -1,0 +1,19 @@
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "tero-edge.fullname" . }}-test-connection"
+  labels:
+    {{- include "tero-edge.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
+spec:
+  containers:
+    - name: wget
+      image: busybox:1.36.1
+      command: ["/bin/sh", "-ec"]
+      args:
+        - wget -q -T 5 -O /dev/null http://{{ include "tero-edge.fullname" . }}:{{ .Values.service.port }}/_health
+  restartPolicy: Never
+{{- end }}
