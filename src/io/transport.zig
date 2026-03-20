@@ -100,6 +100,7 @@ pub const UpstreamTransport = struct {
         has_body: bool,
     ) !usize {
         const upstream_uri_str = try self.ctx.upstreams.buildUpstreamUri(
+            req.arena,
             module_id,
             req.url.path,
             req.url.query,

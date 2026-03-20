@@ -341,8 +341,10 @@ pub const ProxyServer = struct {
         const server = try allocator.create(httpz.Server(*ServerContext));
         errdefer allocator.destroy(server);
         server.* = try httpz.Server(*ServerContext).init(allocator, .{
-            .address = ctx.listen_address,
-            .port = listen_port,
+            .address = .{ .ip = .{
+                .host = ctx.listen_address,
+                .port = listen_port,
+            } },
             .request = .{
                 .max_body_size = max_body_size,
             },
@@ -371,6 +373,14 @@ pub const ProxyServer = struct {
             .port = self.context.listen_port,
         });
         try self.server.listen();
+    }
+
+    pub fn listenInNewThread(self: *ProxyServer) !std.Thread {
+        self.context.bus.info(ServerListening{
+            .address = self.context.listen_address,
+            .port = self.context.listen_port,
+        });
+        return self.server.listenInNewThread();
     }
 
     fn formatAddress(allocator: std.mem.Allocator, addr: [4]u8) ![]const u8 {

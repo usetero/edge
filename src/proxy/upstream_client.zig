@@ -15,9 +15,6 @@ const UpstreamData = struct {
     port: u16,
     base_path: []const u8,
 
-    /// Pre-allocated URI buffer for this upstream
-    uri_buffer: []u8,
-
     /// Maximum request/response sizes
     max_request_body: u32,
     max_response_body: u32,
@@ -63,12 +60,11 @@ pub const UpstreamClientManager = struct {
 
         const slice = self.upstreams.slice();
 
-        // Free all allocated strings and buffers
+        // Free all allocated strings
         for (0..self.upstreams.len) |i| {
             self.allocator.free(slice.items(.scheme)[i]);
             self.allocator.free(slice.items(.host)[i]);
             self.allocator.free(slice.items(.base_path)[i]);
-            self.allocator.free(slice.items(.uri_buffer)[i]);
         }
 
         self.upstreams.deinit(self.allocator);
@@ -91,6 +87,7 @@ pub const UpstreamClientManager = struct {
         max_request_body: u32,
         max_response_body: u32,
     ) !ModuleId {
+        _ = max_path_length;
         const uri = try std.Uri.parse(upstream_url);
 
         const scheme = try self.allocator.dupe(u8, uri.scheme);
@@ -107,11 +104,6 @@ pub const UpstreamClientManager = struct {
             try self.allocator.dupe(u8, "");
         errdefer self.allocator.free(base_path);
 
-        // URI buffer needs to fit: scheme + "://" + host + ":" + port + base_path + path + "?" + query
-        // Max port is 5 digits, scheme is ~8, separators ~10, so add ~530 for overhead
-        const uri_buffer = try self.allocator.alloc(u8, max_path_length + 530);
-        errdefer self.allocator.free(uri_buffer);
-
         const port = uri.port orelse if (std.mem.eql(u8, scheme, "https")) @as(u16, 443) else @as(u16, 80);
 
         const upstream_data = UpstreamData{
@@ -119,7 +111,6 @@ pub const UpstreamClientManager = struct {
             .host = host,
             .port = port,
             .base_path = base_path,
-            .uri_buffer = uri_buffer,
             .max_request_body = max_request_body,
             .max_response_body = max_response_body,
         };
@@ -149,10 +140,11 @@ pub const UpstreamClientManager = struct {
         return self.upstreams.slice().items(.max_response_body)[idx];
     }
 
-    /// Build upstream URI from pre-allocated components (zero allocation)
-    /// Returns a slice into the pre-allocated buffer
+    /// Build upstream URI from stored components.
+    /// Caller owns returned memory.
     pub fn buildUpstreamUri(
         self: *UpstreamClientManager,
+        allocator: std.mem.Allocator,
         module_id: ModuleId,
         request_path: []const u8,
         query_string: []const u8,
@@ -164,10 +156,9 @@ pub const UpstreamClientManager = struct {
         const host = slice.items(.host)[idx];
         const port = slice.items(.port)[idx];
         const base_path = slice.items(.base_path)[idx];
-        const uri_buffer = slice.items(.uri_buffer)[idx];
-
-        var fbs = std.io.fixedBufferStream(uri_buffer);
-        const writer = fbs.writer();
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const writer = &out.writer;
 
         try writer.writeAll(scheme);
         try writer.writeAll("://");
@@ -201,7 +192,7 @@ pub const UpstreamClientManager = struct {
             try writer.writeAll(query_string);
         }
 
-        return fbs.getWritten();
+        return try out.toOwnedSlice();
     }
 };
 
@@ -263,15 +254,18 @@ test "UpstreamClientManager buildUpstreamUri" {
     );
 
     // Test basic path
-    const uri1 = try manager.buildUpstreamUri(module_id, "/logs", "");
+    const uri1 = try manager.buildUpstreamUri(allocator, module_id, "/logs", "");
+    defer allocator.free(uri1);
     try std.testing.expectEqualStrings("https://api.example.com/v2/logs", uri1);
 
     // Test with query string
-    const uri2 = try manager.buildUpstreamUri(module_id, "/logs", "api_key=xxx&source=test");
+    const uri2 = try manager.buildUpstreamUri(allocator, module_id, "/logs", "api_key=xxx&source=test");
+    defer allocator.free(uri2);
     try std.testing.expectEqualStrings("https://api.example.com/v2/logs?api_key=xxx&source=test", uri2);
 
     // Test empty path
-    const uri3 = try manager.buildUpstreamUri(module_id, "", "");
+    const uri3 = try manager.buildUpstreamUri(allocator, module_id, "", "");
+    defer allocator.free(uri3);
     try std.testing.expectEqualStrings("https://api.example.com/v2", uri3);
 }
 
@@ -288,7 +282,8 @@ test "UpstreamClientManager buildUpstreamUri with non-standard port" {
         1024,
     );
 
-    const uri = try manager.buildUpstreamUri(module_id, "/test", "");
+    const uri = try manager.buildUpstreamUri(allocator, module_id, "/test", "");
+    defer allocator.free(uri);
     try std.testing.expectEqualStrings("http://localhost:9999/test", uri);
 }
 
