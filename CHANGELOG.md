@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.18.0](https://github.com/usetero/edge/compare/v1.17.0...v1.18.0) (2026-04-06)
+
+
+### Features
+
+* bump to latest version of policy-zig ([#170](https://github.com/usetero/edge/issues/170)) ([5c2cd09](https://github.com/usetero/edge/commit/5c2cd09ffba4e74a1fe4550767f7a1b495d57748))
+
 ## [1.17.0](https://github.com/usetero/edge/compare/v1.16.3...v1.17.0) (2026-03-20)
 
 
