@@ -41,8 +41,8 @@
             .hash = "zimdjson-0.1.1-89pgxT5VBgBMxsGpAd90DI0e-DzHGKiRVlquliE5FivH",
         },
         .policy_zig = .{
-            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.1.17.tar.gz",
-            .hash = "policy_zig-0.1.7-5_dp3mh0DwDRVIcv_V_LNPBOjuAQfjZhyMKp-43cfkHy",
+            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "policy_zig-0.1.7-5_dp3jGADwA5pynfr-GFHcZdAZTQAuH3YvmDSGokUEp3",
         },
         .metrics = .{
             .url = "git+https://github.com/karlseguin/metrics.zig#28cf547974144d827b5f85c07af7f9ec72c302dc",
