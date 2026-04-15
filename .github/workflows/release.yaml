@@ -168,7 +168,7 @@ jobs:
         run: ls -la artifacts/
 
       - name: Upload binaries to release
-        uses: softprops/action-gh-release@1853d73993c8ca1b2c9c1a7fede39682d0ab5c2a # v2.5.3
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: artifacts/*
         env:
