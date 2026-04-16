@@ -32,10 +32,6 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .httpz = .{
-            .url = "git+https://github.com/karlseguin/http.zig?ref=master#844f8016e6616f00b05d4cc3c713307b0fe586c7",
-            .hash = "httpz-0.0.0-PNVzrBtMBwAPcQx3mNEgat3Xbsynw-eIC9SmOX5M9XtP",
-        },
         .zimdjson = .{
             .url = "git+https://github.com/jaronoff97/zimdjson?ref=zig-0.15.1-support#f31efc9e698246f994df8eba44646134a93fa2b6",
             .hash = "zimdjson-0.1.1-89pgxT5VBgBMxsGpAd90DI0e-DzHGKiRVlquliE5FivH",
@@ -47,6 +43,10 @@
         .metrics = .{
             .url = "git+https://github.com/karlseguin/metrics.zig#28cf547974144d827b5f85c07af7f9ec72c302dc",
             .hash = "metrics-0.0.0-W7G4ePy_AQBozb1s8-avLxHOd4thMO92zKXDW84tmAhf",
+        },
+        .zzz = .{
+            .url = "git+https://github.com/tardy-org/zzz?ref=v0.3.1#ef11e7626f026196941d6bfe64f87aa15f361a88",
+            .hash = "zzz-0.3.1-4HoaJh1TAgBMJwppWIBhiP4yhT1seaG71plxw6DpfnVI",
         },
     },
     .paths = .{

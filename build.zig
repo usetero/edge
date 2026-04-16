@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     // Dependencies
     // ==========================================================================
 
-    const httpz = b.dependency("httpz", .{
+    const zzz = b.dependency("zzz", .{
         .target = target,
         .optimize = optimize,
     });
@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.addImport("httpz", httpz.module("httpz"));
+    exe.root_module.addImport("zzz", zzz.module("zzz"));
     exe.root_module.addImport("proto", proto_mod);
     exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
     exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
@@ -106,7 +106,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        dist_exe.root_module.addImport("httpz", httpz.module("httpz"));
+        dist_exe.root_module.addImport("zzz", zzz.module("zzz"));
         dist_exe.root_module.addImport("proto", proto_mod);
         dist_exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
         dist_exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
@@ -170,7 +170,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    echo_server.root_module.addImport("httpz", httpz.module("httpz"));
+    echo_server.root_module.addImport("zzz", zzz.module("zzz"));
 
     const echo_step = b.step("echo-server", "Build the echo server for benchmarking");
     echo_step.dependOn(&b.addInstallArtifact(echo_server, .{}).step);

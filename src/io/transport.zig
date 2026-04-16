@@ -1,5 +1,6 @@
 const std = @import("std");
-const httpz = @import("httpz");
+const zzz = @import("zzz");
+const http = zzz.HTTP;
 const o11y = @import("o11y");
 const proxy_module = @import("../modules/proxy_module.zig");
 const upstream_client = @import("../proxy/upstream_client.zig");
@@ -44,10 +45,13 @@ pub const Context = struct {
 pub const UpstreamTransport = struct {
     ctx: Context,
 
-    pub fn proxyPrepared(
+    pub fn proxyPreparedStreaming(
         self: *const UpstreamTransport,
-        req: *httpz.Request,
-        res: *httpz.Response,
+        zctx: *const http.Context,
+        req: *const http.Request,
+        path: []const u8,
+        query: ?[]const u8,
+        allocator: std.mem.Allocator,
         method: std.http.Method,
         module_id: ModuleId,
         module: ProxyModule,
@@ -56,6 +60,7 @@ pub const UpstreamTransport = struct {
     ) !usize {
         const max_retries = self.ctx.max_upstream_retries;
         var attempt: u8 = 0;
+        var downstream_started = false;
 
         // https://codeberg.org/ziglang/zig/issues/30165
         // TODO: Remove this once the bug is fixed.
@@ -63,19 +68,24 @@ pub const UpstreamTransport = struct {
         // requests and fail on first write/read despite being selected from pool.
         // We precompute a replayable outbound body so retries are deterministic.
         while (attempt < max_retries) : (attempt += 1) {
-            const result = self.proxyOnce(
+            const result = self.proxyOnceStreaming(
+                zctx,
                 req,
-                res,
+                path,
+                query,
+                allocator,
                 method,
                 module_id,
                 module,
                 prepared_body,
                 has_body,
+                &downstream_started,
             );
             if (result) |bytes| {
                 return bytes;
             } else |err| {
                 const err_name = @errorName(err);
+                if (downstream_started) return err;
                 if (!shouldRetryErrorName(err_name) or attempt + 1 >= max_retries) return err;
 
                 self.ctx.bus.warn(UpstreamRetry{
@@ -89,21 +99,25 @@ pub const UpstreamTransport = struct {
         return error.NotEnoughData;
     }
 
-    fn proxyOnce(
+    fn proxyOnceStreaming(
         self: *const UpstreamTransport,
-        req: *httpz.Request,
-        res: *httpz.Response,
+        zctx: *const http.Context,
+        req: *const http.Request,
+        path: []const u8,
+        query: ?[]const u8,
+        allocator: std.mem.Allocator,
         method: std.http.Method,
         module_id: ModuleId,
         module: ProxyModule,
         prepared_body: []const u8,
         has_body: bool,
+        downstream_started: *bool,
     ) !usize {
         const upstream_uri_str = try self.ctx.upstreams.buildUpstreamUri(
-            req.arena,
+            allocator,
             module_id,
-            req.url.path,
-            req.url.query,
+            path,
+            query orelse "",
         );
         const uri = try std.Uri.parse(upstream_uri_str);
 
@@ -165,47 +179,278 @@ pub const UpstreamTransport = struct {
         }
 
         var upstream_res = try upstream_req.receiveHead(&.{});
-        res.status = @intFromEnum(upstream_res.head.status);
+        var chunk_buffer: [32 * 1024]u8 = undefined;
+        var raw_writer: RawSocketWriter = .init(&zctx.socket, zctx.runtime, &chunk_buffer);
+        var chunked_writer: ChunkedSocketWriter = .init(&zctx.socket, zctx.runtime, &chunk_buffer);
 
-        var header_it = upstream_res.head.iterateHeaders();
-        while (header_it.next()) |header| {
-            if (shouldSkipResponseHeader(header.name)) continue;
-            const header_name = try req.arena.dupe(u8, header.name);
-            const header_value = try req.arena.dupe(u8, header.value);
-            res.header(header_name, header_value);
-        }
-
-        const max_size = self.ctx.upstreams.getMaxResponseBody(module_id);
-        var read_buffer: [8192]u8 = undefined;
-        const upstream_body_reader = upstream_res.reader(&read_buffer);
-        const response_writer = res.writer();
-
-        var response_filter = module.createResponseFilter(response_writer, req.arena) catch |err| blk: {
+        var response_filter = module.createResponseFilter(&chunked_writer.interface, allocator) catch |err| blk: {
             self.ctx.bus.warn(ModuleError{ .err = @errorName(err) });
             break :blk null;
         };
         defer if (response_filter) |*filter| filter.destroy();
 
-        const target_writer = if (response_filter) |*filter| filter.writer() else response_writer;
+        const has_filter = response_filter != null;
+        const use_chunked = has_filter or upstream_res.head.content_length == null;
+
+        zctx.response.status = statusFromStd(upstream_res.head.status);
+        zctx.response.mime = if (upstream_res.head.content_type) |content_type|
+            http.Mime.from_content_type(content_type)
+        else
+            .BIN;
+
+        downstream_started.* = true;
+        try writeResponseHead(
+            &zctx.socket,
+            zctx.runtime,
+            allocator,
+            upstream_res.head,
+            use_chunked,
+        );
+
+        const max_size = self.ctx.upstreams.getMaxResponseBody(module_id);
+        var read_buffer: [32 * 1024]u8 = undefined;
+        const upstream_body_reader = upstream_res.reader(&read_buffer);
+        const inner_writer: *std.Io.Writer = if (use_chunked) &chunked_writer.interface else &raw_writer.interface;
+
+        const target_writer = if (response_filter) |*filter| filter.writer() else inner_writer;
         const total_bytes = try streamReaderToWriter(
             upstream_body_reader,
             target_writer,
             max_size,
         );
+        try target_writer.flush();
 
         var bytes_forwarded: usize = total_bytes;
         if (response_filter) |*filter| {
             bytes_forwarded = filter.finish() catch total_bytes;
         }
-        try response_writer.flush();
+        try inner_writer.flush();
+        if (use_chunked) try chunked_writer.finish();
         return bytes_forwarded;
     }
 };
+
+const RawSocketWriter = struct {
+    socket: *const zzz.secsock.SecureSocket,
+    runtime: *zzz.tardy.Runtime,
+    interface: std.Io.Writer,
+    err: ?anyerror = null,
+
+    fn init(
+        socket: *const zzz.secsock.SecureSocket,
+        runtime: *zzz.tardy.Runtime,
+        buffer: []u8,
+    ) RawSocketWriter {
+        return .{
+            .socket = socket,
+            .runtime = runtime,
+            .interface = .{
+                .vtable = &.{
+                    .drain = drain,
+                    .sendFile = sendFile,
+                },
+                .buffer = buffer,
+            },
+        };
+    }
+
+    fn writeBytes(self: *RawSocketWriter, payload: []const u8) !usize {
+        if (payload.len == 0) return 0;
+        const sent = try self.socket.send_all(self.runtime, payload);
+        if (sent != payload.len) return error.Closed;
+        return payload.len;
+    }
+
+    fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const w: *RawSocketWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        const buffered = io_w.buffered();
+
+        if (buffered.len != 0) {
+            const n = w.writeBytes(buffered) catch |err| {
+                w.err = err;
+                return error.WriteFailed;
+            };
+            return io_w.consume(n);
+        }
+
+        for (data[0 .. data.len - 1]) |buf| {
+            if (buf.len == 0) continue;
+            const n = w.writeBytes(buf) catch |err| {
+                w.err = err;
+                return error.WriteFailed;
+            };
+            return io_w.consume(n);
+        }
+
+        const pattern = data[data.len - 1];
+        if (pattern.len == 0 or splat == 0) return 0;
+        const n = w.writeBytes(pattern) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+        return io_w.consume(n);
+    }
+
+    fn sendFile(
+        io_w: *std.Io.Writer,
+        file_reader: *std.fs.File.Reader,
+        limit: std.Io.Limit,
+    ) std.Io.Writer.FileError!usize {
+        _ = io_w;
+        _ = file_reader;
+        _ = limit;
+        return error.Unimplemented;
+    }
+};
+
+const ChunkedSocketWriter = struct {
+    socket: *const zzz.secsock.SecureSocket,
+    runtime: *zzz.tardy.Runtime,
+    interface: std.Io.Writer,
+    err: ?anyerror = null,
+    closed: bool = false,
+
+    fn init(
+        socket: *const zzz.secsock.SecureSocket,
+        runtime: *zzz.tardy.Runtime,
+        buffer: []u8,
+    ) ChunkedSocketWriter {
+        return .{
+            .socket = socket,
+            .runtime = runtime,
+            .interface = .{
+                .vtable = &.{
+                    .drain = drain,
+                    .sendFile = sendFile,
+                },
+                .buffer = buffer,
+            },
+        };
+    }
+
+    fn finish(self: *ChunkedSocketWriter) !void {
+        if (self.closed) return;
+        const sent = try self.socket.send_all(self.runtime, "0\r\n\r\n");
+        if (sent != "0\r\n\r\n".len) return error.Closed;
+        self.closed = true;
+    }
+
+    fn writeChunk(self: *ChunkedSocketWriter, payload: []const u8) !usize {
+        if (payload.len == 0) return 0;
+        var len_buf: [32]u8 = undefined;
+        const len_slice = try std.fmt.bufPrint(&len_buf, "{x}\r\n", .{payload.len});
+
+        const h = try self.socket.send_all(self.runtime, len_slice);
+        if (h != len_slice.len) return error.Closed;
+        const b = try self.socket.send_all(self.runtime, payload);
+        if (b != payload.len) return error.Closed;
+        const t = try self.socket.send_all(self.runtime, "\r\n");
+        if (t != 2) return error.Closed;
+        return payload.len;
+    }
+
+    fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const w: *ChunkedSocketWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        const buffered = io_w.buffered();
+
+        if (buffered.len != 0) {
+            const n = w.writeChunk(buffered) catch |err| {
+                w.err = err;
+                return error.WriteFailed;
+            };
+            return io_w.consume(n);
+        }
+
+        for (data[0 .. data.len - 1]) |buf| {
+            if (buf.len == 0) continue;
+            const n = w.writeChunk(buf) catch |err| {
+                w.err = err;
+                return error.WriteFailed;
+            };
+            return io_w.consume(n);
+        }
+
+        const pattern = data[data.len - 1];
+        if (pattern.len == 0 or splat == 0) return 0;
+        const n = w.writeChunk(pattern) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+        return io_w.consume(n);
+    }
+
+    fn sendFile(
+        io_w: *std.Io.Writer,
+        file_reader: *std.fs.File.Reader,
+        limit: std.Io.Limit,
+    ) std.Io.Writer.FileError!usize {
+        _ = io_w;
+        _ = file_reader;
+        _ = limit;
+        return error.Unimplemented;
+    }
+};
+
+fn statusFromStd(status: std.http.Status) http.Status {
+    return std.meta.intToEnum(http.Status, @intFromEnum(status)) catch .@"Internal Server Error";
+}
+
+fn writeResponseHead(
+    socket: *const zzz.secsock.SecureSocket,
+    runtime: *zzz.tardy.Runtime,
+    allocator: std.mem.Allocator,
+    head: std.http.Client.Response.Head,
+    chunked: bool,
+) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+
+    const status = statusFromStd(head.status);
+    try writer.print("HTTP/1.1 {d} {s}\r\n", .{
+        @intFromEnum(status),
+        @tagName(status),
+    });
+    try writer.writeAll("Server: edge\r\n");
+    try writer.writeAll("Connection: keep-alive\r\n");
+
+    if (head.content_type) |content_type| {
+        try writer.print("Content-Type: {s}\r\n", .{content_type});
+    } else {
+        try writer.writeAll("Content-Type: application/octet-stream\r\n");
+    }
+
+    var it = head.iterateHeaders();
+    while (it.next()) |header| {
+        if (shouldSkipResponseHeader(header.name)) continue;
+        try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+
+    if (chunked) {
+        try writer.writeAll("Transfer-Encoding: chunked\r\n");
+    } else if (head.content_length) |len| {
+        try writer.print("Content-Length: {d}\r\n", .{len});
+    } else {
+        try writer.writeAll("Transfer-Encoding: chunked\r\n");
+    }
+    try writer.writeAll("\r\n");
+
+    const bytes = out.written();
+    const sent = try socket.send_all(runtime, bytes);
+    if (sent != bytes.len) return error.Closed;
+}
 
 pub fn shouldRetryErrorName(err_name: []const u8) bool {
     return std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
         std.mem.eql(u8, err_name, "BrokenPipe") or
         std.mem.eql(u8, err_name, "ConnectionTimedOut") or
+        std.mem.eql(u8, err_name, "UnexpectedConnectFailure") or
+        std.mem.eql(u8, err_name, "ConnectionRefused") or
+        std.mem.eql(u8, err_name, "NetworkUnreachable") or
+        std.mem.eql(u8, err_name, "HostUnreachable") or
+        std.mem.eql(u8, err_name, "TemporaryNameServerFailure") or
+        std.mem.eql(u8, err_name, "TryAgain") or
+        std.mem.eql(u8, err_name, "SystemResources") or
         std.mem.eql(u8, err_name, "UnexpectedReadFailure") or
         std.mem.eql(u8, err_name, "HttpConnectionClosing") or
         std.mem.eql(u8, err_name, "UnexpectedWriteFailure");
@@ -220,20 +465,23 @@ pub fn shouldSkipRequestHeader(name: []const u8) bool {
 
 pub fn shouldSkipResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "content-type") or
+        std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "server");
 }
 
-pub fn buildHeadersArray(req: *httpz.Request, buffer: []std.http.Header) ![]std.http.Header {
+pub fn buildHeadersArray(req: *const http.Request, buffer: []std.http.Header) ![]std.http.Header {
     var count: usize = 0;
     var it = req.headers.iterator();
 
     while (it.next()) |header| {
-        if (shouldSkipRequestHeader(header.key)) continue;
+        if (shouldSkipRequestHeader(header.key_ptr.*)) continue;
         if (count >= buffer.len) return error.TooManyHeaders;
 
         buffer[count] = .{
-            .name = header.key,
-            .value = header.value,
+            .name = header.key_ptr.*,
+            .value = header.value_ptr.*,
         };
         count += 1;
     }
@@ -266,6 +514,7 @@ fn getUnderlyingWriteError(upstream_req: *std.http.Client.Request) ?[]const u8 {
 test "shouldRetryErrorName covers transient connection failures" {
     try std.testing.expect(shouldRetryErrorName("BrokenPipe"));
     try std.testing.expect(shouldRetryErrorName("ConnectionResetByPeer"));
+    try std.testing.expect(shouldRetryErrorName("UnexpectedConnectFailure"));
     try std.testing.expect(!shouldRetryErrorName("AccessDenied"));
 }
 
@@ -273,6 +522,7 @@ test "header skip helpers" {
     try std.testing.expect(shouldSkipRequestHeader("Host"));
     try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
     try std.testing.expect(!shouldSkipRequestHeader("Content-Type"));
+    try std.testing.expect(shouldSkipResponseHeader("Content-Type"));
     try std.testing.expect(!shouldSkipResponseHeader("X-Test"));
 }
 

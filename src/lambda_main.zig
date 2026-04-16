@@ -376,7 +376,7 @@ pub fn main() !void {
 
                 // Stop proxy server gracefully
                 shutdown_requested.store(true, .release);
-                proxy.server.stop();
+                proxy.stop();
                 break;
             },
         }

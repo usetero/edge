@@ -253,7 +253,7 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
 
 fn stopWorkerThread(ctx: StopWorkerContext) void {
     setShutdownState(ctx.bus, ctx.shutdown_state, .stopping, "server.stop.begin");
-    ctx.server.server.stop();
+    ctx.server.stop();
 }
 
 fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {

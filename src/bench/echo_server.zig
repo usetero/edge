@@ -1,5 +1,10 @@
 const std = @import("std");
-const httpz = @import("httpz");
+const zzz = @import("zzz");
+const http = zzz.HTTP;
+const tardy = zzz.tardy;
+const Tardy = tardy.Tardy(.auto);
+const Runtime = tardy.Runtime;
+const Socket = tardy.Socket;
 
 const EndpointStats = struct {
     requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -207,6 +212,16 @@ const ServerContext = struct {
 
 var server_context: ?*ServerContext = null;
 
+fn splitUri(uri: []const u8) struct { path: []const u8, query: ?[]const u8 } {
+    if (std.mem.indexOfScalar(u8, uri, '?')) |idx| {
+        return .{
+            .path = uri[0..idx],
+            .query = if (idx + 1 < uri.len) uri[idx + 1 ..] else "",
+        };
+    }
+    return .{ .path = uri, .query = null };
+}
+
 fn shutdown(_: c_int) callconv(.c) void {
     if (server_context) |ctx| {
         std.debug.print("\nReceived {d} requests, {d} bytes.\n", .{
@@ -217,30 +232,34 @@ fn shutdown(_: c_int) callconv(.c) void {
     std.process.exit(0);
 }
 
-fn handleRequest(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response) !void {
-    const path = req.url.path;
+fn handleRequest(zctx: *const http.Context, ctx: *ServerContext) !http.Respond {
+    const req = zctx.request;
+    const uri = req.uri orelse "/";
+    const parts = splitUri(uri);
+    const path = parts.path;
 
     // Handle stats endpoint
     if (std.mem.eql(u8, path, "/stats")) {
-        res.status = 200;
-        res.content_type = .JSON;
+        zctx.response.status = .OK;
+        zctx.response.mime = .JSON;
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         try ctx.writeStats(buf.writer(ctx.allocator));
-        res.body = try buf.toOwnedSlice(ctx.allocator);
-        return;
+        zctx.response.body = try buf.toOwnedSlice(ctx.allocator);
+        return .standard;
     }
 
     // Handle reset endpoint
     if (std.mem.eql(u8, path, "/reset")) {
         ctx.reset();
-        res.status = 200;
-        res.body = "{\"status\":\"reset\"}";
-        return;
+        zctx.response.status = .OK;
+        zctx.response.mime = .JSON;
+        zctx.response.body = "{\"status\":\"reset\"}";
+        return .standard;
     }
 
     // Handle capture start endpoint: /capture/start?name=<name>
     if (std.mem.eql(u8, path, "/capture/start")) {
-        const query = req.url.query;
+        const query = parts.query orelse "";
         // Parse name from query string (format: name=value or just value)
         const capture_name = if (query.len == 0)
             "capture"
@@ -250,48 +269,52 @@ fn handleRequest(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response)
             query;
 
         ctx.startCapture(capture_name) catch |err| {
-            res.status = 500;
-            res.body = @errorName(err);
-            return;
+            zctx.response.status = .@"Internal Server Error";
+            zctx.response.mime = .TEXT;
+            zctx.response.body = @errorName(err);
+            return .standard;
         };
-        res.status = 200;
-        res.content_type = .JSON;
-        res.body = "{\"status\":\"capture_started\"}";
-        return;
+        zctx.response.status = .OK;
+        zctx.response.mime = .JSON;
+        zctx.response.body = "{\"status\":\"capture_started\"}";
+        return .standard;
     }
 
     // Handle capture stop endpoint
     if (std.mem.eql(u8, path, "/capture/stop")) {
         const count = ctx.stopCapture() catch |err| {
-            res.status = 500;
-            res.body = @errorName(err);
-            return;
+            zctx.response.status = .@"Internal Server Error";
+            zctx.response.mime = .TEXT;
+            zctx.response.body = @errorName(err);
+            return .standard;
         };
-        res.status = 200;
-        res.content_type = .JSON;
+        zctx.response.status = .OK;
+        zctx.response.mime = .JSON;
 
         var buf: [128]u8 = undefined;
         const json = std.fmt.bufPrint(&buf, "{{\"status\":\"capture_stopped\",\"count\":{d}}}", .{count}) catch {
-            res.body = "{\"status\":\"capture_stopped\"}";
-            return;
+            zctx.response.body = "{\"status\":\"capture_stopped\"}";
+            return .standard;
         };
-        res.body = try ctx.allocator.dupe(u8, json);
-        return;
+        zctx.response.body = try ctx.allocator.dupe(u8, json);
+        return .standard;
     }
 
     // Record stats for all other requests
-    const body = req.body();
+    const body = req.body;
     const body_len = if (body) |b| b.len else 0;
     ctx.recordRequest(path, body_len);
 
     // Capture payload if capture mode is enabled
     if (body) |b| {
-        const content_type = req.header("content-type") orelse "application/octet-stream";
+        const content_type = req.headers.get("content-type") orelse "application/octet-stream";
         ctx.capturePayload(path, content_type, b);
     }
 
-    res.status = 202;
-    res.body = "{}";
+    zctx.response.status = .Accepted;
+    zctx.response.mime = .JSON;
+    zctx.response.body = "{}";
+    return .standard;
 }
 
 pub fn main() !void {
@@ -321,24 +344,35 @@ pub fn main() !void {
         .flags = 0,
     }, null);
 
-    var server = try httpz.Server(*ServerContext).init(allocator, .{
-        .address = .{ .ip = .{
+    var t: Tardy = try .init(allocator, .{
+        .threading = .auto,
+    });
+    defer t.deinit();
+
+    var router: http.Router = try .init(allocator, &.{
+        http.Route.init("/stats").get(&ctx, handleRequest).layer(),
+        http.Route.init("/reset").post(&ctx, handleRequest).layer(),
+        http.Route.init("/capture/start").get(&ctx, handleRequest).post(&ctx, handleRequest).layer(),
+        http.Route.init("/capture/stop").get(&ctx, handleRequest).post(&ctx, handleRequest).layer(),
+        http.Route.init("/").post(&ctx, handleRequest).layer(),
+        http.Route.init("/%r").post(&ctx, handleRequest).layer(),
+    }, .{});
+    defer router.deinit(allocator);
+
+    var socket: Socket = try .init(.{
+        .tcp = .{
             .host = "127.0.0.1",
             .port = port,
-        } },
-        .request = .{
-            .max_body_size = 5194304,
         },
-    }, &ctx);
+    });
+    defer socket.close_blocking();
+    try socket.bind();
+    try socket.listen(4096);
 
-    var router = try server.router(.{});
-    router.get("/stats", handleRequest, .{});
-    router.post("/reset", handleRequest, .{});
-    router.get("/capture/start", handleRequest, .{});
-    router.post("/capture/start", handleRequest, .{});
-    router.get("/capture/stop", handleRequest, .{});
-    router.post("/capture/stop", handleRequest, .{});
-    router.post("/*", handleRequest, .{});
+    const EntryParams = struct {
+        router: *const http.Router,
+        socket: Socket,
+    };
 
     std.debug.print("Echo server listening on http://127.0.0.1:{d}\n", .{port});
     std.debug.print("Output directory: {s}\n", .{output_dir});
@@ -350,5 +384,17 @@ pub fn main() !void {
     std.debug.print("  GET  /capture/stop - Stop capturing and save to file\n", .{});
     std.debug.print("Press Ctrl+C to stop\n", .{});
 
-    try server.listen();
+    try t.entry(
+        EntryParams{ .router = &router, .socket = socket },
+        struct {
+            fn entry(rt: *Runtime, p: EntryParams) !void {
+                var server: http.Server = .init(.{
+                    .stack_size = 1024 * 1024 * 4,
+                    .socket_buffer_bytes = 1024 * 2,
+                    .request_bytes_max = 5194304,
+                });
+                try server.serve(rt, p.router, .{ .normal = p.socket });
+            }
+        }.entry,
+    );
 }
