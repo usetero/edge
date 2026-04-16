@@ -322,8 +322,10 @@ pub fn main() !void {
     }, null);
 
     var server = try httpz.Server(*ServerContext).init(allocator, .{
-        .port = port,
-        .address = "127.0.0.1",
+        .address = .{ .ip = .{
+            .host = "127.0.0.1",
+            .port = port,
+        } },
         .request = .{
             .max_body_size = 5194304,
         },
