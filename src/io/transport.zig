@@ -119,6 +119,7 @@ pub const UpstreamTransport = struct {
             path,
             query orelse "",
         );
+        defer allocator.free(upstream_uri_str);
         const uri = try std.Uri.parse(upstream_uri_str);
 
         self.ctx.bus.debug(UpstreamRequest{
@@ -444,12 +445,6 @@ pub fn shouldRetryErrorName(err_name: []const u8) bool {
     return std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
         std.mem.eql(u8, err_name, "BrokenPipe") or
         std.mem.eql(u8, err_name, "ConnectionTimedOut") or
-        std.mem.eql(u8, err_name, "UnexpectedConnectFailure") or
-        std.mem.eql(u8, err_name, "ConnectionRefused") or
-        std.mem.eql(u8, err_name, "NetworkUnreachable") or
-        std.mem.eql(u8, err_name, "HostUnreachable") or
-        std.mem.eql(u8, err_name, "TemporaryNameServerFailure") or
-        std.mem.eql(u8, err_name, "TryAgain") or
         std.mem.eql(u8, err_name, "SystemResources") or
         std.mem.eql(u8, err_name, "UnexpectedReadFailure") or
         std.mem.eql(u8, err_name, "HttpConnectionClosing") or
@@ -514,7 +509,7 @@ fn getUnderlyingWriteError(upstream_req: *std.http.Client.Request) ?[]const u8 {
 test "shouldRetryErrorName covers transient connection failures" {
     try std.testing.expect(shouldRetryErrorName("BrokenPipe"));
     try std.testing.expect(shouldRetryErrorName("ConnectionResetByPeer"));
-    try std.testing.expect(shouldRetryErrorName("UnexpectedConnectFailure"));
+    try std.testing.expect(!shouldRetryErrorName("UnexpectedConnectFailure"));
     try std.testing.expect(!shouldRetryErrorName("AccessDenied"));
 }
 

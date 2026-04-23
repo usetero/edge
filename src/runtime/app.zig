@@ -37,18 +37,9 @@ const HealthModule = health_mod.HealthModule;
 const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
 
 pub const std_options: std.Options = .{
-    .log_level = .debug,
+    .log_level = .warn,
     .logFn = StdLogAdapter.logFn,
 };
-
-const ShutdownSignalReceived = struct { signal: []const u8, count: u32 };
-const ShutdownForceExit = struct { signal: []const u8, count: u32 };
-const ShutdownStateTransition = struct {
-    from: []const u8,
-    to: []const u8,
-    reason: []const u8,
-};
-const SignalHandlingNotSupported = struct { platform: []const u8 };
 
 const ServerStarting = struct {};
 const ConfigurationLoaded = struct { path: []const u8 };
@@ -66,10 +57,13 @@ const ServiceConfigured = struct {
     instance_id: []const u8,
     version: []const u8,
 };
-
+const ConfigValidationError = struct { field: []const u8, value: []const u8 };
 const ServerReady = struct {};
-const ShutdownHint = struct { pid: c_int };
 const ServerStopped = struct {};
+const ShutdownSignalReceived = struct { signal: []const u8, count: u32 };
+const ShutdownForceExit = struct { signal: []const u8, count: u32 };
+const ShutdownHint = struct { pid: c_int };
+const SignalHandlingNotSupported = struct { platform: []const u8 };
 
 const RouteBundle = enum {
     datadog_logs,
@@ -78,32 +72,16 @@ const RouteBundle = enum {
     prometheus,
 };
 
-const edge_bundles = [_]RouteBundle{
-    .datadog_logs,
-    .datadog_metrics,
-    .otlp,
-    .prometheus,
-};
-const datadog_bundles = [_]RouteBundle{
-    .datadog_logs,
-    .datadog_metrics,
-};
+const edge_bundles = [_]RouteBundle{ .datadog_logs, .datadog_metrics, .otlp, .prometheus };
+const datadog_bundles = [_]RouteBundle{ .datadog_logs, .datadog_metrics };
 const otlp_bundles = [_]RouteBundle{.otlp};
 const prometheus_bundles = [_]RouteBundle{.prometheus};
-
-const ShutdownState = enum(u8) {
-    running,
-    shutdown_requested,
-    stopping,
-    stopped,
-    force_exit,
-};
 
 const SignalWaiterContext = struct {
     bus: *EventBus,
     server: *ProxyServer,
     signal_count: *std.atomic.Value(u32),
-    shutdown_state: *std.atomic.Value(u8),
+    stopping: *std.atomic.Value(bool),
     shutdown_waiter: *std.atomic.Value(bool),
     signal_set: std.posix.sigset_t,
 };
@@ -111,12 +89,6 @@ const SignalWaiterContext = struct {
 const SignalWaiterHandle = struct {
     thread: std.Thread,
     previous_mask: std.posix.sigset_t,
-};
-
-const StopWorkerContext = struct {
-    bus: *EventBus,
-    server: *ProxyServer,
-    shutdown_state: *std.atomic.Value(u8),
 };
 
 fn supportedStagesFor(distribution: mode.Distribution) []const policy.proto.policy.PolicyStage {
@@ -160,35 +132,15 @@ fn distributionLabel(distribution: mode.Distribution) runtime_metrics_mod.Distri
     };
 }
 
-fn stateName(state: ShutdownState) []const u8 {
-    return @tagName(state);
-}
-
-fn loadShutdownState(state: *const std.atomic.Value(u8)) ShutdownState {
-    return @enumFromInt(state.load(.acquire));
-}
-
-fn setShutdownState(
-    bus: *EventBus,
-    state: *std.atomic.Value(u8),
-    next: ShutdownState,
-    reason: []const u8,
-) void {
-    const previous: ShutdownState = @enumFromInt(state.swap(@intFromEnum(next), .acq_rel));
-    if (previous == next) return;
-
-    bus.info(ShutdownStateTransition{
-        .from = stateName(previous),
-        .to = stateName(next),
-        .reason = reason,
-    });
+fn containsTemplatePlaceholder(value: []const u8) bool {
+    return std.mem.indexOf(u8, value, "${") != null;
 }
 
 fn installSignalWaiter(
     bus: *EventBus,
     server: *ProxyServer,
     signal_count: *std.atomic.Value(u32),
-    shutdown_state: *std.atomic.Value(u8),
+    stopping: *std.atomic.Value(bool),
     shutdown_waiter: *std.atomic.Value(bool),
 ) anyerror!SignalWaiterHandle {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
@@ -200,6 +152,7 @@ fn installSignalWaiter(
     std.posix.sigaddset(&signal_set, std.posix.SIG.INT);
     std.posix.sigaddset(&signal_set, std.posix.SIG.TERM);
     std.posix.sigaddset(&signal_set, std.posix.SIG.USR1);
+
     var previous_mask = std.posix.sigemptyset();
     std.posix.sigprocmask(std.posix.SIG.BLOCK, &signal_set, &previous_mask);
 
@@ -207,10 +160,11 @@ fn installSignalWaiter(
         .bus = bus,
         .server = server,
         .signal_count = signal_count,
-        .shutdown_state = shutdown_state,
+        .stopping = stopping,
         .shutdown_waiter = shutdown_waiter,
         .signal_set = signal_set,
     }});
+
     return .{
         .thread = waiter,
         .previous_mask = previous_mask,
@@ -227,63 +181,16 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
         const count = ctx.signal_count.fetchAdd(1, .acq_rel) + 1;
 
         if (count == 1) {
-            ctx.bus.info(ShutdownSignalReceived{
-                .signal = signal_name,
-                .count = count,
-            });
-            setShutdownState(ctx.bus, ctx.shutdown_state, .shutdown_requested, "signal.received");
-
-            const stop_worker = std.Thread.spawn(.{}, stopWorkerThread, .{StopWorkerContext{
-                .bus = ctx.bus,
-                .server = ctx.server,
-                .shutdown_state = ctx.shutdown_state,
-            }}) catch continue;
-            stop_worker.detach();
+            ctx.bus.info(ShutdownSignalReceived{ .signal = signal_name, .count = count });
+            if (!ctx.stopping.swap(true, .acq_rel)) {
+                ctx.server.stop();
+            }
             continue;
         }
 
-        ctx.bus.info(ShutdownForceExit{
-            .signal = signal_name,
-            .count = count,
-        });
-        setShutdownState(ctx.bus, ctx.shutdown_state, .force_exit, "second.signal");
+        ctx.bus.info(ShutdownForceExit{ .signal = signal_name, .count = count });
         std.posix.exit(1);
     }
-}
-
-fn stopWorkerThread(ctx: StopWorkerContext) void {
-    setShutdownState(ctx.bus, ctx.shutdown_state, .stopping, "server.stop.begin");
-    ctx.server.stop();
-}
-
-fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
-    _ = sig;
-    _ = ctx_ptr;
-
-    std.debug.print("\n=== SEGFAULT ===\n", .{});
-
-    const fault_addr: usize = switch (builtin.os.tag) {
-        .macos => @intFromPtr(info.addr),
-        .linux => @intFromPtr(info.fields.sigfault.addr),
-        else => 0,
-    };
-    std.debug.print("Faulting address: 0x{x}\n", .{fault_addr});
-    std.debug.print("Signal code: {d}\n", .{info.code});
-    std.debug.print("Stack trace:\n", .{});
-    std.debug.dumpCurrentStackTrace(@returnAddress());
-
-    std.posix.abort();
-}
-
-fn installSegfaultHandler() void {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
-
-    const segv_act = std.posix.Sigaction{
-        .handler = .{ .sigaction = handleSegfault },
-        .mask = std.posix.sigemptyset(),
-        .flags = std.posix.SA.SIGINFO,
-    };
-    std.posix.sigaction(std.posix.SIG.SEGV, &segv_act, null);
 }
 
 pub fn run(distribution: mode.Distribution) !void {
@@ -342,12 +249,8 @@ pub fn run(distribution: mode.Distribution) !void {
 
     bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
     bus.info(UpstreamConfigured{ .url = config.upstream_url });
-    if (config.logs_url) |logs_url| {
-        bus.info(LogsUpstreamConfigured{ .url = logs_url });
-    }
-    if (config.metrics_url) |metrics_url| {
-        bus.info(MetricsUpstreamConfigured{ .url = metrics_url });
-    }
+    if (config.logs_url) |logs_url| bus.info(LogsUpstreamConfigured{ .url = logs_url });
+    if (config.metrics_url) |metrics_url| bus.info(MetricsUpstreamConfigured{ .url = metrics_url });
     bus.info(ServiceConfigured{
         .namespace = service_metadata.namespace,
         .name = service_metadata.name,
@@ -357,6 +260,32 @@ pub fn run(distribution: mode.Distribution) !void {
 
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
+
+    if (containsTemplatePlaceholder(config.upstream_url)) {
+        bus.err(ConfigValidationError{
+            .field = "upstream_url",
+            .value = config.upstream_url,
+        });
+        return error.InvalidConfig;
+    }
+    if (config.logs_url) |logs_url| {
+        if (containsTemplatePlaceholder(logs_url)) {
+            bus.err(ConfigValidationError{
+                .field = "logs_url",
+                .value = logs_url,
+            });
+            return error.InvalidConfig;
+        }
+    }
+    if (config.metrics_url) |metrics_url| {
+        if (containsTemplatePlaceholder(metrics_url)) {
+            bus.err(ConfigValidationError{
+                .field = "metrics_url",
+                .value = metrics_url,
+            });
+            return error.InvalidConfig;
+        }
+    }
 
     var runtime_metrics = try RuntimeMetrics.init(allocator, distributionLabel(distribution));
     defer runtime_metrics.deinit();
@@ -372,22 +301,17 @@ pub fn run(distribution: mode.Distribution) !void {
     defer loader.deinit();
 
     try loader.startAsync();
-    installSegfaultHandler();
-
-    const server_allocator = allocator;
 
     var datadog_config = DatadogConfig{
         .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
-
     var otlp_config = OtlpConfig{
         .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
-
     var prometheus_config = PrometheusConfig{
         .registry = &registry,
         .bus = bus,
@@ -421,50 +345,42 @@ pub fn run(distribution: mode.Distribution) !void {
 
     for (bundlesFor(distribution)) |bundle| {
         switch (bundle) {
-            .datadog_logs => {
-                try module_registrations.append(allocator, .{
-                    .module = .{ .datadog = &datadog_logs_module },
-                    .route_kind = .datadog_logs,
-                    .routes = &datadog_mod.logs_routes,
-                    .upstream_url = logs_upstream,
-                    .max_request_body = config.max_body_size,
-                    .max_response_body = config.max_body_size,
-                    .module_data = @ptrCast(&datadog_config),
-                });
-            },
-            .datadog_metrics => {
-                try module_registrations.append(allocator, .{
-                    .module = .{ .datadog = &datadog_metrics_module },
-                    .route_kind = .datadog_metrics,
-                    .routes = &datadog_mod.metrics_routes,
-                    .upstream_url = metrics_upstream,
-                    .max_request_body = config.max_body_size,
-                    .max_response_body = config.max_body_size,
-                    .module_data = @ptrCast(&datadog_config),
-                });
-            },
-            .otlp => {
-                try module_registrations.append(allocator, .{
-                    .module = .{ .otlp = &otlp_module },
-                    .route_kind = .otlp_logs,
-                    .routes = &otlp_mod.routes,
-                    .upstream_url = config.upstream_url,
-                    .max_request_body = config.max_body_size,
-                    .max_response_body = config.max_body_size,
-                    .module_data = @ptrCast(&otlp_config),
-                });
-            },
-            .prometheus => {
-                try module_registrations.append(allocator, .{
-                    .module = .{ .prometheus = &prometheus_module },
-                    .route_kind = .prometheus_metrics,
-                    .routes = &prometheus_mod.default_routes,
-                    .upstream_url = metrics_upstream,
-                    .max_request_body = 1024,
-                    .max_response_body = config.max_body_size,
-                    .module_data = @ptrCast(&prometheus_config),
-                });
-            },
+            .datadog_logs => try module_registrations.append(allocator, .{
+                .module = .{ .datadog = &datadog_logs_module },
+                .route_kind = .datadog_logs,
+                .routes = &datadog_mod.logs_routes,
+                .upstream_url = logs_upstream,
+                .max_request_body = config.max_body_size,
+                .max_response_body = config.max_body_size,
+                .module_data = @ptrCast(&datadog_config),
+            }),
+            .datadog_metrics => try module_registrations.append(allocator, .{
+                .module = .{ .datadog = &datadog_metrics_module },
+                .route_kind = .datadog_metrics,
+                .routes = &datadog_mod.metrics_routes,
+                .upstream_url = metrics_upstream,
+                .max_request_body = config.max_body_size,
+                .max_response_body = config.max_body_size,
+                .module_data = @ptrCast(&datadog_config),
+            }),
+            .otlp => try module_registrations.append(allocator, .{
+                .module = .{ .otlp = &otlp_module },
+                .route_kind = .otlp_logs,
+                .routes = &otlp_mod.routes,
+                .upstream_url = config.upstream_url,
+                .max_request_body = config.max_body_size,
+                .max_response_body = config.max_body_size,
+                .module_data = @ptrCast(&otlp_config),
+            }),
+            .prometheus => try module_registrations.append(allocator, .{
+                .module = .{ .prometheus = &prometheus_module },
+                .route_kind = .prometheus_metrics,
+                .routes = &prometheus_mod.default_routes,
+                .upstream_url = metrics_upstream,
+                .max_request_body = 1024,
+                .max_response_body = config.max_body_size,
+                .module_data = @ptrCast(&prometheus_config),
+            }),
         }
     }
 
@@ -479,7 +395,7 @@ pub fn run(distribution: mode.Distribution) !void {
     });
 
     var proxy = try ProxyServer.init(
-        server_allocator,
+        allocator,
         bus,
         &runtime_metrics,
         config.listen_address,
@@ -491,10 +407,11 @@ pub fn run(distribution: mode.Distribution) !void {
     defer proxy.deinit();
 
     var signal_count = std.atomic.Value(u32).init(0);
-    var shutdown_state = std.atomic.Value(u8).init(@intFromEnum(ShutdownState.running));
+    var stopping = std.atomic.Value(bool).init(false);
     var shutdown_waiter = std.atomic.Value(bool).init(false);
+
     var signal_waiter: ?SignalWaiterHandle = null;
-    if (installSignalWaiter(bus, &proxy, &signal_count, &shutdown_state, &shutdown_waiter)) |waiter| {
+    if (installSignalWaiter(bus, &proxy, &signal_count, &stopping, &shutdown_waiter)) |waiter| {
         signal_waiter = waiter;
     } else |err| switch (err) {
         error.UnsupportedPlatform => {},
@@ -506,10 +423,13 @@ pub fn run(distribution: mode.Distribution) !void {
         bus.info(ShutdownHint{ .pid = std.c.getpid() });
     }
 
-    const listen_thread = try proxy.listenInNewThread();
-    listen_thread.join();
-
-    setShutdownState(bus, &shutdown_state, .stopped, "listen.returned");
+    proxy.listen() catch |err| {
+        if (stopping.load(.acquire)) {
+            // Listener was interrupted by shutdown and may report socket-close errors.
+        } else {
+            return err;
+        }
+    };
 
     if (signal_waiter) |waiter| {
         shutdown_waiter.store(true, .release);
