@@ -126,7 +126,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install zig vectorscan zstd
+          brew install vectorscan zstd
+
+      - name: Setup Zig
+        uses: https://codeberg.org/mlugg/setup-zig@v2@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
 
       - name: Fetch Zig dependencies
         run: |
