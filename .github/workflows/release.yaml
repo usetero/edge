@@ -78,9 +78,12 @@ jobs:
           sudo apt-get install -y libzstd-dev zlib1g-dev
 
       - uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
+        with:
+          cache: "true"
 
       - name: Verify Hermit Zig
         run: |
+          ./bin/hermit --level=info exec ./bin/zig -- version
           which zig
           zig version
 
@@ -131,9 +134,12 @@ jobs:
           brew install vectorscan zstd
 
       - uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
+        with:
+          cache: "true"
 
       - name: Verify Hermit Zig
         run: |
+          ./bin/hermit --level=info exec ./bin/zig -- version
           which zig
           zig version
 
