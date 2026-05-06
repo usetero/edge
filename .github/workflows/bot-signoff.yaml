@@ -76,6 +76,11 @@ jobs:
 
       - uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
 
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
       - run: git config --global url.https://x-access-token:${{ steps.generate-token.outputs.token }}@github.com/.insteadOf https://github.com/
 
       - run: gh extension install basecamp/gh-signoff
@@ -91,6 +96,13 @@ jobs:
             task ci:setup
           fi
 
-      - run: task signoff
+      - name: Run signoff checks
+        run: |
+          set -euxo pipefail
+          zig version
+          task do
+          git diff --exit-code
+          task build:safe
+          timeout 60s gh signoff -f
         env:
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
