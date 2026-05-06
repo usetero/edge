@@ -21,6 +21,7 @@ pub fn classifyRoute(path: []const u8, method: HttpMethod) RouteKind {
 }
 
 pub fn prefilter(route_kind: RouteKind, method: HttpMethod, content_type: ?[]const u8) PrefilterDecision {
+    if (route_kind == .health) return .policy_path;
     if (method != .POST) return .fast_path;
 
     return switch (route_kind) {
@@ -47,6 +48,7 @@ test "classifyRoute matches core routes" {
 test "prefilter policy path for ingest routes" {
     try std.testing.expectEqual(PrefilterDecision.policy_path, prefilter(.datadog_logs, .POST, "application/json"));
     try std.testing.expectEqual(PrefilterDecision.policy_path, prefilter(.otlp_metrics, .POST, "application/x-protobuf"));
+    try std.testing.expectEqual(PrefilterDecision.policy_path, prefilter(.health, .GET, null));
     try std.testing.expectEqual(PrefilterDecision.fast_path, prefilter(.prometheus_metrics, .GET, null));
     try std.testing.expectEqual(PrefilterDecision.fast_path, prefilter(.passthrough, .GET, null));
 }
