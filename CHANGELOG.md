@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.18.1](https://github.com/usetero/edge/compare/v1.18.0...v1.18.1) (2026-05-06)
+
+
+### Bug Fixes
+
+* health was not fast returning ([#174](https://github.com/usetero/edge/issues/174)) ([163e8e4](https://github.com/usetero/edge/commit/163e8e4b37faecae85ef2eda4f5894a2de7639bb))
+
 ## [1.18.0](https://github.com/usetero/edge/compare/v1.17.0...v1.18.0) (2026-04-06)
 
 
