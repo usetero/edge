@@ -77,7 +77,7 @@ jobs:
       - uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        uses: https://codeberg.org/mlugg/setup-zig@v2@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
 
