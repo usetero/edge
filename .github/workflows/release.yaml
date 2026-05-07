@@ -83,7 +83,9 @@ jobs:
 
       - name: Verify Hermit Zig
         run: |
-          ./bin/hermit --level=info exec ./bin/zig -- version
+          for i in 1 2 3 4 5; do
+            ./bin/hermit --level=info exec ./bin/zig -- version
+          done
           which zig
           zig version
 
@@ -139,7 +141,9 @@ jobs:
 
       - name: Verify Hermit Zig
         run: |
-          ./bin/hermit --level=info exec ./bin/zig -- version
+          for i in 1 2 3 4 5; do
+            ./bin/hermit --level=info exec ./bin/zig -- version
+          done
           which zig
           zig version
 

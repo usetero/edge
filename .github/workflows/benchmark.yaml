@@ -59,7 +59,9 @@ jobs:
         run: |
           oha --version
           bench/bin/otelcol-contrib --version
-          ./bin/hermit --level=info exec ./bin/zig -- version
+          for i in 1 2 3 4 5; do
+            ./bin/hermit --level=info exec ./bin/zig -- version
+          done
           vector --version
           jq --version
           zig version
