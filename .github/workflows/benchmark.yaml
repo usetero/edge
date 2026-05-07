@@ -38,6 +38,11 @@ jobs:
         with:
           cache: "true"
 
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
       - name: Install oha
         run: |
           # oha is not available in Hermit, install from GitHub releases
@@ -59,9 +64,6 @@ jobs:
         run: |
           oha --version
           bench/bin/otelcol-contrib --version
-          for i in 1 2 3 4 5; do
-            ./bin/hermit --level=info exec ./bin/zig -- version
-          done
           vector --version
           jq --version
           zig version

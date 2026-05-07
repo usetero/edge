@@ -77,15 +77,13 @@ jobs:
           fi
           sudo apt-get install -y libzstd-dev zlib1g-dev
 
-      - uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
         with:
-          cache: "true"
+          version: 0.15.2
 
-      - name: Verify Hermit Zig
+      - name: Verify Zig
         run: |
-          for i in 1 2 3 4 5; do
-            ./bin/hermit --level=info exec ./bin/zig -- version
-          done
           which zig
           zig version
 
@@ -135,15 +133,13 @@ jobs:
         run: |
           brew install vectorscan zstd
 
-      - uses: cashapp/activate-hermit@12a728b03ad41eace0f9abaf98a035e7e8ea2318 # v1.1.4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
         with:
-          cache: "true"
+          version: 0.15.2
 
-      - name: Verify Hermit Zig
+      - name: Verify Zig
         run: |
-          for i in 1 2 3 4 5; do
-            ./bin/hermit --level=info exec ./bin/zig -- version
-          done
           which zig
           zig version
 
