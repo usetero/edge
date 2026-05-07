@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.18.3](https://github.com/usetero/edge/compare/v1.18.2...v1.18.3) (2026-05-07)
+
+
+### Bug Fixes
+
+* more docker build fixes ([#181](https://github.com/usetero/edge/issues/181)) ([6f41e23](https://github.com/usetero/edge/commit/6f41e23f3a06ea7e56d9081f1b62d3ac223eaeaa))
+
 ## [1.18.2](https://github.com/usetero/edge/compare/v1.18.1...v1.18.2) (2026-05-06)
 
 
