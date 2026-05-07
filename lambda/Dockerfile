@@ -8,9 +8,15 @@
 #   docker buildx build --platform linux/arm64 -f lambda/Dockerfile -o type=local,dest=.layers .
 #   docker buildx build --platform linux/amd64 -f lambda/Dockerfile -o type=local,dest=.layers .
 
-FROM alpine:edge@sha256:9a341ff2287c54b86425cbee0141114d811ae69d88a36019087be6d896cef241
+FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
 
-# Install Zig and build dependencies
+# Install build dependencies from build.zig:
+# - zlib-dev/zlib-static: linkSystemLibrary("z")
+# - zstd-dev/zstd-static: linkSystemLibrary("zstd")
+# - musl-dev: link_libc
+# - g++: link_libcpp (C++ for jsoncons)
+# - linux-headers: linux/futex.h for libcxx
+# - zig: compiler
 RUN apk add --no-cache \
     zig="0.15.2-r0" \
     zlib-dev \
@@ -23,8 +29,9 @@ RUN apk add --no-cache \
     pkgconf \
     vectorscan-dev \
     vectorscan-static
-
+RUN zig version
 WORKDIR /build
+
 
 # Copy source code
 COPY build.zig build.zig.zon ./

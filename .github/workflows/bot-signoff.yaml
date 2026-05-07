@@ -78,10 +78,14 @@ jobs:
         with:
           cache: "true"
 
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
       - name: Verify Hermit tools
         run: |
           set -euxo pipefail
-          ./bin/hermit --level=info exec ./bin/zig -- version
           ./bin/hermit --level=info exec ./bin/task -- --version
           which zig
           zig version
