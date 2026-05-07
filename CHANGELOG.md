@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.18.2](https://github.com/usetero/edge/compare/v1.18.1...v1.18.2) (2026-05-06)
+
+
+### Bug Fixes
+
+* pin zig version for darwin ([#176](https://github.com/usetero/edge/issues/176)) ([6702e9a](https://github.com/usetero/edge/commit/6702e9a319ce2222101557c2c5e53c13f463ed35))
+* rely on hermit version ([#180](https://github.com/usetero/edge/issues/180)) ([cb4bbd0](https://github.com/usetero/edge/commit/cb4bbd0a0fac36bd8691cfd2b51dd9d26e790de8))
+* signoff hanging with better debugs ([#178](https://github.com/usetero/edge/issues/178)) ([9895c59](https://github.com/usetero/edge/commit/9895c59916bc34e681d0dd684dd9e8a5ba565fec))
+* use proper ref for gha ([#179](https://github.com/usetero/edge/issues/179)) ([24838ea](https://github.com/usetero/edge/commit/24838ea98921188640a603bc01693d376a885c5e))
+
 ## [1.18.1](https://github.com/usetero/edge/compare/v1.18.0...v1.18.1) (2026-05-06)
 
 
