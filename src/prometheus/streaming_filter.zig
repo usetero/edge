@@ -23,7 +23,6 @@ const PolicyEngine = policy.PolicyEngine;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const PrometheusFieldContext = field_accessor.PrometheusFieldContext;
-const prometheusFieldAccessor = field_accessor.prometheusFieldAccessor;
 
 /// Result of processing a chunk of data
 pub const ProcessResult = struct {
@@ -507,14 +506,13 @@ pub const PolicyStreamingFilter = struct {
         // Create engine on demand (same pattern as other modules)
         const engine = PolicyEngine.init(self.bus, self.registry);
 
-        // Evaluate against policy engine
-        // Note: We pass null for mutator since Prometheus metrics are immutable in exposition format
+        // Evaluate against policy engine. Prometheus metrics are immutable in
+        // exposition format, so no scratch allocator is needed.
         const result = engine.evaluate(
             .metric,
             @ptrCast(&ctx),
-            prometheusFieldAccessor,
-            null, // No mutation support for Prometheus
             &self.policy_id_buf,
+            .{},
         );
 
         // Continue means keep, drop means filter out
@@ -1645,7 +1643,7 @@ test "PolicyStreamingFilter - no policies passes all metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     var line_buf: [1024]u8 = undefined;
@@ -1683,7 +1681,7 @@ test "PolicyStreamingFilter - DROP policy filters metrics by name" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for metrics starting with "debug_"
@@ -1746,7 +1744,7 @@ test "PolicyStreamingFilter - DROP policy to keep only non-matching metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for metrics NOT starting with "important_"
@@ -1805,7 +1803,7 @@ test "PolicyStreamingFilter - filter by label value" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for metrics with env="debug" label
@@ -1863,7 +1861,7 @@ test "PolicyStreamingFilter - metadata excluded when all samples dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for all debug_ metrics
@@ -1925,7 +1923,7 @@ test "PolicyStreamingFilter - metadata included when some samples kept" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for instance="debug" label
@@ -1984,7 +1982,7 @@ test "PolicyStreamingFilter - histogram buckets filtered together" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for debug histograms
@@ -2054,7 +2052,7 @@ test "PolicyStreamingFilter - comments preserved regardless of policy" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for all metrics starting with "metric_"
@@ -2113,7 +2111,7 @@ test "PolicyStreamingFilter - empty lines preserved regardless of policy" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
@@ -2165,7 +2163,7 @@ test "PolicyStreamingFilter - stats track dropped vs kept correctly" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
@@ -2226,7 +2224,7 @@ test "PolicyStreamingFilter - max_input_bytes truncation with policy" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
@@ -2316,7 +2314,7 @@ test "FilteringWriter - basic streaming with reader.stream() pattern" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
@@ -2398,7 +2396,7 @@ test "FilteringWriter - simulated chunked streaming" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // No policies - passthrough
@@ -2456,7 +2454,7 @@ test "FilteringWriter - max_input_bytes limit" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = field_accessor.metric_accessor });
     defer registry.deinit();
 
     // No policies - test just the byte limit

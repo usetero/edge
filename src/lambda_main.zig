@@ -198,8 +198,8 @@ pub fn main() !void {
         },
     };
 
-    // Create policy registry
-    var registry = policy.Registry.init(allocator, bus);
+    // Lambda distribution serves Datadog telemetry only.
+    var registry = policy.Registry.init(allocator, bus, datadog_mod.accessor_templates);
     defer registry.deinit();
 
     var runtime_metrics = try RuntimeMetrics.init(allocator, .lambda);

@@ -18,6 +18,12 @@ const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = proto.policy.MetricField;
 const AttributePath = proto.policy.AttributePath;
 
+/// MetricAccessor template for unit tests in this module. Prometheus metrics
+/// are immutable in exposition format - only `value` is wired.
+pub const metric_accessor: policy.MetricAccessor = .{
+    .value = metricValue,
+};
+
 /// Context for Prometheus field access.
 /// Contains the parsed line and a labels cache for efficient lookups.
 pub const PrometheusFieldContext = struct {
@@ -87,10 +93,7 @@ pub const PrometheusFieldContext = struct {
 
 /// Field accessor function for Prometheus metrics.
 /// Maps MetricFieldRef to values from the Prometheus context.
-///
-/// This follows the same signature as other metric field accessors
-/// (otlpMetricFieldAccessor, datadogMetricFieldAccessor).
-pub fn prometheusFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
+pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
     const prom_ctx: *const PrometheusFieldContext = @ptrCast(@alignCast(ctx));
 
     return switch (field) {
@@ -199,7 +202,7 @@ test "prometheusFieldAccessor - metric name" {
 
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
 
-    const name = prometheusFieldAccessor(&ctx, .{ .metric_field = .METRIC_FIELD_NAME });
+    const name = metricValue(&ctx, .{ .metric_field = .METRIC_FIELD_NAME });
     try std.testing.expect(name != null);
     try std.testing.expectEqualStrings("http_requests_total", name.?);
 }
@@ -211,16 +214,16 @@ test "prometheusFieldAccessor - label lookup" {
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
 
     // Lookup existing label
-    const method = prometheusFieldAccessor(&ctx, .{ .datapoint_attribute = testAttrPath("method") });
+    const method = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("method") });
     try std.testing.expect(method != null);
     try std.testing.expectEqualStrings("get", method.?);
 
-    const status = prometheusFieldAccessor(&ctx, .{ .datapoint_attribute = testAttrPath("status") });
+    const status = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("status") });
     try std.testing.expect(status != null);
     try std.testing.expectEqualStrings("200", status.?);
 
     // Lookup non-existing label
-    const missing = prometheusFieldAccessor(&ctx, .{ .datapoint_attribute = testAttrPath("host") });
+    const missing = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("host") });
     try std.testing.expect(missing == null);
 }
 
@@ -230,7 +233,7 @@ test "prometheusFieldAccessor - value access" {
 
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
 
-    const value = prometheusFieldAccessor(&ctx, .{ .datapoint_attribute = testAttrPath("value") });
+    const value = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("value") });
     try std.testing.expect(value != null);
     try std.testing.expectEqualStrings("0.75", value.?);
 }
@@ -241,7 +244,7 @@ test "prometheusFieldAccessor - timestamp access" {
 
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
 
-    const ts = prometheusFieldAccessor(&ctx, .{ .datapoint_attribute = testAttrPath("timestamp") });
+    const ts = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("timestamp") });
     try std.testing.expect(ts != null);
     try std.testing.expectEqualStrings("1234567890", ts.?);
 }
@@ -253,15 +256,15 @@ test "prometheusFieldAccessor - unsupported fields return null" {
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
 
     // Description null when not provided
-    const desc = prometheusFieldAccessor(&ctx, .{ .metric_field = .METRIC_FIELD_DESCRIPTION });
+    const desc = metricValue(&ctx, .{ .metric_field = .METRIC_FIELD_DESCRIPTION });
     try std.testing.expect(desc == null);
 
     // Resource attributes not available
-    const res = prometheusFieldAccessor(&ctx, .{ .resource_attribute = testAttrPath("service.name") });
+    const res = metricValue(&ctx, .{ .resource_attribute = testAttrPath("service.name") });
     try std.testing.expect(res == null);
 
     // Metric type null when not provided
-    const mt = prometheusFieldAccessor(&ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
+    const mt = metricValue(&ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
     try std.testing.expect(mt == null);
 }
 
@@ -272,7 +275,7 @@ test "prometheusFieldAccessor - description from metadata" {
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
     ctx.description = "Total number of HTTP requests";
 
-    const desc = prometheusFieldAccessor(&ctx, .{ .metric_field = .METRIC_FIELD_DESCRIPTION });
+    const desc = metricValue(&ctx, .{ .metric_field = .METRIC_FIELD_DESCRIPTION });
     try std.testing.expect(desc != null);
     try std.testing.expectEqualStrings("Total number of HTTP requests", desc.?);
 }
@@ -284,7 +287,7 @@ test "prometheusFieldAccessor - metric type from metadata" {
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
     ctx.metric_type = "counter";
 
-    const mt = prometheusFieldAccessor(&ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
+    const mt = metricValue(&ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
     try std.testing.expect(mt != null);
     try std.testing.expectEqualStrings("counter", mt.?);
 }
@@ -301,7 +304,7 @@ test "prometheusFieldAccessor - labels cache" {
     var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
     ctx.labels_cache = labels_cache;
 
-    const labels = prometheusFieldAccessor(&ctx, .{ .datapoint_attribute = testAttrPath("labels") });
+    const labels = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("labels") });
     try std.testing.expect(labels != null);
     try std.testing.expectEqualStrings("a=1,b=2,c=3", labels.?);
 }

@@ -9,6 +9,7 @@ const config_types = edge.config_types;
 const zonfig = edge.zonfig;
 const server_mod = edge.server;
 const runtime_metrics_mod = @import("runtime_metrics.zig");
+const MultiRegistryLoader = @import("multi_registry_loader.zig").MultiRegistryLoader;
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough_module;
 const datadog_mod = edge.datadog_module;
@@ -355,17 +356,28 @@ pub fn run(distribution: mode.Distribution) !void {
         .version = service_metadata.version,
     });
 
-    var registry = policy.Registry.init(allocator, bus);
-    defer registry.deinit();
+    // Per-module registries. Each module's accessor is wired statically to
+    // its own context type, so the engine never has to dispatch between
+    // consumer types at evaluation time. Policy state is kept in sync
+    // across registries via MultiRegistryLoader's fan-out callback.
+    var otlp_registry = policy.Registry.init(allocator, bus, otlp_mod.accessor_templates);
+    defer otlp_registry.deinit();
+
+    var datadog_registry = policy.Registry.init(allocator, bus, datadog_mod.accessor_templates);
+    defer datadog_registry.deinit();
+
+    var prometheus_registry = policy.Registry.init(allocator, bus, prometheus_mod.accessor_templates);
+    defer prometheus_registry.deinit();
 
     var runtime_metrics = try RuntimeMetrics.init(allocator, distributionLabel(distribution));
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
-    var loader = try policy.Loader.init(
+    const registries = [_]*policy.Registry{ &otlp_registry, &datadog_registry, &prometheus_registry };
+    var loader = try MultiRegistryLoader.init(
         allocator,
         bus,
-        &registry,
+        &registries,
         config.policy_providers,
         service_metadata,
     );
@@ -377,19 +389,19 @@ pub fn run(distribution: mode.Distribution) !void {
     const server_allocator = allocator;
 
     var datadog_config = DatadogConfig{
-        .registry = &registry,
+        .registry = &datadog_registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
 
     var otlp_config = OtlpConfig{
-        .registry = &registry,
+        .registry = &otlp_registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
 
     var prometheus_config = PrometheusConfig{
-        .registry = &registry,
+        .registry = &prometheus_registry,
         .bus = bus,
         .metrics = &runtime_metrics,
         .max_input_bytes_per_scrape = config.prometheus.max_input_bytes_per_scrape,

@@ -16,11 +16,13 @@ const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;
 const FilterDecision = policy.FilterDecision;
 const FieldRef = policy.FieldRef;
+const LogAccessor = policy.LogAccessor;
 const LogField = proto.policy.LogField;
 const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
+
 
 const LogsProcessingFailed = struct { err: []const u8, contentType: []const u8 };
 
@@ -160,8 +162,8 @@ fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     }
 }
 
-/// Context for OTLP log field accessor and mutator - provides access to log record plus parent context
-const OtlpLogContext = struct {
+/// Context for OTLP log field accessor and mutator - provides access to log record plus parent context.
+pub const OtlpLogContext = struct {
     log_record: *LogRecord,
     resource_logs: *ResourceLogs,
     scope_logs: *ScopeLogs,
@@ -175,9 +177,9 @@ const removeAttributeByPath = otlp_attr.removeAttributeByPath;
 const setAttributeByPath = otlp_attr.setAttributeByPath;
 const setAttribute = otlp_attr.setAttribute;
 
-/// Field accessor for OTLP log format
-/// Maps FieldRef to the appropriate field in the OTLP log structure
-fn otlpFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
+/// Field accessor primitive for the OTLP log context.
+/// Returns the string view of the requested field, or null if missing/non-string.
+pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     const log_ctx: *const OtlpLogContext = @ptrCast(@alignCast(ctx));
 
     return switch (field) {
@@ -197,175 +199,120 @@ fn otlpFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     };
 }
 
-const MutateOp = policy.MutateOp;
-const FieldMutator = policy.FieldMutator;
-
-/// Field mutator for OTLP log format
-/// Supports remove, set, and rename operations on log fields and attributes
-fn otlpFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
+/// Upsert a field. The engine pre-validates existence/upsert semantics, so
+/// `set` is always called at a point where the write is expected to succeed.
+pub fn logSet(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
     const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
-
-    switch (op) {
-        .remove => |field| {
-            switch (field) {
-                .log_field => |lf| switch (lf) {
-                    .LOG_FIELD_BODY => {
-                        if (log_ctx.log_record.body != null) {
-                            log_ctx.log_record.body = null;
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_SEVERITY_TEXT => {
-                        if (log_ctx.log_record.severity_text.len > 0) {
-                            log_ctx.log_record.severity_text = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_TRACE_ID => {
-                        if (log_ctx.log_record.trace_id.len > 0) {
-                            log_ctx.log_record.trace_id = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_SPAN_ID => {
-                        if (log_ctx.log_record.span_id.len > 0) {
-                            log_ctx.log_record.span_id = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_EVENT_NAME => {
-                        if (log_ctx.log_record.event_name.len > 0) {
-                            log_ctx.log_record.event_name = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_RESOURCE_SCHEMA_URL => {
-                        if (log_ctx.resource_logs.schema_url.len > 0) {
-                            log_ctx.resource_logs.schema_url = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_SCOPE_SCHEMA_URL => {
-                        if (log_ctx.scope_logs.schema_url.len > 0) {
-                            log_ctx.scope_logs.schema_url = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    else => return false,
-                },
-                .log_attribute => |attr_path| {
-                    return removeAttributeByPath(&log_ctx.log_record.attributes, attr_path.path.items);
-                },
-                .resource_attribute => |attr_path| {
-                    if (log_ctx.resource_logs.resource) |*res| {
-                        return removeAttributeByPath(&res.attributes, attr_path.path.items);
-                    }
-                    return false;
-                },
-                .scope_attribute => |attr_path| {
-                    if (log_ctx.scope_logs.scope) |*scope| {
-                        return removeAttributeByPath(&scope.attributes, attr_path.path.items);
-                    }
-                    return false;
-                },
+    switch (field) {
+        .log_field => |lf| switch (lf) {
+            .LOG_FIELD_BODY => log_ctx.log_record.body = .{ .value = .{ .string_value = value } },
+            .LOG_FIELD_SEVERITY_TEXT => log_ctx.log_record.severity_text = value,
+            .LOG_FIELD_TRACE_ID => log_ctx.log_record.trace_id = value,
+            .LOG_FIELD_SPAN_ID => log_ctx.log_record.span_id = value,
+            .LOG_FIELD_EVENT_NAME => log_ctx.log_record.event_name = value,
+            .LOG_FIELD_RESOURCE_SCHEMA_URL => log_ctx.resource_logs.schema_url = value,
+            .LOG_FIELD_SCOPE_SCHEMA_URL => log_ctx.scope_logs.schema_url = value,
+            else => {},
+        },
+        .log_attribute => |attr_path| {
+            _ = setAttributeByPath(log_ctx.allocator, &log_ctx.log_record.attributes, attr_path.path.items, value);
+        },
+        .resource_attribute => |attr_path| {
+            if (log_ctx.resource_logs.resource) |*res| {
+                _ = setAttributeByPath(log_ctx.allocator, &res.attributes, attr_path.path.items, value);
             }
         },
-        .set => |s| {
-            switch (s.field) {
-                .log_field => |lf| switch (lf) {
-                    .LOG_FIELD_BODY => {
-                        log_ctx.log_record.body = .{ .value = .{ .string_value = s.value } };
-                        return true;
-                    },
-                    .LOG_FIELD_SEVERITY_TEXT => {
-                        log_ctx.log_record.severity_text = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_TRACE_ID => {
-                        log_ctx.log_record.trace_id = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_SPAN_ID => {
-                        log_ctx.log_record.span_id = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_EVENT_NAME => {
-                        log_ctx.log_record.event_name = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_RESOURCE_SCHEMA_URL => {
-                        log_ctx.resource_logs.schema_url = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_SCOPE_SCHEMA_URL => {
-                        log_ctx.scope_logs.schema_url = s.value;
-                        return true;
-                    },
-                    else => return false,
-                },
-                .log_attribute => |attr_path| {
-                    return setAttributeByPath(log_ctx.allocator, &log_ctx.log_record.attributes, attr_path.path.items, s.value);
-                },
-                .resource_attribute => |attr_path| {
-                    if (log_ctx.resource_logs.resource) |*res| {
-                        return setAttributeByPath(log_ctx.allocator, &res.attributes, attr_path.path.items, s.value);
-                    }
-                    return false;
-                },
-                .scope_attribute => |attr_path| {
-                    if (log_ctx.scope_logs.scope) |*scope| {
-                        return setAttributeByPath(log_ctx.allocator, &scope.attributes, attr_path.path.items, s.value);
-                    }
-                    return false;
-                },
+        .scope_attribute => |attr_path| {
+            if (log_ctx.scope_logs.scope) |*scope| {
+                _ = setAttributeByPath(log_ctx.allocator, &scope.attributes, attr_path.path.items, value);
             }
-        },
-        .rename => |r| {
-            const attrs: *std.ArrayListUnmanaged(KeyValue) = switch (r.from) {
-                .log_attribute => &log_ctx.log_record.attributes,
-                .resource_attribute => if (log_ctx.resource_logs.resource) |*res| &res.attributes else return false,
-                .scope_attribute => if (log_ctx.scope_logs.scope) |*scope| &scope.attributes else return false,
-                .log_field => return false, // renaming fixed fields not supported
-            };
-            const key = switch (r.from) {
-                .log_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
-                .resource_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
-                .scope_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
-                .log_field => return false,
-            };
-
-            // Find source attribute
-            const src_idx = findAttrIndex(attrs.items, key) orelse return false;
-            const src_val = attrs.items[src_idx].value;
-
-            // If not upsert and target exists, don't overwrite
-            if (!r.upsert) {
-                if (findAttrIndex(attrs.items, r.to) != null) return true; // blocked but not an error
-            }
-
-            // Remove source
-            _ = attrs.orderedRemove(src_idx);
-
-            // Remove existing target if upsert
-            if (r.upsert) {
-                if (findAttrIndex(attrs.items, r.to)) |ti| {
-                    _ = attrs.orderedRemove(ti);
-                }
-            }
-
-            // Add renamed entry
-            attrs.append(log_ctx.allocator, .{ .key = r.to, .value = src_val }) catch return false;
-            return true;
         },
     }
 }
+
+/// Remove a field. Returns true iff it existed.
+pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
+    return switch (field) {
+        .log_field => |lf| switch (lf) {
+            .LOG_FIELD_BODY => blk: {
+                if (log_ctx.log_record.body == null) break :blk false;
+                log_ctx.log_record.body = null;
+                break :blk true;
+            },
+            .LOG_FIELD_SEVERITY_TEXT => blk: {
+                if (log_ctx.log_record.severity_text.len == 0) break :blk false;
+                log_ctx.log_record.severity_text = &.{};
+                break :blk true;
+            },
+            .LOG_FIELD_TRACE_ID => blk: {
+                if (log_ctx.log_record.trace_id.len == 0) break :blk false;
+                log_ctx.log_record.trace_id = &.{};
+                break :blk true;
+            },
+            .LOG_FIELD_SPAN_ID => blk: {
+                if (log_ctx.log_record.span_id.len == 0) break :blk false;
+                log_ctx.log_record.span_id = &.{};
+                break :blk true;
+            },
+            .LOG_FIELD_EVENT_NAME => blk: {
+                if (log_ctx.log_record.event_name.len == 0) break :blk false;
+                log_ctx.log_record.event_name = &.{};
+                break :blk true;
+            },
+            .LOG_FIELD_RESOURCE_SCHEMA_URL => blk: {
+                if (log_ctx.resource_logs.schema_url.len == 0) break :blk false;
+                log_ctx.resource_logs.schema_url = &.{};
+                break :blk true;
+            },
+            .LOG_FIELD_SCOPE_SCHEMA_URL => blk: {
+                if (log_ctx.scope_logs.schema_url.len == 0) break :blk false;
+                log_ctx.scope_logs.schema_url = &.{};
+                break :blk true;
+            },
+            else => false,
+        },
+        .log_attribute => |attr_path| removeAttributeByPath(&log_ctx.log_record.attributes, attr_path.path.items),
+        .resource_attribute => |attr_path| if (log_ctx.resource_logs.resource) |*res|
+            removeAttributeByPath(&res.attributes, attr_path.path.items)
+        else
+            false,
+        .scope_attribute => |attr_path| if (log_ctx.scope_logs.scope) |*scope|
+            removeAttributeByPath(&scope.attributes, attr_path.path.items)
+        else
+            false,
+    };
+}
+
+/// Rename: move source attribute value to `to` key. The engine pre-checks
+/// source existence and upsert/conflict semantics, so this just performs the
+/// move.
+pub fn logMove(ctx: *anyopaque, from: FieldRef, to: []const u8) void {
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
+    const attrs: *std.ArrayListUnmanaged(KeyValue) = switch (from) {
+        .log_attribute => &log_ctx.log_record.attributes,
+        .resource_attribute => if (log_ctx.resource_logs.resource) |*res| &res.attributes else return,
+        .scope_attribute => if (log_ctx.scope_logs.scope) |*scope| &scope.attributes else return,
+        .log_field => return,
+    };
+    const key = switch (from) {
+        .log_attribute, .resource_attribute, .scope_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return,
+        .log_field => return,
+    };
+    const src_idx = findAttrIndex(attrs.items, key) orelse return;
+    const src_val = attrs.items[src_idx].value;
+    _ = attrs.orderedRemove(src_idx);
+    attrs.append(log_ctx.allocator, .{ .key = to, .value = src_val }) catch return;
+}
+
+/// LogAccessor template used when the OTLP logs module is the only consumer
+/// (e.g., in unit tests).
+pub const log_accessor: LogAccessor = .{
+    .value = logValue,
+    .set = logSet,
+    .delete = logDelete,
+    .move = logMove,
+};
 
 /// Result of filtering logs in-place
 const FilterCounts = struct {
@@ -411,7 +358,7 @@ fn filterLogsInPlace(
                     .allocator = allocator,
                 };
 
-                const result = engine.evaluate(.log, &ctx, otlpFieldAccessor, otlpFieldMutator, &policy_id_buf);
+                const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{ .scratch = allocator });
 
                 if (result.was_transformed) {
                     was_transformed = true;
@@ -622,7 +569,7 @@ test "processLogs - parses and re-serializes JSON" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const logs =
@@ -658,7 +605,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -691,7 +638,7 @@ test "processLogs - unknown content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const data = "some unknown data";
@@ -724,7 +671,7 @@ test "processLogs - malformed protobuf returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const malformed = "not valid protobuf";
@@ -757,7 +704,7 @@ test "processLogs - no policies keeps all logs" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const logs =
@@ -796,7 +743,7 @@ test "processLogs - DROP policy filters logs by severity" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for DEBUG logs
@@ -852,7 +799,7 @@ test "processLogs - DROP policy filters logs by body content" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for logs containing "secret"
@@ -906,7 +853,7 @@ test "processLogs - DROP policy filters logs by resource attribute" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for logs from "test-service"
@@ -964,7 +911,7 @@ test "processLogs - all logs dropped returns empty structure" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches all logs (using body pattern that matches both messages)
@@ -1052,7 +999,7 @@ test "processLogs - protobuf parses and re-serializes" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create valid protobuf data
@@ -1089,7 +1036,7 @@ test "processLogs - protobuf DROP policy filters logs" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for logs containing "secret"
@@ -1157,7 +1104,7 @@ test "processLogs - protobuf all logs dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches all logs
@@ -1218,7 +1165,7 @@ test "processLogs - JSON transform removes severity_text field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes the severity_text field
@@ -1286,7 +1233,7 @@ test "processLogs - JSON transform removes log attribute" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes a log attribute
@@ -1357,7 +1304,7 @@ test "processLogs - DROP policy filters logs by event_name" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for logs with event_name matching "user.login"
@@ -1413,7 +1360,7 @@ test "processLogs - JSON transform removes event_name field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes event_name
@@ -1653,7 +1600,7 @@ test "processLogs - DROP policy with nested attribute path" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy matching nested path http.method = GET
@@ -1719,7 +1666,7 @@ test "processLogs - policy with misaligned nested path returns no match" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy matching nested path http.request.method

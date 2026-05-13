@@ -16,6 +16,15 @@ const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 const RuntimeMetrics = runtime_metrics.RuntimeMetrics;
 
+/// AccessorTemplates wiring all OTLP consumers (logs + metrics + traces).
+/// Each binary/test creates its own registry with this template to keep
+/// accessor dispatch concrete and avoid runtime tag-based switching.
+pub const accessor_templates: policy.AccessorTemplates = .{
+    .log = otlp_logs.log_accessor,
+    .metric = otlp_metrics.metric_accessor,
+    .trace = otlp_traces.trace_accessor,
+};
+
 // =============================================================================
 // Observability Events
 // =============================================================================
@@ -208,7 +217,7 @@ test "OtlpModule processes POST requests" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
@@ -257,7 +266,7 @@ test "OtlpModule ignores GET requests" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
@@ -305,7 +314,7 @@ test "OtlpModule: DROP policy filters matching logs" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create a DROP policy for logs with severity "DEBUG"
@@ -377,7 +386,7 @@ test "OtlpModule: all logs dropped returns empty response" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create a DROP policy that matches all logs
@@ -442,7 +451,7 @@ test "OtlpModule: filter logs by resource attribute" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create a DROP policy for logs from "test-service"
@@ -518,7 +527,7 @@ test "OtlpModule: DROP policy filters matching metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create a DROP policy for metrics with "debug" in the name
@@ -589,7 +598,7 @@ test "OtlpModule: all metrics dropped returns empty response" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
@@ -654,7 +663,7 @@ test "OtlpModule: filter metrics by metric type" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     const MetricType = proto.policy.MetricType;
@@ -726,7 +735,7 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create a DROP policy that won't match any metrics

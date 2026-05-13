@@ -22,6 +22,13 @@ const FilteringWriter = prometheus.FilteringWriter;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const RuntimeMetrics = runtime_metrics.RuntimeMetrics;
+const field_accessor = @import("../prometheus/field_accessor.zig");
+
+/// AccessorTemplates for the Prometheus metric consumer. Prometheus
+/// exposition format is immutable, so only `.value` is wired.
+pub const accessor_templates: policy.AccessorTemplates = .{
+    .metric = field_accessor.metric_accessor,
+};
 
 // =============================================================================
 // Observability Events
@@ -286,7 +293,7 @@ test "PrometheusModule - createResponseFilter with config" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(testing.allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(testing.allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     var config = PrometheusConfig{
@@ -340,7 +347,7 @@ test "PrometheusModule - response filter with DROP policy" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(testing.allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(testing.allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create DROP policy for debug metrics

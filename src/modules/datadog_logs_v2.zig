@@ -104,14 +104,11 @@ fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     }
 }
 
-/// Context for field accessor and mutator - holds the DatadogLog struct
-const FieldAccessorContext = struct {
+/// Context for field accessor and mutator - holds the DatadogLog struct.
+pub const FieldAccessorContext = struct {
     log: *DatadogLog,
     allocator: std.mem.Allocator,
 };
-
-const MutateOp = policy.MutateOp;
-const FieldMutator = policy.FieldMutator;
 
 /// Get the first path segment for flat attribute lookup
 /// Datadog uses flat attributes, so only the first path segment is used
@@ -139,11 +136,11 @@ fn lookupLogAttribute(log: *DatadogLog, allocator: std.mem.Allocator, path: []co
     return log.findExtraString(allocator, path);
 }
 
-/// Field accessor for Datadog JSON log format
+/// Field accessor for Datadog JSON log format.
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
 /// All attribute types (log, resource, scope) search the same flat namespace since
 /// Datadog has no OTLP-style resource/scope hierarchy.
-fn datadogFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
+pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     const field_ctx: *const FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const log = field_ctx.log;
 
@@ -259,73 +256,64 @@ fn setLogAttribute(log: *DatadogLog, path: []const []const u8, value: []const u8
     return false;
 }
 
-/// Field mutator for Datadog JSON log format
-/// Supports remove and set operations on known fields.
-/// All attribute types (log, resource, scope) use the same mutation logic.
-fn datadogFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
+/// Field setter for Datadog JSON log format. The engine handles upsert
+/// semantics before calling set; for fields that don't exist in the Datadog
+/// schema, the engine's snapshot-compile-time validation rejects the policy
+/// (so set is never called).
+pub fn logSet(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
     const field_ctx: *FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const log = field_ctx.log;
-
-    switch (op) {
-        .remove => |field| {
-            switch (field) {
-                .log_field => |lf| switch (lf) {
-                    .LOG_FIELD_BODY => {
-                        if (log.message != null) {
-                            log.message = null;
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_SEVERITY_TEXT => {
-                        var removed = false;
-                        if (log.status != null) {
-                            log.status = null;
-                            removed = true;
-                        }
-                        if (log.level != null) {
-                            log.level = null;
-                            removed = true;
-                        }
-                        return removed;
-                    },
-                    else => return false,
-                },
-                .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
-                    return removeLogAttribute(log, attr_path.path.items);
-                },
-            }
+    switch (field) {
+        .log_field => |lf| switch (lf) {
+            .LOG_FIELD_BODY => log.message = value,
+            .LOG_FIELD_SEVERITY_TEXT => log.status = value,
+            else => {},
         },
-        .set => |s| {
-            switch (s.field) {
-                .log_field => |lf| switch (lf) {
-                    .LOG_FIELD_BODY => {
-                        if (s.upsert or log.message != null) {
-                            log.message = s.value;
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_SEVERITY_TEXT => {
-                        if (s.upsert or log.status != null) {
-                            log.status = s.value;
-                            return true;
-                        }
-                        return false;
-                    },
-                    else => return false,
-                },
-                .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
-                    return setLogAttribute(log, attr_path.path.items, s.value, s.upsert);
-                },
-            }
-        },
-        .rename => {
-            // Rename not yet supported for Datadog logs
-            return false;
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
+            // Datadog attribute storage is flat - upsert flag handled engine-side.
+            _ = setLogAttribute(log, attr_path.path.items, value, true);
         },
     }
 }
+
+/// Field deleter for Datadog JSON log format. Returns true iff the field
+/// existed.
+pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
+    const field_ctx: *FieldAccessorContext = @ptrCast(@alignCast(ctx));
+    const log = field_ctx.log;
+    return switch (field) {
+        .log_field => |lf| switch (lf) {
+            .LOG_FIELD_BODY => blk: {
+                if (log.message == null) break :blk false;
+                log.message = null;
+                break :blk true;
+            },
+            .LOG_FIELD_SEVERITY_TEXT => blk: {
+                var removed = false;
+                if (log.status != null) {
+                    log.status = null;
+                    removed = true;
+                }
+                if (log.level != null) {
+                    log.level = null;
+                    removed = true;
+                }
+                break :blk removed;
+            },
+            else => false,
+        },
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| removeLogAttribute(log, attr_path.path.items),
+    };
+}
+
+/// LogAccessor template for unit tests in this module. Datadog logs don't
+/// support rename, so `move` is left null (policies that require rename are
+/// rejected at snapshot-compile time).
+pub const log_accessor: policy.LogAccessor = .{
+    .value = logValue,
+    .set = logSet,
+    .delete = logDelete,
+};
 
 /// Result of evaluating a single log
 const FilterLogResult = struct {
@@ -337,7 +325,7 @@ const FilterLogResult = struct {
 /// Returns whether to keep the log and whether it was mutated.
 fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, allocator: std.mem.Allocator, policy_id_buf: [][]const u8) FilterLogResult {
     var field_ctx = FieldAccessorContext{ .log = log, .allocator = allocator };
-    const result = engine.evaluate(.log, &field_ctx, datadogFieldAccessor, datadogFieldMutator, policy_id_buf);
+    const result = engine.evaluate(.log, &field_ctx, policy_id_buf, .{ .scratch = allocator });
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
@@ -522,12 +510,12 @@ test "datadogFieldAccessor - extra field lookup" {
     var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // Test known field
-    const message_val = datadogFieldAccessor(&field_ctx, .{ .log_field = .LOG_FIELD_BODY });
+    const message_val = logValue(&field_ctx, .{ .log_field = .LOG_FIELD_BODY });
     try std.testing.expect(message_val != null);
     try std.testing.expectEqualStrings("test", message_val.?);
 
     // Test extra field - this is the critical test
-    const trace_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = testAttrPath("trace_id") });
+    const trace_val = logValue(&field_ctx, .{ .log_attribute = testAttrPath("trace_id") });
     try std.testing.expect(trace_val != null);
     try std.testing.expectEqualStrings("abc123-def456", trace_val.?);
 }
@@ -549,12 +537,12 @@ test "datadogFieldAccessor - resource_attribute searches log attributes" {
     var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // resource_attribute should find known fields
-    const svc_val = datadogFieldAccessor(&field_ctx, .{ .resource_attribute = testAttrPath("service") });
+    const svc_val = logValue(&field_ctx, .{ .resource_attribute = testAttrPath("service") });
     try std.testing.expect(svc_val != null);
     try std.testing.expectEqualStrings("my-svc", svc_val.?);
 
     // resource_attribute should find extra fields
-    const trace_val = datadogFieldAccessor(&field_ctx, .{ .resource_attribute = testAttrPath("trace_id") });
+    const trace_val = logValue(&field_ctx, .{ .resource_attribute = testAttrPath("trace_id") });
     try std.testing.expect(trace_val != null);
     try std.testing.expectEqualStrings("abc123", trace_val.?);
 }
@@ -576,7 +564,7 @@ test "datadogFieldAccessor - scope_attribute searches log attributes" {
     var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     // scope_attribute should find known fields
-    const host_val = datadogFieldAccessor(&field_ctx, .{ .scope_attribute = testAttrPath("hostname") });
+    const host_val = logValue(&field_ctx, .{ .scope_attribute = testAttrPath("hostname") });
     try std.testing.expect(host_val != null);
     try std.testing.expectEqualStrings("web-01", host_val.?);
 }
@@ -602,7 +590,7 @@ test "datadogFieldAccessor - nested extra field access via dotted key" {
     const method_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }) },
     };
-    const method_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = method_path });
+    const method_val = logValue(&field_ctx, .{ .log_attribute = method_path });
     try std.testing.expect(method_val != null);
     try std.testing.expectEqualStrings("GET", method_val.?);
 }
@@ -627,7 +615,7 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
     const missing_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "nonexistent" }) },
     };
-    const val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = missing_path });
+    const val = logValue(&field_ctx, .{ .log_attribute = missing_path });
     try std.testing.expect(val == null);
 }
 
@@ -650,14 +638,14 @@ test "datadogFieldAccessor - nested object fallback via path segments" {
     const status_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "status_code" }) },
     };
-    const status_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = status_path });
+    const status_val = logValue(&field_ctx, .{ .log_attribute = status_path });
     try std.testing.expect(status_val != null);
     try std.testing.expectEqualStrings("200", status_val.?);
 
     const region_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "meta", "region" }) },
     };
-    const region_val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = region_path });
+    const region_val = logValue(&field_ctx, .{ .log_attribute = region_path });
     try std.testing.expect(region_val != null);
     try std.testing.expectEqualStrings("us-east-1", region_val.?);
 }
@@ -682,7 +670,7 @@ test "datadogFieldAccessor - multi-segment path with no matching dotted key retu
     const bad_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "flat_field", "nested" }) },
     };
-    const val = datadogFieldAccessor(&field_ctx, .{ .log_attribute = bad_path });
+    const val = logValue(&field_ctx, .{ .log_attribute = bad_path });
     try std.testing.expect(val == null);
 }
 
@@ -691,7 +679,7 @@ test "processLogs - no policies keeps all logs in array" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const logs =
@@ -729,7 +717,7 @@ test "processLogs - DROP policy filters logs from array" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for DEBUG logs
@@ -785,7 +773,7 @@ test "processLogs - DROP policy drops single object" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     var drop_policy = proto.policy.Policy{
@@ -837,7 +825,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -870,7 +858,7 @@ test "processLogs - non-JSON content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const data = "some raw log data";
@@ -903,7 +891,7 @@ test "processLogs - Datadog format with ddtags and service" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     const logs =
@@ -940,7 +928,7 @@ test "processLogs - filter on arbitrary custom field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches on a custom field "environment"
@@ -999,7 +987,7 @@ test "processLogs - extra fields are preserved when no logs dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // No policies - all logs kept, original data returned unchanged
@@ -1043,7 +1031,7 @@ test "processLogs - nested extra fields are preserved when reserializing after d
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Drop DEBUG logs so remaining logs are reserialized.
@@ -1105,7 +1093,7 @@ test "processLogs - nested extra transform is ignored and payload is unchanged" 
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     var transform = proto.policy.LogTransform{};
@@ -1168,7 +1156,7 @@ test "processLogs - mutation triggers reserialization and removes field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes the 'service' field
@@ -1241,7 +1229,7 @@ test "processLogs - filter on dynamic extra field not in schema" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches on a dynamic field "trace_id" (not in schema)
@@ -1305,7 +1293,7 @@ test "processLogs - filter on nested extra field with exists" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that drops logs where "debug_info" field exists

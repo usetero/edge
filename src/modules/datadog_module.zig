@@ -15,6 +15,13 @@ const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 const RuntimeMetrics = runtime_metrics.RuntimeMetrics;
 
+/// AccessorTemplates wiring the Datadog log + metric consumers. Each
+/// binary/test creates its own registry with this template.
+pub const accessor_templates: policy.AccessorTemplates = .{
+    .log = logs_v2.log_accessor,
+    .metric = metrics_v2.metric_accessor,
+};
+
 // =============================================================================
 // Observability Events
 // =============================================================================
@@ -223,7 +230,7 @@ test "DatadogModule processes POST requests to /api/v2/logs" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
@@ -270,7 +277,7 @@ test "DatadogModule processes POST requests to /api/v2/series" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
@@ -317,7 +324,7 @@ test "DatadogModule ignores GET requests" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
@@ -361,7 +368,7 @@ test "DatadogModule filters logs with DROP policy" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create DROP policy for DEBUG logs
@@ -428,7 +435,7 @@ test "DatadogModule filters metrics with DROP policy" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
@@ -497,7 +504,7 @@ test "DatadogModule returns 202 when all logs dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create DROP policy that matches INFO logs (test data uses INFO)
@@ -561,7 +568,7 @@ test "DatadogModule returns 202 when all metrics dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), accessor_templates);
     defer registry.deinit();
 
     // Create DROP policy that matches the test metric

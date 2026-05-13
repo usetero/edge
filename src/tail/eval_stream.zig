@@ -48,7 +48,7 @@ pub const StreamEvaluator = struct {
 
         const registry = try allocator.create(policy.Registry);
         errdefer allocator.destroy(registry);
-        registry.* = policy.Registry.init(allocator, bus);
+        registry.* = policy.Registry.init(allocator, bus, .{ .log = context.log_accessor });
         errdefer registry.deinit();
 
         const policies = try policy.parser.parsePoliciesFile(allocator, policy_path.?);
@@ -80,11 +80,15 @@ pub const StreamEvaluator = struct {
     }
 
     pub fn evalLine(self: *StreamEvaluator, line: []const u8) !bool {
-        const result = try self.evalLineResult(line, false);
+        const result = try self.evalLineResult(line);
         return result.decision != FilterDecision.drop;
     }
 
-    pub fn evalLineResult(self: *StreamEvaluator, line: []const u8, apply_transforms: bool) !PolicyResult {
+    /// Evaluate a single line. Transforms wired on the registry's accessor
+    /// always run when a matched policy has transforms configured — the
+    /// engine no longer separates a "filter only" mode from "filter + apply
+    /// transforms," that distinction lives in policy configuration now.
+    pub fn evalLineResult(self: *StreamEvaluator, line: []const u8) !PolicyResult {
         return switch (self.mode) {
             .disabled => PolicyResult.unmatched,
             .active => |*active| blk: {
@@ -95,9 +99,8 @@ pub const StreamEvaluator = struct {
                 const result = active.engine.evaluate(
                     .log,
                     &ctx,
-                    context.TailLineContext.fieldAccessor,
-                    if (apply_transforms) context.TailLineContext.fieldMutator else null,
                     &active.policy_id_buf,
+                    .{ .scratch = line_alloc },
                 );
                 break :blk result;
             },
@@ -229,12 +232,12 @@ test "eval stream public API: evaluate result exposes keep hit ids and miss" {
     var eval = try StreamEvaluator.init(testing.allocator, .raw, policy_path, stdio_bus.eventBus());
     defer eval.deinit();
 
-    const hit = try eval.evalLineResult("info request", false);
+    const hit = try eval.evalLineResult("info request");
     try testing.expectEqual(policy.FilterDecision.keep, hit.decision);
     try testing.expectEqual(@as(usize, 1), hit.matched_policy_ids.len);
     try testing.expectEqualStrings("keep-info", hit.matched_policy_ids[0]);
 
-    const miss = try eval.evalLineResult("debug request", false);
+    const miss = try eval.evalLineResult("debug request");
     try testing.expectEqual(policy.FilterDecision.unset, miss.decision);
     try testing.expectEqual(@as(usize, 0), miss.matched_policy_ids.len);
 }
@@ -277,10 +280,7 @@ test "eval stream public API: transforms report hit and miss via was_transformed
     var eval = try StreamEvaluator.init(testing.allocator, .raw, policy_path, stdio_bus.eventBus());
     defer eval.deinit();
 
-    const without_transforms = try eval.evalLineResult("order accepted", false);
-    try testing.expectEqual(false, without_transforms.was_transformed);
-
-    const with_transforms = try eval.evalLineResult("order accepted", true);
+    const with_transforms = try eval.evalLineResult("order accepted");
     try testing.expectEqual(policy.FilterDecision.keep, with_transforms.decision);
     try testing.expectEqual(true, with_transforms.was_transformed);
 }
@@ -312,7 +312,7 @@ test "eval stream public API: transform miss does not set was_transformed" {
     var eval = try StreamEvaluator.init(testing.allocator, .raw, policy_path, stdio_bus.eventBus());
     defer eval.deinit();
 
-    const with_transforms = try eval.evalLineResult("checkout start", true);
+    const with_transforms = try eval.evalLineResult("checkout start");
     try testing.expectEqual(policy.FilterDecision.keep, with_transforms.decision);
     try testing.expectEqual(false, with_transforms.was_transformed);
 }
@@ -323,7 +323,7 @@ test "eval stream public API: disabled evaluator returns unmatched and keeps lin
     defer eval.deinit();
 
     try testing.expect(try eval.evalLine("anything"));
-    const result = try eval.evalLineResult("anything", true);
+    const result = try eval.evalLineResult("anything");
     try testing.expectEqual(policy.FilterDecision.unset, result.decision);
 }
 

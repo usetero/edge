@@ -105,15 +105,12 @@ fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     }
 }
 
-/// Context for field accessor - holds the MetricSeries struct
-const FieldAccessorContext = struct {
+/// Context for field accessor - holds the MetricSeries struct.
+pub const FieldAccessorContext = struct {
     series: *MetricSeries,
     /// Cached concatenated tags string for tag matching
     tags_cache: ?[]const u8,
 };
-
-const MetricMutateOp = policy.MetricMutateOp;
-const MetricFieldMutator = policy.MetricFieldMutator;
 
 /// Get the first path segment for flat attribute lookup
 /// Datadog uses flat attributes, so only the first path segment is used
@@ -155,11 +152,11 @@ fn lookupMetricAttribute(series: *MetricSeries, tags_cache: ?[]const u8, path: [
 
 const findExtraField = otlp_attr.findExtraField;
 
-/// Field accessor for Datadog metric format
-/// Maps MetricFieldRef to actual field values in MetricSeries.
+/// Field accessor for Datadog metric format.
+/// Maps `MetricFieldRef` to actual field values in MetricSeries.
 /// All attribute types (datapoint, resource, scope) search the same flat namespace since
 /// Datadog has no OTLP-style resource/scope hierarchy.
-fn datadogMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
+pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
     const field_ctx: *const FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const series = field_ctx.series;
 
@@ -198,105 +195,12 @@ fn getDatadogMetricTypeString(series: *MetricSeries) ?[]const u8 {
     };
 }
 
-/// Remove a known metric attribute by key. Only supports top-level (single-segment) keys.
-fn removeMetricAttribute(series: *MetricSeries, path: []const []const u8) bool {
-    const key = getFirstPathSegment(path) orelse return false;
-    if (path.len > 1) return false;
-    if (std.mem.eql(u8, key, "tags")) {
-        if (series.tags != null) {
-            series.tags = null;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "source_type_name")) {
-        if (series.source_type_name != null) {
-            series.source_type_name = null;
-            return true;
-        }
-        return false;
-    }
-    return false;
-}
-
-/// Set a known metric attribute by key. Only supports top-level (single-segment) keys.
-fn setMetricAttribute(series: *MetricSeries, path: []const []const u8, value: []const u8, upsert: bool) bool {
-    const key = getFirstPathSegment(path) orelse return false;
-    if (path.len > 1) return false;
-    if (std.mem.eql(u8, key, "source_type_name")) {
-        if (upsert or series.source_type_name != null) {
-            series.source_type_name = value;
-            return true;
-        }
-        return false;
-    }
-    return false;
-}
-
-/// Field mutator for Datadog metric format
-/// Supports remove and set operations on known fields.
-/// All attribute types (datapoint, resource, scope) use the same mutation logic.
-fn datadogMetricFieldMutator(ctx: *anyopaque, op: MetricMutateOp) bool {
-    const field_ctx: *FieldAccessorContext = @ptrCast(@alignCast(ctx));
-    const series = field_ctx.series;
-
-    switch (op) {
-        .remove => |field| {
-            switch (field) {
-                .metric_field => |mf| switch (mf) {
-                    .METRIC_FIELD_NAME => {
-                        if (series.metric != null) {
-                            series.metric = null;
-                            return true;
-                        }
-                        return false;
-                    },
-                    .METRIC_FIELD_UNIT => {
-                        if (series.unit != null) {
-                            series.unit = null;
-                            return true;
-                        }
-                        return false;
-                    },
-                    else => return false,
-                },
-                .datapoint_attribute, .resource_attribute, .scope_attribute => |attr_path| {
-                    return removeMetricAttribute(series, attr_path.path.items);
-                },
-                .metric_type, .aggregation_temporality => return false,
-            }
-        },
-        .set => |s| {
-            switch (s.field) {
-                .metric_field => |mf| switch (mf) {
-                    .METRIC_FIELD_NAME => {
-                        if (s.upsert or series.metric != null) {
-                            series.metric = s.value;
-                            return true;
-                        }
-                        return false;
-                    },
-                    .METRIC_FIELD_UNIT => {
-                        if (s.upsert or series.unit != null) {
-                            series.unit = s.value;
-                            return true;
-                        }
-                        return false;
-                    },
-                    else => return false,
-                },
-                .datapoint_attribute, .resource_attribute, .scope_attribute => |attr_path| {
-                    return setMetricAttribute(series, attr_path.path.items, s.value, s.upsert);
-                },
-                .metric_type, .aggregation_temporality => return false,
-            }
-        },
-        .rename => {
-            // Rename not yet supported for Datadog metrics
-            return false;
-        },
-    }
-}
+/// MetricAccessor template for unit tests in this module. Metric mutations
+/// are not part of the v0.3.0 MetricAccessor interface; the policy engine
+/// only evaluates filter decisions for metrics.
+pub const metric_accessor: policy.MetricAccessor = .{
+    .value = metricValue,
+};
 
 /// Result of evaluating a single metric series
 const FilterMetricResult = struct {
@@ -319,7 +223,7 @@ fn filterMetric(
         .series = series,
         .tags_cache = tags_cache,
     };
-    const result = engine.evaluate(.metric, &field_ctx, datadogMetricFieldAccessor, datadogMetricFieldMutator, policy_id_buf);
+    const result = engine.evaluate(.metric, &field_ctx, policy_id_buf, .{});
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
@@ -515,17 +419,17 @@ test "datadogMetricFieldAccessor - extra field lookup" {
     };
 
     // Test known field
-    const metric_val = datadogMetricFieldAccessor(&field_ctx, .{ .metric_field = .METRIC_FIELD_NAME });
+    const metric_val = metricValue(&field_ctx, .{ .metric_field = .METRIC_FIELD_NAME });
     try std.testing.expect(metric_val != null);
     try std.testing.expectEqualStrings("system.load.1", metric_val.?);
 
     // Test tags field
-    const tags_val = datadogMetricFieldAccessor(&field_ctx, .{ .datapoint_attribute = testAttrPath("tags") });
+    const tags_val = metricValue(&field_ctx, .{ .datapoint_attribute = testAttrPath("tags") });
     try std.testing.expect(tags_val != null);
     try std.testing.expectEqualStrings("env:prod,service:web", tags_val.?);
 
     // Test metric type
-    const type_val = datadogMetricFieldAccessor(&field_ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
+    const type_val = metricValue(&field_ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
     try std.testing.expect(type_val != null);
     try std.testing.expectEqualStrings("gauge", type_val.?);
 }
@@ -535,7 +439,7 @@ test "processMetrics - no policies keeps all metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     const metrics =
@@ -572,7 +476,7 @@ test "processMetrics - DROP policy filters metrics by name" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for debug metrics
@@ -633,7 +537,7 @@ test "processMetrics - returns 202-compatible response when all metrics dropped"
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches the test metric
@@ -687,7 +591,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -720,7 +624,7 @@ test "processMetrics - non-JSON content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     const data = "some raw metric data";
@@ -753,7 +657,7 @@ test "processMetrics - filter on tags" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches on tags containing "env:dev"
@@ -815,7 +719,7 @@ test "processMetrics - preserves all fields when no metrics dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // No policies - all metrics kept, original data returned unchanged
@@ -856,7 +760,7 @@ test "processMetrics - extra fields are preserved when no metrics dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // No policies - all metrics kept, original data returned unchanged
@@ -899,7 +803,7 @@ test "processMetrics - filter on metric type" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches on metric type "count"
@@ -978,12 +882,12 @@ test "datadogMetricFieldAccessor - scope_attribute searches metric attributes" {
     };
 
     // scope_attribute should find tags
-    const tags_val = datadogMetricFieldAccessor(&field_ctx, .{ .scope_attribute = testAttrPath("tags") });
+    const tags_val = metricValue(&field_ctx, .{ .scope_attribute = testAttrPath("tags") });
     try std.testing.expect(tags_val != null);
     try std.testing.expectEqualStrings("env:prod,service:web", tags_val.?);
 
     // scope_attribute should find resources
-    const host_val = datadogMetricFieldAccessor(&field_ctx, .{ .scope_attribute = testAttrPath("host") });
+    const host_val = metricValue(&field_ctx, .{ .scope_attribute = testAttrPath("host") });
     try std.testing.expect(host_val != null);
     try std.testing.expectEqualStrings("web-01", host_val.?);
 }
@@ -1011,7 +915,7 @@ test "datadogMetricFieldAccessor - resource with nested path" {
     const nested_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "host", "name" }) },
     };
-    const name_val = datadogMetricFieldAccessor(&field_ctx, .{ .resource_attribute = nested_path });
+    const name_val = metricValue(&field_ctx, .{ .resource_attribute = nested_path });
     try std.testing.expect(name_val != null);
     try std.testing.expectEqualStrings("web-01", name_val.?);
 
@@ -1019,7 +923,7 @@ test "datadogMetricFieldAccessor - resource with nested path" {
     const type_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "host", "type" }) },
     };
-    const type_val = datadogMetricFieldAccessor(&field_ctx, .{ .resource_attribute = type_path });
+    const type_val = metricValue(&field_ctx, .{ .resource_attribute = type_path });
     try std.testing.expect(type_val != null);
     try std.testing.expectEqualStrings("host", type_val.?);
 }
@@ -1048,7 +952,7 @@ test "datadogMetricFieldAccessor - nested extra field via dotted key" {
     const nested_path = proto.policy.AttributePath{
         .path = .{ .items = @constCast(&[_][]const u8{ "custom_data", "region" }) },
     };
-    const val = datadogMetricFieldAccessor(&field_ctx, .{ .datapoint_attribute = nested_path });
+    const val = metricValue(&field_ctx, .{ .datapoint_attribute = nested_path });
     try std.testing.expect(val != null);
     try std.testing.expectEqualStrings("us-east", val.?);
 }

@@ -165,8 +165,8 @@ fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
 // Internal Implementation
 // =============================================================================
 
-/// Context for OTLP metric field accessor - provides access to metric plus parent context
-const OtlpMetricContext = struct {
+/// Context for OTLP metric field accessor - provides access to metric plus parent context.
+pub const OtlpMetricContext = struct {
     metric: *Metric,
     resource_metrics: *ResourceMetrics,
     scope_metrics: *ScopeMetrics,
@@ -177,9 +177,9 @@ const getAnyValueString = otlp_attr.getStringValue;
 const findAttribute = otlp_attr.findAttribute;
 const findNestedAttribute = otlp_attr.findNestedAttribute;
 
-/// Field accessor for OTLP metric format
-/// Maps MetricFieldRef to the appropriate field in the OTLP metric structure
-fn otlpMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
+/// Field accessor for OTLP metric format.
+/// Maps `MetricFieldRef` to the appropriate field in the OTLP metric structure.
+pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
     const metric_ctx: *const OtlpMetricContext = @ptrCast(@alignCast(ctx));
 
     return switch (field) {
@@ -232,14 +232,12 @@ fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
     };
 }
 
-const MetricMutateOp = policy.MetricMutateOp;
-
-/// Field mutator for OTLP metric format
-/// Currently only supports drop decision (keep=false), no transforms
-fn otlpMetricFieldMutator(_: *anyopaque, _: MetricMutateOp) bool {
-    // Metric transforms not yet implemented for OTLP
-    return false;
-}
+/// MetricAccessor template for unit tests in this module. The runtime app
+/// composes a unified accessor that dispatches between OTLP/Datadog/Prometheus
+/// metric contexts.
+pub const metric_accessor: policy.MetricAccessor = .{
+    .value = metricValue,
+};
 
 /// Result of filtering metrics in-place
 const FilterCounts = struct {
@@ -279,7 +277,7 @@ fn filterMetricsInPlace(
                     .datapoint_attributes = getDatapointAttrs(metric),
                 };
 
-                const result = engine.evaluate(.metric, &ctx, otlpMetricFieldAccessor, otlpMetricFieldMutator, &policy_id_buf);
+                const result = engine.evaluate(.metric, &ctx, &policy_id_buf, .{});
 
                 if (result.decision.shouldContinue()) {
                     // Keep this metric - move to write position if needed
@@ -430,7 +428,7 @@ test "processMetrics - parses and re-serializes JSON" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     const metrics =
@@ -466,7 +464,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -513,7 +511,7 @@ test "processMetrics - unknown content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     const data = "some unknown data";
@@ -546,7 +544,7 @@ test "processMetrics - no policies keeps all metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     const metrics =
@@ -584,7 +582,7 @@ test "processMetrics - DROP policy filters metrics by name" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for metrics matching "debug"
@@ -640,7 +638,7 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for metrics from "test-service"
@@ -697,7 +695,7 @@ test "processMetrics - all metrics dropped returns empty structure" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
@@ -800,7 +798,7 @@ test "processMetrics - protobuf parses and re-serializes" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create valid protobuf data
@@ -837,7 +835,7 @@ test "processMetrics - protobuf DROP policy filters metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy for metrics containing "debug"
@@ -905,7 +903,7 @@ test "processMetrics - protobuf all metrics dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
