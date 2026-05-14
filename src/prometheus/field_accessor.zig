@@ -18,8 +18,8 @@ const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = proto.policy.MetricField;
 const AttributePath = proto.policy.AttributePath;
 
-/// MetricAccessor template for unit tests in this module. Prometheus metrics
-/// are immutable in exposition format - only `value` is wired.
+/// MetricAccessor template for Prometheus. Exposition format is immutable
+/// (lines are forwarded verbatim or dropped), so only `value` is wired.
 pub const metric_accessor: policy.MetricAccessor = .{
     .value = metricValue,
 };

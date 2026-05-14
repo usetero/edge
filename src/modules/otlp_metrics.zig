@@ -232,9 +232,8 @@ fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
     };
 }
 
-/// MetricAccessor template for unit tests in this module. The runtime app
-/// composes a unified accessor that dispatches between OTLP/Datadog/Prometheus
-/// metric contexts.
+/// MetricAccessor template wiring the OTLP metric value primitive.
+/// Metric mutations aren't part of the policy-zig MetricAccessor interface.
 pub const metric_accessor: policy.MetricAccessor = .{
     .value = metricValue,
 };

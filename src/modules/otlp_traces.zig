@@ -268,8 +268,7 @@ pub fn traceSet(ctx: *anyopaque, field: TraceFieldRef, value: []const u8) void {
     }
 }
 
-/// TraceAccessor template for unit tests in this module. The runtime app
-/// composes a unified accessor.
+/// TraceAccessor template wiring the OTLP trace primitives.
 pub const trace_accessor: policy.TraceAccessor = .{
     .value = traceValue,
     .set = traceSet,

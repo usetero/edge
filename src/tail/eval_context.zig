@@ -111,9 +111,7 @@ pub const TailLineContext = struct {
     }
 };
 
-/// LogAccessor template for the tail evaluator. Wires all primitives —
-/// the tail registry is dedicated to TailLineContext only, so no runtime
-/// dispatch is needed.
+/// LogAccessor template wiring the tail-evaluator primitives.
 pub const log_accessor: LogAccessor = .{
     .value = TailLineContext.logValue,
     .set = TailLineContext.logSet,

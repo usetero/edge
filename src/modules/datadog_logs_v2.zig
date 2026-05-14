@@ -110,10 +110,6 @@ pub const FieldAccessorContext = struct {
     allocator: std.mem.Allocator,
 };
 
-/// Get the first path segment for flat attribute lookup
-/// Datadog uses flat attributes, so only the first path segment is used
-const getFirstPathSegment = otlp_attr.getFirstPathSegment;
-
 /// Look up an attribute across all Datadog log data sources.
 /// Searches known fields, ddtags, and extra HashMap (with nested support).
 /// Since Datadog has no resource/scope distinction, all attribute types
@@ -156,104 +152,26 @@ pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     };
 }
 
-/// Remove a known log attribute by key. Only supports top-level (single-segment) keys.
-fn removeLogAttribute(log: *DatadogLog, path: []const []const u8) bool {
-    const key = getFirstPathSegment(path) orelse return false;
-    // Only support removing top-level known fields (nested extra fields are read-only)
-    if (path.len > 1) return false;
-    if (std.mem.eql(u8, key, "service")) {
-        if (log.service != null) {
-            log.service = null;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "hostname")) {
-        if (log.hostname != null) {
-            log.hostname = null;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "ddsource")) {
-        if (log.ddsource != null) {
-            log.ddsource = null;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "ddtags")) {
-        if (log.ddtags != null) {
-            log.ddtags = null;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "environment")) {
-        if (log.environment != null) {
-            log.environment = null;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "custom_field")) {
-        if (log.custom_field != null) {
-            log.custom_field = null;
-            return true;
-        }
-        return false;
-    }
-    return false;
-}
+/// Top-level Datadog log fields that policies can mutate. Nested keys (in
+/// `log.extra`) are read-only; rename targets resolve to these fields only.
+const writable_log_fields = [_][]const u8{
+    "service",
+    "hostname",
+    "ddsource",
+    "ddtags",
+    "environment",
+    "custom_field",
+};
 
-/// Set a known log attribute by key. Only supports top-level (single-segment) keys.
-fn setLogAttribute(log: *DatadogLog, path: []const []const u8, value: []const u8, upsert: bool) bool {
-    const key = getFirstPathSegment(path) orelse return false;
-    // Only support setting top-level known fields (nested extra fields are read-only)
-    if (path.len > 1) return false;
-    if (std.mem.eql(u8, key, "service")) {
-        if (upsert or log.service != null) {
-            log.service = value;
-            return true;
-        }
-        return false;
+/// Resolve a writable single-segment field name to its storage slot, or
+/// null when the path is multi-segment or names an unknown field.
+fn writableFieldRef(log: *DatadogLog, path: []const []const u8) ?*?[]const u8 {
+    if (path.len != 1) return null;
+    const key = path[0];
+    inline for (writable_log_fields) |name| {
+        if (std.mem.eql(u8, key, name)) return &@field(log, name);
     }
-    if (std.mem.eql(u8, key, "hostname")) {
-        if (upsert or log.hostname != null) {
-            log.hostname = value;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "ddsource")) {
-        if (upsert or log.ddsource != null) {
-            log.ddsource = value;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "ddtags")) {
-        if (upsert or log.ddtags != null) {
-            log.ddtags = value;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "environment")) {
-        if (upsert or log.environment != null) {
-            log.environment = value;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, key, "custom_field")) {
-        if (upsert or log.custom_field != null) {
-            log.custom_field = value;
-            return true;
-        }
-        return false;
-    }
-    return false;
+    return null;
 }
 
 /// Field setter for Datadog JSON log format. The engine handles upsert
@@ -270,8 +188,7 @@ pub fn logSet(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
             else => {},
         },
         .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
-            // Datadog attribute storage is flat - upsert flag handled engine-side.
-            _ = setLogAttribute(log, attr_path.path.items, value, true);
+            if (writableFieldRef(log, attr_path.path.items)) |ref| ref.* = value;
         },
     }
 }
@@ -302,7 +219,12 @@ pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
             },
             else => false,
         },
-        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| removeLogAttribute(log, attr_path.path.items),
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
+            const ref = writableFieldRef(log, attr_path.path.items) orelse break :blk false;
+            if (ref.* == null) break :blk false;
+            ref.* = null;
+            break :blk true;
+        },
     };
 }
 

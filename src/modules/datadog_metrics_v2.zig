@@ -195,9 +195,9 @@ fn getDatadogMetricTypeString(series: *MetricSeries) ?[]const u8 {
     };
 }
 
-/// MetricAccessor template for unit tests in this module. Metric mutations
-/// are not part of the v0.3.0 MetricAccessor interface; the policy engine
-/// only evaluates filter decisions for metrics.
+/// MetricAccessor template wiring the Datadog metric value primitive.
+/// Metric mutations aren't part of the policy-zig MetricAccessor interface;
+/// the engine only runs filter decisions on metrics.
 pub const metric_accessor: policy.MetricAccessor = .{
     .value = metricValue,
 };

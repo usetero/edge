@@ -9,7 +9,6 @@ const config_types = edge.config_types;
 const zonfig = edge.zonfig;
 const server_mod = edge.server;
 const runtime_metrics_mod = @import("runtime_metrics.zig");
-const MultiRegistryLoader = @import("multi_registry_loader.zig").MultiRegistryLoader;
 const proxy_module = edge.proxy_module;
 const passthrough_mod = edge.passthrough_module;
 const datadog_mod = edge.datadog_module;
@@ -356,38 +355,64 @@ pub fn run(distribution: mode.Distribution) !void {
         .version = service_metadata.version,
     });
 
-    // Per-module registries. Each module's accessor is wired statically to
-    // its own context type, so the engine never has to dispatch between
-    // consumer types at evaluation time. Policy state is kept in sync
-    // across registries via MultiRegistryLoader's fan-out callback.
-    var otlp_registry = policy.Registry.init(allocator, bus, otlp_mod.accessor_templates);
-    defer otlp_registry.deinit();
+    // Each module's registry is wired statically to its own context type, so
+    // the engine never has to dispatch between consumer types at evaluation
+    // time. Each active registry runs its own policy.Loader; providers/I/O
+    // are duplicated across registries (file watches + HTTP polls). The
+    // duplication is acceptable for file providers and for HTTP polling at
+    // the default cadence (~60s). Revisit if HTTP cadence drops or many
+    // bundles are active in one binary.
+    var needs_otlp = false;
+    var needs_datadog = false;
+    var needs_prometheus = false;
+    for (bundlesFor(distribution)) |b| switch (b) {
+        .otlp => needs_otlp = true,
+        .datadog_logs, .datadog_metrics => needs_datadog = true,
+        .prometheus => needs_prometheus = true,
+    };
 
-    var datadog_registry = policy.Registry.init(allocator, bus, datadog_mod.accessor_templates);
-    defer datadog_registry.deinit();
+    var otlp_registry: policy.Registry = undefined;
+    if (needs_otlp) otlp_registry = policy.Registry.init(allocator, bus, otlp_mod.accessor_templates);
+    defer if (needs_otlp) otlp_registry.deinit();
 
-    var prometheus_registry = policy.Registry.init(allocator, bus, prometheus_mod.accessor_templates);
-    defer prometheus_registry.deinit();
+    var datadog_registry: policy.Registry = undefined;
+    if (needs_datadog) datadog_registry = policy.Registry.init(allocator, bus, datadog_mod.accessor_templates);
+    defer if (needs_datadog) datadog_registry.deinit();
+
+    var prometheus_registry: policy.Registry = undefined;
+    if (needs_prometheus) prometheus_registry = policy.Registry.init(allocator, bus, prometheus_mod.accessor_templates);
+    defer if (needs_prometheus) prometheus_registry.deinit();
 
     var runtime_metrics = try RuntimeMetrics.init(allocator, distributionLabel(distribution));
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
-    const registries = [_]*policy.Registry{ &otlp_registry, &datadog_registry, &prometheus_registry };
-    var loader = try MultiRegistryLoader.init(
-        allocator,
-        bus,
-        &registries,
-        config.policy_providers,
-        service_metadata,
-    );
-    defer loader.deinit();
+    var otlp_loader: ?*policy.Loader = null;
+    defer if (otlp_loader) |l| l.deinit();
+    var datadog_loader: ?*policy.Loader = null;
+    defer if (datadog_loader) |l| l.deinit();
+    var prometheus_loader: ?*policy.Loader = null;
+    defer if (prometheus_loader) |l| l.deinit();
 
-    try loader.startAsync();
+    if (needs_otlp) {
+        otlp_loader = try policy.Loader.init(allocator, bus, &otlp_registry, config.policy_providers, service_metadata);
+        try otlp_loader.?.startAsync();
+    }
+    if (needs_datadog) {
+        datadog_loader = try policy.Loader.init(allocator, bus, &datadog_registry, config.policy_providers, service_metadata);
+        try datadog_loader.?.startAsync();
+    }
+    if (needs_prometheus) {
+        prometheus_loader = try policy.Loader.init(allocator, bus, &prometheus_registry, config.policy_providers, service_metadata);
+        try prometheus_loader.?.startAsync();
+    }
     installSegfaultHandler();
 
     const server_allocator = allocator;
 
+    // Configs hold a pointer into the matching registry. The bundle loop
+    // below only references them for bundles whose `needs_*` was true, so
+    // the undefined-registry case is unreachable through `.module_data`.
     var datadog_config = DatadogConfig{
         .registry = &datadog_registry,
         .bus = bus,

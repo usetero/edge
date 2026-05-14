@@ -177,25 +177,48 @@ const removeAttributeByPath = otlp_attr.removeAttributeByPath;
 const setAttributeByPath = otlp_attr.setAttributeByPath;
 const setAttribute = otlp_attr.setAttribute;
 
+/// Pointer to the storage slot for a `[]const u8` field, or null if the
+/// field tag isn't a plain string field on the OTLP context. `body` is
+/// `?AnyValue` and handled separately in each primitive.
+fn stringFieldRef(log_ctx: *OtlpLogContext, lf: LogField) ?*[]const u8 {
+    return switch (lf) {
+        .LOG_FIELD_SEVERITY_TEXT => &log_ctx.log_record.severity_text,
+        .LOG_FIELD_TRACE_ID => &log_ctx.log_record.trace_id,
+        .LOG_FIELD_SPAN_ID => &log_ctx.log_record.span_id,
+        .LOG_FIELD_EVENT_NAME => &log_ctx.log_record.event_name,
+        .LOG_FIELD_RESOURCE_SCHEMA_URL => &log_ctx.resource_logs.schema_url,
+        .LOG_FIELD_SCOPE_SCHEMA_URL => &log_ctx.scope_logs.schema_url,
+        else => null,
+    };
+}
+
+/// Attribute list backing a `FieldRef` attribute variant, or null when the
+/// resource/scope wrapper is absent on this record. `log_field` returns
+/// null — fixed fields are not stored as attributes.
+fn attributeList(log_ctx: *OtlpLogContext, field: FieldRef) ?*std.ArrayListUnmanaged(KeyValue) {
+    return switch (field) {
+        .log_attribute => &log_ctx.log_record.attributes,
+        .resource_attribute => if (log_ctx.resource_logs.resource) |*res| &res.attributes else null,
+        .scope_attribute => if (log_ctx.scope_logs.scope) |*scope| &scope.attributes else null,
+        .log_field => null,
+    };
+}
+
 /// Field accessor primitive for the OTLP log context.
 /// Returns the string view of the requested field, or null if missing/non-string.
 pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
-    const log_ctx: *const OtlpLogContext = @ptrCast(@alignCast(ctx));
-
+    const log_ctx: *OtlpLogContext = @constCast(@ptrCast(@alignCast(ctx)));
     return switch (field) {
-        .log_field => |lf| switch (lf) {
-            .LOG_FIELD_BODY => getAnyValueString(log_ctx.log_record.body),
-            .LOG_FIELD_SEVERITY_TEXT => if (log_ctx.log_record.severity_text.len > 0) log_ctx.log_record.severity_text else null,
-            .LOG_FIELD_TRACE_ID => if (log_ctx.log_record.trace_id.len > 0) log_ctx.log_record.trace_id else null,
-            .LOG_FIELD_SPAN_ID => if (log_ctx.log_record.span_id.len > 0) log_ctx.log_record.span_id else null,
-            .LOG_FIELD_EVENT_NAME => if (log_ctx.log_record.event_name.len > 0) log_ctx.log_record.event_name else null,
-            .LOG_FIELD_RESOURCE_SCHEMA_URL => if (log_ctx.resource_logs.schema_url.len > 0) log_ctx.resource_logs.schema_url else null,
-            .LOG_FIELD_SCOPE_SCHEMA_URL => if (log_ctx.scope_logs.schema_url.len > 0) log_ctx.scope_logs.schema_url else null,
-            else => null,
+        .log_field => |lf| if (lf == .LOG_FIELD_BODY)
+            getAnyValueString(log_ctx.log_record.body)
+        else if (stringFieldRef(log_ctx, lf)) |ref|
+            if (ref.len > 0) ref.* else null
+        else
+            null,
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
+            const attrs = attributeList(log_ctx, field) orelse break :blk null;
+            break :blk findNestedAttribute(attrs.items, attr_path.path.items);
         },
-        .log_attribute => |attr_path| findNestedAttribute(log_ctx.log_record.attributes.items, attr_path.path.items),
-        .resource_attribute => |attr_path| if (log_ctx.resource_logs.resource) |res| findNestedAttribute(res.attributes.items, attr_path.path.items) else null,
-        .scope_attribute => |attr_path| if (log_ctx.scope_logs.scope) |scope| findNestedAttribute(scope.attributes.items, attr_path.path.items) else null,
     };
 }
 
@@ -204,27 +227,14 @@ pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
 pub fn logSet(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
     const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
     switch (field) {
-        .log_field => |lf| switch (lf) {
-            .LOG_FIELD_BODY => log_ctx.log_record.body = .{ .value = .{ .string_value = value } },
-            .LOG_FIELD_SEVERITY_TEXT => log_ctx.log_record.severity_text = value,
-            .LOG_FIELD_TRACE_ID => log_ctx.log_record.trace_id = value,
-            .LOG_FIELD_SPAN_ID => log_ctx.log_record.span_id = value,
-            .LOG_FIELD_EVENT_NAME => log_ctx.log_record.event_name = value,
-            .LOG_FIELD_RESOURCE_SCHEMA_URL => log_ctx.resource_logs.schema_url = value,
-            .LOG_FIELD_SCOPE_SCHEMA_URL => log_ctx.scope_logs.schema_url = value,
-            else => {},
+        .log_field => |lf| if (lf == .LOG_FIELD_BODY) {
+            log_ctx.log_record.body = .{ .value = .{ .string_value = value } };
+        } else if (stringFieldRef(log_ctx, lf)) |ref| {
+            ref.* = value;
         },
-        .log_attribute => |attr_path| {
-            _ = setAttributeByPath(log_ctx.allocator, &log_ctx.log_record.attributes, attr_path.path.items, value);
-        },
-        .resource_attribute => |attr_path| {
-            if (log_ctx.resource_logs.resource) |*res| {
-                _ = setAttributeByPath(log_ctx.allocator, &res.attributes, attr_path.path.items, value);
-            }
-        },
-        .scope_attribute => |attr_path| {
-            if (log_ctx.scope_logs.scope) |*scope| {
-                _ = setAttributeByPath(log_ctx.allocator, &scope.attributes, attr_path.path.items, value);
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
+            if (attributeList(log_ctx, field)) |attrs| {
+                _ = setAttributeByPath(log_ctx.allocator, attrs, attr_path.path.items, value);
             }
         },
     }
@@ -234,79 +244,40 @@ pub fn logSet(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
 pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
     const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
     return switch (field) {
-        .log_field => |lf| switch (lf) {
-            .LOG_FIELD_BODY => blk: {
-                if (log_ctx.log_record.body == null) break :blk false;
-                log_ctx.log_record.body = null;
-                break :blk true;
-            },
-            .LOG_FIELD_SEVERITY_TEXT => blk: {
-                if (log_ctx.log_record.severity_text.len == 0) break :blk false;
-                log_ctx.log_record.severity_text = &.{};
-                break :blk true;
-            },
-            .LOG_FIELD_TRACE_ID => blk: {
-                if (log_ctx.log_record.trace_id.len == 0) break :blk false;
-                log_ctx.log_record.trace_id = &.{};
-                break :blk true;
-            },
-            .LOG_FIELD_SPAN_ID => blk: {
-                if (log_ctx.log_record.span_id.len == 0) break :blk false;
-                log_ctx.log_record.span_id = &.{};
-                break :blk true;
-            },
-            .LOG_FIELD_EVENT_NAME => blk: {
-                if (log_ctx.log_record.event_name.len == 0) break :blk false;
-                log_ctx.log_record.event_name = &.{};
-                break :blk true;
-            },
-            .LOG_FIELD_RESOURCE_SCHEMA_URL => blk: {
-                if (log_ctx.resource_logs.schema_url.len == 0) break :blk false;
-                log_ctx.resource_logs.schema_url = &.{};
-                break :blk true;
-            },
-            .LOG_FIELD_SCOPE_SCHEMA_URL => blk: {
-                if (log_ctx.scope_logs.schema_url.len == 0) break :blk false;
-                log_ctx.scope_logs.schema_url = &.{};
-                break :blk true;
-            },
-            else => false,
+        .log_field => |lf| if (lf == .LOG_FIELD_BODY) blk: {
+            if (log_ctx.log_record.body == null) break :blk false;
+            log_ctx.log_record.body = null;
+            break :blk true;
+        } else if (stringFieldRef(log_ctx, lf)) |ref| blk: {
+            if (ref.len == 0) break :blk false;
+            ref.* = &.{};
+            break :blk true;
+        } else false,
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
+            const attrs = attributeList(log_ctx, field) orelse break :blk false;
+            break :blk removeAttributeByPath(attrs, attr_path.path.items);
         },
-        .log_attribute => |attr_path| removeAttributeByPath(&log_ctx.log_record.attributes, attr_path.path.items),
-        .resource_attribute => |attr_path| if (log_ctx.resource_logs.resource) |*res|
-            removeAttributeByPath(&res.attributes, attr_path.path.items)
-        else
-            false,
-        .scope_attribute => |attr_path| if (log_ctx.scope_logs.scope) |*scope|
-            removeAttributeByPath(&scope.attributes, attr_path.path.items)
-        else
-            false,
     };
 }
 
 /// Rename: move source attribute value to `to` key. The engine pre-checks
 /// source existence and upsert/conflict semantics, so this just performs the
-/// move.
+/// move. `log_field` sources are not renamable.
 pub fn logMove(ctx: *anyopaque, from: FieldRef, to: []const u8) void {
     const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
-    const attrs: *std.ArrayListUnmanaged(KeyValue) = switch (from) {
-        .log_attribute => &log_ctx.log_record.attributes,
-        .resource_attribute => if (log_ctx.resource_logs.resource) |*res| &res.attributes else return,
-        .scope_attribute => if (log_ctx.scope_logs.scope) |*scope| &scope.attributes else return,
+    const attrs = attributeList(log_ctx, from) orelse return;
+    const path = switch (from) {
+        .log_attribute, .resource_attribute, .scope_attribute => |attr| attr.path.items,
         .log_field => return,
     };
-    const key = switch (from) {
-        .log_attribute, .resource_attribute, .scope_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return,
-        .log_field => return,
-    };
-    const src_idx = findAttrIndex(attrs.items, key) orelse return;
+    if (path.len == 0) return;
+    const src_idx = findAttrIndex(attrs.items, path[0]) orelse return;
     const src_val = attrs.items[src_idx].value;
     _ = attrs.orderedRemove(src_idx);
     attrs.append(log_ctx.allocator, .{ .key = to, .value = src_val }) catch return;
 }
 
-/// LogAccessor template used when the OTLP logs module is the only consumer
-/// (e.g., in unit tests).
+/// LogAccessor template wiring the OTLP log primitives to a registry.
 pub const log_accessor: LogAccessor = .{
     .value = logValue,
     .set = logSet,
