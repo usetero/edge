@@ -355,78 +355,37 @@ pub fn run(distribution: mode.Distribution) !void {
         .version = service_metadata.version,
     });
 
-    // Each module's registry is wired statically to its own context type, so
-    // the engine never has to dispatch between consumer types at evaluation
-    // time. Each active registry runs its own policy.Loader; providers/I/O
-    // are duplicated across registries (file watches + HTTP polls). The
-    // duplication is acceptable for file providers and for HTTP polling at
-    // the default cadence (~60s). Revisit if HTTP cadence drops or many
-    // bundles are active in one binary.
-    var needs_otlp = false;
-    var needs_datadog = false;
-    var needs_prometheus = false;
-    for (bundlesFor(distribution)) |b| switch (b) {
-        .otlp => needs_otlp = true,
-        .datadog_logs, .datadog_metrics => needs_datadog = true,
-        .prometheus => needs_prometheus = true,
-    };
-
-    var otlp_registry: policy.Registry = undefined;
-    if (needs_otlp) otlp_registry = policy.Registry.init(allocator, bus, otlp_mod.accessor_templates);
-    defer if (needs_otlp) otlp_registry.deinit();
-
-    var datadog_registry: policy.Registry = undefined;
-    if (needs_datadog) datadog_registry = policy.Registry.init(allocator, bus, datadog_mod.accessor_templates);
-    defer if (needs_datadog) datadog_registry.deinit();
-
-    var prometheus_registry: policy.Registry = undefined;
-    if (needs_prometheus) prometheus_registry = policy.Registry.init(allocator, bus, prometheus_mod.accessor_templates);
-    defer if (needs_prometheus) prometheus_registry.deinit();
+    // policy-zig v0.3.1+: the registry is accessor-agnostic; each consumer
+    // module passes its own accessor at evaluate time. One registry +
+    // one loader services every bundle in this distribution.
+    var registry = policy.Registry.init(allocator, bus);
+    defer registry.deinit();
 
     var runtime_metrics = try RuntimeMetrics.init(allocator, distributionLabel(distribution));
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
-    var otlp_loader: ?*policy.Loader = null;
-    defer if (otlp_loader) |l| l.deinit();
-    var datadog_loader: ?*policy.Loader = null;
-    defer if (datadog_loader) |l| l.deinit();
-    var prometheus_loader: ?*policy.Loader = null;
-    defer if (prometheus_loader) |l| l.deinit();
-
-    if (needs_otlp) {
-        otlp_loader = try policy.Loader.init(allocator, bus, &otlp_registry, config.policy_providers, service_metadata);
-        try otlp_loader.?.startAsync();
-    }
-    if (needs_datadog) {
-        datadog_loader = try policy.Loader.init(allocator, bus, &datadog_registry, config.policy_providers, service_metadata);
-        try datadog_loader.?.startAsync();
-    }
-    if (needs_prometheus) {
-        prometheus_loader = try policy.Loader.init(allocator, bus, &prometheus_registry, config.policy_providers, service_metadata);
-        try prometheus_loader.?.startAsync();
-    }
+    var loader = try policy.Loader.init(allocator, bus, &registry, config.policy_providers, service_metadata);
+    defer loader.deinit();
+    try loader.startAsync();
     installSegfaultHandler();
 
     const server_allocator = allocator;
 
-    // Configs hold a pointer into the matching registry. The bundle loop
-    // below only references them for bundles whose `needs_*` was true, so
-    // the undefined-registry case is unreachable through `.module_data`.
     var datadog_config = DatadogConfig{
-        .registry = &datadog_registry,
+        .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
 
     var otlp_config = OtlpConfig{
-        .registry = &otlp_registry,
+        .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
 
     var prometheus_config = PrometheusConfig{
-        .registry = &prometheus_registry,
+        .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
         .max_input_bytes_per_scrape = config.prometheus.max_input_bytes_per_scrape,

@@ -329,7 +329,7 @@ fn filterLogsInPlace(
                     .allocator = allocator,
                 };
 
-                const result = engine.evaluate(.log, &ctx, &policy_id_buf, .{ .scratch = allocator });
+                const result = engine.evaluate(.log, &log_accessor, &ctx, &policy_id_buf, .{ .scratch = allocator });
 
                 if (result.was_transformed) {
                     was_transformed = true;
@@ -540,7 +540,7 @@ test "processLogs - parses and re-serializes JSON" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const logs =
@@ -576,7 +576,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -609,7 +609,7 @@ test "processLogs - unknown content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const data = "some unknown data";
@@ -642,7 +642,7 @@ test "processLogs - malformed protobuf returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const malformed = "not valid protobuf";
@@ -675,7 +675,7 @@ test "processLogs - no policies keeps all logs" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const logs =
@@ -714,7 +714,7 @@ test "processLogs - DROP policy filters logs by severity" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for DEBUG logs
@@ -770,7 +770,7 @@ test "processLogs - DROP policy filters logs by body content" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for logs containing "secret"
@@ -824,7 +824,7 @@ test "processLogs - DROP policy filters logs by resource attribute" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for logs from "test-service"
@@ -882,7 +882,7 @@ test "processLogs - all logs dropped returns empty structure" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches all logs (using body pattern that matches both messages)
@@ -970,7 +970,7 @@ test "processLogs - protobuf parses and re-serializes" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create valid protobuf data
@@ -1007,7 +1007,7 @@ test "processLogs - protobuf DROP policy filters logs" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for logs containing "secret"
@@ -1075,7 +1075,7 @@ test "processLogs - protobuf all logs dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches all logs
@@ -1136,7 +1136,7 @@ test "processLogs - JSON transform removes severity_text field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes the severity_text field
@@ -1204,7 +1204,7 @@ test "processLogs - JSON transform removes log attribute" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes a log attribute
@@ -1275,7 +1275,7 @@ test "processLogs - DROP policy filters logs by event_name" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for logs with event_name matching "user.login"
@@ -1331,7 +1331,7 @@ test "processLogs - JSON transform removes event_name field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes event_name
@@ -1571,7 +1571,7 @@ test "processLogs - DROP policy with nested attribute path" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy matching nested path http.method = GET
@@ -1637,7 +1637,7 @@ test "processLogs - policy with misaligned nested path returns no match" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy matching nested path http.request.method

@@ -247,7 +247,7 @@ const FilterLogResult = struct {
 /// Returns whether to keep the log and whether it was mutated.
 fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, allocator: std.mem.Allocator, policy_id_buf: [][]const u8) FilterLogResult {
     var field_ctx = FieldAccessorContext{ .log = log, .allocator = allocator };
-    const result = engine.evaluate(.log, &field_ctx, policy_id_buf, .{ .scratch = allocator });
+    const result = engine.evaluate(.log, &log_accessor, &field_ctx, policy_id_buf, .{ .scratch = allocator });
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
@@ -601,7 +601,7 @@ test "processLogs - no policies keeps all logs in array" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const logs =
@@ -639,7 +639,7 @@ test "processLogs - DROP policy filters logs from array" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for DEBUG logs
@@ -695,7 +695,7 @@ test "processLogs - DROP policy drops single object" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     var drop_policy = proto.policy.Policy{
@@ -747,7 +747,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -780,7 +780,7 @@ test "processLogs - non-JSON content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const data = "some raw log data";
@@ -813,7 +813,7 @@ test "processLogs - Datadog format with ddtags and service" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const logs =
@@ -850,7 +850,7 @@ test "processLogs - filter on arbitrary custom field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches on a custom field "environment"
@@ -909,7 +909,7 @@ test "processLogs - extra fields are preserved when no logs dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // No policies - all logs kept, original data returned unchanged
@@ -953,7 +953,7 @@ test "processLogs - nested extra fields are preserved when reserializing after d
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Drop DEBUG logs so remaining logs are reserialized.
@@ -1015,7 +1015,7 @@ test "processLogs - nested extra transform is ignored and payload is unchanged" 
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     var transform = proto.policy.LogTransform{};
@@ -1078,7 +1078,7 @@ test "processLogs - mutation triggers reserialization and removes field" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes the 'service' field
@@ -1151,7 +1151,7 @@ test "processLogs - filter on dynamic extra field not in schema" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches on a dynamic field "trace_id" (not in schema)
@@ -1215,7 +1215,7 @@ test "processLogs - filter on nested extra field with exists" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .log = log_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that drops logs where "debug_info" field exists

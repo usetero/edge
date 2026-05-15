@@ -48,7 +48,7 @@ pub const StreamEvaluator = struct {
 
         const registry = try allocator.create(policy.Registry);
         errdefer allocator.destroy(registry);
-        registry.* = policy.Registry.init(allocator, bus, .{ .log = context.log_accessor });
+        registry.* = policy.Registry.init(allocator, bus);
         errdefer registry.deinit();
 
         const policies = try policy.parser.parsePoliciesFile(allocator, policy_path.?);
@@ -98,6 +98,7 @@ pub const StreamEvaluator = struct {
                 var ctx = try parse.parseLine(line_alloc, self.input_format, line);
                 const result = active.engine.evaluate(
                     .log,
+                    &context.log_accessor,
                     &ctx,
                     &active.policy_id_buf,
                     .{ .scratch = line_alloc },

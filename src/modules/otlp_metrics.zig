@@ -276,7 +276,7 @@ fn filterMetricsInPlace(
                     .datapoint_attributes = getDatapointAttrs(metric),
                 };
 
-                const result = engine.evaluate(.metric, &ctx, &policy_id_buf, .{});
+                const result = engine.evaluate(.metric, &metric_accessor, &ctx, &policy_id_buf, .{});
 
                 if (result.decision.shouldContinue()) {
                     // Keep this metric - move to write position if needed
@@ -427,7 +427,7 @@ test "processMetrics - parses and re-serializes JSON" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const metrics =
@@ -463,7 +463,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -510,7 +510,7 @@ test "processMetrics - unknown content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const data = "some unknown data";
@@ -543,7 +543,7 @@ test "processMetrics - no policies keeps all metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const metrics =
@@ -581,7 +581,7 @@ test "processMetrics - DROP policy filters metrics by name" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for metrics matching "debug"
@@ -637,7 +637,7 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for metrics from "test-service"
@@ -694,7 +694,7 @@ test "processMetrics - all metrics dropped returns empty structure" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
@@ -797,7 +797,7 @@ test "processMetrics - protobuf parses and re-serializes" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create valid protobuf data
@@ -834,7 +834,7 @@ test "processMetrics - protobuf DROP policy filters metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for metrics containing "debug"
@@ -902,7 +902,7 @@ test "processMetrics - protobuf all metrics dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics

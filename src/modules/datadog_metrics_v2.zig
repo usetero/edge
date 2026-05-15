@@ -223,7 +223,7 @@ fn filterMetric(
         .series = series,
         .tags_cache = tags_cache,
     };
-    const result = engine.evaluate(.metric, &field_ctx, policy_id_buf, .{});
+    const result = engine.evaluate(.metric, &metric_accessor, &field_ctx, policy_id_buf, .{});
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
@@ -439,7 +439,7 @@ test "processMetrics - no policies keeps all metrics" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const metrics =
@@ -476,7 +476,7 @@ test "processMetrics - DROP policy filters metrics by name" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy for debug metrics
@@ -537,7 +537,7 @@ test "processMetrics - returns 202-compatible response when all metrics dropped"
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches the test metric
@@ -591,7 +591,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
@@ -624,7 +624,7 @@ test "processMetrics - non-JSON content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const data = "some raw metric data";
@@ -657,7 +657,7 @@ test "processMetrics - filter on tags" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches on tags containing "env:dev"
@@ -719,7 +719,7 @@ test "processMetrics - preserves all fields when no metrics dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // No policies - all metrics kept, original data returned unchanged
@@ -760,7 +760,7 @@ test "processMetrics - extra fields are preserved when no metrics dropped" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // No policies - all metrics kept, original data returned unchanged
@@ -803,7 +803,7 @@ test "processMetrics - filter on metric type" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .metric = metric_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     // Create a DROP policy that matches on metric type "count"

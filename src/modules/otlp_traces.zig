@@ -363,7 +363,7 @@ fn filterSpansInPlace(
                     .allocator = allocator,
                 };
 
-                const result = engine.evaluate(.trace, &ctx, &policy_id_buf, .{});
+                const result = engine.evaluate(.trace, &trace_accessor, &ctx, &policy_id_buf, .{});
 
                 if (result.was_transformed) {
                     was_transformed = true;
@@ -652,7 +652,7 @@ test "processTraces - parses and re-serializes JSON" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .trace = trace_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const traces =
@@ -688,7 +688,7 @@ test "processTraces - malformed JSON returns unchanged (fail-open)" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .trace = trace_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const malformed = "{ invalid json }";
@@ -735,7 +735,7 @@ test "processTraces - unknown content type returns unchanged" {
 
     var noop_bus: NoopEventBus = undefined;
     noop_bus.init();
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus(), .{ .trace = trace_accessor });
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
     const data = "some data";
