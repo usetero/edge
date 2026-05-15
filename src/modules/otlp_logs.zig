@@ -276,9 +276,43 @@ pub fn logMove(ctx: *anyopaque, from: FieldRef, to: []const u8) void {
     attrs.append(log_ctx.allocator, .{ .key = to, .value = src_val }) catch return;
 }
 
+/// Presence check for `exists` matchers. The engine's default fallback
+/// (`value != null`) is wrong for `LOG_FIELD_BODY` in two ways:
+///
+///   1. `body = { stringValue: "" }` reads as the empty string via
+///      `value()`, but per OTel-policy spec an empty body must be treated
+///      as not-present.
+///   2. `body = { intValue: ... }` (or any non-string body) reads as
+///      `null` via `value()` because we only return string content, but
+///      the spec says a non-null non-string body IS present.
+///
+/// String-typed log_fields (severity_text, trace_id, …) and attribute
+/// paths follow the simpler "non-empty string view" rule, so wiring this
+/// explicitly is still cheaper than relying on the fallback because we
+/// skip the allocator-touching `findNestedAttribute` for presence-only
+/// checks.
+pub fn logExists(ctx: *const anyopaque, field: FieldRef) bool {
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(@constCast(ctx)));
+    return switch (field) {
+        .log_field => |lf| if (lf == .LOG_FIELD_BODY) blk: {
+            const body = log_ctx.log_record.body orelse break :blk false;
+            const inner = body.value orelse break :blk false;
+            break :blk switch (inner) {
+                .string_value => |s| s.len > 0,
+                else => true,
+            };
+        } else if (stringFieldRef(log_ctx, lf)) |ref| ref.len > 0 else false,
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
+            const attrs = attributeList(log_ctx, field) orelse break :blk false;
+            break :blk findNestedAttribute(attrs.items, attr_path.path.items) != null;
+        },
+    };
+}
+
 /// LogAccessor template wiring the OTLP log primitives to a registry.
 pub const log_accessor: LogAccessor = .{
     .value = logValue,
+    .exists = logExists,
     .set = logSet,
     .delete = logDelete,
     .move = logMove,
@@ -874,6 +908,44 @@ test "processLogs - DROP policy filters logs by resource attribute" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "from prod service") != null);
     try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
+}
+
+test "logExists - empty body string treated as not present (spec)" {
+    // Regression for the `compound_empty_vs_missing` conformance failure:
+    // an OTel body with `stringValue: ""` MUST be treated as not present
+    // for `exists: true` matchers. Edge previously fell back to the
+    // engine's default callExists (`value != null`), which read the empty
+    // string as a non-null view and reported exists=true.
+    const allocator = std.testing.allocator;
+
+    const empty_body = proto.common.AnyValue{ .value = .{ .string_value = "" } };
+    const non_empty_body = proto.common.AnyValue{ .value = .{ .string_value = "x" } };
+    const int_body = proto.common.AnyValue{ .value = .{ .int_value = 42 } };
+
+    var record_empty = proto.logs.LogRecord{ .body = empty_body };
+    var record_nonempty = proto.logs.LogRecord{ .body = non_empty_body };
+    var record_int = proto.logs.LogRecord{ .body = int_body };
+    var record_missing = proto.logs.LogRecord{};
+    var resource_logs = proto.logs.ResourceLogs{};
+    defer resource_logs.deinit(allocator);
+    var scope_logs = proto.logs.ScopeLogs{};
+    defer scope_logs.deinit(allocator);
+
+    inline for (.{
+        .{ &record_empty, false },
+        .{ &record_nonempty, true },
+        .{ &record_int, true },
+        .{ &record_missing, false },
+    }) |case| {
+        var ctx = OtlpLogContext{
+            .log_record = case[0],
+            .resource_logs = &resource_logs,
+            .scope_logs = &scope_logs,
+            .allocator = allocator,
+        };
+        const got = logExists(&ctx, .{ .log_field = .LOG_FIELD_BODY });
+        try std.testing.expectEqual(@as(bool, case[1]), got);
+    }
 }
 
 test "processLogs - all logs dropped returns empty structure" {
