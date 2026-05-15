@@ -16,6 +16,7 @@ const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;
 const FilterDecision = policy.FilterDecision;
 const FieldRef = policy.FieldRef;
+const LogAccessor = policy.LogAccessor;
 const LogField = proto.policy.LogField;
 const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
 const PolicyRegistry = policy.Registry;
@@ -160,8 +161,8 @@ fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     }
 }
 
-/// Context for OTLP log field accessor and mutator - provides access to log record plus parent context
-const OtlpLogContext = struct {
+/// Context for OTLP log field accessor and mutator - provides access to log record plus parent context.
+pub const OtlpLogContext = struct {
     log_record: *LogRecord,
     resource_logs: *ResourceLogs,
     scope_logs: *ScopeLogs,
@@ -175,197 +176,147 @@ const removeAttributeByPath = otlp_attr.removeAttributeByPath;
 const setAttributeByPath = otlp_attr.setAttributeByPath;
 const setAttribute = otlp_attr.setAttribute;
 
-/// Field accessor for OTLP log format
-/// Maps FieldRef to the appropriate field in the OTLP log structure
-fn otlpFieldAccessor(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
-    const log_ctx: *const OtlpLogContext = @ptrCast(@alignCast(ctx));
-
-    return switch (field) {
-        .log_field => |lf| switch (lf) {
-            .LOG_FIELD_BODY => getAnyValueString(log_ctx.log_record.body),
-            .LOG_FIELD_SEVERITY_TEXT => if (log_ctx.log_record.severity_text.len > 0) log_ctx.log_record.severity_text else null,
-            .LOG_FIELD_TRACE_ID => if (log_ctx.log_record.trace_id.len > 0) log_ctx.log_record.trace_id else null,
-            .LOG_FIELD_SPAN_ID => if (log_ctx.log_record.span_id.len > 0) log_ctx.log_record.span_id else null,
-            .LOG_FIELD_EVENT_NAME => if (log_ctx.log_record.event_name.len > 0) log_ctx.log_record.event_name else null,
-            .LOG_FIELD_RESOURCE_SCHEMA_URL => if (log_ctx.resource_logs.schema_url.len > 0) log_ctx.resource_logs.schema_url else null,
-            .LOG_FIELD_SCOPE_SCHEMA_URL => if (log_ctx.scope_logs.schema_url.len > 0) log_ctx.scope_logs.schema_url else null,
-            else => null,
-        },
-        .log_attribute => |attr_path| findNestedAttribute(log_ctx.log_record.attributes.items, attr_path.path.items),
-        .resource_attribute => |attr_path| if (log_ctx.resource_logs.resource) |res| findNestedAttribute(res.attributes.items, attr_path.path.items) else null,
-        .scope_attribute => |attr_path| if (log_ctx.scope_logs.scope) |scope| findNestedAttribute(scope.attributes.items, attr_path.path.items) else null,
+/// Pointer to the storage slot for a `[]const u8` field, or null if the
+/// field tag isn't a plain string field on the OTLP context. `body` is
+/// `?AnyValue` and handled separately in each primitive.
+fn stringFieldRef(log_ctx: *OtlpLogContext, lf: LogField) ?*[]const u8 {
+    return switch (lf) {
+        .LOG_FIELD_SEVERITY_TEXT => &log_ctx.log_record.severity_text,
+        .LOG_FIELD_TRACE_ID => &log_ctx.log_record.trace_id,
+        .LOG_FIELD_SPAN_ID => &log_ctx.log_record.span_id,
+        .LOG_FIELD_EVENT_NAME => &log_ctx.log_record.event_name,
+        .LOG_FIELD_RESOURCE_SCHEMA_URL => &log_ctx.resource_logs.schema_url,
+        .LOG_FIELD_SCOPE_SCHEMA_URL => &log_ctx.scope_logs.schema_url,
+        else => null,
     };
 }
 
-const MutateOp = policy.MutateOp;
-const FieldMutator = policy.FieldMutator;
+/// Attribute list backing a `FieldRef` attribute variant, or null when the
+/// resource/scope wrapper is absent on this record. `log_field` returns
+/// null — fixed fields are not stored as attributes.
+fn attributeList(log_ctx: *OtlpLogContext, field: FieldRef) ?*std.ArrayListUnmanaged(KeyValue) {
+    return switch (field) {
+        .log_attribute => &log_ctx.log_record.attributes,
+        .resource_attribute => if (log_ctx.resource_logs.resource) |*res| &res.attributes else null,
+        .scope_attribute => if (log_ctx.scope_logs.scope) |*scope| &scope.attributes else null,
+        .log_field => null,
+    };
+}
 
-/// Field mutator for OTLP log format
-/// Supports remove, set, and rename operations on log fields and attributes
-fn otlpFieldMutator(ctx: *anyopaque, op: MutateOp) bool {
+/// Field accessor primitive for the OTLP log context.
+/// Returns the string view of the requested field, or null if missing/non-string.
+pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(@constCast(ctx)));
+    return switch (field) {
+        .log_field => |lf| if (lf == .LOG_FIELD_BODY)
+            getAnyValueString(log_ctx.log_record.body)
+        else if (stringFieldRef(log_ctx, lf)) |ref|
+            if (ref.len > 0) ref.* else null
+        else
+            null,
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
+            const attrs = attributeList(log_ctx, field) orelse break :blk null;
+            break :blk findNestedAttribute(attrs.items, attr_path.path.items);
+        },
+    };
+}
+
+/// Upsert a field. The engine pre-validates existence/upsert semantics, so
+/// `set` is always called at a point where the write is expected to succeed.
+pub fn logSet(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
     const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
-
-    switch (op) {
-        .remove => |field| {
-            switch (field) {
-                .log_field => |lf| switch (lf) {
-                    .LOG_FIELD_BODY => {
-                        if (log_ctx.log_record.body != null) {
-                            log_ctx.log_record.body = null;
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_SEVERITY_TEXT => {
-                        if (log_ctx.log_record.severity_text.len > 0) {
-                            log_ctx.log_record.severity_text = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_TRACE_ID => {
-                        if (log_ctx.log_record.trace_id.len > 0) {
-                            log_ctx.log_record.trace_id = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_SPAN_ID => {
-                        if (log_ctx.log_record.span_id.len > 0) {
-                            log_ctx.log_record.span_id = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_EVENT_NAME => {
-                        if (log_ctx.log_record.event_name.len > 0) {
-                            log_ctx.log_record.event_name = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_RESOURCE_SCHEMA_URL => {
-                        if (log_ctx.resource_logs.schema_url.len > 0) {
-                            log_ctx.resource_logs.schema_url = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    .LOG_FIELD_SCOPE_SCHEMA_URL => {
-                        if (log_ctx.scope_logs.schema_url.len > 0) {
-                            log_ctx.scope_logs.schema_url = &.{};
-                            return true;
-                        }
-                        return false;
-                    },
-                    else => return false,
-                },
-                .log_attribute => |attr_path| {
-                    return removeAttributeByPath(&log_ctx.log_record.attributes, attr_path.path.items);
-                },
-                .resource_attribute => |attr_path| {
-                    if (log_ctx.resource_logs.resource) |*res| {
-                        return removeAttributeByPath(&res.attributes, attr_path.path.items);
-                    }
-                    return false;
-                },
-                .scope_attribute => |attr_path| {
-                    if (log_ctx.scope_logs.scope) |*scope| {
-                        return removeAttributeByPath(&scope.attributes, attr_path.path.items);
-                    }
-                    return false;
-                },
-            }
+    switch (field) {
+        .log_field => |lf| if (lf == .LOG_FIELD_BODY) {
+            log_ctx.log_record.body = .{ .value = .{ .string_value = value } };
+        } else if (stringFieldRef(log_ctx, lf)) |ref| {
+            ref.* = value;
         },
-        .set => |s| {
-            switch (s.field) {
-                .log_field => |lf| switch (lf) {
-                    .LOG_FIELD_BODY => {
-                        log_ctx.log_record.body = .{ .value = .{ .string_value = s.value } };
-                        return true;
-                    },
-                    .LOG_FIELD_SEVERITY_TEXT => {
-                        log_ctx.log_record.severity_text = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_TRACE_ID => {
-                        log_ctx.log_record.trace_id = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_SPAN_ID => {
-                        log_ctx.log_record.span_id = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_EVENT_NAME => {
-                        log_ctx.log_record.event_name = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_RESOURCE_SCHEMA_URL => {
-                        log_ctx.resource_logs.schema_url = s.value;
-                        return true;
-                    },
-                    .LOG_FIELD_SCOPE_SCHEMA_URL => {
-                        log_ctx.scope_logs.schema_url = s.value;
-                        return true;
-                    },
-                    else => return false,
-                },
-                .log_attribute => |attr_path| {
-                    return setAttributeByPath(log_ctx.allocator, &log_ctx.log_record.attributes, attr_path.path.items, s.value);
-                },
-                .resource_attribute => |attr_path| {
-                    if (log_ctx.resource_logs.resource) |*res| {
-                        return setAttributeByPath(log_ctx.allocator, &res.attributes, attr_path.path.items, s.value);
-                    }
-                    return false;
-                },
-                .scope_attribute => |attr_path| {
-                    if (log_ctx.scope_logs.scope) |*scope| {
-                        return setAttributeByPath(log_ctx.allocator, &scope.attributes, attr_path.path.items, s.value);
-                    }
-                    return false;
-                },
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
+            if (attributeList(log_ctx, field)) |attrs| {
+                _ = setAttributeByPath(log_ctx.allocator, attrs, attr_path.path.items, value);
             }
-        },
-        .rename => |r| {
-            const attrs: *std.ArrayListUnmanaged(KeyValue) = switch (r.from) {
-                .log_attribute => &log_ctx.log_record.attributes,
-                .resource_attribute => if (log_ctx.resource_logs.resource) |*res| &res.attributes else return false,
-                .scope_attribute => if (log_ctx.scope_logs.scope) |*scope| &scope.attributes else return false,
-                .log_field => return false, // renaming fixed fields not supported
-            };
-            const key = switch (r.from) {
-                .log_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
-                .resource_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
-                .scope_attribute => |attr| if (attr.path.items.len > 0) attr.path.items[0] else return false,
-                .log_field => return false,
-            };
-
-            // Find source attribute
-            const src_idx = findAttrIndex(attrs.items, key) orelse return false;
-            const src_val = attrs.items[src_idx].value;
-
-            // If not upsert and target exists, don't overwrite
-            if (!r.upsert) {
-                if (findAttrIndex(attrs.items, r.to) != null) return true; // blocked but not an error
-            }
-
-            // Remove source
-            _ = attrs.orderedRemove(src_idx);
-
-            // Remove existing target if upsert
-            if (r.upsert) {
-                if (findAttrIndex(attrs.items, r.to)) |ti| {
-                    _ = attrs.orderedRemove(ti);
-                }
-            }
-
-            // Add renamed entry
-            attrs.append(log_ctx.allocator, .{ .key = r.to, .value = src_val }) catch return false;
-            return true;
         },
     }
 }
+
+/// Remove a field. Returns true iff it existed.
+pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
+    return switch (field) {
+        .log_field => |lf| if (lf == .LOG_FIELD_BODY) blk: {
+            if (log_ctx.log_record.body == null) break :blk false;
+            log_ctx.log_record.body = null;
+            break :blk true;
+        } else if (stringFieldRef(log_ctx, lf)) |ref| blk: {
+            if (ref.len == 0) break :blk false;
+            ref.* = &.{};
+            break :blk true;
+        } else false,
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
+            const attrs = attributeList(log_ctx, field) orelse break :blk false;
+            break :blk removeAttributeByPath(attrs, attr_path.path.items);
+        },
+    };
+}
+
+/// Rename: move source attribute value to `to` key. The engine pre-checks
+/// source existence and upsert/conflict semantics, so this just performs the
+/// move. `log_field` sources are not renamable.
+pub fn logMove(ctx: *anyopaque, from: FieldRef, to: []const u8) void {
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(ctx));
+    const attrs = attributeList(log_ctx, from) orelse return;
+    const path = switch (from) {
+        .log_attribute, .resource_attribute, .scope_attribute => |attr| attr.path.items,
+        .log_field => return,
+    };
+    if (path.len == 0) return;
+    const src_idx = findAttrIndex(attrs.items, path[0]) orelse return;
+    const src_val = attrs.items[src_idx].value;
+    _ = attrs.orderedRemove(src_idx);
+    attrs.append(log_ctx.allocator, .{ .key = to, .value = src_val }) catch return;
+}
+
+/// Presence check for `exists` matchers. The engine's default fallback
+/// (`value != null`) is wrong for `LOG_FIELD_BODY` in two ways:
+///
+///   1. `body = { stringValue: "" }` reads as the empty string via
+///      `value()`, but per OTel-policy spec an empty body must be treated
+///      as not-present.
+///   2. `body = { intValue: ... }` (or any non-string body) reads as
+///      `null` via `value()` because we only return string content, but
+///      the spec says a non-null non-string body IS present.
+///
+/// String-typed log_fields (severity_text, trace_id, …) and attribute
+/// paths follow the simpler "non-empty string view" rule, so wiring this
+/// explicitly is still cheaper than relying on the fallback because we
+/// skip the allocator-touching `findNestedAttribute` for presence-only
+/// checks.
+pub fn logExists(ctx: *const anyopaque, field: FieldRef) bool {
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(@constCast(ctx)));
+    return switch (field) {
+        .log_field => |lf| if (lf == .LOG_FIELD_BODY) blk: {
+            const body = log_ctx.log_record.body orelse break :blk false;
+            const inner = body.value orelse break :blk false;
+            break :blk switch (inner) {
+                .string_value => |s| s.len > 0,
+                else => true,
+            };
+        } else if (stringFieldRef(log_ctx, lf)) |ref| ref.len > 0 else false,
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
+            const attrs = attributeList(log_ctx, field) orelse break :blk false;
+            break :blk findNestedAttribute(attrs.items, attr_path.path.items) != null;
+        },
+    };
+}
+
+/// LogAccessor template wiring the OTLP log primitives to a registry.
+pub const log_accessor: LogAccessor = .{
+    .value = logValue,
+    .exists = logExists,
+    .set = logSet,
+    .delete = logDelete,
+    .move = logMove,
+};
 
 /// Result of filtering logs in-place
 const FilterCounts = struct {
@@ -411,7 +362,7 @@ fn filterLogsInPlace(
                     .allocator = allocator,
                 };
 
-                const result = engine.evaluate(.log, &ctx, otlpFieldAccessor, otlpFieldMutator, &policy_id_buf);
+                const result = engine.evaluate(.log, &log_accessor, &ctx, &policy_id_buf, .{ .scratch = allocator });
 
                 if (result.was_transformed) {
                     was_transformed = true;
@@ -957,6 +908,44 @@ test "processLogs - DROP policy filters logs by resource attribute" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "from prod service") != null);
     try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
+}
+
+test "logExists - empty body string treated as not present (spec)" {
+    // Regression for the `compound_empty_vs_missing` conformance failure:
+    // an OTel body with `stringValue: ""` MUST be treated as not present
+    // for `exists: true` matchers. Edge previously fell back to the
+    // engine's default callExists (`value != null`), which read the empty
+    // string as a non-null view and reported exists=true.
+    const allocator = std.testing.allocator;
+
+    const empty_body = proto.common.AnyValue{ .value = .{ .string_value = "" } };
+    const non_empty_body = proto.common.AnyValue{ .value = .{ .string_value = "x" } };
+    const int_body = proto.common.AnyValue{ .value = .{ .int_value = 42 } };
+
+    var record_empty = proto.logs.LogRecord{ .body = empty_body };
+    var record_nonempty = proto.logs.LogRecord{ .body = non_empty_body };
+    var record_int = proto.logs.LogRecord{ .body = int_body };
+    var record_missing = proto.logs.LogRecord{};
+    var resource_logs = proto.logs.ResourceLogs{};
+    defer resource_logs.deinit(allocator);
+    var scope_logs = proto.logs.ScopeLogs{};
+    defer scope_logs.deinit(allocator);
+
+    inline for (.{
+        .{ &record_empty, false },
+        .{ &record_nonempty, true },
+        .{ &record_int, true },
+        .{ &record_missing, false },
+    }) |case| {
+        var ctx = OtlpLogContext{
+            .log_record = case[0],
+            .resource_logs = &resource_logs,
+            .scope_logs = &scope_logs,
+            .allocator = allocator,
+        };
+        const got = logExists(&ctx, .{ .log_field = .LOG_FIELD_BODY });
+        try std.testing.expectEqual(@as(bool, case[1]), got);
+    }
 }
 
 test "processLogs - all logs dropped returns empty structure" {

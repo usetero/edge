@@ -23,7 +23,6 @@ const PolicyEngine = policy.PolicyEngine;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const PrometheusFieldContext = field_accessor.PrometheusFieldContext;
-const prometheusFieldAccessor = field_accessor.prometheusFieldAccessor;
 
 /// Result of processing a chunk of data
 pub const ProcessResult = struct {
@@ -507,14 +506,14 @@ pub const PolicyStreamingFilter = struct {
         // Create engine on demand (same pattern as other modules)
         const engine = PolicyEngine.init(self.bus, self.registry);
 
-        // Evaluate against policy engine
-        // Note: We pass null for mutator since Prometheus metrics are immutable in exposition format
+        // Evaluate against policy engine. Prometheus metrics are immutable in
+        // exposition format, so no scratch allocator is needed.
         const result = engine.evaluate(
             .metric,
+            &field_accessor.metric_accessor,
             @ptrCast(&ctx),
-            prometheusFieldAccessor,
-            null, // No mutation support for Prometheus
             &self.policy_id_buf,
+            .{},
         );
 
         // Continue means keep, drop means filter out

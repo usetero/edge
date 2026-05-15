@@ -165,8 +165,8 @@ fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
 // Internal Implementation
 // =============================================================================
 
-/// Context for OTLP metric field accessor - provides access to metric plus parent context
-const OtlpMetricContext = struct {
+/// Context for OTLP metric field accessor - provides access to metric plus parent context.
+pub const OtlpMetricContext = struct {
     metric: *Metric,
     resource_metrics: *ResourceMetrics,
     scope_metrics: *ScopeMetrics,
@@ -177,9 +177,9 @@ const getAnyValueString = otlp_attr.getStringValue;
 const findAttribute = otlp_attr.findAttribute;
 const findNestedAttribute = otlp_attr.findNestedAttribute;
 
-/// Field accessor for OTLP metric format
-/// Maps MetricFieldRef to the appropriate field in the OTLP metric structure
-fn otlpMetricFieldAccessor(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
+/// Field accessor for OTLP metric format.
+/// Maps `MetricFieldRef` to the appropriate field in the OTLP metric structure.
+pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
     const metric_ctx: *const OtlpMetricContext = @ptrCast(@alignCast(ctx));
 
     return switch (field) {
@@ -232,14 +232,11 @@ fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
     };
 }
 
-const MetricMutateOp = policy.MetricMutateOp;
-
-/// Field mutator for OTLP metric format
-/// Currently only supports drop decision (keep=false), no transforms
-fn otlpMetricFieldMutator(_: *anyopaque, _: MetricMutateOp) bool {
-    // Metric transforms not yet implemented for OTLP
-    return false;
-}
+/// MetricAccessor template wiring the OTLP metric value primitive.
+/// Metric mutations aren't part of the policy-zig MetricAccessor interface.
+pub const metric_accessor: policy.MetricAccessor = .{
+    .value = metricValue,
+};
 
 /// Result of filtering metrics in-place
 const FilterCounts = struct {
@@ -279,7 +276,7 @@ fn filterMetricsInPlace(
                     .datapoint_attributes = getDatapointAttrs(metric),
                 };
 
-                const result = engine.evaluate(.metric, &ctx, otlpMetricFieldAccessor, otlpMetricFieldMutator, &policy_id_buf);
+                const result = engine.evaluate(.metric, &metric_accessor, &ctx, &policy_id_buf, .{});
 
                 if (result.decision.shouldContinue()) {
                     // Keep this metric - move to write position if needed

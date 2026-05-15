@@ -198,7 +198,6 @@ pub fn main() !void {
         },
     };
 
-    // Create policy registry
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 

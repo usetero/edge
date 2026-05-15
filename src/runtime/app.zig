@@ -355,6 +355,9 @@ pub fn run(distribution: mode.Distribution) !void {
         .version = service_metadata.version,
     });
 
+    // policy-zig v0.3.1+: the registry is accessor-agnostic; each consumer
+    // module passes its own accessor at evaluate time. One registry +
+    // one loader services every bundle in this distribution.
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
@@ -362,15 +365,8 @@ pub fn run(distribution: mode.Distribution) !void {
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
-    var loader = try policy.Loader.init(
-        allocator,
-        bus,
-        &registry,
-        config.policy_providers,
-        service_metadata,
-    );
+    var loader = try policy.Loader.init(allocator, bus, &registry, config.policy_providers, service_metadata);
     defer loader.deinit();
-
     try loader.startAsync();
     installSegfaultHandler();
 

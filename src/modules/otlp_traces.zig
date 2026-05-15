@@ -168,8 +168,8 @@ fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
 // Internal Implementation
 // =============================================================================
 
-/// Context for OTLP span field accessor - provides access to span plus parent context
-const OtlpSpanContext = struct {
+/// Context for OTLP span field accessor - provides access to span plus parent context.
+pub const OtlpSpanContext = struct {
     span: *Span,
     resource_spans: *ResourceSpans,
     scope_spans: *ScopeSpans,
@@ -190,9 +190,9 @@ fn traceIdToHex(trace_id: []const u8, buf: *[32]u8) ?[]const u8 {
     return buf[0..32];
 }
 
-/// Field accessor for OTLP trace format
-/// Maps TraceFieldRef to the appropriate field in the OTLP span structure
-fn otlpSpanFieldAccessor(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
+/// Field accessor for OTLP trace format.
+/// Maps `TraceFieldRef` to the appropriate field in the OTLP span structure.
+pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
     const span_ctx: *const OtlpSpanContext = @ptrCast(@alignCast(ctx));
 
     return switch (field) {
@@ -255,30 +255,24 @@ fn otlpSpanFieldAccessor(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u
     };
 }
 
-const TraceMutateOp = policy.TraceMutateOp;
-
-/// Field mutator for OTLP trace format
-/// Handles tracestate updates from the sampling engine.
-fn otlpSpanFieldMutator(ctx: *anyopaque, op: TraceMutateOp) bool {
+/// Field setter for OTLP trace format. The engine only writes
+/// `TRACE_FIELD_TRACE_STATE` (the sampling threshold writeback); we merge
+/// the raw hex value into the W3C tracestate as `ot=th:VALUE`.
+pub fn traceSet(ctx: *anyopaque, field: TraceFieldRef, value: []const u8) void {
     const span_ctx: *OtlpSpanContext = @ptrCast(@alignCast(ctx));
-    switch (op) {
-        .set => |s| {
-            switch (s.field) {
-                .trace_field => |tf| {
-                    if (tf == .TRACE_FIELD_TRACE_STATE) {
-                        // The engine writes the raw threshold hex value.
-                        // Merge it into the W3C tracestate as ot=th:VALUE.
-                        span_ctx.span.trace_state = mergeOTTracestate(span_ctx.allocator, span_ctx.span.trace_state, s.value);
-                        return true;
-                    }
-                },
-                else => {},
-            }
+    switch (field) {
+        .trace_field => |tf| if (tf == .TRACE_FIELD_TRACE_STATE) {
+            span_ctx.span.trace_state = mergeOTTracestate(span_ctx.allocator, span_ctx.span.trace_state, value);
         },
         else => {},
     }
-    return false;
 }
+
+/// TraceAccessor template wiring the OTLP trace primitives.
+pub const trace_accessor: policy.TraceAccessor = .{
+    .value = traceValue,
+    .set = traceSet,
+};
 
 /// Merge a sampling threshold into W3C tracestate as ot=th:VALUE.
 /// Preserves existing vendor entries and other ot sub-keys (like rv).
@@ -369,7 +363,7 @@ fn filterSpansInPlace(
                     .allocator = allocator,
                 };
 
-                const result = engine.evaluate(.trace, &ctx, otlpSpanFieldAccessor, otlpSpanFieldMutator, &policy_id_buf);
+                const result = engine.evaluate(.trace, &trace_accessor, &ctx, &policy_id_buf, .{});
 
                 if (result.was_transformed) {
                     was_transformed = true;
