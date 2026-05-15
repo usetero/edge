@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.19.0](https://github.com/usetero/edge/compare/v1.18.3...v1.19.0) (2026-05-15)
+
+
+### Features
+
+* upgrade policy zig library ([#183](https://github.com/usetero/edge/issues/183)) ([2f0b977](https://github.com/usetero/edge/commit/2f0b9775b631fc8715aa2053c6cec01e13c5095b))
+
 ## [1.18.3](https://github.com/usetero/edge/compare/v1.18.2...v1.18.3) (2026-05-07)
 
 
