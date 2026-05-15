@@ -23,7 +23,6 @@ const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
-
 const LogsProcessingFailed = struct { err: []const u8, contentType: []const u8 };
 
 /// Result of processing logs
@@ -207,7 +206,7 @@ fn attributeList(log_ctx: *OtlpLogContext, field: FieldRef) ?*std.ArrayListUnman
 /// Field accessor primitive for the OTLP log context.
 /// Returns the string view of the requested field, or null if missing/non-string.
 pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
-    const log_ctx: *OtlpLogContext = @constCast(@ptrCast(@alignCast(ctx)));
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(@constCast(ctx)));
     return switch (field) {
         .log_field => |lf| if (lf == .LOG_FIELD_BODY)
             getAnyValueString(log_ctx.log_record.body)
