@@ -10,10 +10,10 @@ const checkpoint_mod = @import("checkpoint/mod.zig");
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
-fn initEventBus() o11y.StdioEventBus {
+fn initEventBus(io: std.Io, environ_map: *const std.process.Environ.Map) o11y.StdioEventBus {
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init();
-    stdio_bus.eventBus().setLevel(o11y.Level.parseFromEnv("TERO_LOG_LEVEL", .warn));
+    stdio_bus.init(io);
+    stdio_bus.eventBus().setLevel(o11y.Level.parseFromEnv(environ_map, "TERO_LOG_LEVEL", .warn));
     return stdio_bus;
 }
 
@@ -40,10 +40,17 @@ fn installSignalHandlers() void {
 /// Watch/discovery/checkpoint modules will plug in as the next step.
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
     cfg: types.TailConfig,
     watch_backend: watch_mod.BackendKind = .poll,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: types.TailConfig) !Runtime {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environ_map: *const std.process.Environ.Map,
+        cfg: types.TailConfig,
+    ) !Runtime {
         try types.validateConfig(cfg);
         const backend: watch_mod.BackendKind = switch (types.normalizeIoEngine(cfg.io_engine)) {
             .poll => .poll,
@@ -53,6 +60,8 @@ pub const Runtime = struct {
         };
         return .{
             .allocator = allocator,
+            .io = io,
+            .environ_map = environ_map,
             .cfg = cfg,
             .watch_backend = backend,
         };
@@ -65,7 +74,7 @@ pub const Runtime = struct {
     }
 
     pub fn runStream(self: *Runtime, input: *io_mod.Input, output: *io_mod.Output) !void {
-        var stdio_bus = initEventBus();
+        var stdio_bus = initEventBus(self.io, self.environ_map);
         var evaluator = try eval_stream.StreamEvaluator.init(
             self.allocator,
             self.cfg.input_format,
@@ -106,7 +115,7 @@ pub const Runtime = struct {
         stop_requested.store(false, .release);
         installSignalHandlers();
 
-        var stdio_bus = initEventBus();
+        var stdio_bus = initEventBus(self.io, self.environ_map);
         var framer = try framer_mod.LineFramer.init(self.allocator, self.cfg.read_buf, self.cfg.max_line);
         defer framer.deinit();
         var evaluator = try eval_stream.StreamEvaluator.init(
@@ -116,11 +125,12 @@ pub const Runtime = struct {
             stdio_bus.eventBus(),
         );
         defer evaluator.deinit();
-        var scheduler = try read_scheduler.EngineScheduler.init(self.allocator, self.cfg.io_engine);
+        var scheduler = try read_scheduler.EngineScheduler.init(self.allocator, self.io, self.cfg.io_engine);
         defer scheduler.deinit();
 
         var watcher = try watch_mod.Watcher.init(
             self.allocator,
+            self.io,
             backend,
             inputs,
             self.cfg.output_path,
@@ -133,6 +143,7 @@ pub const Runtime = struct {
 
         var checkpoint = try checkpoint_mod.Lane.init(
             self.allocator,
+            self.io,
             self.cfg.state_dir,
             4096,
             self.cfg.checkpoint_max_slots,
@@ -151,7 +162,7 @@ pub const Runtime = struct {
 
         const sleep_ns = self.cfg.poll_ms * std.time.ns_per_ms;
         const flush_ns = self.cfg.flush_interval_ms * std.time.ns_per_ms;
-        var next_flush_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(flush_ns));
+        var next_flush_ns: i128 = std.Io.Timestamp.now(self.io, .awake).toNanoseconds() + @as(i128, @intCast(flush_ns));
         var buffered_lines: usize = 0;
         while (true) {
             if (stop_requested.load(.acquire)) break;
@@ -171,14 +182,14 @@ pub const Runtime = struct {
                             .identity = id,
                             .byte_offset = evt.end_offset,
                             .last_seen_size = evt.end_offset,
-                            .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+                            .last_seen_ns = @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds()),
                         }) catch false;
                     }
                 }
                 buffered_lines += processed;
             }
 
-            const now = std.time.nanoTimestamp();
+            const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
             const due_timer = now >= next_flush_ns;
             const due_threshold = buffered_lines >= self.cfg.flush_line_threshold;
             if (due_timer or due_threshold) {
@@ -186,16 +197,21 @@ pub const Runtime = struct {
                 buffered_lines = 0;
                 next_flush_ns = now + @as(i128, @intCast(flush_ns));
             }
-            std.Thread.sleep(sleep_ns);
+            self.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
         }
         try output.flush();
     }
 };
 
-pub fn runStdinToOutput(allocator: std.mem.Allocator, cfg: types.TailConfig) !void {
-    var runtime = try Runtime.init(allocator, cfg);
+pub fn runStdinToOutput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    cfg: types.TailConfig,
+) !void {
+    var runtime = try Runtime.init(allocator, io, environ_map, cfg);
 
-    var input = try io_mod.Input.init(allocator, .stdin, cfg.read_buf);
+    var input = try io_mod.Input.init(allocator, io, .stdin, cfg.read_buf);
     defer input.deinit();
 
     const out_target: io_mod.OutputTarget = if (std.mem.eql(u8, cfg.output_path, "-"))
@@ -203,21 +219,27 @@ pub fn runStdinToOutput(allocator: std.mem.Allocator, cfg: types.TailConfig) !vo
     else
         .{ .file_append = cfg.output_path };
 
-    var output = try io_mod.Output.init(allocator, out_target, cfg.write_buf);
+    var output = try io_mod.Output.init(allocator, io, out_target, cfg.write_buf);
     defer output.deinit();
 
     try runtime.runStream(&input, &output);
 }
 
-pub fn runFilesToOutput(allocator: std.mem.Allocator, cfg: types.TailConfig, inputs: []const []const u8) !void {
-    var runtime = try Runtime.init(allocator, cfg);
+pub fn runFilesToOutput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    cfg: types.TailConfig,
+    inputs: []const []const u8,
+) !void {
+    var runtime = try Runtime.init(allocator, io, environ_map, cfg);
 
     const out_target: io_mod.OutputTarget = if (std.mem.eql(u8, cfg.output_path, "-"))
         .stdout
     else
         .{ .file_append = cfg.output_path };
 
-    var output = try io_mod.Output.init(allocator, out_target, cfg.write_buf);
+    var output = try io_mod.Output.init(allocator, io, out_target, cfg.write_buf);
     defer output.deinit();
 
     try runtime.runFilesLoop(inputs, &output);
@@ -250,11 +272,14 @@ test "runtime public API: runStream copies framed bytes" {
         .max_line = 1024,
         .write_buf = 16,
     };
-    var runtime = try Runtime.init(testing.allocator, cfg);
+    const io = std.Options.debug_io;
+    var env_map = std.process.Environ.Map.init(testing.allocator);
+    defer env_map.deinit();
+    var runtime = try Runtime.init(testing.allocator, io, &env_map, cfg);
 
-    var input = try io_mod.Input.init(testing.allocator, .{ .file = abs_in }, cfg.read_buf);
+    var input = try io_mod.Input.init(testing.allocator, io, .{ .file = abs_in }, cfg.read_buf);
     defer input.deinit();
-    var output = try io_mod.Output.init(testing.allocator, .{ .file_append = abs_out }, cfg.write_buf);
+    var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out }, cfg.write_buf);
     defer output.deinit();
 
     try runtime.runStream(&input, &output);
@@ -312,11 +337,14 @@ test "runtime public API: runStream applies policy drops" {
         .max_line = 1024,
         .write_buf = 32,
     };
-    var runtime = try Runtime.init(testing.allocator, cfg);
+    const io = std.Options.debug_io;
+    var env_map = std.process.Environ.Map.init(testing.allocator);
+    defer env_map.deinit();
+    var runtime = try Runtime.init(testing.allocator, io, &env_map, cfg);
 
-    var input = try io_mod.Input.init(testing.allocator, .{ .file = abs_in }, cfg.read_buf);
+    var input = try io_mod.Input.init(testing.allocator, io, .{ .file = abs_in }, cfg.read_buf);
     defer input.deinit();
-    var output = try io_mod.Output.init(testing.allocator, .{ .file_append = abs_out }, cfg.write_buf);
+    var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out }, cfg.write_buf);
     defer output.deinit();
 
     try runtime.runStream(&input, &output);

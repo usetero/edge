@@ -16,6 +16,7 @@ const ActiveEvaluator = struct {
     policy_id_buf: [policy.MAX_MATCHES_PER_SCAN][]const u8 = undefined,
     arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
+    io: std.Io,
 
     fn deinit(self: *ActiveEvaluator) void {
         self.registry.deinit();
@@ -67,6 +68,7 @@ pub const StreamEvaluator = struct {
                     .engine = policy.PolicyEngine.init(bus, registry),
                     .arena = std.heap.ArenaAllocator.init(allocator),
                     .allocator = allocator,
+                    .io = bus.io,
                 },
             },
         };
@@ -101,7 +103,7 @@ pub const StreamEvaluator = struct {
                     &context.log_accessor,
                     &ctx,
                     &active.policy_id_buf,
-                    .{ .scratch = line_alloc },
+                    .{ .scratch = line_alloc, .io = self.bus.io },
                 );
                 break :blk result;
             },
@@ -120,7 +122,7 @@ fn writePolicyFile(tmp: *std.testing.TmpDir, json: []const u8) ![]u8 {
 
 fn testBus() o11y.StdioEventBus {
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init();
+    stdio_bus.init(std.Options.debug_io);
     stdio_bus.eventBus().setLevel(.err);
     return stdio_bus;
 }

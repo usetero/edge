@@ -247,7 +247,7 @@ const FilterLogResult = struct {
 /// Returns whether to keep the log and whether it was mutated.
 fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, allocator: std.mem.Allocator, policy_id_buf: [][]const u8) FilterLogResult {
     var field_ctx = FieldAccessorContext{ .log = log, .allocator = allocator };
-    const result = engine.evaluate(.log, &log_accessor, &field_ctx, policy_id_buf, .{ .scratch = allocator });
+    const result = engine.evaluate(.log, &log_accessor, &field_ctx, policy_id_buf, .{ .scratch = allocator, .io = engine.bus.io });
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
@@ -406,7 +406,8 @@ const proto = @import("proto");
 /// Test helper to create an AttributePath from a single key string.
 /// Uses comptime to ensure the array literal has static storage.
 fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
-    return .{ .path = .{ .items = @constCast(&[_][]const u8{key}) } };
+    const items = @constCast(&[_][]const u8{key});
+    return .{ .path = .{ .items = items, .capacity = items.len } };
 }
 
 test "datadogFieldAccessor - extra field lookup" {
@@ -510,7 +511,7 @@ test "datadogFieldAccessor - nested extra field access via dotted key" {
 
     // Two-segment path should be joined with '.' to match dotted key
     const method_path = proto.policy.AttributePath{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }) },
+        .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }), .capacity = 2 },
     };
     const method_val = logValue(&field_ctx, .{ .log_attribute = method_path });
     try std.testing.expect(method_val != null);
@@ -535,7 +536,7 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
 
     // Path to non-existent dotted key
     const missing_path = proto.policy.AttributePath{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "nonexistent" }) },
+        .path = .{ .items = @constCast(&[_][]const u8{ "http", "nonexistent" }), .capacity = 2 },
     };
     const val = logValue(&field_ctx, .{ .log_attribute = missing_path });
     try std.testing.expect(val == null);
@@ -558,14 +559,14 @@ test "datadogFieldAccessor - nested object fallback via path segments" {
     var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
 
     const status_path = proto.policy.AttributePath{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "status_code" }) },
+        .path = .{ .items = @constCast(&[_][]const u8{ "http", "status_code" }), .capacity = 2 },
     };
     const status_val = logValue(&field_ctx, .{ .log_attribute = status_path });
     try std.testing.expect(status_val != null);
     try std.testing.expectEqualStrings("200", status_val.?);
 
     const region_path = proto.policy.AttributePath{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "meta", "region" }) },
+        .path = .{ .items = @constCast(&[_][]const u8{ "http", "meta", "region" }), .capacity = 3 },
     };
     const region_val = logValue(&field_ctx, .{ .log_attribute = region_path });
     try std.testing.expect(region_val != null);
@@ -590,7 +591,7 @@ test "datadogFieldAccessor - multi-segment path with no matching dotted key retu
 
     // Multi-segment path that doesn't match any dotted key
     const bad_path = proto.policy.AttributePath{
-        .path = .{ .items = @constCast(&[_][]const u8{ "flat_field", "nested" }) },
+        .path = .{ .items = @constCast(&[_][]const u8{ "flat_field", "nested" }), .capacity = 2 },
     };
     const val = logValue(&field_ctx, .{ .log_attribute = bad_path });
     try std.testing.expect(val == null);
@@ -600,7 +601,7 @@ test "processLogs - no policies keeps all logs in array" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -638,7 +639,7 @@ test "processLogs - DROP policy filters logs from array" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -694,7 +695,7 @@ test "processLogs - DROP policy drops single object" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -746,7 +747,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -779,7 +780,7 @@ test "processLogs - non-JSON content type returns unchanged" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -812,7 +813,7 @@ test "processLogs - Datadog format with ddtags and service" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -849,7 +850,7 @@ test "processLogs - filter on arbitrary custom field" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -908,7 +909,7 @@ test "processLogs - extra fields are preserved when no logs dropped" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -952,7 +953,7 @@ test "processLogs - nested extra fields are preserved when reserializing after d
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1014,7 +1015,7 @@ test "processLogs - nested extra transform is ignored and payload is unchanged" 
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1077,7 +1078,7 @@ test "processLogs - mutation triggers reserialization and removes field" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1150,7 +1151,7 @@ test "processLogs - filter on dynamic extra field not in schema" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1214,7 +1215,7 @@ test "processLogs - filter on nested extra field with exists" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 

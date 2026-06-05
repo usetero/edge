@@ -485,7 +485,7 @@ pub const PolicyStreamingFilter = struct {
     }
 
     /// Sample type from ParsedLine union
-    const Sample = std.meta.TagPayload(line_parser.ParsedLine, .sample);
+    const Sample = @FieldType(line_parser.ParsedLine, "sample");
 
     /// Evaluate whether to keep a metric sample based on policy
     fn shouldKeepMetric(self: *PolicyStreamingFilter, sample: Sample, line: []const u8) bool {
@@ -945,9 +945,9 @@ test "StreamingPrometheusFilter - exact buffer boundary" {
 // This validates the streaming approach works correctly with std.Io interfaces.
 
 /// Helper to create a mock "upstream" reader from a string
-fn createMockReader(data: []const u8, read_buf: []u8) std.io.FixedBufferStream([]const u8) {
+fn createMockReader(data: []const u8, read_buf: []u8) std.Io.Reader {
     _ = read_buf;
-    return std.io.fixedBufferStream(data);
+    return std.Io.Reader.fixed(data);
 }
 
 /// Simulates streaming from reader -> filter -> writer
@@ -1503,14 +1503,13 @@ test "Reader/Writer streaming - many small metrics" {
 
     // Generate 100 metrics
     var input_buf: [10000]u8 = undefined;
-    var input_stream = std.io.fixedBufferStream(&input_buf);
-    const input_writer = input_stream.writer();
+    var input_writer = std.Io.Writer.fixed(&input_buf);
 
     for (0..100) |i| {
         input_writer.print("metric_{d} {d}\n", .{ i, i * 10 }) catch unreachable;
     }
 
-    const input = input_stream.getWritten();
+    const input = input_writer.buffered();
 
     const result = try streamThroughFilter(
         input,
@@ -1643,7 +1642,7 @@ test "PolicyStreamingFilter - no policies passes all metrics" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1681,7 +1680,7 @@ test "PolicyStreamingFilter - DROP policy filters metrics by name" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1744,7 +1743,7 @@ test "PolicyStreamingFilter - DROP policy to keep only non-matching metrics" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1803,7 +1802,7 @@ test "PolicyStreamingFilter - filter by label value" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1861,7 +1860,7 @@ test "PolicyStreamingFilter - metadata excluded when all samples dropped" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1923,7 +1922,7 @@ test "PolicyStreamingFilter - metadata included when some samples kept" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1982,7 +1981,7 @@ test "PolicyStreamingFilter - histogram buckets filtered together" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -2052,7 +2051,7 @@ test "PolicyStreamingFilter - comments preserved regardless of policy" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -2111,7 +2110,7 @@ test "PolicyStreamingFilter - empty lines preserved regardless of policy" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -2163,7 +2162,7 @@ test "PolicyStreamingFilter - stats track dropped vs kept correctly" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -2224,7 +2223,7 @@ test "PolicyStreamingFilter - max_input_bytes truncation with policy" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -2314,7 +2313,7 @@ test "FilteringWriter - basic streaming with reader.stream() pattern" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -2396,7 +2395,7 @@ test "FilteringWriter - simulated chunked streaming" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -2454,7 +2453,7 @@ test "FilteringWriter - max_input_bytes limit" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 

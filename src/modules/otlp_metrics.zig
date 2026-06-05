@@ -276,7 +276,7 @@ fn filterMetricsInPlace(
                     .datapoint_attributes = getDatapointAttrs(metric),
                 };
 
-                const result = engine.evaluate(.metric, &metric_accessor, &ctx, &policy_id_buf, .{});
+                const result = engine.evaluate(.metric, &metric_accessor, &ctx, &policy_id_buf, .{ .io = bus.io });
 
                 if (result.decision.shouldContinue()) {
                     // Keep this metric - move to write position if needed
@@ -326,11 +326,11 @@ fn processJsonMetrics(
     bus: *EventBus,
     data: []const u8,
 ) !ProcessResult {
-    // Parse JSON into MetricsData protobuf struct
-    proto.protobuf.json.pb_options.emit_oneof_field_name = false;
-
-    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.)
-    proto.protobuf.json.pb_options.bytes_as_hex = true;
+    // Parse JSON into MetricsData protobuf struct.
+    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.);
+    // decode reads this thread-local, encode takes it via pb_options below.
+    proto.protobuf.json.tl_bytes_as_hex = true;
+    defer proto.protobuf.json.tl_bytes_as_hex = false;
 
     var parsed = try MetricsData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
@@ -341,7 +341,10 @@ fn processJsonMetrics(
     const counts = filterMetricsInPlace(&parsed.value, registry, bus);
 
     // Re-serialize to JSON
-    const output = try parsed.value.jsonEncode(.{}, allocator);
+    const output = try parsed.value.jsonEncode(.{}, .{
+        .emit_oneof_field_name = false,
+        .bytes_as_hex = true,
+    }, allocator);
 
     return .{
         .data = @constCast(output),
@@ -426,7 +429,7 @@ test "processMetrics - parses and re-serializes JSON" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -462,7 +465,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -509,7 +512,7 @@ test "processMetrics - unknown content type returns unchanged" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -542,7 +545,7 @@ test "processMetrics - no policies keeps all metrics" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -580,7 +583,7 @@ test "processMetrics - DROP policy filters metrics by name" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -636,7 +639,7 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -693,7 +696,7 @@ test "processMetrics - all metrics dropped returns empty structure" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -796,7 +799,7 @@ test "processMetrics - protobuf parses and re-serializes" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -833,7 +836,7 @@ test "processMetrics - protobuf DROP policy filters metrics" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -901,7 +904,7 @@ test "processMetrics - protobuf all metrics dropped" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 

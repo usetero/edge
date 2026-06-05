@@ -193,7 +193,8 @@ pub fn buildLabelsCache(allocator: std.mem.Allocator, parsed: line_parser.Parsed
 
 /// Helper function to create an AttributePath from a simple key for tests
 fn testAttrPath(comptime key: []const u8) AttributePath {
-    return .{ .path = .{ .items = @constCast(&[_][]const u8{key}) } };
+    const items = @constCast(&[_][]const u8{key});
+    return .{ .path = .{ .items = items, .capacity = items.len } };
 }
 
 test "prometheusFieldAccessor - metric name" {

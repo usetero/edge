@@ -40,11 +40,12 @@ pub const UpstreamClientManager = struct {
     /// Thread-safe allocator for HTTP client operations
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) UpstreamClientManager {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator) UpstreamClientManager {
         return .{
             .upstreams = .{},
             .http_client = .{
                 .allocator = allocator,
+                .io = io,
                 // TLS requires buffers of at least max_ciphertext_record_len for read/write
                 .tls_buffer_size = tls_min_buffer,
                 .read_buffer_size = tls_min_buffer,
@@ -203,7 +204,7 @@ pub const UpstreamClientManager = struct {
 test "UpstreamClientManager createUpstream parses URL correctly" {
     const allocator = std.testing.allocator;
 
-    var manager = UpstreamClientManager.init(allocator);
+    var manager = UpstreamClientManager.init(std.Options.debug_io, allocator);
     defer manager.deinit();
 
     const module_id = try manager.createUpstream(
@@ -223,7 +224,7 @@ test "UpstreamClientManager createUpstream parses URL correctly" {
 test "UpstreamClientManager createUpstream with explicit port" {
     const allocator = std.testing.allocator;
 
-    var manager = UpstreamClientManager.init(allocator);
+    var manager = UpstreamClientManager.init(std.Options.debug_io, allocator);
     defer manager.deinit();
 
     const module_id = try manager.createUpstream(
@@ -243,7 +244,7 @@ test "UpstreamClientManager createUpstream with explicit port" {
 test "UpstreamClientManager buildUpstreamUri" {
     const allocator = std.testing.allocator;
 
-    var manager = UpstreamClientManager.init(allocator);
+    var manager = UpstreamClientManager.init(std.Options.debug_io, allocator);
     defer manager.deinit();
 
     const module_id = try manager.createUpstream(
@@ -272,7 +273,7 @@ test "UpstreamClientManager buildUpstreamUri" {
 test "UpstreamClientManager buildUpstreamUri with non-standard port" {
     const allocator = std.testing.allocator;
 
-    var manager = UpstreamClientManager.init(allocator);
+    var manager = UpstreamClientManager.init(std.Options.debug_io, allocator);
     defer manager.deinit();
 
     const module_id = try manager.createUpstream(
@@ -290,7 +291,7 @@ test "UpstreamClientManager buildUpstreamUri with non-standard port" {
 test "UpstreamClientManager multiple upstreams" {
     const allocator = std.testing.allocator;
 
-    var manager = UpstreamClientManager.init(allocator);
+    var manager = UpstreamClientManager.init(std.Options.debug_io, allocator);
     defer manager.deinit();
 
     const id0 = try manager.createUpstream("https://api1.example.com", 2048, 1024, 1024);

@@ -113,11 +113,12 @@ pub const LineFramer = struct {
         try self.finish(writer, filter_ctx, filter_fn);
     }
 
-    /// Reads `[start_offset, end_offset)` from `file` using pread and frames
-    /// newline-delimited lines to the writer.
+    /// Reads `[start_offset, end_offset)` from `file` using positional reads and
+    /// frames newline-delimited lines to the writer.
     pub fn readRange(
         self: *LineFramer,
-        file: *const std.fs.File,
+        io: std.Io,
+        file: *const std.Io.File,
         start_offset: u64,
         end_offset: u64,
         writer: *std.Io.Writer,
@@ -128,7 +129,7 @@ pub const LineFramer = struct {
         while (offset < end_offset) {
             const remaining = end_offset - offset;
             const to_read: usize = @intCast(@min(remaining, self.read_buf.len));
-            const n = try std.posix.pread(file.handle, self.read_buf[0..to_read], @intCast(offset));
+            const n = try file.readPositionalAll(io, self.read_buf[0..to_read], offset);
             if (n == 0) break;
 
             try self.ingestChunk(self.read_buf[0..n], writer, filter_ctx, filter_fn);
@@ -243,12 +244,13 @@ test "framer public API: readRange emits file bytes as lines" {
         try f.writeAll("x\ny\n");
     }
 
+    const io = std.Options.debug_io;
     const in_path = try tmp.dir.realpathAlloc(testing.allocator, "in.log");
     defer testing.allocator.free(in_path);
 
-    const file = try std.fs.openFileAbsolute(in_path, .{ .mode = .read_only });
-    defer file.close();
-    const size = (try file.stat()).size;
+    const file = try std.Io.Dir.cwd().openFile(io, in_path, .{ .mode = .read_only });
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
 
     var framer = try LineFramer.init(testing.allocator, 8, 1024);
     defer framer.deinit();
@@ -256,7 +258,7 @@ test "framer public API: readRange emits file bytes as lines" {
     defer out.deinit();
 
     var ctx: u8 = 0;
-    try framer.readRange(&file, 0, size, &out.writer, &ctx, keepAll);
+    try framer.readRange(io, &file, 0, size, &out.writer, &ctx, keepAll);
     try framer.finish(&out.writer, &ctx, keepAll);
     try testing.expectEqualStrings("x\ny\n", out.written());
 }

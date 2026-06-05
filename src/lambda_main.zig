@@ -138,18 +138,17 @@ fn serverThread(ctx: *ServerThreadContext) void {
 // Main Entry Point
 // =============================================================================
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     // Initialize observability
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init();
+    stdio_bus.init(io);
     const bus = stdio_bus.eventBus();
 
     // Parse log level from environment
-    bus.setLevel(Level.parseFromEnv("TERO_LOG_LEVEL", .info));
+    bus.setLevel(Level.parseFromEnv(init.environ_map, "TERO_LOG_LEVEL", .info));
 
     // Initialize std.log adapter
     StdLogAdapter.init(bus);
@@ -161,7 +160,7 @@ pub fn main() !void {
     bus.info(LambdaExtensionStarting{});
 
     // Load configuration via zonfig (env vars with TERO_ prefix, no JSON file)
-    const config = zonfig.load(LambdaConfig, allocator, .{ .env_prefix = "TERO" }) catch |err| {
+    const config = zonfig.load(LambdaConfig, allocator, .{ .env_prefix = "TERO", .environ = init.environ_map }) catch |err| {
         bus.err(LambdaExtensionError{ .err = @errorName(err) });
         return err;
     };
@@ -179,7 +178,7 @@ pub fn main() !void {
     // Generate instance ID
     var instance_id_buf: [64]u8 = undefined;
     const instance_id = try std.fmt.bufPrint(&instance_id_buf, "lambda-{d}-{d}", .{
-        std.time.milliTimestamp(),
+        std.Io.Timestamp.now(io, .real).toMilliseconds(),
         std.Thread.getCurrentId(),
     });
     const instance_id_copy = try allocator.dupe(u8, instance_id);
@@ -201,7 +200,7 @@ pub fn main() !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
-    var runtime_metrics = try RuntimeMetrics.init(allocator, .lambda);
+    var runtime_metrics = try RuntimeMetrics.init(allocator, io, .lambda);
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
@@ -254,12 +253,13 @@ pub fn main() !void {
         const providers = [_]policy.ProviderConfig{provider_config};
         loader = try policy.Loader.init(
             allocator,
+            io,
             bus,
             &registry,
             &providers,
             service_metadata,
         );
-        try loader.?.startAsync();
+        try loader.?.startAsync(io);
     }
 
     // Create Datadog module configuration
@@ -318,6 +318,7 @@ pub fn main() !void {
     // Create proxy server
     var proxy = try ProxyServer.init(
         allocator,
+        io,
         bus,
         &runtime_metrics,
         config.listen_address,
@@ -339,7 +340,7 @@ pub fn main() !void {
     const server_thread = try std.Thread.spawn(.{}, serverThread, .{&server_ctx});
 
     // Initialize Lambda Extensions API client
-    var extension = try ExtensionClient.init(allocator, bus, "tero-edge");
+    var extension = try ExtensionClient.init(allocator, io, bus, init.environ_map, "tero-edge");
     defer extension.deinit();
 
     // Register with Lambda Extensions API

@@ -17,7 +17,8 @@ pub const State = struct {
     read_armed: bool = false,
 };
 
-pub fn init(allocator: std.mem.Allocator) !State {
+pub fn init(allocator: std.mem.Allocator, io: std.Io) !State {
+    _ = io;
     if (builtin.os.tag != .linux) return error.UnsupportedWatcherBackend;
     const ino_flags: u32 = @bitCast(std.posix.O{ .NONBLOCK = true, .CLOEXEC = true });
     const fd = try std.posix.inotify_init1(ino_flags);

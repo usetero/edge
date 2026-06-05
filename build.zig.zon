@@ -25,7 +25,7 @@
     .fingerprint = 0x7506d36611375239, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,20 +33,18 @@
     // internet connectivity.
     .dependencies = .{
         .httpz = .{
-            .url = "git+https://github.com/karlseguin/http.zig?ref=master#844f8016e6616f00b05d4cc3c713307b0fe586c7",
-            .hash = "httpz-0.0.0-PNVzrBtMBwAPcQx3mNEgat3Xbsynw-eIC9SmOX5M9XtP",
+            .url = "git+https://github.com/karlseguin/http.zig?ref=master#f39f1ed803fcf080a01a3ab9c11b3cf9e0ff9aa8",
+            .hash = "httpz-0.0.0-PNVzrLLOCAD99G3Q3N-nDSsL40Yl7bAJ0_et7PXeWgsa",
         },
         .zimdjson = .{
-            .url = "git+https://github.com/jaronoff97/zimdjson?ref=zig-0.15.1-support#f31efc9e698246f994df8eba44646134a93fa2b6",
-            .hash = "zimdjson-0.1.1-89pgxT5VBgBMxsGpAd90DI0e-DzHGKiRVlquliE5FivH",
+            .path = "../zimdjson",
         },
         .policy_zig = .{
-            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.3.1.tar.gz",
-            .hash = "policy_zig-0.1.7-5_dp3ps4EACY3nicmFNzL2EUIbKEM5q3fROlZirr1id8",
+            .path = "../policy-zig",
         },
         .metrics = .{
-            .url = "git+https://github.com/karlseguin/metrics.zig#28cf547974144d827b5f85c07af7f9ec72c302dc",
-            .hash = "metrics-0.0.0-W7G4ePy_AQBozb1s8-avLxHOd4thMO92zKXDW84tmAhf",
+            .url = "git+https://github.com/karlseguin/metrics.zig#6de29b83a750a06c438d268543e0e3c3c1b309da",
+            .hash = "metrics-0.0.0-W7G4eIegAQD4XxA9Co7Atbw59u_2zvxYf406AZuoAHPM",
         },
     },
     .paths = .{

@@ -222,7 +222,7 @@ test "DatadogModule processes POST requests to /api/v2/logs" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -269,7 +269,7 @@ test "DatadogModule processes POST requests to /api/v2/series" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -316,7 +316,7 @@ test "DatadogModule ignores GET requests" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -360,7 +360,7 @@ test "DatadogModule filters logs with DROP policy" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -427,7 +427,7 @@ test "DatadogModule filters metrics with DROP policy" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -496,7 +496,7 @@ test "DatadogModule returns 202 when all logs dropped" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -560,7 +560,7 @@ test "DatadogModule returns 202 when all metrics dropped" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 

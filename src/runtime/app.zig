@@ -221,9 +221,9 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
     while (true) {
         var sig: c_int = 0;
         if (std.c.sigwait(@constCast(&ctx.signal_set), &sig) != 0) continue;
-        if (sig == std.posix.SIG.USR1 and ctx.shutdown_waiter.load(.acquire)) return;
+        if (sig == @intFromEnum(std.posix.SIG.USR1) and ctx.shutdown_waiter.load(.acquire)) return;
 
-        const signal_name = if (sig == std.posix.SIG.INT) "SIGINT" else "SIGTERM";
+        const signal_name = if (sig == @intFromEnum(std.posix.SIG.INT)) "SIGINT" else "SIGTERM";
         const count = ctx.signal_count.fetchAdd(1, .acq_rel) + 1;
 
         if (count == 1) {
@@ -247,7 +247,7 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
             .count = count,
         });
         setShutdownState(ctx.bus, ctx.shutdown_state, .force_exit, "second.signal");
-        std.posix.exit(1);
+        std.process.exit(1);
     }
 }
 
@@ -256,7 +256,7 @@ fn stopWorkerThread(ctx: StopWorkerContext) void {
     ctx.server.server.stop();
 }
 
-fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
+fn handleSegfault(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
     _ = sig;
     _ = ctx_ptr;
 
@@ -270,9 +270,9 @@ fn handleSegfault(sig: c_int, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyop
     std.debug.print("Faulting address: 0x{x}\n", .{fault_addr});
     std.debug.print("Signal code: {d}\n", .{info.code});
     std.debug.print("Stack trace:\n", .{});
-    std.debug.dumpCurrentStackTrace(@returnAddress());
+    std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
 
-    std.posix.abort();
+    std.process.abort();
 }
 
 fn installSegfaultHandler() void {
@@ -286,30 +286,30 @@ fn installSegfaultHandler() void {
     std.posix.sigaction(std.posix.SIG.SEGV, &segv_act, null);
 }
 
-pub fn run(distribution: mode.Distribution) !void {
-    const allocator = std.heap.smp_allocator;
+pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init();
+    stdio_bus.init(io);
     const bus = stdio_bus.eventBus();
 
-    bus.setLevel(Level.parseFromEnv("TERO_LOG_LEVEL", .info));
+    bus.setLevel(Level.parseFromEnv(init.environ_map, "TERO_LOG_LEVEL", .info));
 
     StdLogAdapter.init(bus);
     defer StdLogAdapter.deinit();
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-
-    _ = args.next();
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
     const config_path = args.next() orelse distribution.defaultConfigPath();
 
     bus.info(ServerStarting{});
     bus.info(ConfigurationLoaded{ .path = config_path });
 
-    const config = zonfig.load(ProxyConfig, allocator, .{
+    const config = zonfig.load(ProxyConfig, allocator, io, .{
         .json_path = config_path,
         .env_prefix = "TERO",
+        .environ = init.environ_map,
     }) catch |err| {
         bus.err(ConfigLoadError{ .err = @errorName(err) });
         return err;
@@ -318,7 +318,7 @@ pub fn run(distribution: mode.Distribution) !void {
 
     var instance_id_buf: [64]u8 = undefined;
     const instance_id = try std.fmt.bufPrint(&instance_id_buf, "edge-{d}-{d}", .{
-        std.time.milliTimestamp(),
+        std.Io.Timestamp.now(io, .real).toMilliseconds(),
         std.Thread.getCurrentId(),
     });
     const instance_id_copy = try allocator.dupe(u8, instance_id);
@@ -361,13 +361,13 @@ pub fn run(distribution: mode.Distribution) !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
-    var runtime_metrics = try RuntimeMetrics.init(allocator, distributionLabel(distribution));
+    var runtime_metrics = try RuntimeMetrics.init(allocator, io, distributionLabel(distribution));
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
-    var loader = try policy.Loader.init(allocator, bus, &registry, config.policy_providers, service_metadata);
+    var loader = try policy.Loader.init(allocator, io, bus, &registry, config.policy_providers, service_metadata);
     defer loader.deinit();
-    try loader.startAsync();
+    try loader.startAsync(io);
     installSegfaultHandler();
 
     const server_allocator = allocator;
@@ -402,7 +402,7 @@ pub fn run(distribution: mode.Distribution) !void {
     var prometheus_module = PrometheusModule{};
     var passthrough_module = PassthroughModule{};
 
-    var module_registrations = std.ArrayListUnmanaged(ModuleRegistration){};
+    var module_registrations = std.ArrayListUnmanaged(ModuleRegistration).empty;
     defer module_registrations.deinit(allocator);
 
     try module_registrations.append(allocator, .{
@@ -476,6 +476,7 @@ pub fn run(distribution: mode.Distribution) !void {
 
     var proxy = try ProxyServer.init(
         server_allocator,
+        io,
         bus,
         &runtime_metrics,
         config.listen_address,

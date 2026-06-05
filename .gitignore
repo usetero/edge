@@ -13,6 +13,7 @@
 .zig-cache-global/
 *.pyc
 zig-out/
+zig-pkg/
 /release/
 /debug/
 /build/

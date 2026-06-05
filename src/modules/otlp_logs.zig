@@ -362,7 +362,7 @@ fn filterLogsInPlace(
                     .allocator = allocator,
                 };
 
-                const result = engine.evaluate(.log, &log_accessor, &ctx, &policy_id_buf, .{ .scratch = allocator });
+                const result = engine.evaluate(.log, &log_accessor, &ctx, &policy_id_buf, .{ .scratch = allocator, .io = bus.io });
 
                 if (result.was_transformed) {
                     was_transformed = true;
@@ -430,11 +430,11 @@ fn processJsonLogs(
         };
     }
 
-    // Parse JSON into LogsData protobuf struct
-    proto.protobuf.json.pb_options.emit_oneof_field_name = false;
-
-    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.)
-    proto.protobuf.json.pb_options.bytes_as_hex = true;
+    // Parse JSON into LogsData protobuf struct.
+    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.);
+    // decode reads this thread-local, encode takes it via pb_options below.
+    proto.protobuf.json.tl_bytes_as_hex = true;
+    defer proto.protobuf.json.tl_bytes_as_hex = false;
 
     var parsed = try LogsData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
@@ -457,7 +457,10 @@ fn processJsonLogs(
     }
 
     // Re-serialize to JSON
-    const output = try parsed.value.jsonEncode(.{}, allocator);
+    const output = try parsed.value.jsonEncode(.{}, .{
+        .emit_oneof_field_name = false,
+        .bytes_as_hex = true,
+    }, allocator);
 
     return .{
         .data = @constCast(output),
@@ -572,7 +575,7 @@ test "processLogs - parses and re-serializes JSON" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -608,7 +611,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -641,7 +644,7 @@ test "processLogs - unknown content type returns unchanged" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -674,7 +677,7 @@ test "processLogs - malformed protobuf returns unchanged (fail-open)" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -707,7 +710,7 @@ test "processLogs - no policies keeps all logs" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -746,7 +749,7 @@ test "processLogs - DROP policy filters logs by severity" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -802,7 +805,7 @@ test "processLogs - DROP policy filters logs by body content" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -856,7 +859,7 @@ test "processLogs - DROP policy filters logs by resource attribute" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -952,7 +955,7 @@ test "processLogs - all logs dropped returns empty structure" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1040,7 +1043,7 @@ test "processLogs - protobuf parses and re-serializes" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1077,7 +1080,7 @@ test "processLogs - protobuf DROP policy filters logs" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1145,7 +1148,7 @@ test "processLogs - protobuf all logs dropped" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1206,7 +1209,7 @@ test "processLogs - JSON transform removes severity_text field" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1274,7 +1277,7 @@ test "processLogs - JSON transform removes log attribute" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1345,7 +1348,7 @@ test "processLogs - DROP policy filters logs by event_name" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1401,7 +1404,7 @@ test "processLogs - JSON transform removes event_name field" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1468,7 +1471,7 @@ test "processLogs - JSON transform removes event_name field" {
 
 test "findNestedAttribute - single segment path" {
     // Test that single-segment paths work correctly
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1483,7 +1486,7 @@ test "findNestedAttribute - single segment path" {
 
 test "findNestedAttribute - two segment path through kvlist" {
     // Test path ["http", "method"] where http contains a kvlist
-    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer inner_attrs.deinit(std.testing.allocator);
 
     try inner_attrs.append(std.testing.allocator, .{
@@ -1495,7 +1498,7 @@ test "findNestedAttribute - two segment path through kvlist" {
         .value = .{ .value = .{ .string_value = "200" } },
     });
 
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1516,7 +1519,7 @@ test "findNestedAttribute - two segment path through kvlist" {
 
 test "findNestedAttribute - three segment deep path" {
     // Test path ["request", "headers", "content-type"]
-    var headers_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var headers_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer headers_attrs.deinit(std.testing.allocator);
 
     try headers_attrs.append(std.testing.allocator, .{
@@ -1524,7 +1527,7 @@ test "findNestedAttribute - three segment deep path" {
         .value = .{ .value = .{ .string_value = "application/json" } },
     });
 
-    var request_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var request_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer request_attrs.deinit(std.testing.allocator);
 
     try request_attrs.append(std.testing.allocator, .{
@@ -1532,7 +1535,7 @@ test "findNestedAttribute - three segment deep path" {
         .value = .{ .value = .{ .kvlist_value = .{ .values = headers_attrs } } },
     });
 
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1546,7 +1549,7 @@ test "findNestedAttribute - three segment deep path" {
 }
 
 test "findNestedAttribute - path segment not found" {
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1565,7 +1568,7 @@ test "findNestedAttribute - path segment not found" {
 
 test "findNestedAttribute - path longer than nesting depth" {
     // Path ["http", "method", "extra"] but http.method is a string, not kvlist
-    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer inner_attrs.deinit(std.testing.allocator);
 
     try inner_attrs.append(std.testing.allocator, .{
@@ -1573,7 +1576,7 @@ test "findNestedAttribute - path longer than nesting depth" {
         .value = .{ .value = .{ .string_value = "GET" } },
     });
 
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1588,7 +1591,7 @@ test "findNestedAttribute - path longer than nesting depth" {
 
 test "findNestedAttribute - intermediate segment is not kvlist" {
     // Path ["service", "name"] but service is a string, not a kvlist
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1602,7 +1605,7 @@ test "findNestedAttribute - intermediate segment is not kvlist" {
 }
 
 test "findNestedAttribute - empty path returns null" {
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1616,7 +1619,7 @@ test "findNestedAttribute - empty path returns null" {
 
 test "findNestedAttribute - intermediate segment missing" {
     // Path ["http", "request", "method"] but http only has "response"
-    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer inner_attrs.deinit(std.testing.allocator);
 
     try inner_attrs.append(std.testing.allocator, .{
@@ -1624,7 +1627,7 @@ test "findNestedAttribute - intermediate segment missing" {
         .value = .{ .value = .{ .string_value = "ok" } },
     });
 
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .{};
+    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1641,7 +1644,7 @@ test "processLogs - DROP policy with nested attribute path" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -1707,7 +1710,7 @@ test "processLogs - policy with misaligned nested path returns no match" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 

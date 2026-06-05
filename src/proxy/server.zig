@@ -179,9 +179,12 @@ const ServerContext = struct {
 
     allocator: std.mem.Allocator,
 
+    /// I/O implementation
+    io: std.Io,
+
     /// Handle all requests directly - we do our own routing
     pub fn handle(self: *ServerContext, req: *httpz.Request, res: *httpz.Response) void {
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
         var metric_ctx = RequestMetricContext{
             .known_path = classifyKnownPath(req.url.path, toHttpMethod(req.method)),
             .route_kind = .passthrough,
@@ -201,7 +204,7 @@ const ServerContext = struct {
             self.uncaughtError(req, res, err, &metric_ctx);
         };
 
-        const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+        const elapsed_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds() - start_ns;
         const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         self.metrics.recordRequest(
             toMethodLabel(toHttpMethod(req.method)),
@@ -232,13 +235,12 @@ const ServerContext = struct {
         var stack_trace_str: ?[]const u8 = null;
 
         if (@errorReturnTrace()) |trace| {
-            var fbs = std.io.fixedBufferStream(&stack_buf);
-            const writer = fbs.writer().any();
+            var writer = std.Io.Writer.fixed(&stack_buf);
             const frames = trace.instruction_addresses[0..@min(trace.index, trace.instruction_addresses.len)];
             for (frames) |addr| {
                 writer.print("0x{x} ", .{addr}) catch break;
             }
-            stack_trace_str = fbs.getWritten();
+            stack_trace_str = writer.buffered();
         }
 
         self.bus.err(RequestError{
@@ -266,6 +268,7 @@ pub const ProxyServer = struct {
     /// Initialize the proxy server with registered modules
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         bus: *EventBus,
         metrics: *RuntimeMetrics,
         listen_address: [4]u8,
@@ -278,16 +281,17 @@ pub const ProxyServer = struct {
         errdefer allocator.destroy(ctx);
 
         ctx.allocator = allocator;
+        ctx.io = io;
         ctx.bus = bus;
         ctx.metrics = metrics;
         ctx.max_upstream_retries = max_upstream_retries;
-        ctx.upstreams = UpstreamClientManager.init(allocator);
+        ctx.upstreams = UpstreamClientManager.init(io, allocator);
         errdefer ctx.upstreams.deinit();
         ctx.modules = .{ .modules = .{} };
         errdefer ctx.modules.deinit(allocator);
 
         // Build module configs for router
-        var module_configs = std.ArrayListUnmanaged(ModuleConfig){};
+        var module_configs = std.ArrayListUnmanaged(ModuleConfig).empty;
         defer module_configs.deinit(allocator);
 
         // Initialize modules
@@ -338,11 +342,11 @@ pub const ProxyServer = struct {
         // Create httpz server - using handle() for direct request handling
         const server = try allocator.create(httpz.Server(*ServerContext));
         errdefer allocator.destroy(server);
-        server.* = try httpz.Server(*ServerContext).init(allocator, .{
-            .address = .{ .ip = .{
-                .host = ctx.listen_address,
+        server.* = try httpz.Server(*ServerContext).init(io, allocator, .{
+            .address = .{ .ip = .{ .ip4 = .{
+                .bytes = listen_address,
                 .port = listen_port,
-            } },
+            } } },
             .request = .{
                 .max_body_size = max_body_size,
             },

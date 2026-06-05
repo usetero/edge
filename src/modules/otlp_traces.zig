@@ -244,7 +244,7 @@ pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
             }
             break :blk null;
         },
-        .link_trace_id => |_| blk: {
+        .link_trace_id => blk: {
             // Check if span has any links - return first linked trace_id as hex
             if (span_ctx.span.links.items.len == 0) break :blk null;
             const S = struct {
@@ -363,7 +363,7 @@ fn filterSpansInPlace(
                     .allocator = allocator,
                 };
 
-                const result = engine.evaluate(.trace, &trace_accessor, &ctx, &policy_id_buf, .{});
+                const result = engine.evaluate(.trace, &trace_accessor, &ctx, &policy_id_buf, .{ .io = bus.io });
 
                 if (result.was_transformed) {
                     was_transformed = true;
@@ -419,11 +419,11 @@ fn processJsonTraces(
     bus: *EventBus,
     data: []const u8,
 ) !ProcessResult {
-    // Parse JSON into TracesData protobuf struct
-    proto.protobuf.json.pb_options.emit_oneof_field_name = false;
-
-    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.)
-    proto.protobuf.json.pb_options.bytes_as_hex = true;
+    // Parse JSON into TracesData protobuf struct.
+    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.);
+    // decode reads this thread-local, encode takes it via pb_options below.
+    proto.protobuf.json.tl_bytes_as_hex = true;
+    defer proto.protobuf.json.tl_bytes_as_hex = false;
 
     var parsed = try TracesData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
@@ -434,7 +434,10 @@ fn processJsonTraces(
     const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus);
 
     // Re-serialize to JSON
-    const output = try parsed.value.jsonEncode(.{}, allocator);
+    const output = try parsed.value.jsonEncode(.{}, .{
+        .emit_oneof_field_name = false,
+        .bytes_as_hex = true,
+    }, allocator);
 
     return .{
         .data = @constCast(output),
@@ -651,7 +654,7 @@ test "processTraces - parses and re-serializes JSON" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -687,7 +690,7 @@ test "processTraces - malformed JSON returns unchanged (fail-open)" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -734,7 +737,7 @@ test "processTraces - unknown content type returns unchanged" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 

@@ -207,7 +207,7 @@ test "OtlpModule processes POST requests" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -256,7 +256,7 @@ test "OtlpModule ignores GET requests" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -304,7 +304,7 @@ test "OtlpModule: DROP policy filters matching logs" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -376,7 +376,7 @@ test "OtlpModule: all logs dropped returns empty response" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -441,7 +441,7 @@ test "OtlpModule: filter logs by resource attribute" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -517,7 +517,7 @@ test "OtlpModule: DROP policy filters matching metrics" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -588,7 +588,7 @@ test "OtlpModule: all metrics dropped returns empty response" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -653,7 +653,7 @@ test "OtlpModule: filter metrics by metric type" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -725,7 +725,7 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -781,8 +781,5 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
 
     const result = try runModuleForTest(&module, &req, allocator);
 
-    // Stream JSON path may reserialize while preserving semantic content.
-    try std.testing.expectEqual(ModuleResult.Action.proxy_modified, result.action);
-    try std.testing.expect(std.mem.indexOf(u8, result.modified_body, "http.requests") != null);
-    allocator.free(result.modified_body);
+    try std.testing.expectEqual(ModuleResult.Action.proxy_unchanged, result.action);
 }

@@ -12,7 +12,7 @@ pub const BackendKind = enum {
 };
 
 pub const Event = struct {
-    file: *const std.fs.File,
+    file: *const std.Io.File,
     start_offset: u64,
     end_offset: u64,
     identity: ?types.FileIdentity,
@@ -29,13 +29,14 @@ const Backend = union(BackendKind) {
 /// - hot data: parallel arrays for fd/offset/identity/flags
 pub const Watcher = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     backend: BackendKind,
     inputs: std.ArrayList([]u8),
     output_path: []u8,
 
     paths: std.ArrayList([]u8),
-    files: std.ArrayList(?std.fs.File),
-    pending_files: std.ArrayList(?std.fs.File),
+    files: std.ArrayList(?std.Io.File),
+    pending_files: std.ArrayList(?std.Io.File),
     identities: std.ArrayList(?types.FileIdentity),
     pending_identities: std.ArrayList(?types.FileIdentity),
     offsets: std.ArrayList(u64),
@@ -57,6 +58,7 @@ pub const Watcher = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         kind: BackendKind,
         inputs: []const []const u8,
         output_path: []const u8,
@@ -76,6 +78,7 @@ pub const Watcher = struct {
 
         var self = Watcher{
             .allocator = allocator,
+            .io = io,
             .backend = kind,
             .inputs = input_copy,
             .output_path = out_copy,
@@ -96,7 +99,7 @@ pub const Watcher = struct {
             .glob_interval_ns = @as(i128, @intCast(glob_interval_ms)) * std.time.ns_per_ms,
             .rotate_wait_ns = @as(i128, @intCast(rotate_wait_ms)) * std.time.ns_per_ms,
             .removed_expire_ns = @as(i128, @intCast(removed_expire_ms)) * std.time.ns_per_ms,
-            .next_glob_refresh_ns = std.time.nanoTimestamp(),
+            .next_glob_refresh_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds(),
             .backend_state = .{ .poll = {} },
         };
         errdefer self.deinit();
@@ -115,8 +118,8 @@ pub const Watcher = struct {
 
         var i: usize = 0;
         while (i < self.paths.items.len) : (i += 1) {
-            if (self.files.items[i]) |f| f.close();
-            if (self.pending_files.items[i]) |f| f.close();
+            if (self.files.items[i]) |f| f.close(self.io);
+            if (self.pending_files.items[i]) |f| f.close(self.io);
             self.allocator.free(self.paths.items[i]);
         }
         self.paths.deinit(self.allocator);
@@ -139,8 +142,8 @@ pub const Watcher = struct {
     fn initBackend(self: *Watcher) !void {
         self.backend_state = switch (self.backend) {
             .poll => .{ .poll = {} },
-            .uring => .{ .uring = try uring_backend.init(self.allocator) },
-            .kqueue => .{ .kqueue = try kqueue_backend.init(self.allocator) },
+            .uring => .{ .uring = try uring_backend.init(self.allocator, self.io) },
+            .kqueue => .{ .kqueue = try kqueue_backend.init(self.allocator, self.io) },
         };
     }
 
@@ -160,7 +163,7 @@ pub const Watcher = struct {
     ) !void {
         out.clearRetainingCapacity();
 
-        const now = std.time.nanoTimestamp();
+        const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
         if (now >= self.next_glob_refresh_ns) {
             try self.refreshPaths(read_from);
             self.next_glob_refresh_ns = now + self.glob_interval_ns;
@@ -255,15 +258,15 @@ pub const Watcher = struct {
     fn readActiveSizeOrReset(self: *Watcher, idx: u32) ?u64 {
         const i: usize = @intCast(idx);
         const file = self.files.items[i] orelse return null;
-        const st = std.posix.fstat(file.handle) catch {
-            file.close();
+        const st = fstatHandle(file.handle) catch {
+            file.close(self.io);
             self.files.items[i] = null;
             self.identities.items[i] = null;
             self.offsets.items[i] = 0;
             self.clearPending(idx);
             return null;
         };
-        return @bitCast(st.size);
+        return st.size;
     }
 
     fn emitReadableRange(self: *Watcher, out: *std.ArrayList(Event), idx: u32, size: u64) !bool {
@@ -280,7 +283,7 @@ pub const Watcher = struct {
     }
 
     fn refreshPaths(self: *Watcher, read_from: types.ReadFrom) !void {
-        const now = std.time.nanoTimestamp();
+        const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
         for (self.matched.items) |*m| m.* = false;
 
         var refs: std.ArrayList([]const u8) = .{};
@@ -288,7 +291,7 @@ pub const Watcher = struct {
         try refs.ensureTotalCapacity(self.allocator, self.inputs.items.len);
         for (self.inputs.items) |p| refs.appendAssumeCapacity(p);
 
-        var expanded = try expandPatterns(self.allocator, refs.items);
+        var expanded = try expandPatterns(self.allocator, self.io, refs.items);
         defer expanded.deinit();
 
         for (expanded.items.items) |p| {
@@ -354,7 +357,7 @@ pub const Watcher = struct {
     }
 
     fn removeTracked(self: *Watcher, idx: usize) void {
-        if (self.files.items[idx]) |f| f.close();
+        if (self.files.items[idx]) |f| f.close(self.io);
         self.clearPending(@intCast(idx));
         self.backendRemoveTracked(@intCast(idx));
 
@@ -384,18 +387,18 @@ pub const Watcher = struct {
     fn openTracked(self: *Watcher, idx: u32, read_from: types.ReadFrom) !void {
         if (self.files.items[idx] != null) return;
 
-        const file = std.fs.cwd().openFile(self.paths.items[idx], .{ .mode = .read_only }) catch |err| switch (err) {
+        const file = std.Io.Dir.cwd().openFile(self.io, self.paths.items[idx], .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
-        errdefer file.close();
+        errdefer file.close(self.io);
 
-        const st = try std.posix.fstat(file.handle);
-        const size: u64 = @bitCast(st.size);
+        const st = try fstatHandle(file.handle);
+        const size: u64 = st.size;
         self.identities.items[idx] = .{
             .dev = @intCast(st.dev),
             .inode = @intCast(st.ino),
-            .fingerprint = try computeFingerprint(file),
+            .fingerprint = try computeFingerprint(self.io, file),
         };
         self.files.items[idx] = file;
         self.initHeadPrefix(idx, size) catch {};
@@ -416,26 +419,26 @@ pub const Watcher = struct {
         if (self.files.items[i] == null) return;
         if (self.pending_files.items[i] != null) return;
 
-        var path_file = std.fs.cwd().openFile(self.paths.items[i], .{ .mode = .read_only }) catch |err| switch (err) {
+        var path_file = std.Io.Dir.cwd().openFile(self.io, self.paths.items[i], .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
-        errdefer path_file.close();
+        errdefer path_file.close(self.io);
 
-        const path_st = try std.posix.fstat(path_file.handle);
-        const cur_st = try std.posix.fstat(self.files.items[i].?.handle);
-        if (@as(u64, @intCast(path_st.dev)) == @as(u64, @intCast(cur_st.dev)) and @as(u64, @intCast(path_st.ino)) == @as(u64, @intCast(cur_st.ino))) {
-            path_file.close();
+        const path_st = try fstatHandle(path_file.handle);
+        const cur_st = try fstatHandle(self.files.items[i].?.handle);
+        if (path_st.dev == cur_st.dev and path_st.ino == cur_st.ino) {
+            path_file.close(self.io);
             return;
         }
 
         self.pending_identities.items[i] = .{
             .dev = @intCast(path_st.dev),
             .inode = @intCast(path_st.ino),
-            .fingerprint = try computeFingerprint(path_file),
+            .fingerprint = try computeFingerprint(self.io, path_file),
         };
         self.pending_files.items[i] = path_file;
-        self.pending_detected_ns.items[i] = std.time.nanoTimestamp();
+        self.pending_detected_ns.items[i] = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
     }
 
     fn maybeHandleContentRewrite(self: *Watcher, idx: u32, size: u64) !void {
@@ -451,7 +454,7 @@ pub const Watcher = struct {
         if (prefix_len == 0) {
             prefix_len = @min(@as(u64, 64), size);
             self.head_prefix_lens.items[i] = @intCast(prefix_len);
-            self.head_prefix_hashes.items[i] = try prefixHash(file, prefix_len);
+            self.head_prefix_hashes.items[i] = try prefixHash(self.io, file, prefix_len);
             return;
         }
 
@@ -459,11 +462,11 @@ pub const Watcher = struct {
             if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
             const new_len: u64 = @min(@as(u64, 64), size);
             self.head_prefix_lens.items[i] = @intCast(new_len);
-            self.head_prefix_hashes.items[i] = try prefixHash(file, new_len);
+            self.head_prefix_hashes.items[i] = try prefixHash(self.io, file, new_len);
             return;
         }
 
-        const observed = try prefixHash(file, prefix_len);
+        const observed = try prefixHash(self.io, file, prefix_len);
         if (observed == self.head_prefix_hashes.items[i]) return;
 
         if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
@@ -480,18 +483,18 @@ pub const Watcher = struct {
             return;
         };
 
-        const cur_st = std.posix.fstat(cur_file.handle) catch {
-            cur_file.close();
+        const cur_st = fstatHandle(cur_file.handle) catch {
+            cur_file.close(self.io);
             try self.switchToPending(idx);
             self.markDirty(idx);
             return;
         };
-        const cur_size: u64 = @bitCast(cur_st.size);
+        const cur_size: u64 = cur_st.size;
         if (cur_size > self.offsets.items[i]) return;
-        const now = std.time.nanoTimestamp();
+        const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
         if (now - self.pending_detected_ns.items[i] < self.rotate_wait_ns) return;
 
-        cur_file.close();
+        cur_file.close(self.io);
         try self.switchToPending(idx);
         self.markDirty(idx);
     }
@@ -506,13 +509,13 @@ pub const Watcher = struct {
         self.pending_detected_ns.items[i] = 0;
         self.offsets.items[i] = 0;
 
-        const st = try std.posix.fstat(next_file.handle);
-        try self.initHeadPrefix(idx, @bitCast(st.size));
+        const st = try fstatHandle(next_file.handle);
+        try self.initHeadPrefix(idx, st.size);
     }
 
     fn clearPending(self: *Watcher, idx: u32) void {
         const i: usize = @intCast(idx);
-        if (self.pending_files.items[i]) |f| f.close();
+        if (self.pending_files.items[i]) |f| f.close(self.io);
         self.pending_files.items[i] = null;
         self.pending_identities.items[i] = null;
         self.pending_detected_ns.items[i] = 0;
@@ -575,7 +578,7 @@ pub const Watcher = struct {
             self.head_prefix_hashes.items[idx] = 0;
             return;
         }
-        self.head_prefix_hashes.items[idx] = try prefixHash(self.files.items[idx].?, len);
+        self.head_prefix_hashes.items[idx] = try prefixHash(self.io, self.files.items[idx].?, len);
     }
 };
 
@@ -584,17 +587,36 @@ fn shouldTrackPath(output_path: []const u8, candidate_path: []const u8) bool {
     return !std.mem.eql(u8, output_path, candidate_path);
 }
 
-fn computeFingerprint(file: std.fs.File) !u32 {
+/// Subset of fstat results needed for file identity and size tracking. The
+/// std.Io.File.Stat type does not expose the device id, so we fall back to a
+/// raw libc fstat on the file handle to recover dev/ino/size atomically.
+pub const FsStat = struct {
+    dev: u64,
+    ino: u64,
+    size: u64,
+};
+
+fn fstatHandle(handle: std.posix.fd_t) !FsStat {
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(handle, &st) != 0) return error.StatFailed;
+    return .{
+        .dev = @intCast(st.dev),
+        .ino = @intCast(st.ino),
+        .size = @intCast(st.size),
+    };
+}
+
+fn computeFingerprint(io: std.Io, file: std.Io.File) !u32 {
     var buf: [1024]u8 = undefined;
-    const n = try std.posix.pread(file.handle, &buf, 0);
+    const n = try file.readPositionalAll(io, &buf, 0);
     return std.hash.Crc32.hash(buf[0..n]);
 }
 
-fn prefixHash(file: std.fs.File, len: u64) !u64 {
+fn prefixHash(io: std.Io, file: std.Io.File, len: u64) !u64 {
     if (len == 0) return 0;
     var buf: [64]u8 = undefined;
     const want: usize = @intCast(@min(len, buf.len));
-    const n = try std.posix.pread(file.handle, buf[0..want], 0);
+    const n = try file.readPositionalAll(io, buf[0..want], 0);
     var hasher = std.hash.Fnv1a_64.init();
     hasher.update(buf[0..n]);
     return hasher.final();
@@ -613,7 +635,7 @@ const ExpandedPaths = struct {
     }
 };
 
-fn expandPatterns(allocator: std.mem.Allocator, inputs: []const []const u8) !ExpandedPaths {
+fn expandPatterns(allocator: std.mem.Allocator, io: std.Io, inputs: []const []const u8) !ExpandedPaths {
     var out = ExpandedPaths.init(allocator);
     errdefer out.deinit();
     for (inputs) |input| {
@@ -621,7 +643,7 @@ fn expandPatterns(allocator: std.mem.Allocator, inputs: []const []const u8) !Exp
             try out.items.append(allocator, try allocator.dupe(u8, input));
             continue;
         }
-        try expandOnePattern(allocator, input, &out.items);
+        try expandOnePattern(allocator, io, input, &out.items);
     }
     return out;
 }
@@ -630,16 +652,16 @@ fn isGlobPattern(input: []const u8) bool {
     return std.mem.indexOfAny(u8, input, "*?[") != null;
 }
 
-fn expandOnePattern(allocator: std.mem.Allocator, pattern: []const u8, out: *std.ArrayList([]u8)) !void {
+fn expandOnePattern(allocator: std.mem.Allocator, io: std.Io, pattern: []const u8, out: *std.ArrayList([]u8)) !void {
     const dir_path = std.fs.path.dirname(pattern) orelse ".";
     const base_pat = std.fs.path.basename(pattern);
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(io);
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind == .directory) continue;
         if (!match(base_pat, entry.name)) continue;
         const full = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
@@ -690,7 +712,7 @@ test "watch public API: collect emits appended file bytes" {
     const abs = try tmp.dir.realpathAlloc(testing.allocator, "tail.log");
     defer testing.allocator.free(abs);
 
-    var w = try Watcher.init(testing.allocator, .poll, &.{abs}, "-", .tail, 1000, 50, 1000);
+    var w = try Watcher.init(testing.allocator, std.Options.debug_io, .poll, &.{abs}, "-", .tail, 1000, 50, 1000);
     defer w.deinit();
 
     var events: std.ArrayList(Event) = .{};

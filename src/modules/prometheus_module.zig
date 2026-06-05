@@ -285,7 +285,7 @@ test "PrometheusModule - createResponseFilter with config" {
     const NoopEventBus = o11y.NoopEventBus;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(testing.allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -339,7 +339,7 @@ test "PrometheusModule - response filter with DROP policy" {
     const proto = @import("proto");
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(testing.allocator, noop_bus.eventBus());
     defer registry.deinit();
 

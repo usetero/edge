@@ -132,61 +132,70 @@ pub const RuntimeMetrics = struct {
     distribution: DistributionLabel,
     internal: InternalMetrics = m.initializeNoop(InternalMetrics),
 
-    pub fn init(allocator: std.mem.Allocator, distribution: DistributionLabel) !RuntimeMetrics {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, distribution: DistributionLabel) !RuntimeMetrics {
         var metrics = RuntimeMetrics{
             .allocator = allocator,
             .distribution = distribution,
             .internal = .{
                 .edge_requests_total = try InternalMetrics.RequestsTotal.init(
                     allocator,
+                    io,
                     "edge_requests_total",
                     .{ .help = "Total number of HTTP requests handled by edge." },
                     .{},
                 ),
                 .edge_request_duration_seconds = try InternalMetrics.RequestDurationSeconds.init(
                     allocator,
+                    io,
                     "edge_request_duration_seconds",
                     .{ .help = "HTTP request latency in seconds." },
                     .{},
                 ),
                 .edge_responses_total = try InternalMetrics.ResponsesTotal.init(
                     allocator,
+                    io,
                     "edge_responses_total",
                     .{ .help = "Total number of HTTP responses produced by edge." },
                     .{},
                 ),
                 .edge_prefilter_decisions_total = try InternalMetrics.PrefilterDecisionsTotal.init(
                     allocator,
+                    io,
                     "edge_prefilter_decisions_total",
                     .{ .help = "Total number of prefilter routing decisions." },
                     .{},
                 ),
                 .edge_request_errors_total = try InternalMetrics.RequestErrorsTotal.init(
                     allocator,
+                    io,
                     "edge_request_errors_total",
                     .{ .help = "Total number of request-level errors." },
                     .{},
                 ),
                 .edge_policy_records_evaluated_total = try InternalMetrics.PolicyRecordsEvaluatedTotal.init(
                     allocator,
+                    io,
                     "edge_policy_records_evaluated_total",
                     .{ .help = "Total number of telemetry records evaluated by the policy engine." },
                     .{},
                 ),
                 .edge_policy_records_kept_total = try InternalMetrics.PolicyRecordsKeptTotal.init(
                     allocator,
+                    io,
                     "edge_policy_records_kept_total",
                     .{ .help = "Total number of telemetry records kept after policy evaluation." },
                     .{},
                 ),
                 .edge_policy_records_dropped_total = try InternalMetrics.PolicyRecordsDroppedTotal.init(
                     allocator,
+                    io,
                     "edge_policy_records_dropped_total",
                     .{ .help = "Total number of telemetry records dropped after policy evaluation." },
                     .{},
                 ),
                 .edge_build_info = try InternalMetrics.BuildInfo.init(
                     allocator,
+                    io,
                     "edge_build_info",
                     .{ .help = "Build metadata for this edge process." },
                     .{},

@@ -32,7 +32,7 @@ pub const SubstResult = struct {
 ///   - `${UNSET_VAR}` -> `` (empty string)
 ///   - `no variables here` -> `no variables here` (original, not copied)
 ///   - `$${ESCAPED}` -> `${ESCAPED}` (double $ escapes)
-pub fn substitute(allocator: std.mem.Allocator, input: []const u8) SubstError!SubstResult {
+pub fn substitute(allocator: std.mem.Allocator, input: []const u8, environ: *const std.process.Environ.Map) SubstError!SubstResult {
     // Quick scan to see if there are any potential variables
     if (std.mem.indexOf(u8, input, "${") == null) {
         return .{ .value = input, .was_substituted = false };
@@ -71,7 +71,7 @@ pub fn substitute(allocator: std.mem.Allocator, input: []const u8) SubstError!Su
             }
 
             // Get environment variable value
-            if (std.posix.getenv(var_name)) |value| {
+            if (environ.get(var_name)) |value| {
                 result.appendSlice(allocator, value) catch return error.OutOfMemory;
             }
             // If not set, we just skip it (replace with empty string)
@@ -95,8 +95,9 @@ pub fn substituteRequired(
     allocator: std.mem.Allocator,
     input: []const u8,
     comptime allow_empty: bool,
+    environ: *const std.process.Environ.Map,
 ) (SubstError || error{MissingRequiredVariable})!SubstResult {
-    const result = try substitute(allocator, input);
+    const result = try substitute(allocator, input, environ);
 
     if (!allow_empty and result.value.len == 0 and result.was_substituted) {
         if (result.was_substituted) {
@@ -170,36 +171,38 @@ pub fn parseVariable(input: []const u8) ?[]const u8 {
 // ============================================================================
 
 test "substitute: no variables returns original" {
-    const result = try substitute(std.testing.allocator, "no variables here");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "no variables here", &env_map);
     try std.testing.expectEqual(false, result.was_substituted);
     try std.testing.expectEqualStrings("no variables here", result.value);
     // Should not free - original string
 }
 
 test "substitute: empty string returns original" {
-    const result = try substitute(std.testing.allocator, "");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "", &env_map);
     try std.testing.expectEqual(false, result.was_substituted);
     try std.testing.expectEqualStrings("", result.value);
 }
 
 test "substitute: simple variable" {
-    // We can't set env vars in tests easily, but we can test the parsing
-    // For actual env var tests, we rely on integration tests or mock
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("PATH", "/usr/bin");
 
-    // Test with a likely-set variable (PATH is almost always set)
-    const result = try substitute(std.testing.allocator, "path=${PATH}");
+    const result = try substitute(std.testing.allocator, "path=${PATH}", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
-    if (std.posix.getenv("PATH")) |path_value| {
-        const expected = try std.fmt.allocPrint(std.testing.allocator, "path={s}", .{path_value});
-        defer std.testing.allocator.free(expected);
-        try std.testing.expectEqualStrings(expected, result.value);
-        try std.testing.expectEqual(true, result.was_substituted);
-    }
+    try std.testing.expectEqualStrings("path=/usr/bin", result.value);
+    try std.testing.expectEqual(true, result.was_substituted);
 }
 
 test "substitute: unset variable becomes empty" {
-    const result = try substitute(std.testing.allocator, "prefix_${DEFINITELY_NOT_SET_VAR_12345}_suffix");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "prefix_${DEFINITELY_NOT_SET_VAR_12345}_suffix", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("prefix__suffix", result.value);
@@ -207,7 +210,9 @@ test "substitute: unset variable becomes empty" {
 }
 
 test "substitute: multiple variables" {
-    const result = try substitute(std.testing.allocator, "${UNSET1}_${UNSET2}_${UNSET3}");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "${UNSET1}_${UNSET2}_${UNSET3}", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("__", result.value);
@@ -215,28 +220,36 @@ test "substitute: multiple variables" {
 }
 
 test "substitute: variable at start" {
-    const result = try substitute(std.testing.allocator, "${UNSET_VAR}suffix");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "${UNSET_VAR}suffix", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("suffix", result.value);
 }
 
 test "substitute: variable at end" {
-    const result = try substitute(std.testing.allocator, "prefix${UNSET_VAR}");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "prefix${UNSET_VAR}", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("prefix", result.value);
 }
 
 test "substitute: only variable" {
-    const result = try substitute(std.testing.allocator, "${UNSET_VAR}");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "${UNSET_VAR}", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("", result.value);
 }
 
 test "substitute: escape sequence" {
-    const result = try substitute(std.testing.allocator, "literal $${VAR} here");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "literal $${VAR} here", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("literal ${VAR} here", result.value);
@@ -244,71 +257,91 @@ test "substitute: escape sequence" {
 }
 
 test "substitute: mixed escape and real variable" {
-    const result = try substitute(std.testing.allocator, "$${ESCAPED}_${UNSET}_end");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "$${ESCAPED}_${UNSET}_end", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("${ESCAPED}__end", result.value);
 }
 
 test "substitute: unclosed variable error" {
-    const result = substitute(std.testing.allocator, "prefix${UNCLOSED");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = substitute(std.testing.allocator, "prefix${UNCLOSED", &env_map);
     try std.testing.expectError(error.UnclosedVariable, result);
 }
 
 test "substitute: empty variable name error" {
-    const result = substitute(std.testing.allocator, "prefix${}_suffix");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = substitute(std.testing.allocator, "prefix${}_suffix", &env_map);
     try std.testing.expectError(error.EmptyVariableName, result);
 }
 
 test "substitute: invalid variable name - starts with digit" {
-    const result = substitute(std.testing.allocator, "${1INVALID}");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = substitute(std.testing.allocator, "${1INVALID}", &env_map);
     try std.testing.expectError(error.InvalidVariableName, result);
 }
 
 test "substitute: invalid variable name - contains special char" {
-    const result = substitute(std.testing.allocator, "${VAR-NAME}");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = substitute(std.testing.allocator, "${VAR-NAME}", &env_map);
     try std.testing.expectError(error.InvalidVariableName, result);
 }
 
 test "substitute: invalid variable name - contains space" {
-    const result = substitute(std.testing.allocator, "${VAR NAME}");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = substitute(std.testing.allocator, "${VAR NAME}", &env_map);
     try std.testing.expectError(error.InvalidVariableName, result);
 }
 
 test "substitute: valid variable names" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
     // Underscore prefix is valid
-    const r1 = try substitute(std.testing.allocator, "${_VAR}");
+    const r1 = try substitute(std.testing.allocator, "${_VAR}", &env_map);
     defer if (r1.was_substituted) std.testing.allocator.free(r1.value);
 
     // All caps with underscore
-    const r2 = try substitute(std.testing.allocator, "${MY_VAR_123}");
+    const r2 = try substitute(std.testing.allocator, "${MY_VAR_123}", &env_map);
     defer if (r2.was_substituted) std.testing.allocator.free(r2.value);
 
     // Mixed case
-    const r3 = try substitute(std.testing.allocator, "${myVar}");
+    const r3 = try substitute(std.testing.allocator, "${myVar}", &env_map);
     defer if (r3.was_substituted) std.testing.allocator.free(r3.value);
 
     // Single character
-    const r4 = try substitute(std.testing.allocator, "${X}");
+    const r4 = try substitute(std.testing.allocator, "${X}", &env_map);
     defer if (r4.was_substituted) std.testing.allocator.free(r4.value);
 }
 
 test "substitute: dollar sign not followed by brace" {
-    const result = try substitute(std.testing.allocator, "price is $100");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "price is $100", &env_map);
     try std.testing.expectEqual(false, result.was_substituted);
     try std.testing.expectEqualStrings("price is $100", result.value);
 }
 
 test "substitute: adjacent variables" {
-    const result = try substitute(std.testing.allocator, "${A}${B}${C}");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "${A}${B}${C}", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("", result.value);
 }
 
 test "substitute: nested braces not supported" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
     // This should work - inner ${B} is just literal text in var name, which is invalid
-    const result = substitute(std.testing.allocator, "${A${B}}");
+    const result = substitute(std.testing.allocator, "${A${B}}", &env_map);
     try std.testing.expectError(error.InvalidVariableName, result);
 }
 
@@ -357,39 +390,43 @@ test "parseVariable" {
 }
 
 test "substitute: real environment variable HOME" {
-    // HOME is almost always set on Unix systems
-    if (std.posix.getenv("HOME")) |home_value| {
-        const result = try substitute(std.testing.allocator, "${HOME}/.config");
-        defer if (result.was_substituted) std.testing.allocator.free(result.value);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/home/user");
 
-        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/.config", .{home_value});
-        defer std.testing.allocator.free(expected);
+    const result = try substitute(std.testing.allocator, "${HOME}/.config", &env_map);
+    defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
-        try std.testing.expectEqualStrings(expected, result.value);
-        try std.testing.expectEqual(true, result.was_substituted);
-    }
+    try std.testing.expectEqualStrings("/home/user/.config", result.value);
+    try std.testing.expectEqual(true, result.was_substituted);
 }
 
 test "substitute: preserves surrounding content exactly" {
-    const result = try substitute(std.testing.allocator, "Bearer ${UNSET_TOKEN}");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "Bearer ${UNSET_TOKEN}", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("Bearer ", result.value);
 }
 
 test "substitute: handles special JSON characters in surrounding text" {
-    const result = try substitute(std.testing.allocator, "\"key\": \"${UNSET}\"");
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try substitute(std.testing.allocator, "\"key\": \"${UNSET}\"", &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     try std.testing.expectEqualStrings("\"key\": \"\"", result.value);
 }
 
 test "substitute: long variable name" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
     const long_name = "THIS_IS_A_VERY_LONG_ENVIRONMENT_VARIABLE_NAME_THAT_SHOULD_STILL_WORK";
     const input = try std.fmt.allocPrint(std.testing.allocator, "${{{s}}}", .{long_name});
     defer std.testing.allocator.free(input);
 
-    const result = try substitute(std.testing.allocator, input);
+    const result = try substitute(std.testing.allocator, input, &env_map);
     defer if (result.was_substituted) std.testing.allocator.free(result.value);
 
     // Should succeed (var is unset, so result is empty)

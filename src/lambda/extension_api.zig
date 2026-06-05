@@ -76,14 +76,16 @@ pub const ExtensionClient = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         bus: *EventBus,
+        environ: *const std.process.Environ.Map,
         extension_name: []const u8,
     ) !*Self {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
         // Get runtime API endpoint from environment
-        const runtime_api = std.posix.getenv("AWS_LAMBDA_RUNTIME_API") orelse
+        const runtime_api = environ.get("AWS_LAMBDA_RUNTIME_API") orelse
             return error.MissingRuntimeApiEnv;
 
         const runtime_api_copy = try allocator.dupe(u8, runtime_api);
@@ -93,7 +95,7 @@ pub const ExtensionClient = struct {
 
         self.* = .{
             .allocator = allocator,
-            .http_client = std.http.Client{ .allocator = allocator },
+            .http_client = std.http.Client{ .allocator = allocator, .io = io },
             .runtime_api = runtime_api_copy,
             .extension_id = null,
             .extension_name = name_copy,

@@ -223,7 +223,7 @@ fn filterMetric(
         .series = series,
         .tags_cache = tags_cache,
     };
-    const result = engine.evaluate(.metric, &metric_accessor, &field_ctx, policy_id_buf, .{});
+    const result = engine.evaluate(.metric, &metric_accessor, &field_ctx, policy_id_buf, .{ .io = engine.bus.io });
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
@@ -391,7 +391,8 @@ const proto = @import("proto");
 /// Test helper to create an AttributePath from a single key string.
 /// Uses comptime to ensure the array literal has static storage.
 fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
-    return .{ .path = .{ .items = @constCast(&[_][]const u8{key}) } };
+    const items = @constCast(&[_][]const u8{key});
+    return .{ .path = .{ .items = items, .capacity = items.len } };
 }
 
 test "datadogMetricFieldAccessor - extra field lookup" {
@@ -438,7 +439,7 @@ test "processMetrics - no policies keeps all metrics" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -475,7 +476,7 @@ test "processMetrics - DROP policy filters metrics by name" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -536,7 +537,7 @@ test "processMetrics - returns 202-compatible response when all metrics dropped"
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -590,7 +591,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -623,7 +624,7 @@ test "processMetrics - non-JSON content type returns unchanged" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -656,7 +657,7 @@ test "processMetrics - filter on tags" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -718,7 +719,7 @@ test "processMetrics - preserves all fields when no metrics dropped" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -759,7 +760,7 @@ test "processMetrics - extra fields are preserved when no metrics dropped" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -802,7 +803,7 @@ test "processMetrics - filter on metric type" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
-    noop_bus.init();
+    noop_bus.init(std.Options.debug_io);
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
@@ -913,7 +914,7 @@ test "datadogMetricFieldAccessor - resource with nested path" {
 
     // Two-segment path ["host", "name"] should find resource type=host and return name
     const nested_path = proto.policy.AttributePath{
-        .path = .{ .items = @constCast(&[_][]const u8{ "host", "name" }) },
+        .path = .{ .items = @constCast(&[_][]const u8{ "host", "name" }), .capacity = 2 },
     };
     const name_val = metricValue(&field_ctx, .{ .resource_attribute = nested_path });
     try std.testing.expect(name_val != null);
@@ -921,7 +922,7 @@ test "datadogMetricFieldAccessor - resource with nested path" {
 
     // Two-segment path ["host", "type"] should return the type
     const type_path = proto.policy.AttributePath{
-        .path = .{ .items = @constCast(&[_][]const u8{ "host", "type" }) },
+        .path = .{ .items = @constCast(&[_][]const u8{ "host", "type" }), .capacity = 2 },
     };
     const type_val = metricValue(&field_ctx, .{ .resource_attribute = type_path });
     try std.testing.expect(type_val != null);
@@ -950,7 +951,7 @@ test "datadogMetricFieldAccessor - nested extra field via dotted key" {
 
     // Two-segment path joined with '.' to match dotted key
     const nested_path = proto.policy.AttributePath{
-        .path = .{ .items = @constCast(&[_][]const u8{ "custom_data", "region" }) },
+        .path = .{ .items = @constCast(&[_][]const u8{ "custom_data", "region" }), .capacity = 2 },
     };
     const val = metricValue(&field_ctx, .{ .datapoint_attribute = nested_path });
     try std.testing.expect(val != null);

@@ -398,7 +398,7 @@ test "findAttrIndex - duplicate keys returns first" {
 
 test "removeAttribute - removes existing key" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("a", "1"));
     try list.append(alloc, makeKV("b", "2"));
@@ -412,7 +412,7 @@ test "removeAttribute - removes existing key" {
 
 test "removeAttribute - missing key returns false" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("a", "1"));
 
@@ -421,13 +421,13 @@ test "removeAttribute - missing key returns false" {
 }
 
 test "removeAttribute - empty list returns false" {
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     try std.testing.expect(!removeAttribute(&list, "any"));
 }
 
 test "removeAttribute - removes first of duplicates" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("x", "first"));
     try list.append(alloc, makeKV("x", "second"));
@@ -439,7 +439,7 @@ test "removeAttribute - removes first of duplicates" {
 
 test "removeAttribute - removes only element" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("only", "val"));
 
@@ -451,7 +451,7 @@ test "removeAttribute - removes only element" {
 
 test "removeAttributeByPath - single segment" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("target", "val"));
 
@@ -462,7 +462,7 @@ test "removeAttributeByPath - single segment" {
 
 test "removeAttributeByPath - empty path" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("a", "1"));
 
@@ -473,7 +473,7 @@ test "removeAttributeByPath - empty path" {
 
 test "removeAttributeByPath - multi-segment removes top-level key" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("http", "nested"));
 
@@ -486,7 +486,7 @@ test "removeAttributeByPath - multi-segment removes top-level key" {
 
 test "setAttribute - updates existing key" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("key", "old"));
 
@@ -497,7 +497,7 @@ test "setAttribute - updates existing key" {
 
 test "setAttribute - inserts new key" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
 
     try std.testing.expect(setAttribute(alloc, &list, "new-key", "val"));
@@ -508,7 +508,7 @@ test "setAttribute - inserts new key" {
 
 test "setAttribute - inserts into non-empty list" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeKV("existing", "val"));
 
@@ -520,7 +520,7 @@ test "setAttribute - inserts into non-empty list" {
 
 test "setAttribute - overwrites non-string value" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
     try list.append(alloc, makeIntKV("count", 42));
 
@@ -534,7 +534,7 @@ test "setAttribute - overwrites non-string value" {
 
 test "setAttributeByPath - single segment" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
 
     const path = [_][]const u8{"key"};
@@ -545,7 +545,7 @@ test "setAttributeByPath - single segment" {
 
 test "setAttributeByPath - empty path" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
 
     const path = [_][]const u8{};
@@ -555,7 +555,7 @@ test "setAttributeByPath - empty path" {
 
 test "setAttributeByPath - multi-segment uses first" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue){};
+    var list = std.ArrayListUnmanaged(KeyValue).empty;
     defer list.deinit(alloc);
 
     const path = [_][]const u8{ "http", "method" };

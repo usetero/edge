@@ -16,9 +16,8 @@ FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a50
 # - musl-dev: link_libc
 # - g++: link_libcpp (C++ for jsoncons)
 # - linux-headers: linux/futex.h for libcxx
-# - zig: compiler
+# - curl/xz: download and unpack the pinned Zig compiler
 RUN apk add --no-cache \
-    zig="0.15.2-r0" \
     zlib-dev \
     zlib-static \
     zstd-dev \
@@ -28,7 +27,23 @@ RUN apk add --no-cache \
     linux-headers \
     pkgconf \
     vectorscan-dev \
-    vectorscan-static
+    vectorscan-static \
+    curl \
+    xz
+
+ARG ZIG_VERSION=0.16.0
+RUN ARCH="$(uname -m)" && \
+    case "$ARCH" in \
+    x86_64) ZIG_ARCH="x86_64"; ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00" ;; \
+    aarch64) ZIG_ARCH="aarch64"; ZIG_SHA256="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17" ;; \
+    *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
+    mkdir -p /opt/zig && \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && \
+    ln -s /opt/zig/zig /usr/local/bin/zig && \
+    rm /tmp/zig.tar.xz
 RUN zig version
 WORKDIR /build
 

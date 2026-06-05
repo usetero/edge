@@ -7,8 +7,27 @@ const KQUEUE_EV_ENABLE: u16 = 0x0004;
 const KQUEUE_EV_CLEAR: u16 = 0x0020;
 const KQUEUE_VNODE_MASK: u32 = 0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 | 0x00000020 | 0x00000040;
 
+const Kevent = std.posix.Kevent;
+
+fn closeFd(fd: std.posix.fd_t) void {
+    _ = std.c.close(fd);
+}
+
+/// Submit `changes` and collect up to `out.len` events with an optional timeout.
+fn kevent(kq: std.posix.fd_t, changes: []const Kevent, out: []Kevent, timeout: ?*const std.c.timespec) c_int {
+    return std.c.kevent(
+        kq,
+        changes.ptr,
+        @intCast(changes.len),
+        out.ptr,
+        @intCast(out.len),
+        timeout,
+    );
+}
+
 pub const State = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     fd: std.posix.fd_t,
     fd_to_idx: std.AutoHashMap(std.posix.fd_t, u32),
     dir_watches: std.ArrayList(DirWatch),
@@ -19,11 +38,13 @@ const DirWatch = struct {
     fd: std.posix.fd_t,
 };
 
-pub fn init(allocator: std.mem.Allocator) !State {
+pub fn init(allocator: std.mem.Allocator, io: std.Io) !State {
     if (comptime builtin.os.tag != .macos) return error.UnsupportedWatcherBackend;
-    const kq = try std.posix.kqueue();
+    const kq = std.c.kqueue();
+    if (kq < 0) return error.UnsupportedWatcherBackend;
     return .{
         .allocator = allocator,
+        .io = io,
         .fd = kq,
         .fd_to_idx = std.AutoHashMap(std.posix.fd_t, u32).init(allocator),
         .dir_watches = .{},
@@ -33,11 +54,11 @@ pub fn init(allocator: std.mem.Allocator) !State {
 pub fn deinit(s: *State) void {
     s.fd_to_idx.deinit();
     for (s.dir_watches.items) |dw| {
-        std.posix.close(dw.fd);
+        closeFd(dw.fd);
         s.allocator.free(dw.path);
     }
     s.dir_watches.deinit(s.allocator);
-    std.posix.close(s.fd);
+    closeFd(s.fd);
 }
 
 pub fn collectDirty(self: anytype) !void {
@@ -45,11 +66,12 @@ pub fn collectDirty(self: anytype) !void {
     const kq = &self.backend_state.kqueue;
     try ensureDirectoryWatches(self);
 
-    var out_events: [64]std.posix.Kevent = undefined;
-    var timeout = std.posix.timespec{ .sec = 0, .nsec = 0 };
-    const n = std.posix.kevent(kq.fd, &.{}, out_events[0..], &timeout) catch return;
+    var out_events: [64]Kevent = undefined;
+    var timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
+    const n = kevent(kq.fd, &.{}, out_events[0..], &timeout);
+    if (n <= 0) return;
     var i: usize = 0;
-    while (i < n) : (i += 1) {
+    while (i < @as(usize, @intCast(n))) : (i += 1) {
         const ev = out_events[i];
         const fd: std.posix.fd_t = @intCast(ev.ident);
         if (kq.fd_to_idx.get(fd)) |idx| {
@@ -66,7 +88,7 @@ pub fn trackOpenFile(self: anytype, idx: u32, path: []const u8, fd: std.posix.fd
     if (comptime builtin.os.tag != .macos) return;
     const kq = &self.backend_state.kqueue;
     try ensureDirectoryWatch(kq, path);
-    var changes = [_]std.posix.Kevent{.{
+    var changes = [_]Kevent{.{
         .ident = @intCast(fd),
         .filter = KQUEUE_FILTER_VNODE,
         .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
@@ -74,7 +96,7 @@ pub fn trackOpenFile(self: anytype, idx: u32, path: []const u8, fd: std.posix.fd
         .data = 0,
         .udata = 0,
     }};
-    _ = std.posix.kevent(kq.fd, changes[0..], &.{}, null) catch return;
+    _ = kevent(kq.fd, changes[0..], &.{}, null);
     try kq.fd_to_idx.put(fd, idx);
 }
 
@@ -98,7 +120,7 @@ pub fn rebuildIndexes(self: anytype) void {
     var i: usize = 0;
     while (i < self.paths.items.len) : (i += 1) {
         const file = self.files.items[i] orelse continue;
-        var changes = [_]std.posix.Kevent{.{
+        var changes = [_]Kevent{.{
             .ident = @intCast(file.handle),
             .filter = KQUEUE_FILTER_VNODE,
             .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
@@ -106,7 +128,7 @@ pub fn rebuildIndexes(self: anytype) void {
             .data = 0,
             .udata = 0,
         }};
-        _ = std.posix.kevent(kq.fd, changes[0..], &.{}, null) catch continue;
+        _ = kevent(kq.fd, changes[0..], &.{}, null);
         kq.fd_to_idx.put(file.handle, @intCast(i)) catch {};
     }
 
@@ -128,14 +150,14 @@ fn ensureDirectoryWatch(kq: *State, path: []const u8) !void {
     const owned_dir_path = try kq.allocator.dupe(u8, dir_path);
     errdefer kq.allocator.free(owned_dir_path);
 
-    const dir = std.fs.cwd().openDir(owned_dir_path, .{}) catch |err| switch (err) {
+    const dir = std.Io.Dir.cwd().openDir(kq.io, owned_dir_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    const dir_fd = dir.fd;
-    errdefer std.posix.close(dir_fd);
+    const dir_fd = dir.handle;
+    errdefer closeFd(dir_fd);
 
-    var changes = [_]std.posix.Kevent{.{
+    var changes = [_]Kevent{.{
         .ident = @intCast(dir_fd),
         .filter = KQUEUE_FILTER_VNODE,
         .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
@@ -143,10 +165,10 @@ fn ensureDirectoryWatch(kq: *State, path: []const u8) !void {
         .data = 0,
         .udata = 0,
     }};
-    _ = std.posix.kevent(kq.fd, changes[0..], &.{}, null) catch {
-        std.posix.close(dir_fd);
+    if (kevent(kq.fd, changes[0..], &.{}, null) < 0) {
+        closeFd(dir_fd);
         return;
-    };
+    }
     try kq.dir_watches.append(kq.allocator, .{ .path = owned_dir_path, .fd = dir_fd });
 }
 

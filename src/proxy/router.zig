@@ -60,9 +60,9 @@ pub const Router = struct {
 
     /// Initialize router from module configurations
     pub fn init(allocator: std.mem.Allocator, modules: []const ModuleConfig) !Router {
-        var exact_matches = std.AutoHashMapUnmanaged(u64, ExactMatchEntry){};
-        var prefix_list = std.ArrayListUnmanaged(PrefixRoute){};
-        var suffix_list = std.ArrayListUnmanaged(SuffixRoute){};
+        var exact_matches = std.AutoHashMapUnmanaged(u64, ExactMatchEntry).empty;
+        var prefix_list = std.ArrayListUnmanaged(PrefixRoute).empty;
+        var suffix_list = std.ArrayListUnmanaged(SuffixRoute).empty;
         var fallback: ?FallbackRoute = null;
 
         // Process all routes from all modules
