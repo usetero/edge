@@ -61,7 +61,6 @@ pub const LambdaConfig = struct {
 
     // Limits
     max_body_size: u32 = 5 * 1024 * 1024, // 5MB
-    max_upstream_retries: u8 = 3,
 
     // Service metadata
     service: struct {
@@ -160,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
     bus.info(LambdaExtensionStarting{});
 
     // Load configuration via zonfig (env vars with TERO_ prefix, no JSON file)
-    const config = zonfig.load(LambdaConfig, allocator, .{ .env_prefix = "TERO", .environ = init.environ_map }) catch |err| {
+    const config = zonfig.load(LambdaConfig, allocator, io, .{ .env_prefix = "TERO", .environ = init.environ_map }) catch |err| {
         bus.err(LambdaExtensionError{ .err = @errorName(err) });
         return err;
     };
@@ -323,7 +322,6 @@ pub fn main(init: std.process.Init) !void {
         &runtime_metrics,
         config.listen_address,
         config.listen_port,
-        config.max_upstream_retries,
         config.max_body_size,
         &module_registrations,
     );

@@ -52,7 +52,15 @@ pub const StreamEvaluator = struct {
         registry.* = policy.Registry.init(allocator, bus);
         errdefer registry.deinit();
 
-        const policies = try policy.parser.parsePoliciesFile(allocator, policy_path.?);
+        const policies = blk: {
+            const file_io = bus.io;
+            const file = try std.Io.Dir.cwd().openFile(file_io, policy_path.?, .{});
+            defer file.close(file_io);
+            var file_reader = file.reader(file_io, &.{});
+            const contents = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+            defer allocator.free(contents);
+            break :blk try policy.parser.parsePoliciesBytes(allocator, contents);
+        };
         defer {
             for (policies) |*p| p.deinit(allocator);
             allocator.free(policies);
@@ -103,7 +111,7 @@ pub const StreamEvaluator = struct {
                     &context.log_accessor,
                     &ctx,
                     &active.policy_id_buf,
-                    .{ .scratch = line_alloc, .io = self.bus.io },
+                    .{ .scratch = line_alloc, .io = active.engine.bus.io },
                 );
                 break :blk result;
             },

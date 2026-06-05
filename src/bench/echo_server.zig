@@ -14,21 +14,23 @@ const CapturedPayload = struct {
 
 const ServerContext = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     endpoint_stats: std.StringHashMap(EndpointStats),
     total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     // Capture mode state
-    capture_mutex: std.Thread.Mutex = .{},
+    capture_mutex: std.Io.Mutex = .init,
     capture_enabled: bool = false,
     capture_name: ?[]const u8 = null,
     captured_payloads: std.ArrayListUnmanaged(CapturedPayload) = .empty,
     output_dir: []const u8 = ".",
 
-    pub fn init(allocator: std.mem.Allocator, output_dir: []const u8) ServerContext {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, output_dir: []const u8) ServerContext {
         return .{
             .allocator = allocator,
+            .io = io,
             .endpoint_stats = std.StringHashMap(EndpointStats).init(allocator),
             .output_dir = output_dir,
         };
@@ -56,8 +58,8 @@ const ServerContext = struct {
     }
 
     pub fn startCapture(self: *ServerContext, name: []const u8) !void {
-        self.capture_mutex.lock();
-        defer self.capture_mutex.unlock();
+        self.capture_mutex.lockUncancelable(self.io);
+        defer self.capture_mutex.unlock(self.io);
 
         self.clearCaptures();
         if (self.capture_name) |old_name| {
@@ -68,8 +70,8 @@ const ServerContext = struct {
     }
 
     pub fn stopCapture(self: *ServerContext) !usize {
-        self.capture_mutex.lock();
-        defer self.capture_mutex.unlock();
+        self.capture_mutex.lockUncancelable(self.io);
+        defer self.capture_mutex.unlock(self.io);
 
         self.capture_enabled = false;
         const count = self.captured_payloads.items.len;
@@ -87,11 +89,11 @@ const ServerContext = struct {
         var path_buf: [512]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.jsonl", .{ self.output_dir, name });
 
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(self.io, path, .{});
+        defer file.close(self.io);
 
         var buf: [4096]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(self.io, &buf);
         const writer = &file_writer.interface;
 
         for (self.captured_payloads.items) |payload| {
@@ -117,8 +119,8 @@ const ServerContext = struct {
     }
 
     pub fn capturePayload(self: *ServerContext, path: []const u8, content_type: []const u8, data: []const u8) void {
-        self.capture_mutex.lock();
-        defer self.capture_mutex.unlock();
+        self.capture_mutex.lockUncancelable(self.io);
+        defer self.capture_mutex.unlock(self.io);
 
         if (!self.capture_enabled) return;
 
@@ -134,8 +136,8 @@ const ServerContext = struct {
         _ = self.total_requests.fetchAdd(1, .monotonic);
         _ = self.total_bytes.fetchAdd(body_len, .monotonic);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.endpoint_stats.getPtr(path)) |stats| {
             _ = stats.requests.fetchAdd(1, .monotonic);
@@ -158,8 +160,8 @@ const ServerContext = struct {
         self.total_requests.store(0, .monotonic);
         self.total_bytes.store(0, .monotonic);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var it = self.endpoint_stats.iterator();
         while (it.next()) |entry| {
@@ -168,15 +170,15 @@ const ServerContext = struct {
         }
 
         // Also clear captures
-        self.capture_mutex.lock();
-        defer self.capture_mutex.unlock();
+        self.capture_mutex.lockUncancelable(self.io);
+        defer self.capture_mutex.unlock(self.io);
         self.clearCaptures();
         self.capture_enabled = false;
     }
 
     pub fn writeStats(self: *ServerContext, writer: anytype) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         try writer.writeAll("{\"endpoints\":{");
 
@@ -193,8 +195,8 @@ const ServerContext = struct {
             });
         }
 
-        self.capture_mutex.lock();
-        defer self.capture_mutex.unlock();
+        self.capture_mutex.lockUncancelable(self.io);
+        defer self.capture_mutex.unlock(self.io);
 
         try writer.print("}},\"total_requests\":{d},\"total_bytes\":{d},\"capture_enabled\":{},\"captured_count\":{d}}}", .{
             self.total_requests.load(.monotonic),
@@ -207,7 +209,7 @@ const ServerContext = struct {
 
 var server_context: ?*ServerContext = null;
 
-fn shutdown(_: c_int) callconv(.c) void {
+fn shutdown(_: std.posix.SIG) callconv(.c) void {
     if (server_context) |ctx| {
         std.debug.print("\nReceived {d} requests, {d} bytes.\n", .{
             ctx.total_requests.load(.monotonic),
@@ -224,9 +226,10 @@ fn handleRequest(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response)
     if (std.mem.eql(u8, path, "/stats")) {
         res.status = 200;
         res.content_type = .JSON;
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        try ctx.writeStats(buf.writer(ctx.allocator));
-        res.body = try buf.toOwnedSlice(ctx.allocator);
+        var buf: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer buf.deinit();
+        try ctx.writeStats(&buf.writer);
+        res.body = try buf.toOwnedSlice();
         return;
     }
 
@@ -294,12 +297,10 @@ fn handleRequest(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response)
     res.body = "{}";
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const port: u16 = if (args.len > 1)
         try std.fmt.parseInt(u16, args[1], 10)
@@ -311,7 +312,7 @@ pub fn main() !void {
     else
         ".";
 
-    var ctx = ServerContext.init(allocator, output_dir);
+    var ctx = ServerContext.init(allocator, init.io, output_dir);
     defer ctx.deinit();
     server_context = &ctx;
 
@@ -321,8 +322,8 @@ pub fn main() !void {
         .flags = 0,
     }, null);
 
-    var server = try httpz.Server(*ServerContext).init(allocator, .{
-        .address = .{ .ip = .{ .host = "127.0.0.1", .port = port } },
+    var server = try httpz.Server(*ServerContext).init(init.io, allocator, .{
+        .address = .{ .ip = .{ .ip4 = .{ .bytes = [4]u8{ 127, 0, 0, 1 }, .port = port } } },
         .request = .{
             .max_body_size = 5194304,
         },

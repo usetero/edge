@@ -561,7 +561,7 @@ main() {
     # Build if needed
     if [[ "$SKIP_BUILD" == "false" ]]; then
         log_info "Building release binaries..."
-        zig build echo-server datadog otlp -Doptimize=ReleaseFast
+        zig build echo-server datadog otlp -Doptimize=Debug
         log_success "Build complete"
     fi
 

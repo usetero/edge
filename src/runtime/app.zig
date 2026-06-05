@@ -481,7 +481,6 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         &runtime_metrics,
         config.listen_address,
         config.listen_port,
-        config.max_upstream_retries,
         config.max_body_size,
         module_registrations.items,
     );

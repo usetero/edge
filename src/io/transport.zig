@@ -29,67 +29,15 @@ const UpstreamConnectionError = struct {
     underlying_err: ?[]const u8 = null,
 };
 
-const UpstreamRetry = struct {
-    attempt: u8,
-    max_retries: u8,
-    err: []const u8,
-};
-
 pub const Context = struct {
     upstreams: *UpstreamClientManager,
     bus: *EventBus,
-    max_upstream_retries: u8,
 };
 
 pub const UpstreamTransport = struct {
     ctx: Context,
 
     pub fn proxyPrepared(
-        self: *const UpstreamTransport,
-        req: *httpz.Request,
-        res: *httpz.Response,
-        method: std.http.Method,
-        module_id: ModuleId,
-        module: ProxyModule,
-        prepared_body: []const u8,
-        has_body: bool,
-    ) !usize {
-        const max_retries = self.ctx.max_upstream_retries;
-        var attempt: u8 = 0;
-
-        // https://codeberg.org/ziglang/zig/issues/30165
-        // TODO: Remove this once the bug is fixed.
-        // Retry is needed because pooled upstream connections can go stale between
-        // requests and fail on first write/read despite being selected from pool.
-        // We precompute a replayable outbound body so retries are deterministic.
-        while (attempt < max_retries) : (attempt += 1) {
-            const result = self.proxyOnce(
-                req,
-                res,
-                method,
-                module_id,
-                module,
-                prepared_body,
-                has_body,
-            );
-            if (result) |bytes| {
-                return bytes;
-            } else |err| {
-                const err_name = @errorName(err);
-                if (!shouldRetryErrorName(err_name) or attempt + 1 >= max_retries) return err;
-
-                self.ctx.bus.warn(UpstreamRetry{
-                    .attempt = attempt + 1,
-                    .max_retries = max_retries,
-                    .err = err_name,
-                });
-            }
-        }
-
-        return error.NotEnoughData;
-    }
-
-    fn proxyOnce(
         self: *const UpstreamTransport,
         req: *httpz.Request,
         res: *httpz.Response,
@@ -160,6 +108,22 @@ pub const UpstreamTransport = struct {
             }
 
             try request_body_writer.end();
+        } else if (method.requestHasBody()) {
+            // Body-bearing method (e.g. POST/PUT) with no payload to forward:
+            // send an explicit zero-length body. sendBodiless() is only valid
+            // for bodiless methods (GET/HEAD) and asserts !requestHasBody().
+            upstream_req.transfer_encoding = .{ .content_length = 0 };
+            var empty_write_buffer: [64]u8 = undefined;
+            var empty_body_writer = upstream_req.sendBodyUnflushed(&empty_write_buffer) catch |err| {
+                self.ctx.bus.err(UpstreamConnectionError{
+                    .err = @errorName(err),
+                    .phase = "send_body",
+                    .underlying_err = getUnderlyingWriteError(&upstream_req),
+                });
+                if (upstream_req.connection) |conn| conn.closing = true;
+                return err;
+            };
+            try empty_body_writer.end();
         } else {
             try upstream_req.sendBodiless();
         }
@@ -201,15 +165,6 @@ pub const UpstreamTransport = struct {
         return bytes_forwarded;
     }
 };
-
-pub fn shouldRetryErrorName(err_name: []const u8) bool {
-    return std.mem.eql(u8, err_name, "ConnectionResetByPeer") or
-        std.mem.eql(u8, err_name, "BrokenPipe") or
-        std.mem.eql(u8, err_name, "ConnectionTimedOut") or
-        std.mem.eql(u8, err_name, "UnexpectedReadFailure") or
-        std.mem.eql(u8, err_name, "HttpConnectionClosing") or
-        std.mem.eql(u8, err_name, "UnexpectedWriteFailure");
-}
 
 pub fn shouldSkipRequestHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "host") or
@@ -261,12 +216,6 @@ fn getUnderlyingWriteError(upstream_req: *std.http.Client.Request) ?[]const u8 {
     const connection = upstream_req.connection orelse return null;
     const write_err = connection.stream_writer.err orelse return null;
     return @errorName(write_err);
-}
-
-test "shouldRetryErrorName covers transient connection failures" {
-    try std.testing.expect(shouldRetryErrorName("BrokenPipe"));
-    try std.testing.expect(shouldRetryErrorName("ConnectionResetByPeer"));
-    try std.testing.expect(!shouldRetryErrorName("AccessDenied"));
 }
 
 test "header skip helpers" {

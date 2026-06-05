@@ -248,10 +248,12 @@ pub const RuntimeMetrics = struct {
     }
 
     pub fn deinit(self: *RuntimeMetrics) void {
-        _ = self;
-        // Intentionally no-op at process shutdown.
-        // These metric vectors may still be touched by worker threads during teardown,
-        // and freeing them has caused shutdown-time memory corruption.
+        // Free each metric vector's per-series allocations. Safe at shutdown:
+        // callers deinit RuntimeMetrics only after the server has stopped
+        // (listen thread joined), so no worker threads touch the metrics here.
+        inline for (std.meta.fields(InternalMetrics)) |field| {
+            @field(self.internal, field.name).deinit();
+        }
     }
 
     pub fn writePrometheus(self: *RuntimeMetrics, writer: *std.Io.Writer) !void {

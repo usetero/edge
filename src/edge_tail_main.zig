@@ -114,7 +114,7 @@ fn parseCliOptions(init: std.process.Init) !CliOptions {
     var it = init.minimal.args.iterate();
     _ = it.skip(); // program name
 
-    var opts = CliOptions{ .inputs = .{} };
+    var opts = CliOptions{ .inputs = .empty };
     errdefer opts.deinit(allocator);
 
     while (it.next()) |arg| {

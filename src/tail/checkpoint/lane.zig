@@ -9,6 +9,7 @@ pub const Update = checkpoint_types.Update;
 
 pub const Lane = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     queue: queue_mod.UpdateQueue,
     store: store_mod.Store,
     wal: wal_mod.Wal,
@@ -30,6 +31,7 @@ pub const Lane = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         state_dir: []const u8,
         capacity: usize,
         max_slots: usize,
@@ -42,17 +44,18 @@ pub const Lane = struct {
         if (sync_batch == 0) return error.InvalidCheckpointSyncBatch;
         if (snapshot_interval_ms == 0) return error.InvalidCheckpointSnapshotInterval;
 
-        try std.fs.cwd().makePath(state_dir);
+        try std.Io.Dir.cwd().createDirPath(io, state_dir);
 
         const interval_ns = interval_ms * std.time.ns_per_ms;
         const ttl_ns = @as(i128, @intCast(ttl_ms)) * std.time.ns_per_ms;
 
         var lane = Lane{
             .allocator = allocator,
-            .queue = try queue_mod.UpdateQueue.init(allocator, capacity),
-            .store = store_mod.Store.init(allocator, max_slots, ttl_ns),
-            .wal = try wal_mod.Wal.init(allocator, state_dir),
-            .snapshot = try snapshot_mod.Snapshot.init(allocator, state_dir),
+            .io = io,
+            .queue = try queue_mod.UpdateQueue.init(allocator, io, capacity),
+            .store = store_mod.Store.init(allocator, io, max_slots, ttl_ns),
+            .wal = try wal_mod.Wal.init(allocator, io, state_dir),
+            .snapshot = try snapshot_mod.Snapshot.init(allocator, io, state_dir),
             .interval_ns = interval_ns,
             .ttl_ns = ttl_ns,
             .sync_batch = sync_batch,
@@ -68,7 +71,7 @@ pub const Lane = struct {
         errdefer lane.snapshot.deinit();
 
         try lane.recover();
-        const now = std.time.nanoTimestamp();
+        const now = std.Io.Timestamp.now(io, .awake).toNanoseconds();
         lane.last_sync_ns = now;
         lane.next_gc_ns = now + lane.gc_interval_ns;
         lane.next_snapshot_ns = now + lane.snapshot_interval_ns;
@@ -137,7 +140,7 @@ pub const Lane = struct {
             }
 
             self.runMaintenance(false) catch {};
-            std.Thread.sleep(@min(self.interval_ns, 10 * std.time.ns_per_ms));
+            self.io.sleep(.fromNanoseconds(@intCast(@min(self.interval_ns, 10 * std.time.ns_per_ms))), .awake) catch {};
         }
     }
 
@@ -150,7 +153,7 @@ pub const Lane = struct {
     }
 
     fn runMaintenance(self: *Lane, force: bool) !void {
-        const now = std.time.nanoTimestamp();
+        const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 
         if (force or self.pending_unsynced >= self.sync_batch or (now - self.last_sync_ns) >= self.interval_ns) {
             if (self.pending_unsynced > 0) {

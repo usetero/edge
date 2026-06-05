@@ -327,11 +327,7 @@ fn processJsonMetrics(
     data: []const u8,
 ) !ProcessResult {
     // Parse JSON into MetricsData protobuf struct.
-    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.);
-    // decode reads this thread-local, encode takes it via pb_options below.
-    proto.protobuf.json.tl_bytes_as_hex = true;
-    defer proto.protobuf.json.tl_bytes_as_hex = false;
-
+    // NOTE: bytes-as-hex is temporarily disabled; bytes fields use base64.
     var parsed = try MetricsData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
     }, allocator);
@@ -343,7 +339,7 @@ fn processJsonMetrics(
     // Re-serialize to JSON
     const output = try parsed.value.jsonEncode(.{}, .{
         .emit_oneof_field_name = false,
-        .bytes_as_hex = true,
+        .bytes_as_hex = false,
     }, allocator);
 
     return .{
@@ -370,7 +366,7 @@ fn processProtobufMetrics(
     }
 
     // Use an arena for the protobuf decode/filter/encode cycle
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 

@@ -8,15 +8,17 @@ const Oldest = struct {
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     max_slots: usize,
     ttl_ns: i128,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     by_identity: std.AutoHashMap(u64, checkpoint_types.Value),
     by_inode: std.AutoHashMap(u64, checkpoint_types.Value),
 
-    pub fn init(allocator: std.mem.Allocator, max_slots: usize, ttl_ns: i128) Store {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, max_slots: usize, ttl_ns: i128) Store {
         return .{
             .allocator = allocator,
+            .io = io,
             .max_slots = max_slots,
             .ttl_ns = ttl_ns,
             .by_identity = std.AutoHashMap(u64, checkpoint_types.Value).init(allocator),
@@ -31,8 +33,8 @@ pub const Store = struct {
 
     pub fn upsert(self: *Store, value: checkpoint_types.Value) !void {
         const keys = checkpoint_types.keysFor(value.identity);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (!self.by_identity.contains(keys.identity) and self.by_identity.count() >= self.max_slots) {
             self.evictOldestLocked();
@@ -44,10 +46,10 @@ pub const Store = struct {
 
     pub fn getOffset(self: *Store, identity: @import("../types.zig").FileIdentity) ?u64 {
         const keys = checkpoint_types.keysFor(identity);
-        const now = std.time.nanoTimestamp();
+        const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.by_identity.get(keys.identity)) |value| {
             if (!checkpoint_types.isExpired(value, self.ttl_ns, now)) return value.offset;
@@ -59,10 +61,10 @@ pub const Store = struct {
     }
 
     pub fn evictExpired(self: *Store, now_ns: i128) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        var expired_keys: std.ArrayList(u64) = .{};
+        var expired_keys: std.ArrayList(u64) = .empty;
         defer expired_keys.deinit(self.allocator);
 
         var it = self.by_identity.iterator();
@@ -79,10 +81,10 @@ pub const Store = struct {
     }
 
     pub fn collectValues(self: *Store) !std.ArrayList(checkpoint_types.Value) {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        var out: std.ArrayList(checkpoint_types.Value) = .{};
+        var out: std.ArrayList(checkpoint_types.Value) = .empty;
         try out.ensureTotalCapacity(self.allocator, self.by_identity.count());
 
         var it = self.by_identity.iterator();
@@ -91,8 +93,8 @@ pub const Store = struct {
     }
 
     pub fn loadValues(self: *Store, values: []const checkpoint_types.Value) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         self.by_identity.clearRetainingCapacity();
         self.by_inode.clearRetainingCapacity();

@@ -47,7 +47,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io) !State {
         .io = io,
         .fd = kq,
         .fd_to_idx = std.AutoHashMap(std.posix.fd_t, u32).init(allocator),
-        .dir_watches = .{},
+        .dir_watches = .empty,
     };
 }
 

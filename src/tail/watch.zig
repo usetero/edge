@@ -67,7 +67,7 @@ pub const Watcher = struct {
         rotate_wait_ms: u64,
         removed_expire_ms: u64,
     ) !Watcher {
-        var input_copy: std.ArrayList([]u8) = .{};
+        var input_copy: std.ArrayList([]u8) = .empty;
         errdefer {
             for (input_copy.items) |p| allocator.free(p);
             input_copy.deinit(allocator);
@@ -82,20 +82,20 @@ pub const Watcher = struct {
             .backend = kind,
             .inputs = input_copy,
             .output_path = out_copy,
-            .paths = .{},
-            .files = .{},
-            .pending_files = .{},
-            .identities = .{},
-            .pending_identities = .{},
-            .offsets = .{},
-            .head_prefix_hashes = .{},
-            .head_prefix_lens = .{},
-            .seen_once = .{},
-            .pending_detected_ns = .{},
-            .matched = .{},
-            .last_match_ns = .{},
+            .paths = .empty,
+            .files = .empty,
+            .pending_files = .empty,
+            .identities = .empty,
+            .pending_identities = .empty,
+            .offsets = .empty,
+            .head_prefix_hashes = .empty,
+            .head_prefix_lens = .empty,
+            .seen_once = .empty,
+            .pending_detected_ns = .empty,
+            .matched = .empty,
+            .last_match_ns = .empty,
             .dirty = .{},
-            .dirty_queue = .{},
+            .dirty_queue = .empty,
             .glob_interval_ns = @as(i128, @intCast(glob_interval_ms)) * std.time.ns_per_ms,
             .rotate_wait_ns = @as(i128, @intCast(rotate_wait_ms)) * std.time.ns_per_ms,
             .removed_expire_ns = @as(i128, @intCast(removed_expire_ms)) * std.time.ns_per_ms,
@@ -286,7 +286,7 @@ pub const Watcher = struct {
         const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
         for (self.matched.items) |*m| m.* = false;
 
-        var refs: std.ArrayList([]const u8) = .{};
+        var refs: std.ArrayList([]const u8) = .empty;
         defer refs.deinit(self.allocator);
         try refs.ensureTotalCapacity(self.allocator, self.inputs.items.len);
         for (self.inputs.items) |p| refs.appendAssumeCapacity(p);
@@ -596,7 +596,7 @@ pub const FsStat = struct {
     size: u64,
 };
 
-fn fstatHandle(handle: std.posix.fd_t) !FsStat {
+pub fn fstatHandle(handle: std.posix.fd_t) !FsStat {
     var st: std.c.Stat = undefined;
     if (std.c.fstat(handle, &st) != 0) return error.StatFailed;
     return .{
@@ -627,7 +627,7 @@ const ExpandedPaths = struct {
     items: std.ArrayList([]u8),
 
     fn init(allocator: std.mem.Allocator) ExpandedPaths {
-        return .{ .allocator = allocator, .items = .{} };
+        return .{ .allocator = allocator, .items = .empty };
     }
     fn deinit(self: *ExpandedPaths) void {
         for (self.items.items) |p| self.allocator.free(p);

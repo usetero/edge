@@ -13,7 +13,7 @@ pub const TailLineContext = struct {
     allocator: std.mem.Allocator,
     message: ?[]const u8 = null,
     severity: ?[]const u8 = null,
-    attrs: std.ArrayListUnmanaged(TailAttr) = .{},
+    attrs: std.ArrayListUnmanaged(TailAttr) = .empty,
 
     pub fn logValue(ctx_ptr: *const anyopaque, field: FieldRef) ?[]const u8 {
         const self: *const TailLineContext = @ptrCast(@alignCast(ctx_ptr));

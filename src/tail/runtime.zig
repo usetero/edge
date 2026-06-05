@@ -17,7 +17,7 @@ fn initEventBus(io: std.Io, environ_map: *const std.process.Environ.Map) o11y.St
     return stdio_bus;
 }
 
-fn handleSignal(_: c_int) callconv(.c) void {
+fn handleSignal(_: std.posix.SIG) callconv(.c) void {
     stop_requested.store(true, .release);
 }
 
@@ -157,7 +157,7 @@ pub const Runtime = struct {
         const checkpoint_lane: ?*checkpoint_mod.Lane = if (self.cfg.read_from == .checkpoint) &checkpoint else null;
         if (checkpoint_lane) |lane| watcher.applyCheckpointLane(lane);
 
-        var events: std.ArrayList(watch_mod.Event) = .{};
+        var events: std.ArrayList(watch_mod.Event) = .empty;
         defer events.deinit(self.allocator);
 
         const sleep_ns = self.cfg.poll_ms * std.time.ns_per_ms;

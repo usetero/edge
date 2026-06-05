@@ -18,7 +18,7 @@ pub const LineFramer = struct {
         return .{
             .allocator = allocator,
             .read_buf = try allocator.alloc(u8, read_buf_size),
-            .remainder = .{},
+            .remainder = .empty,
             .max_line = max_line,
             .remainder_truncated = false,
         };

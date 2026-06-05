@@ -431,11 +431,7 @@ fn processJsonLogs(
     }
 
     // Parse JSON into LogsData protobuf struct.
-    // OTel JSON uses lowercase hex for bytes fields (traceId, spanId, etc.);
-    // decode reads this thread-local, encode takes it via pb_options below.
-    proto.protobuf.json.tl_bytes_as_hex = true;
-    defer proto.protobuf.json.tl_bytes_as_hex = false;
-
+    // NOTE: bytes-as-hex is temporarily disabled; bytes fields use base64.
     var parsed = try LogsData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
     }, allocator);
@@ -459,7 +455,7 @@ fn processJsonLogs(
     // Re-serialize to JSON
     const output = try parsed.value.jsonEncode(.{}, .{
         .emit_oneof_field_name = false,
-        .bytes_as_hex = true,
+        .bytes_as_hex = false,
     }, allocator);
 
     return .{

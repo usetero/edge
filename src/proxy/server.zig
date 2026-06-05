@@ -168,9 +168,6 @@ const ServerContext = struct {
     /// Listen port
     listen_port: u16,
 
-    /// Maximum retries for failed upstream requests
-    max_upstream_retries: u8,
-
     /// Event bus for observability
     bus: *EventBus,
 
@@ -273,7 +270,6 @@ pub const ProxyServer = struct {
         metrics: *RuntimeMetrics,
         listen_address: [4]u8,
         listen_port: u16,
-        max_upstream_retries: u8,
         max_body_size: u32,
         module_registrations: []const ModuleRegistration,
     ) !ProxyServer {
@@ -284,7 +280,6 @@ pub const ProxyServer = struct {
         ctx.io = io;
         ctx.bus = bus;
         ctx.metrics = metrics;
-        ctx.max_upstream_retries = max_upstream_retries;
         ctx.upstreams = UpstreamClientManager.init(io, allocator);
         errdefer ctx.upstreams.deinit();
         ctx.modules = .{ .modules = .{} };
@@ -561,7 +556,6 @@ fn proxyToUpstreamStreaming(
     const transport = UpstreamTransport{ .ctx = .{
         .upstreams = &ctx.upstreams,
         .bus = ctx.bus,
-        .max_upstream_retries = ctx.max_upstream_retries,
     } };
     return transport.proxyPrepared(
         req,
