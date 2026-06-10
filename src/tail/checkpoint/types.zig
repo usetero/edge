@@ -41,8 +41,8 @@ pub fn isExpired(value: Value, ttl_ns: i128, now_ns: i128) bool {
 const testing = std.testing;
 
 test "checkpoint/types: valueFromUpdate copies checkpoint fields" {
-    const id = tail_types.FileIdentity{ .dev = 1, .inode = 2, .fingerprint = 3 };
-    const update = Update{ .identity = id, .byte_offset = 99, .last_seen_size = 123, .last_seen_ns = 456 };
+    const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 2, .fingerprint = 3 };
+    const update: Update = .{ .identity = id, .byte_offset = 99, .last_seen_size = 123, .last_seen_ns = 456 };
     const value = valueFromUpdate(update);
 
     try testing.expectEqual(id.dev, value.identity.dev);

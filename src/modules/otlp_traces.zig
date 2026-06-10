@@ -26,6 +26,8 @@ const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const otlp_attr = @import("otlp_attributes.zig");
 
+const log = std.log.scoped(.otlp_traces);
+
 const TracesData = proto.trace.TracesData;
 const ResourceSpans = proto.trace.ResourceSpans;
 const ScopeSpans = proto.trace.ScopeSpans;
@@ -34,8 +36,8 @@ const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
 
 const PolicyEngine = policy.PolicyEngine;
-const TraceFieldRef = policy.TraceFieldRef;
-const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
+pub const TraceFieldRef = policy.TraceFieldRef;
+const MAX_MATCHES_PER_SCAN = policy.max_matches_per_scan;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -151,7 +153,7 @@ fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try streamAll(reader, &out.writer);
-    return try out.toOwnedSlice();
+    return out.toOwnedSlice();
 }
 
 fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
@@ -200,17 +202,41 @@ pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
             .TRACE_FIELD_NAME => if (span_ctx.span.name.len > 0) span_ctx.span.name else null,
             .TRACE_FIELD_TRACE_ID => if (span_ctx.span.trace_id.len > 0) span_ctx.span.trace_id else null,
             .TRACE_FIELD_SPAN_ID => if (span_ctx.span.span_id.len > 0) span_ctx.span.span_id else null,
-            .TRACE_FIELD_PARENT_SPAN_ID => if (span_ctx.span.parent_span_id.len > 0) span_ctx.span.parent_span_id else null,
-            .TRACE_FIELD_TRACE_STATE => if (span_ctx.span.trace_state.len > 0) span_ctx.span.trace_state else null,
-            .TRACE_FIELD_RESOURCE_SCHEMA_URL => if (span_ctx.resource_spans.schema_url.len > 0) span_ctx.resource_spans.schema_url else null,
-            .TRACE_FIELD_SCOPE_SCHEMA_URL => if (span_ctx.scope_spans.schema_url.len > 0) span_ctx.scope_spans.schema_url else null,
-            .TRACE_FIELD_SCOPE_NAME => if (span_ctx.scope_spans.scope) |scope| (if (scope.name.len > 0) scope.name else null) else null,
-            .TRACE_FIELD_SCOPE_VERSION => if (span_ctx.scope_spans.scope) |scope| (if (scope.version.len > 0) scope.version else null) else null,
+            .TRACE_FIELD_PARENT_SPAN_ID => if (span_ctx.span.parent_span_id.len > 0)
+                span_ctx.span.parent_span_id
+            else
+                null,
+            .TRACE_FIELD_TRACE_STATE => if (span_ctx.span.trace_state.len > 0)
+                span_ctx.span.trace_state
+            else
+                null,
+            .TRACE_FIELD_RESOURCE_SCHEMA_URL => if (span_ctx.resource_spans.schema_url.len > 0)
+                span_ctx.resource_spans.schema_url
+            else
+                null,
+            .TRACE_FIELD_SCOPE_SCHEMA_URL => if (span_ctx.scope_spans.schema_url.len > 0)
+                span_ctx.scope_spans.schema_url
+            else
+                null,
+            .TRACE_FIELD_SCOPE_NAME => if (span_ctx.scope_spans.scope) |scope|
+                (if (scope.name.len > 0) scope.name else null)
+            else
+                null,
+            .TRACE_FIELD_SCOPE_VERSION => if (span_ctx.scope_spans.scope) |scope|
+                (if (scope.version.len > 0) scope.version else null)
+            else
+                null,
             else => null,
         },
         .span_attribute => |attr_path| findNestedAttribute(span_ctx.span.attributes.items, attr_path.path.items),
-        .resource_attribute => |attr_path| if (span_ctx.resource_spans.resource) |res| findNestedAttribute(res.attributes.items, attr_path.path.items) else null,
-        .scope_attribute => |attr_path| if (span_ctx.scope_spans.scope) |scope| findNestedAttribute(scope.attributes.items, attr_path.path.items) else null,
+        .resource_attribute => |attr_path| if (span_ctx.resource_spans.resource) |res|
+            findNestedAttribute(res.attributes.items, attr_path.path.items)
+        else
+            null,
+        .scope_attribute => |attr_path| if (span_ctx.scope_spans.scope) |scope|
+            findNestedAttribute(scope.attributes.items, attr_path.path.items)
+        else
+            null,
         .span_kind => |requested_kind| blk: {
             // Compare by integer value — OTel SpanKind and policy SpanKind share values
             break :blk if (@intFromEnum(span_ctx.span.kind) == @intFromEnum(requested_kind))
@@ -262,7 +288,17 @@ pub fn traceSet(ctx: *anyopaque, field: TraceFieldRef, value: []const u8) void {
     const span_ctx: *OtlpSpanContext = @ptrCast(@alignCast(ctx));
     switch (field) {
         .trace_field => |tf| if (tf == .TRACE_FIELD_TRACE_STATE) {
-            span_ctx.span.trace_state = mergeOTTracestate(span_ctx.allocator, span_ctx.span.trace_state, value);
+            // On allocation failure, keep the original tracestate rather than
+            // writing a partially-built (corrupt) value.
+            const merged = mergeOtTracestate(
+                span_ctx.allocator,
+                span_ctx.span.trace_state,
+                value,
+            ) catch |err| {
+                log.warn("traceSet: failed to merge tracestate, keeping original: {}", .{err});
+                return;
+            };
+            span_ctx.span.trace_state = merged;
         },
         else => {},
     }
@@ -276,9 +312,11 @@ pub const trace_accessor: policy.TraceAccessor = .{
 
 /// Merge a sampling threshold into W3C tracestate as ot=th:VALUE.
 /// Preserves existing vendor entries and other ot sub-keys (like rv).
-fn mergeOTTracestate(allocator: std.mem.Allocator, tracestate: []const u8, th_value: []const u8) []const u8 {
-    var ot_parts: std.ArrayListUnmanaged(u8) = .empty;
-    var other_vendors: std.ArrayListUnmanaged(u8) = .empty;
+fn mergeOtTracestate(allocator: std.mem.Allocator, tracestate: []const u8, th_value: []const u8) ![]const u8 {
+    var ot_parts: std.ArrayList(u8) = .empty;
+    defer ot_parts.deinit(allocator);
+    var other_vendors: std.ArrayList(u8) = .empty;
+    defer other_vendors.deinit(allocator);
 
     if (tracestate.len > 0) {
         var vendors = std.mem.splitScalar(u8, tracestate, ',');
@@ -293,30 +331,31 @@ fn mergeOTTracestate(allocator: std.mem.Allocator, tracestate: []const u8, th_va
                     if (part.len == 0) continue;
                     // Skip existing th: sub-key (we're replacing it)
                     if (std.mem.startsWith(u8, part, "th:")) continue;
-                    if (ot_parts.items.len > 0) ot_parts.appendSlice(allocator, ";") catch {};
-                    ot_parts.appendSlice(allocator, part) catch {};
+                    if (ot_parts.items.len > 0) try ot_parts.appendSlice(allocator, ";");
+                    try ot_parts.appendSlice(allocator, part);
                 }
             } else {
-                if (other_vendors.items.len > 0) other_vendors.appendSlice(allocator, ",") catch {};
-                other_vendors.appendSlice(allocator, vendor) catch {};
+                if (other_vendors.items.len > 0) try other_vendors.appendSlice(allocator, ",");
+                try other_vendors.appendSlice(allocator, vendor);
             }
         }
     }
 
     // Build result: ot=[existing_subkeys;]th:VALUE[,other_vendors]
-    var result: std.ArrayListUnmanaged(u8) = .empty;
-    result.appendSlice(allocator, "ot=") catch {};
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, "ot=");
     if (ot_parts.items.len > 0) {
-        result.appendSlice(allocator, ot_parts.items) catch {};
-        result.appendSlice(allocator, ";") catch {};
+        try result.appendSlice(allocator, ot_parts.items);
+        try result.appendSlice(allocator, ";");
     }
-    result.appendSlice(allocator, "th:") catch {};
-    result.appendSlice(allocator, th_value) catch {};
+    try result.appendSlice(allocator, "th:");
+    try result.appendSlice(allocator, th_value);
     if (other_vendors.items.len > 0) {
-        result.appendSlice(allocator, ",") catch {};
-        result.appendSlice(allocator, other_vendors.items) catch {};
+        try result.appendSlice(allocator, ",");
+        try result.appendSlice(allocator, other_vendors.items);
     }
-    return result.items;
+    return result.toOwnedSlice(allocator);
 }
 
 /// Result of filtering traces in-place
@@ -330,7 +369,7 @@ const FilterCounts = struct {
 /// This is the shared filtering logic used by both JSON and protobuf processing
 ///
 /// Sampling and tracestate updates are handled by the policy engine via
-/// the field mutator callback (mergeOTTracestate).
+/// the field mutator callback (mergeOtTracestate).
 fn filterSpansInPlace(
     allocator: std.mem.Allocator,
     traces_data: *TracesData,
@@ -356,7 +395,7 @@ fn filterSpansInPlace(
             // Filter spans in place by shrinking the list
             var write_idx: usize = 0;
             for (scope_spans.spans.items) |*span| {
-                var ctx = OtlpSpanContext{
+                var ctx: OtlpSpanContext = .{
                     .span = span,
                     .resource_spans = resource_spans,
                     .scope_spans = scope_spans,
@@ -529,121 +568,178 @@ fn processProtobufTracesStream(
 // =============================================================================
 
 // =============================================================================
-// mergeOTTracestate tests
+// mergeOtTracestate tests
 // =============================================================================
 
-test "mergeOTTracestate - empty tracestate" {
+test "mergeOtTracestate - empty tracestate" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:8", mergeOTTracestate(arena.allocator(), "", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=th:8",
+        try mergeOtTracestate(arena.allocator(), "", "8"),
+    );
 }
 
-test "mergeOTTracestate - empty tracestate with zero threshold" {
+test "mergeOtTracestate - empty tracestate with zero threshold" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:0", mergeOTTracestate(arena.allocator(), "", "0"));
+    try std.testing.expectEqualStrings(
+        "ot=th:0",
+        try mergeOtTracestate(arena.allocator(), "", "0"),
+    );
 }
 
-test "mergeOTTracestate - empty tracestate with multi-char threshold" {
+test "mergeOtTracestate - empty tracestate with multi-char threshold" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:abc123", mergeOTTracestate(arena.allocator(), "", "abc123"));
+    try std.testing.expectEqualStrings(
+        "ot=th:abc123",
+        try mergeOtTracestate(arena.allocator(), "", "abc123"),
+    );
 }
 
-test "mergeOTTracestate - single vendor preserved" {
+test "mergeOtTracestate - single vendor preserved" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:0,vendor1=abc", mergeOTTracestate(arena.allocator(), "vendor1=abc", "0"));
+    try std.testing.expectEqualStrings(
+        "ot=th:0,vendor1=abc",
+        try mergeOtTracestate(arena.allocator(), "vendor1=abc", "0"),
+    );
 }
 
-test "mergeOTTracestate - multiple vendors preserved" {
+test "mergeOtTracestate - multiple vendors preserved" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:0,vendor1=abc,vendor2=xyz", mergeOTTracestate(arena.allocator(), "vendor1=abc,vendor2=xyz", "0"));
+    try std.testing.expectEqualStrings(
+        "ot=th:0,vendor1=abc,vendor2=xyz",
+        try mergeOtTracestate(arena.allocator(), "vendor1=abc,vendor2=xyz", "0"),
+    );
 }
 
-test "mergeOTTracestate - existing ot=th replaced" {
+test "mergeOtTracestate - existing ot=th replaced" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:8", mergeOTTracestate(arena.allocator(), "ot=th:4", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=th:8",
+        try mergeOtTracestate(arena.allocator(), "ot=th:4", "8"),
+    );
 }
 
-test "mergeOTTracestate - existing ot=th:0 replaced" {
+test "mergeOtTracestate - existing ot=th:0 replaced" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:8", mergeOTTracestate(arena.allocator(), "ot=th:0", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=th:8",
+        try mergeOtTracestate(arena.allocator(), "ot=th:0", "8"),
+    );
 }
 
-test "mergeOTTracestate - existing ot with rv preserved, th replaced" {
+test "mergeOtTracestate - existing ot with rv preserved, th replaced" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=rv:abc123;th:8", mergeOTTracestate(arena.allocator(), "ot=th:4;rv:abc123", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=rv:abc123;th:8",
+        try mergeOtTracestate(arena.allocator(), "ot=th:4;rv:abc123", "8"),
+    );
 }
 
-test "mergeOTTracestate - existing ot with rv only, th added" {
+test "mergeOtTracestate - existing ot with rv only, th added" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=rv:abc123;th:8", mergeOTTracestate(arena.allocator(), "ot=rv:abc123", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=rv:abc123;th:8",
+        try mergeOtTracestate(arena.allocator(), "ot=rv:abc123", "8"),
+    );
 }
 
-test "mergeOTTracestate - existing ot=th with vendor preserved" {
+test "mergeOtTracestate - existing ot=th with vendor preserved" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:8,vendor=xyz", mergeOTTracestate(arena.allocator(), "ot=th:c,vendor=xyz", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=th:8,vendor=xyz",
+        try mergeOtTracestate(arena.allocator(), "ot=th:c,vendor=xyz", "8"),
+    );
 }
 
-test "mergeOTTracestate - ot with rv and vendor" {
+test "mergeOtTracestate - ot with rv and vendor" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=rv:abc;th:8,vendor=xyz", mergeOTTracestate(arena.allocator(), "ot=rv:abc;th:4,vendor=xyz", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=rv:abc;th:8,vendor=xyz",
+        try mergeOtTracestate(arena.allocator(), "ot=rv:abc;th:4,vendor=xyz", "8"),
+    );
 }
 
-test "mergeOTTracestate - vendor before ot entry" {
+test "mergeOtTracestate - vendor before ot entry" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:8,vendor1=abc", mergeOTTracestate(arena.allocator(), "vendor1=abc,ot=th:4", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=th:8,vendor1=abc",
+        try mergeOtTracestate(arena.allocator(), "vendor1=abc,ot=th:4", "8"),
+    );
 }
 
-test "mergeOTTracestate - vendor before and after ot entry" {
+test "mergeOtTracestate - vendor before and after ot entry" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:8,v1=a,v2=b", mergeOTTracestate(arena.allocator(), "v1=a,ot=th:4,v2=b", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=th:8,v1=a,v2=b",
+        try mergeOtTracestate(arena.allocator(), "v1=a,ot=th:4,v2=b", "8"),
+    );
 }
 
-test "mergeOTTracestate - multiple ot sub-keys preserved" {
+test "mergeOtTracestate - multiple ot sub-keys preserved" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=rv:abc;p:8;th:8", mergeOTTracestate(arena.allocator(), "ot=rv:abc;p:8;th:4", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=rv:abc;p:8;th:8",
+        try mergeOtTracestate(arena.allocator(), "ot=rv:abc;p:8;th:4", "8"),
+    );
 }
 
-test "mergeOTTracestate - whitespace in vendors trimmed" {
+test "mergeOtTracestate - whitespace in vendors trimmed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:0,vendor1=abc,vendor2=xyz", mergeOTTracestate(arena.allocator(), " vendor1=abc , vendor2=xyz ", "0"));
+    try std.testing.expectEqualStrings(
+        "ot=th:0,vendor1=abc,vendor2=xyz",
+        try mergeOtTracestate(arena.allocator(), " vendor1=abc , vendor2=xyz ", "0"),
+    );
 }
 
-test "mergeOTTracestate - whitespace in ot sub-keys trimmed" {
+test "mergeOtTracestate - whitespace in ot sub-keys trimmed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=rv:abc;th:8", mergeOTTracestate(arena.allocator(), "ot= rv:abc ; th:4 ", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=rv:abc;th:8",
+        try mergeOtTracestate(arena.allocator(), "ot= rv:abc ; th:4 ", "8"),
+    );
 }
 
-test "mergeOTTracestate - empty vendors between commas ignored" {
+test "mergeOtTracestate - empty vendors between commas ignored" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:0,vendor1=abc,vendor2=xyz", mergeOTTracestate(arena.allocator(), "vendor1=abc,,vendor2=xyz", "0"));
+    try std.testing.expectEqualStrings(
+        "ot=th:0,vendor1=abc,vendor2=xyz",
+        try mergeOtTracestate(arena.allocator(), "vendor1=abc,,vendor2=xyz", "0"),
+    );
 }
 
-test "mergeOTTracestate - empty ot sub-keys between semicolons ignored" {
+test "mergeOtTracestate - empty ot sub-keys between semicolons ignored" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=rv:abc;th:8", mergeOTTracestate(arena.allocator(), "ot=rv:abc;;th:4", "8"));
+    try std.testing.expectEqualStrings(
+        "ot=rv:abc;th:8",
+        try mergeOtTracestate(arena.allocator(), "ot=rv:abc;;th:4", "8"),
+    );
 }
 
-test "mergeOTTracestate - ot entry with only th" {
+test "mergeOtTracestate - ot entry with only th" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectEqualStrings("ot=th:0", mergeOTTracestate(arena.allocator(), "ot=th:ffff", "0"));
+    try std.testing.expectEqualStrings(
+        "ot=th:0",
+        try mergeOtTracestate(arena.allocator(), "ot=th:ffff", "0"),
+    );
 }
 
 test "processTraces - parses and re-serializes JSON" {
@@ -655,8 +751,12 @@ test "processTraces - parses and re-serializes JSON" {
     defer registry.deinit();
 
     const traces =
-        \\{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test-service"}}]},"scopeSpans":[{"scope":{"name":"my-tracer","version":"1.0"},"spans":[{"traceId":"0123456789abcdef0123456789abcdef","spanId":"0123456789abcdef","name":"test-span","kind":1,"startTimeUnixNano":"1000000000","endTimeUnixNano":"2000000000"}]}]}]}
-    ;
+        "{\"resourceSpans\":[{\"resource\":{\"attributes\":[" ++
+        "{\"key\":\"service.name\",\"value\":{\"stringValue\":\"test-service\"}}]}," ++
+        "\"scopeSpans\":[{\"scope\":{\"name\":\"my-tracer\",\"version\":\"1.0\"}," ++
+        "\"spans\":[{\"traceId\":\"0123456789abcdef0123456789abcdef\"," ++
+        "\"spanId\":\"0123456789abcdef\",\"name\":\"test-span\",\"kind\":1," ++
+        "\"startTimeUnixNano\":\"1000000000\",\"endTimeUnixNano\":\"2000000000\"}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(traces);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -669,7 +769,7 @@ test "processTraces - parses and re-serializes JSON" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -705,7 +805,7 @@ test "processTraces - malformed JSON returns unchanged (fail-open)" {
     ) catch {
         const copied = try allocator.alloc(u8, malformed.len);
         @memcpy(copied, malformed);
-        const result = ProcessResult{
+        const result: ProcessResult = .{
             .data = copied,
             .dropped_count = 0,
             .original_count = 0,
@@ -717,7 +817,7 @@ test "processTraces - malformed JSON returns unchanged (fail-open)" {
         try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
         return;
     };
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -750,7 +850,7 @@ test "processTraces - unknown content type returns unchanged" {
         &out_writer.writer,
         "text/plain",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,

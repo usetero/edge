@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.read_sched_uring);
 const framer_mod = @import("../framer.zig");
 const watch_mod = @import("../watch.zig");
 const common = @import("common.zig");
@@ -34,11 +35,11 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         if (self.fixed_buffers_registered) {
-            self.ring.unregister_buffers() catch {};
+            self.ring.unregister_buffers() catch |err| log.warn("unregister_buffers on deinit failed: {}", .{err});
             self.fixed_buffers_registered = false;
         }
         if (self.fixed_files_registered) {
-            self.ring.unregister_files() catch {};
+            self.ring.unregister_files() catch |err| log.warn("unregister_files on deinit failed: {}", .{err});
             self.fixed_files_registered = false;
         }
         self.ring.deinit();
@@ -47,6 +48,7 @@ pub const Scheduler = struct {
         self.cqes.deinit(self.allocator);
         self.fixed_iovecs.deinit(self.allocator);
         self.fixed_fds.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn processBatch(
@@ -195,7 +197,7 @@ pub const Scheduler = struct {
         if (self.fixed_buffers_registered and self.fixed_buf_size == read_buf_size) return;
 
         if (self.fixed_buffers_registered) {
-            self.ring.unregister_buffers() catch {};
+            self.ring.unregister_buffers() catch |err| log.warn("unregister_buffers on resize failed: {}", .{err});
             self.fixed_buffers_registered = false;
         }
         self.fixed_buf_size = read_buf_size;

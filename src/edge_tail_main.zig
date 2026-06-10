@@ -39,6 +39,7 @@ const CliOptions = struct {
         if (self.state_dir_override) |path| allocator.free(path);
         for (self.inputs.items) |input| allocator.free(input);
         self.inputs.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -114,7 +115,7 @@ fn parseCliOptions(init: std.process.Init) !CliOptions {
     var it = init.minimal.args.iterate();
     _ = it.skip(); // program name
 
-    var opts = CliOptions{ .inputs = .empty };
+    var opts: CliOptions = .{ .inputs = .empty };
     errdefer opts.deinit(allocator);
 
     while (it.next()) |arg| {
@@ -315,7 +316,8 @@ pub fn main(init: std.process.Init) !void {
         var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
         const stderr = &stderr_writer.interface;
         try stderr.print(
-            "edge-tail: read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s} policy={s}\n",
+            "edge-tail: read_from={s} format={s} io_engine={s} poll_ms={d} " ++
+                "glob_interval_ms={d} state_dir={s} policy={s}\n",
             .{
                 @tagName(cfg.read_from),
                 @tagName(cfg.input_format),

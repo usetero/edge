@@ -27,6 +27,7 @@ pub const LineFramer = struct {
     pub fn deinit(self: *LineFramer) void {
         self.allocator.free(self.read_buf);
         self.remainder.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub const LineFilterFn = fn (ctx: *anyopaque, line: []const u8, meta: types.LineMeta) anyerror!bool;
@@ -52,7 +53,7 @@ pub const LineFramer = struct {
         const Lanes = 16;
         const V = @Vector(Lanes, u8);
         const M = @Vector(Lanes, bool);
-        const Bits = std.meta.Int(.unsigned, Lanes);
+        const Bits = @Int(.unsigned, Lanes);
         const needle: V = @splat('\n');
 
         while (i + Lanes <= chunk.len) : (i += Lanes) {
@@ -159,7 +160,13 @@ pub const LineFramer = struct {
     ) !void {
         if (self.remainder.items.len > 0 or self.remainder_truncated) {
             try self.appendCapped(segment);
-            try emitLine(writer, self.remainder.items, .{ .truncated = self.remainder_truncated }, filter_ctx, filter_fn);
+            try emitLine(
+                writer,
+                self.remainder.items,
+                .{ .truncated = self.remainder_truncated },
+                filter_ctx,
+                filter_fn,
+            );
             self.remainder.clearRetainingCapacity();
             self.remainder_truncated = false;
             return;

@@ -14,7 +14,7 @@ const proto = @import("proto");
 const line_parser = @import("line_parser.zig");
 const policy = @import("policy_zig");
 
-const MetricFieldRef = policy.MetricFieldRef;
+pub const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = proto.policy.MetricField;
 const AttributePath = proto.policy.AttributePath;
 

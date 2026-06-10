@@ -72,7 +72,7 @@ pub const ExtensionClient = struct {
     extension_name: []const u8,
     bus: *EventBus,
 
-    const Self = @This();
+    const Self = ExtensionClient;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -105,17 +105,21 @@ pub const ExtensionClient = struct {
         return self;
     }
 
+    // ziglint-ignore: Z030 (deinit frees self; cannot set self.* = undefined last)
     pub fn deinit(self: *Self) void {
         if (self.extension_id) |id| self.allocator.free(id);
         self.allocator.free(self.extension_name);
         self.allocator.free(self.runtime_api);
         self.http_client.deinit();
-        self.allocator.destroy(self);
+        const allocator = self.allocator;
+        self.* = undefined;
+        allocator.destroy(self);
     }
 
     /// Register this extension with the Lambda Extensions API.
     /// Must be called before the init phase completes.
     pub fn register(self: *Self) !void {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         self.bus.info(ExtensionRegistering{ .name = self.extension_name });
 
         // Build registration URL
@@ -155,6 +159,7 @@ pub const ExtensionClient = struct {
         var response = try req.receiveHead(&recv_buffer);
 
         if (response.head.status != .ok) {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             self.bus.err(ExtensionRegistrationFailed{
                 .status = @intFromEnum(response.head.status),
                 .err = "registration failed",
@@ -175,6 +180,7 @@ pub const ExtensionClient = struct {
 
         if (extension_id) |id| {
             self.extension_id = try self.allocator.dupe(u8, id);
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             self.bus.info(ExtensionRegistered{ .identifier = self.extension_id.? });
         } else {
             return error.MissingExtensionId;
@@ -207,6 +213,7 @@ pub const ExtensionClient = struct {
             .extra_headers = &headers,
             .response_writer = &body.writer,
         }) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             self.bus.err(ExtensionEventPollFailed{ .err = @errorName(err) });
             return err;
         };
@@ -217,7 +224,7 @@ pub const ExtensionClient = struct {
 
         // Parse event JSON
         const response_body = body.written();
-        return try parseEvent(arena, response_body, self.bus);
+        return parseEvent(arena, response_body, self.bus);
     }
 
     fn parseEvent(allocator: std.mem.Allocator, body: []const u8, bus: *EventBus) !ExtensionEvent {
@@ -231,6 +238,7 @@ pub const ExtensionClient = struct {
 
         const event = parsed.value;
 
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.debug(ExtensionEventReceived{ .event_type = event.eventType });
 
         if (std.mem.eql(u8, event.eventType, "INVOKE")) {
@@ -241,6 +249,7 @@ pub const ExtensionClient = struct {
             } };
         } else if (std.mem.eql(u8, event.eventType, "SHUTDOWN")) {
             const reason = parseShutdownReason(event.shutdownReason);
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             bus.info(ExtensionShutdownReceived{
                 .reason = event.shutdownReason orelse "unknown",
                 .deadline_ms = event.deadlineMs orelse 0,
@@ -285,7 +294,10 @@ test "parseShutdownReason" {
     try std.testing.expectEqual(ShutdownReason.timeout, ExtensionClient.parseShutdownReason("TIMEOUT"));
     try std.testing.expectEqual(ShutdownReason.failure, ExtensionClient.parseShutdownReason("failure"));
     try std.testing.expectEqual(ShutdownReason.failure, ExtensionClient.parseShutdownReason("FAILURE"));
-    try std.testing.expectEqual(ShutdownReason.sandbox_terminated, ExtensionClient.parseShutdownReason("SandboxTerminated"));
+    try std.testing.expectEqual(
+        ShutdownReason.sandbox_terminated,
+        ExtensionClient.parseShutdownReason("SandboxTerminated"),
+    );
     try std.testing.expectEqual(ShutdownReason.unknown, ExtensionClient.parseShutdownReason("other"));
     try std.testing.expectEqual(ShutdownReason.unknown, ExtensionClient.parseShutdownReason(null));
 }
@@ -295,8 +307,9 @@ test "EventJson parsing" {
 
     // Test INVOKE event
     const invoke_json =
-        \\{"eventType":"INVOKE","requestId":"abc-123","invokedFunctionArn":"arn:aws:lambda:us-east-1:123456789:function:test","deadlineMs":1234567890}
-    ;
+        "{\"eventType\":\"INVOKE\",\"requestId\":\"abc-123\"," ++
+        "\"invokedFunctionArn\":\"arn:aws:lambda:us-east-1:123456789:function:test\"," ++
+        "\"deadlineMs\":1234567890}";
     const invoke_parsed = try std.json.parseFromSlice(EventJson, allocator, invoke_json, .{});
     defer invoke_parsed.deinit();
 

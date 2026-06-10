@@ -27,7 +27,9 @@ pub const PassthroughModule = struct {
         return ModuleStreamResult.forwarded();
     }
 
-    pub fn deinit(_: *PassthroughModule) void {}
+    pub fn deinit(self: *PassthroughModule) void {
+        self.* = undefined;
+    }
 };
 
 pub const default_routes = [_]RoutePattern{
@@ -35,7 +37,7 @@ pub const default_routes = [_]RoutePattern{
 };
 
 test "PassthroughModule always returns unchanged" {
-    var module = PassthroughModule{};
+    var module: PassthroughModule = .{};
 
     try module.init(std.testing.allocator, .{
         .id = @enumFromInt(0),
@@ -51,7 +53,7 @@ test "PassthroughModule always returns unchanged" {
         .module_data = null,
     });
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .GET,
         .path = "/any/path",
         .query = "",

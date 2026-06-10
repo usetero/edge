@@ -1,7 +1,7 @@
 const std = @import("std");
 const policy = @import("policy_zig");
 
-const FieldRef = policy.FieldRef;
+pub const FieldRef = policy.FieldRef;
 const LogAccessor = policy.LogAccessor;
 
 pub const TailAttr = struct {

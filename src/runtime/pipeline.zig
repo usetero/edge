@@ -16,7 +16,11 @@ pub fn classifyRoute(path: []const u8, method: HttpMethod) RouteKind {
     if (method == .POST and std.mem.endsWith(u8, path, "/v1/logs")) return .otlp_logs;
     if (method == .POST and std.mem.endsWith(u8, path, "/v1/metrics")) return .otlp_metrics;
     if (method == .POST and std.mem.endsWith(u8, path, "/v1/traces")) return .otlp_traces;
-    if (method == .GET and (std.mem.eql(u8, path, "/metrics") or std.mem.startsWith(u8, path, "/metrics/"))) return .prometheus_metrics;
+    if (method == .GET and
+        (std.mem.eql(u8, path, "/metrics") or std.mem.startsWith(u8, path, "/metrics/")))
+    {
+        return .prometheus_metrics;
+    }
     return .passthrough;
 }
 
@@ -47,7 +51,10 @@ test "classifyRoute matches core routes" {
 
 test "prefilter policy path for ingest routes" {
     try std.testing.expectEqual(PrefilterDecision.policy_path, prefilter(.datadog_logs, .POST, "application/json"));
-    try std.testing.expectEqual(PrefilterDecision.policy_path, prefilter(.otlp_metrics, .POST, "application/x-protobuf"));
+    try std.testing.expectEqual(
+        PrefilterDecision.policy_path,
+        prefilter(.otlp_metrics, .POST, "application/x-protobuf"),
+    );
     try std.testing.expectEqual(PrefilterDecision.policy_path, prefilter(.health, .GET, null));
     try std.testing.expectEqual(PrefilterDecision.fast_path, prefilter(.prometheus_metrics, .GET, null));
     try std.testing.expectEqual(PrefilterDecision.fast_path, prefilter(.passthrough, .GET, null));

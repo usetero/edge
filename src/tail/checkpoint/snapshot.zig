@@ -45,6 +45,7 @@ pub const Snapshot = struct {
     pub fn deinit(self: *Snapshot) void {
         self.allocator.free(self.path);
         self.allocator.free(self.tmp_path);
+        self.* = undefined;
     }
 
     pub fn load(self: *Snapshot, allocator: std.mem.Allocator) !std.ArrayList(checkpoint_types.Value) {

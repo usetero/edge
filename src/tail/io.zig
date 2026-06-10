@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const log = std.log.scoped(.tail_io);
+
 pub const InputSource = union(enum) {
     stdin,
     file: []const u8,
@@ -68,6 +70,7 @@ pub const Input = struct {
     pub fn deinit(self: *Input) void {
         if (self.close_on_deinit) self.file.close(self.io);
         self.allocator.free(self.read_buf);
+        self.* = undefined;
     }
 };
 
@@ -135,9 +138,10 @@ pub const Output = struct {
     }
 
     pub fn deinit(self: *Output) void {
-        self.file_writer.interface.flush() catch {};
+        self.file_writer.interface.flush() catch |err| log.warn("Output.deinit: flush failed: {}", .{err});
         if (self.close_on_deinit) self.file.close(self.io);
         self.allocator.free(self.write_buf);
+        self.* = undefined;
     }
 };
 

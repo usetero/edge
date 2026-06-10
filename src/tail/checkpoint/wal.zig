@@ -30,6 +30,7 @@ pub const ReplayResult = struct {
 
     pub fn deinit(self: *ReplayResult, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -62,6 +63,7 @@ pub const Wal = struct {
     pub fn deinit(self: *Wal) void {
         self.file.close(self.io);
         self.allocator.free(self.path);
+        self.* = undefined;
     }
 
     pub fn append(self: *Wal, lsn: u64, value: checkpoint_types.Value) !void {
@@ -88,7 +90,7 @@ pub const Wal = struct {
         const end = try self.file.length(self.io);
         const rec_size = @sizeOf(WalRecord);
 
-        var out = ReplayResult{
+        var out: ReplayResult = .{
             .entries = .empty,
             .next_lsn = 1,
         };

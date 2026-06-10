@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const log = std.log.scoped(.watch_uring);
+
 const INOTIFY_MASK: u32 = 0x00000002 | 0x00000004 | 0x00000080 | 0x00000100 | 0x00000400 | 0x00000800;
 const URING_UD_POLL: u64 = 0xED6E_1001;
 const URING_UD_READ: u64 = 0xED6E_1002;
@@ -26,7 +28,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io) !State {
     var ring = try std.os.linux.IoUring.init(64, 0);
     errdefer ring.deinit();
 
-    var s = State{
+    var s: State = .{
         .allocator = allocator,
         .fd = fd,
         .file_wd_to_idx = std.AutoHashMap(i32, u32).init(allocator),
@@ -60,6 +62,7 @@ pub fn deinit(s: *State) void {
         s.ring.deinit();
         std.posix.close(s.fd);
     }
+    s.* = undefined;
 }
 
 fn armInitial(u: anytype) !void {
@@ -83,9 +86,9 @@ pub fn collectDirty(self: anytype) !void {
                 URING_UD_POLL => {
                     u.poll_armed = false;
                     if (cqe.res > 0) {
-                        queueRead(u) catch {};
+                        queueRead(u) catch |err| log.warn("queueRead after poll failed: {}", .{err});
                     } else {
-                        queuePoll(u) catch {};
+                        queuePoll(u) catch |err| log.warn("re-queuePoll failed: {}", .{err});
                     }
                 },
                 URING_UD_READ => {
@@ -93,9 +96,9 @@ pub fn collectDirty(self: anytype) !void {
                     if (cqe.res > 0) {
                         const n: usize = @intCast(cqe.res);
                         parseInotifyEvents(self, u, u.read_buf[0..n]);
-                        queueRead(u) catch {};
+                        queueRead(u) catch |err| log.warn("queueRead after read failed: {}", .{err});
                     } else {
-                        queuePoll(u) catch {};
+                        queuePoll(u) catch |err| log.warn("queuePoll after read failed: {}", .{err});
                     }
                 },
                 else => {},
@@ -104,10 +107,10 @@ pub fn collectDirty(self: anytype) !void {
     }
 
     if (!u.poll_armed and !u.read_armed) {
-        queuePoll(u) catch {};
+        queuePoll(u) catch |err| log.warn("queuePoll on idle failed: {}", .{err});
     }
     if (u.ring.sq_ready() > 0) {
-        _ = u.ring.submit() catch {};
+        _ = u.ring.submit() catch |err| log.warn("ring submit failed: {}", .{err});
     }
 }
 
@@ -141,11 +144,11 @@ pub fn rebuildIndexes(self: anytype) void {
 
     var i: usize = 0;
     while (i < self.paths.items.len) : (i += 1) {
-        ensureDirectoryWatch(u, self.paths.items[i]) catch {};
+        ensureDirectoryWatch(u, self.paths.items[i]) catch |err| log.warn("rebuild dir watch failed: {}", .{err});
         const file = self.files.items[i] orelse continue;
         _ = file;
         const wd = std.posix.inotify_add_watch(u.fd, self.paths.items[i], INOTIFY_MASK) catch continue;
-        u.file_wd_to_idx.put(wd, @intCast(i)) catch {};
+        u.file_wd_to_idx.put(wd, @intCast(i)) catch |err| log.warn("rebuild file_wd_to_idx put failed: {}", .{err});
     }
 }
 
@@ -180,7 +183,8 @@ fn ensureDirectoryWatch(u: *State, path: []const u8) !void {
 fn parseInotifyEvents(self: anytype, u: *State, buf: []const u8) void {
     var off: usize = 0;
     while (off + @sizeOf(std.os.linux.inotify_event) <= buf.len) {
-        const ev = std.mem.bytesAsValue(std.os.linux.inotify_event, buf[off .. off + @sizeOf(std.os.linux.inotify_event)]);
+        const ev_size = @sizeOf(std.os.linux.inotify_event);
+        const ev = std.mem.bytesAsValue(std.os.linux.inotify_event, buf[off .. off + ev_size]);
         if (u.file_wd_to_idx.get(ev.wd)) |idx| {
             self.markDirty(idx);
         } else if (u.dir_wd_to_path.get(ev.wd)) |dir_path| {

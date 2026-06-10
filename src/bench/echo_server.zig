@@ -12,7 +12,7 @@ const CapturedPayload = struct {
     data: []const u8,
 };
 
-const ServerContext = struct {
+pub const ServerContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
@@ -46,6 +46,7 @@ const ServerContext = struct {
         if (self.capture_name) |name| {
             self.allocator.free(name);
         }
+        self.* = undefined;
     }
 
     fn clearCaptures(self: *ServerContext) void {
@@ -124,7 +125,7 @@ const ServerContext = struct {
 
         if (!self.capture_enabled) return;
 
-        const payload = CapturedPayload{
+        const payload: CapturedPayload = .{
             .path = self.allocator.dupe(u8, path) catch return,
             .content_type = self.allocator.dupe(u8, content_type) catch return,
             .data = self.allocator.dupe(u8, data) catch return,
@@ -198,7 +199,8 @@ const ServerContext = struct {
         self.capture_mutex.lockUncancelable(self.io);
         defer self.capture_mutex.unlock(self.io);
 
-        try writer.print("}},\"total_requests\":{d},\"total_bytes\":{d},\"capture_enabled\":{},\"captured_count\":{d}}}", .{
+        try writer.print("}},\"total_requests\":{d},\"total_bytes\":{d}," ++
+            "\"capture_enabled\":{},\"captured_count\":{d}}}", .{
             self.total_requests.load(.monotonic),
             self.total_bytes.load(.monotonic),
             self.capture_enabled,
@@ -247,7 +249,7 @@ fn handleRequest(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response)
         // Parse name from query string (format: name=value or just value)
         const capture_name = if (query.len == 0)
             "capture"
-        else if (std.mem.indexOf(u8, query, "name=")) |idx|
+        else if (std.mem.find(u8, query, "name=")) |idx|
             query[idx + 5 ..]
         else
             query;

@@ -69,6 +69,7 @@ pub const UpstreamClientManager = struct {
         }
 
         self.upstreams.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Get the shared HTTP client for making upstream requests.
@@ -107,7 +108,7 @@ pub const UpstreamClientManager = struct {
 
         const port = uri.port orelse if (std.mem.eql(u8, scheme, "https")) @as(u16, 443) else @as(u16, 80);
 
-        const upstream_data = UpstreamData{
+        const upstream_data: UpstreamData = .{
             .scheme = scheme,
             .host = host,
             .port = port,
@@ -193,7 +194,7 @@ pub const UpstreamClientManager = struct {
             try writer.writeAll(query_string);
         }
 
-        return try out.toOwnedSlice();
+        return out.toOwnedSlice();
     }
 };
 

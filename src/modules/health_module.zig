@@ -19,7 +19,9 @@ pub const HealthModule = struct {
         return ModuleStreamResult.respond(200, "{\"status\":\"ok\"}");
     }
 
-    pub fn deinit(_: *HealthModule) void {}
+    pub fn deinit(self: *HealthModule) void {
+        self.* = undefined;
+    }
 };
 
 pub const routes = [_]RoutePattern{
@@ -27,7 +29,7 @@ pub const routes = [_]RoutePattern{
 };
 
 test "HealthModule returns 200 OK with status json" {
-    var module = HealthModule{};
+    var module: HealthModule = .{};
 
     try module.init(std.testing.allocator, .{
         .id = @enumFromInt(0),
@@ -43,7 +45,7 @@ test "HealthModule returns 200 OK with status json" {
         .module_data = null,
     });
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .GET,
         .path = "/_health",
         .query = "",

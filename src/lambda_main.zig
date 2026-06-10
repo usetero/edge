@@ -14,7 +14,6 @@
 //! - Environment-based configuration (via zonfig)
 
 const std = @import("std");
-const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const edge = @import("root.zig");
@@ -72,7 +71,9 @@ pub const LambdaConfig = struct {
     // Policy configuration
     policy: struct {
         /// JSON array of policies to load at startup
-        /// Example: TERO_POLICY_STATIC='{"policies":[{"id":"drop-health","name":"Drop health","log":{"match":[{"log_field":"body","regex":"health"}],"keep":"none"}}]}'
+        /// Example: TERO_POLICY_STATIC='{"policies":[{"id":"drop-health",
+        ///   "name":"Drop health","log":{"match":[{"log_field":"body",
+        ///   "regex":"health"}],"keep":"none"}}]}'
         static: ?[]const u8 = null,
         /// HTTP policy provider URL for dynamic updates
         url: ?[]const u8 = null,
@@ -124,12 +125,15 @@ const ServerThreadContext = struct {
 };
 
 fn serverThread(ctx: *ServerThreadContext) void {
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     ctx.bus.info(ProxyServerStarted{ .port = ctx.proxy.context.listen_port });
 
     ctx.proxy.listen() catch |err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.err(LambdaExtensionError{ .err = @errorName(err) });
     };
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     ctx.bus.info(ProxyServerStopped{});
 }
 
@@ -156,10 +160,17 @@ pub fn main(init: std.process.Init) !void {
     global_event_bus = bus;
     defer global_event_bus = null;
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(LambdaExtensionStarting{});
 
     // Load configuration via zonfig (env vars with TERO_ prefix, no JSON file)
-    const config = zonfig.load(LambdaConfig, allocator, io, .{ .env_prefix = "TERO", .environ = init.environ_map }) catch |err| {
+    const config = zonfig.load(
+        LambdaConfig,
+        allocator,
+        io,
+        .{ .env_prefix = "TERO", .environ = init.environ_map },
+    ) catch |err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.err(LambdaExtensionError{ .err = @errorName(err) });
         return err;
     };
@@ -169,6 +180,7 @@ pub fn main(init: std.process.Init) !void {
     const logs_url = config.logs_url orelse config.upstream_url;
     const metrics_url = config.metrics_url orelse config.upstream_url;
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ConfigurationLoaded{
         .logs_url = logs_url,
         .metrics_url = metrics_url,
@@ -184,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(instance_id_copy);
 
     // Build service metadata
-    const service_metadata = policy.ServiceMetadata{
+    const service_metadata: policy.ServiceMetadata = .{
         .name = config.service.name,
         .namespace = config.service.namespace,
         .version = config.service.version,
@@ -205,9 +217,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Load static policies from environment variable (TERO_POLICY_STATIC)
     if (config.policy.static) |static_json| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.info(StaticPoliciesLoading{});
 
         const policies = policy.parser.parsePoliciesBytes(allocator, static_json) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             bus.err(StaticPoliciesError{ .err = @errorName(err) });
             return err;
         };
@@ -219,6 +233,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         try registry.updatePolicies(policies, "static", .file);
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.info(StaticPoliciesLoaded{ .count = policies.len });
     }
 
@@ -241,7 +256,7 @@ pub fn main(init: std.process.Init) !void {
             headers_count = 1;
         }
 
-        const provider_config = policy.ProviderConfig{
+        const provider_config: policy.ProviderConfig = .{
             .id = "lambda-http",
             .type = .http,
             .url = policy_url,
@@ -262,17 +277,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Create Datadog module configuration
-    var datadog_config = DatadogConfig{
+    var datadog_config: DatadogConfig = .{
         .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
 
     // Create modules
-    var health_module = HealthModule{};
-    var datadog_logs_module = DatadogModule{};
-    var datadog_metrics_module = DatadogModule{};
-    var passthrough_module = PassthroughModule{};
+    var health_module: HealthModule = .{};
+    var datadog_logs_module: DatadogModule = .{};
+    var datadog_metrics_module: DatadogModule = .{};
+    var passthrough_module: PassthroughModule = .{};
 
     // Register modules (order matters - first match wins)
     const module_registrations = [_]ModuleRegistration{
@@ -331,7 +346,7 @@ pub fn main(init: std.process.Init) !void {
     defer server_instance = null;
 
     // Start proxy server in background thread
-    var server_ctx = ServerThreadContext{
+    var server_ctx: ServerThreadContext = .{
         .proxy = &proxy,
         .bus = bus,
     };
@@ -344,6 +359,7 @@ pub fn main(init: std.process.Init) !void {
     // Register with Lambda Extensions API
     try extension.register();
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(LambdaExtensionReady{ .port = config.listen_port });
 
     // Event loop - poll for Lambda events
@@ -355,6 +371,7 @@ pub fn main(init: std.process.Init) !void {
         _ = arena.reset(.retain_capacity);
 
         const event = extension.nextEvent(arena.allocator()) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             bus.err(LambdaExtensionError{ .err = @errorName(err) });
             continue;
         };
@@ -383,5 +400,6 @@ pub fn main(init: std.process.Init) !void {
     // Wait for server thread to finish
     server_thread.join();
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStopped{});
 }

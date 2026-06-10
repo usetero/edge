@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const log = std.log.scoped(.watch_kqueue);
+
 const KQUEUE_FILTER_VNODE: i16 = -4;
 const KQUEUE_EV_ADD: u16 = 0x0001;
 const KQUEUE_EV_ENABLE: u16 = 0x0004;
@@ -59,6 +61,7 @@ pub fn deinit(s: *State) void {
     }
     s.dir_watches.deinit(s.allocator);
     closeFd(s.fd);
+    s.* = undefined;
 }
 
 pub fn collectDirty(self: anytype) !void {
@@ -67,7 +70,7 @@ pub fn collectDirty(self: anytype) !void {
     try ensureDirectoryWatches(self);
 
     var out_events: [64]Kevent = undefined;
-    var timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
+    var timeout: std.c.timespec = .{ .sec = 0, .nsec = 0 };
     const n = kevent(kq.fd, &.{}, out_events[0..], &timeout);
     if (n <= 0) return;
     var i: usize = 0;
@@ -129,10 +132,10 @@ pub fn rebuildIndexes(self: anytype) void {
             .udata = 0,
         }};
         _ = kevent(kq.fd, changes[0..], &.{}, null);
-        kq.fd_to_idx.put(file.handle, @intCast(i)) catch {};
+        kq.fd_to_idx.put(file.handle, @intCast(i)) catch |err| log.warn("rebuild fd_to_idx put failed: {}", .{err});
     }
 
-    ensureDirectoryWatches(self) catch {};
+    ensureDirectoryWatches(self) catch |err| log.warn("rebuild ensureDirectoryWatches failed: {}", .{err});
 }
 
 fn ensureDirectoryWatches(self: anytype) !void {

@@ -92,7 +92,8 @@ pub fn load(comptime T: type, allocator: std.mem.Allocator, io: std.Io, options:
         defer file.close(io);
 
         var file_reader = file.reader(io, &.{});
-        const contents = file_reader.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024)) catch return LoadError.OutOfMemory;
+        const contents = file_reader.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024)) catch
+            return LoadError.OutOfMemory;
         defer allocator.free(contents);
 
         try parseJsonInto(T, allocator, config, contents);
@@ -109,7 +110,13 @@ pub fn load(comptime T: type, allocator: std.mem.Allocator, io: std.Io, options:
 
 /// Load configuration from JSON bytes with environment variable overrides.
 /// Internal helper - use `load` with `json_path` for file-based loading.
-fn loadFromBytes(comptime T: type, allocator: std.mem.Allocator, json_bytes: []const u8, env_prefix: []const u8, environ: *const std.process.Environ.Map) LoadError!*T {
+fn loadFromBytes(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    json_bytes: []const u8,
+    env_prefix: []const u8,
+    environ: *const std.process.Environ.Map,
+) LoadError!*T {
     const config = try allocator.create(T);
     errdefer allocator.destroy(config);
 
@@ -127,7 +134,12 @@ fn loadFromBytes(comptime T: type, allocator: std.mem.Allocator, json_bytes: []c
 
 /// Load configuration from environment variables only (no JSON).
 /// Internal helper - use `load` with `json_path = null` for env-only loading.
-fn loadFromEnv(comptime T: type, allocator: std.mem.Allocator, env_prefix: []const u8, environ: *const std.process.Environ.Map) LoadError!*T {
+fn loadFromEnv(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    env_prefix: []const u8,
+    environ: *const std.process.Environ.Map,
+) LoadError!*T {
     const config = try allocator.create(T);
     errdefer allocator.destroy(config);
 
@@ -187,7 +199,7 @@ fn defaultValue(comptime T: type) T {
 
 /// Parse JSON into an existing config struct, preserving defaults for missing fields.
 fn parseJsonInto(comptime T: type, allocator: std.mem.Allocator, config: *T, json_bytes: []const u8) LoadError!void {
-    const JsonT = jsonType(T);
+    const JsonT = JsonType(T);
 
     const parsed = std.json.parseFromSlice(
         JsonT,
@@ -207,7 +219,7 @@ fn parseJsonInto(comptime T: type, allocator: std.mem.Allocator, config: *T, jso
 /// - Nested structs are recursively converted
 /// - Slices of structs are converted to optional slices of JSON-compatible structs
 /// - All other fields become optional
-fn jsonType(comptime T: type) type {
+fn JsonType(comptime T: type) type {
     const info = @typeInfo(T);
 
     return switch (info) {
@@ -218,7 +230,7 @@ fn jsonType(comptime T: type) type {
             inline for (s.fields, 0..) |field, i| {
                 const FieldType = field.type;
                 const JsonFieldType = if (@typeInfo(FieldType) == .@"struct")
-                    ?jsonType(FieldType)
+                    ?JsonType(FieldType)
                 else if (@typeInfo(FieldType) == .optional)
                     FieldType
                 else if (@typeInfo(FieldType) == .array and @typeInfo(FieldType).array.child == u8)
@@ -231,7 +243,7 @@ fn jsonType(comptime T: type) type {
                     const ChildType = @typeInfo(FieldType).pointer.child;
                     // Slice of structs - convert to optional slice of JSON-compatible structs
                     if (@typeInfo(ChildType) == .@"struct") {
-                        break :blk2 ?[]const jsonType(ChildType);
+                        break :blk2 ?[]const JsonType(ChildType);
                     } else {
                         // Other slices (strings, etc.) - just make optional
                         break :blk2 ?FieldType;
@@ -298,7 +310,7 @@ fn applyJsonValues(comptime T: type, allocator: std.mem.Allocator, config: *T, j
                         // Fixed-size array (e.g., [4]u8 for IP address)
                         const ArrayInfo = @typeInfo(field.type).array;
                         if (ArrayInfo.child == u8) {
-                            // Parse IP address string (value is []const u8 from jsonType)
+                            // Parse IP address string (value is []const u8 from JsonType)
                             field_ptr.* = parseIpv4(value) catch return LoadError.InvalidIpv4;
                         } else {
                             field_ptr.* = value;
@@ -326,7 +338,13 @@ fn applyJsonValues(comptime T: type, allocator: std.mem.Allocator, config: *T, j
 // =============================================================================
 
 /// Apply environment variable overrides to config.
-fn applyEnvOverrides(comptime T: type, allocator: std.mem.Allocator, config: *T, prefix: []const u8, environ: *const std.process.Environ.Map) LoadError!void {
+fn applyEnvOverrides(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    config: *T,
+    prefix: []const u8,
+    environ: *const std.process.Environ.Map,
+) LoadError!void {
     // Build env var names at runtime using the prefix
     var env_name_buf: [256]u8 = undefined;
     try applyEnvOverridesRecursive(T, allocator, config, prefix, "", &env_name_buf, environ);
@@ -355,7 +373,15 @@ fn applyEnvOverridesRecursive(
 
                 if (@typeInfo(field.type) == .@"struct") {
                     // Recurse into nested struct
-                    try applyEnvOverridesRecursive(field.type, allocator, field_ptr, prefix, field_path, env_name_buf, environ);
+                    try applyEnvOverridesRecursive(
+                        field.type,
+                        allocator,
+                        field_ptr,
+                        prefix,
+                        field_path,
+                        env_name_buf,
+                        environ,
+                    );
                 } else {
                     // Build env var name at runtime: PREFIX_FIELD_PATH
                     // field_path is comptime known, so we pass it directly
@@ -495,7 +521,12 @@ fn applyEnvValue(comptime T: type, allocator: std.mem.Allocator, ptr: *T, env_va
 
 /// Apply environment variable substitution (${VAR}) to all string fields.
 /// This is run as a final pass after JSON parsing and env overrides.
-fn applyEnvSubstitution(comptime T: type, allocator: std.mem.Allocator, config: *T, environ: *const std.process.Environ.Map) LoadError!void {
+fn applyEnvSubstitution(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    config: *T,
+    environ: *const std.process.Environ.Map,
+) LoadError!void {
     applyEnvSubstitutionWithDefaults(T, allocator, config, defaultValue(T), environ) catch |err| switch (err) {
         error.OutOfMemory => return LoadError.OutOfMemory,
         error.UnclosedVariable => return LoadError.UnclosedVariable,
@@ -540,7 +571,13 @@ fn applyEnvSubstitutionWithDefaults(
                         const ChildType = p.child;
                         const child_default = defaultValue(ChildType);
                         for (field_ptr.*) |*elem| {
-                            try applyEnvSubstitutionWithDefaults(ChildType, allocator, @constCast(elem), child_default, environ);
+                            try applyEnvSubstitutionWithDefaults(
+                                ChildType,
+                                allocator,
+                                @constCast(elem),
+                                child_default,
+                                environ,
+                            );
                         }
                     }
                 } else if (@typeInfo(field.type) == .optional) {
@@ -605,7 +642,12 @@ fn freeAllocatedFieldsWithDefaults(comptime T: type, allocator: std.mem.Allocato
                                 const ChildType = p.child;
                                 const child_default = defaultValue(ChildType);
                                 for (slice) |*elem| {
-                                    freeAllocatedFieldsWithDefaults(ChildType, allocator, @constCast(elem), child_default);
+                                    freeAllocatedFieldsWithDefaults(
+                                        ChildType,
+                                        allocator,
+                                        @constCast(elem),
+                                        child_default,
+                                    );
                                 }
                                 if (slice.len > 0) {
                                     allocator.free(slice);
@@ -805,7 +847,12 @@ test "load: JSON file - complete config overrides all defaults" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u16, 9000), config.port);
@@ -832,7 +879,12 @@ test "load: JSON file - partial config preserves defaults for missing fields" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u16, 9000), config.port);
@@ -860,7 +912,12 @@ test "load: JSON file - nested struct partial override" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u16, 9000), config.server.port);
@@ -890,7 +947,12 @@ test "load: JSON file - deeply nested structs" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u32, 42), config.a.b.c.value);
@@ -913,7 +975,12 @@ test "load: JSON file - ignores unknown fields" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u16, 9000), config.port);
@@ -935,7 +1002,12 @@ test "load: JSON file - empty object uses all defaults" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u16, 8080), config.port);
@@ -1047,7 +1119,12 @@ test "load: JSON with optional fields - null values stay null" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u16, 9000), config.required);
@@ -1073,7 +1150,12 @@ test "load: JSON with optional fields - provided values override null" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(?u16, 9000), config.optional_port);
@@ -1092,7 +1174,12 @@ test "load: empty env_prefix - no prefix used" {
     };
 
     // With empty prefix, would look for just "PORT" env var (not set in test)
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .env_prefix = "" });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .env_prefix = "" },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u16, 8080), config.port);
@@ -1106,7 +1193,12 @@ test "load: env_prefix - is converted to uppercase" {
     };
 
     // lowercase prefix should work (converted to MYAPP_PORT internally)
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .env_prefix = "myapp" });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .env_prefix = "myapp" },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u16, 8080), config.port);
@@ -1147,7 +1239,12 @@ test "load: memory - no leaks with JSON strings" {
     const file_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(file_path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = file_path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = file_path },
+    );
     deinit(Config, testing.allocator, config);
     // testing.allocator will detect leaks
 }
@@ -1174,7 +1271,12 @@ test "load: memory - no leaks with nested structs containing strings" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     deinit(Config, testing.allocator, config);
     // testing.allocator will detect leaks
 }
@@ -1196,7 +1298,12 @@ test "load: memory - no leaks with optional strings" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     deinit(Config, testing.allocator, config);
     // testing.allocator will detect leaks
 }
@@ -1224,7 +1331,12 @@ test "load: JSON with various integer types" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(u8, 255), config.u8_val);
@@ -1250,7 +1362,12 @@ test "load: JSON with float types" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectApproxEqAbs(@as(f32, 3.14), config.f32_val, 0.001);
@@ -1275,7 +1392,12 @@ test "load: JSON with boolean values" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(true, config.enabled);
@@ -1341,7 +1463,12 @@ test "load: JSON with slice of structs - empty array" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(usize, 0), config.items.len);
@@ -1368,7 +1495,12 @@ test "load: JSON with slice of structs - single item" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(usize, 1), config.items.len);
@@ -1397,7 +1529,12 @@ test "load: JSON with slice of structs - multiple items" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(usize, 3), config.items.len);
@@ -1430,7 +1567,12 @@ test "load: JSON with slice of structs - partial item uses defaults" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(usize, 2), config.items.len);
@@ -1464,7 +1606,12 @@ test "load: JSON with nested slice of structs containing slices" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(usize, 2), config.providers.len);
@@ -1497,7 +1644,12 @@ test "load: memory - no leaks with slice of structs" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     deinit(Config, testing.allocator, config);
     // testing.allocator will detect leaks
 }
@@ -1524,7 +1676,12 @@ test "load: JSON with enum field from string" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(LogLevel.warn, config.level);
@@ -1552,7 +1709,12 @@ test "load: JSON with slice of structs containing enums" {
     const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
     defer testing.allocator.free(path);
 
-    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map, .json_path = path });
+    const config = try load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map, .json_path = path },
+    );
     defer deinit(Config, testing.allocator, config);
 
     try testing.expectEqual(@as(usize, 2), config.providers.len);

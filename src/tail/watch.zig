@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = std.log.scoped(.tail_watch);
 const types = @import("types.zig");
 const checkpoint_mod = @import("checkpoint/mod.zig");
 const poll_backend = @import("watch_backend/poll.zig");
@@ -76,7 +77,7 @@ pub const Watcher = struct {
         const out_copy = try allocator.dupe(u8, output_path);
         errdefer allocator.free(out_copy);
 
-        var self = Watcher{
+        var self: Watcher = .{
             .allocator = allocator,
             .io = io,
             .backend = kind,
@@ -137,6 +138,7 @@ pub const Watcher = struct {
         self.dirty.deinit(self.allocator);
         self.dirty_queue.deinit(self.allocator);
         self.allocator.free(self.output_path);
+        self.* = undefined;
     }
 
     fn initBackend(self: *Watcher) !void {
@@ -387,7 +389,11 @@ pub const Watcher = struct {
     fn openTracked(self: *Watcher, idx: u32, read_from: types.ReadFrom) !void {
         if (self.files.items[idx] != null) return;
 
-        const file = std.Io.Dir.cwd().openFile(self.io, self.paths.items[idx], .{ .mode = .read_only }) catch |err| switch (err) {
+        const file = std.Io.Dir.cwd().openFile(
+            self.io,
+            self.paths.items[idx],
+            .{ .mode = .read_only },
+        ) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -401,7 +407,7 @@ pub const Watcher = struct {
             .fingerprint = try computeFingerprint(self.io, file),
         };
         self.files.items[idx] = file;
-        self.initHeadPrefix(idx, size) catch {};
+        self.initHeadPrefix(idx, size) catch |err| log.warn("initHeadPrefix on open failed: {}", .{err});
         self.offsets.items[idx] = if (self.seen_once.items[idx])
             0
         else switch (read_from) {
@@ -419,7 +425,11 @@ pub const Watcher = struct {
         if (self.files.items[i] == null) return;
         if (self.pending_files.items[i] != null) return;
 
-        var path_file = std.Io.Dir.cwd().openFile(self.io, self.paths.items[i], .{ .mode = .read_only }) catch |err| switch (err) {
+        var path_file = std.Io.Dir.cwd().openFile(
+            self.io,
+            self.paths.items[i],
+            .{ .mode = .read_only },
+        ) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -525,13 +535,14 @@ pub const Watcher = struct {
         if (idx >= self.paths.items.len) return;
         if (self.dirty.isSet(idx)) return;
         self.dirty.set(idx);
-        self.dirty_queue.append(self.allocator, idx) catch {};
+        self.dirty_queue.append(self.allocator, idx) catch |err| log.warn("dirty_queue append failed: {}", .{err});
     }
 
     pub fn parseInotifyEvents(self: *Watcher, wd_to_idx: *const std.AutoHashMap(i32, u32), buf: []const u8) void {
         var off: usize = 0;
         while (off + @sizeOf(std.os.linux.inotify_event) <= buf.len) {
-            const ev = std.mem.bytesAsValue(std.os.linux.inotify_event, buf[off .. off + @sizeOf(std.os.linux.inotify_event)]);
+            const ev_size = @sizeOf(std.os.linux.inotify_event);
+            const ev = std.mem.bytesAsValue(std.os.linux.inotify_event, buf[off .. off + ev_size]);
             if (wd_to_idx.get(ev.wd)) |idx| self.markDirty(idx);
             off += @sizeOf(std.os.linux.inotify_event) + ev.len;
         }
@@ -632,6 +643,7 @@ const ExpandedPaths = struct {
     fn deinit(self: *ExpandedPaths) void {
         for (self.items.items) |p| self.allocator.free(p);
         self.items.deinit(self.allocator);
+        self.* = undefined;
     }
 };
 

@@ -6,14 +6,14 @@ const context = @import("eval_context.zig");
 const parse = @import("eval_parse.zig");
 
 const FilterDecision = policy.FilterDecision;
-const PolicyResult = policy.PolicyResult;
+pub const PolicyResult = policy.PolicyResult;
 
 const DisabledEvaluator = struct {};
 
 const ActiveEvaluator = struct {
     registry: *policy.Registry,
     engine: policy.PolicyEngine,
-    policy_id_buf: [policy.MAX_MATCHES_PER_SCAN][]const u8 = undefined,
+    policy_id_buf: [policy.max_matches_per_scan][]const u8 = undefined,
     arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -22,6 +22,7 @@ const ActiveEvaluator = struct {
         self.registry.deinit();
         self.allocator.destroy(self.registry);
         self.arena.deinit();
+        self.* = undefined;
     }
 };
 
@@ -87,6 +88,7 @@ pub const StreamEvaluator = struct {
             .disabled => {},
             .active => |*active| active.deinit(),
         }
+        self.* = undefined;
     }
 
     pub fn evalLine(self: *StreamEvaluator, line: []const u8) !bool {
@@ -125,7 +127,7 @@ fn writePolicyFile(tmp: *std.testing.TmpDir, json: []const u8) ![]u8 {
     const f = try tmp.dir.createFile("policies.json", .{ .truncate = true });
     defer f.close();
     try f.writeAll(json);
-    return try tmp.dir.realpathAlloc(testing.allocator, "policies.json");
+    return tmp.dir.realpathAlloc(testing.allocator, "policies.json");
 }
 
 fn testBus() o11y.StdioEventBus {

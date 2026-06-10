@@ -8,6 +8,8 @@ const watch_mod = @import("watch.zig");
 const read_scheduler = @import("read_scheduler.zig");
 const checkpoint_mod = @import("checkpoint/mod.zig");
 
+const log = std.log.scoped(.tail_runtime);
+
 var stop_requested = std.atomic.Value(bool).init(false);
 
 fn initEventBus(io: std.Io, environ_map: *const std.process.Environ.Map) o11y.StdioEventBus {
@@ -23,7 +25,7 @@ fn handleSignal(_: std.posix.SIG) callconv(.c) void {
 
 fn installSignalHandlers() void {
     if (@hasDecl(std.posix, "SIG")) {
-        const action = std.posix.Sigaction{
+        const action: std.posix.Sigaction = .{
             .handler = .{ .handler = handleSignal },
             .mask = std.posix.sigemptyset(),
             .flags = 0,
@@ -197,7 +199,8 @@ pub const Runtime = struct {
                 buffered_lines = 0;
                 next_flush_ns = now + @as(i128, @intCast(flush_ns));
             }
-            self.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+            self.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch |err|
+                log.warn("runFilesLoopBackend: sleep failed: {}", .{err});
         }
         try output.flush();
     }
@@ -266,7 +269,7 @@ test "runtime public API: runStream copies framed bytes" {
     const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
     defer testing.allocator.free(abs_out);
 
-    const cfg = types.TailConfig{
+    const cfg: types.TailConfig = .{
         .output_path = abs_out,
         .read_buf = 16,
         .max_line = 1024,
@@ -329,7 +332,7 @@ test "runtime public API: runStream applies policy drops" {
     const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
     defer testing.allocator.free(abs_out);
 
-    const cfg = types.TailConfig{
+    const cfg: types.TailConfig = .{
         .output_path = abs_out,
         .policy_path = abs_policy,
         .input_format = .raw,

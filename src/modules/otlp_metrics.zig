@@ -30,9 +30,9 @@ const Metric = proto.metrics.Metric;
 const KeyValue = proto.common.KeyValue;
 const AnyValue = proto.common.AnyValue;
 const PolicyEngine = policy.PolicyEngine;
-const MetricFieldRef = policy.MetricFieldRef;
+pub const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = proto.policy.MetricField;
-const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
+const MAX_MATCHES_PER_SCAN = policy.max_matches_per_scan;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -148,7 +148,7 @@ fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try streamAll(reader, &out.writer);
-    return try out.toOwnedSlice();
+    return out.toOwnedSlice();
 }
 
 fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
@@ -185,17 +185,38 @@ pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
     return switch (field) {
         .metric_field => |mf| switch (mf) {
             .METRIC_FIELD_NAME => if (metric_ctx.metric.name.len > 0) metric_ctx.metric.name else null,
-            .METRIC_FIELD_DESCRIPTION => if (metric_ctx.metric.description.len > 0) metric_ctx.metric.description else null,
+            .METRIC_FIELD_DESCRIPTION => if (metric_ctx.metric.description.len > 0)
+                metric_ctx.metric.description
+            else
+                null,
             .METRIC_FIELD_UNIT => if (metric_ctx.metric.unit.len > 0) metric_ctx.metric.unit else null,
-            .METRIC_FIELD_RESOURCE_SCHEMA_URL => if (metric_ctx.resource_metrics.schema_url.len > 0) metric_ctx.resource_metrics.schema_url else null,
-            .METRIC_FIELD_SCOPE_SCHEMA_URL => if (metric_ctx.scope_metrics.schema_url.len > 0) metric_ctx.scope_metrics.schema_url else null,
-            .METRIC_FIELD_SCOPE_NAME => if (metric_ctx.scope_metrics.scope) |scope| (if (scope.name.len > 0) scope.name else null) else null,
-            .METRIC_FIELD_SCOPE_VERSION => if (metric_ctx.scope_metrics.scope) |scope| (if (scope.version.len > 0) scope.version else null) else null,
+            .METRIC_FIELD_RESOURCE_SCHEMA_URL => if (metric_ctx.resource_metrics.schema_url.len > 0)
+                metric_ctx.resource_metrics.schema_url
+            else
+                null,
+            .METRIC_FIELD_SCOPE_SCHEMA_URL => if (metric_ctx.scope_metrics.schema_url.len > 0)
+                metric_ctx.scope_metrics.schema_url
+            else
+                null,
+            .METRIC_FIELD_SCOPE_NAME => if (metric_ctx.scope_metrics.scope) |scope|
+                (if (scope.name.len > 0) scope.name else null)
+            else
+                null,
+            .METRIC_FIELD_SCOPE_VERSION => if (metric_ctx.scope_metrics.scope) |scope|
+                (if (scope.version.len > 0) scope.version else null)
+            else
+                null,
             else => null,
         },
         .datapoint_attribute => |attr_path| findNestedAttribute(metric_ctx.datapoint_attributes, attr_path.path.items),
-        .resource_attribute => |attr_path| if (metric_ctx.resource_metrics.resource) |res| findNestedAttribute(res.attributes.items, attr_path.path.items) else null,
-        .scope_attribute => |attr_path| if (metric_ctx.scope_metrics.scope) |scope| findNestedAttribute(scope.attributes.items, attr_path.path.items) else null,
+        .resource_attribute => |attr_path| if (metric_ctx.resource_metrics.resource) |res|
+            findNestedAttribute(res.attributes.items, attr_path.path.items)
+        else
+            null,
+        .scope_attribute => |attr_path| if (metric_ctx.scope_metrics.scope) |scope|
+            findNestedAttribute(scope.attributes.items, attr_path.path.items)
+        else
+            null,
         .metric_type => |requested_type| blk: {
             const data = metric_ctx.metric.data orelse break :blk null;
             const actual_type: @TypeOf(requested_type) = switch (data) {
@@ -227,7 +248,10 @@ fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
         .gauge => |g| if (g.data_points.items.len > 0) g.data_points.items[0].attributes.items else &.{},
         .sum => |s| if (s.data_points.items.len > 0) s.data_points.items[0].attributes.items else &.{},
         .histogram => |h| if (h.data_points.items.len > 0) h.data_points.items[0].attributes.items else &.{},
-        .exponential_histogram => |eh| if (eh.data_points.items.len > 0) eh.data_points.items[0].attributes.items else &.{},
+        .exponential_histogram => |eh| if (eh.data_points.items.len > 0)
+            eh.data_points.items[0].attributes.items
+        else
+            &.{},
         .summary => |s| if (s.data_points.items.len > 0) s.data_points.items[0].attributes.items else &.{},
     };
 }
@@ -269,7 +293,7 @@ fn filterMetricsInPlace(
             // Filter metrics in place by shrinking the list
             var write_idx: usize = 0;
             for (scope_metrics.metrics.items) |*metric| {
-                var ctx = OtlpMetricContext{
+                var ctx: OtlpMetricContext = .{
                     .metric = metric,
                     .resource_metrics = resource_metrics,
                     .scope_metrics = scope_metrics,
@@ -430,7 +454,13 @@ test "processMetrics - parses and re-serializes JSON" {
     defer registry.deinit();
 
     const metrics =
-        \\{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test-service"}}]},"scopeMetrics":[{"scope":{"name":"my-meter","version":"1.0"},"metrics":[{"name":"http.requests","description":"HTTP request count","unit":"1","sum":{"dataPoints":[{"asInt":"100"}]}}]}]}]}
+        \\{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name",
+    ++
+        \\"value":{"stringValue":"test-service"}}]},"scopeMetrics":[{"scope":
+    ++
+        \\{"name":"my-meter","version":"1.0"},"metrics":[{"name":"http.requests",
+    ++
+        \\"description":"HTTP request count","unit":"1","sum":{"dataPoints":[{"asInt":"100"}]}}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -444,7 +474,7 @@ test "processMetrics - parses and re-serializes JSON" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -480,7 +510,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
     ) catch {
         const copied = try allocator.alloc(u8, malformed.len);
         @memcpy(copied, malformed);
-        const result = ProcessResult{
+        const result: ProcessResult = .{
             .data = copied,
             .dropped_count = 0,
             .original_count = 0,
@@ -492,7 +522,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
         try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
         return;
     };
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -525,7 +555,7 @@ test "processMetrics - unknown content type returns unchanged" {
         &out_writer.writer,
         "text/plain",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -546,7 +576,9 @@ test "processMetrics - no policies keeps all metrics" {
     defer registry.deinit();
 
     const metrics =
-        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"metric1"},{"name":"metric2"}]}]}]}
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
+    ++
+        \\"metrics":[{"name":"metric1"},{"name":"metric2"}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -560,7 +592,7 @@ test "processMetrics - no policies keeps all metrics" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -584,7 +616,7 @@ test "processMetrics - DROP policy filters metrics by name" {
     defer registry.deinit();
 
     // Create a DROP policy for metrics matching "debug"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug-metrics"),
         .name = try allocator.dupe(u8, "drop-debug-metrics"),
         .enabled = true,
@@ -601,7 +633,9 @@ test "processMetrics - DROP policy filters metrics by name" {
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
     const metrics =
-        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"http.requests"},{"name":"debug.internal"}]}]}]}
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
+    ++
+        \\"metrics":[{"name":"http.requests"},{"name":"debug.internal"}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -615,7 +649,7 @@ test "processMetrics - DROP policy filters metrics by name" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -640,7 +674,7 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
     defer registry.deinit();
 
     // Create a DROP policy for metrics from "test-service"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-test-service"),
         .name = try allocator.dupe(u8, "drop-test-service"),
         .enabled = true,
@@ -648,7 +682,7 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
             .keep = false,
         } },
     };
-    var attr_path = proto.policy.AttributePath{};
+    var attr_path: proto.policy.AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
     try drop_policy.target.?.metric.match.append(allocator, .{
         .field = .{ .resource_attribute = attr_path },
@@ -659,7 +693,15 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
     const metrics =
-        \\{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test-service"}}]},"scopeMetrics":[{"scope":{},"metrics":[{"name":"from.test"}]}]},{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"prod-service"}}]},"scopeMetrics":[{"scope":{},"metrics":[{"name":"from.prod"}]}]}]}
+        \\{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name",
+    ++
+        \\"value":{"stringValue":"test-service"}}]},"scopeMetrics":
+    ++
+        \\[{"scope":{},"metrics":[{"name":"from.test"}]}]},{"resource":
+    ++
+        \\{"attributes":[{"key":"service.name","value":{"stringValue":"prod-service"}}]},
+    ++
+        \\"scopeMetrics":[{"scope":{},"metrics":[{"name":"from.prod"}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -673,7 +715,7 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -697,7 +739,7 @@ test "processMetrics - all metrics dropped returns empty structure" {
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
@@ -714,7 +756,9 @@ test "processMetrics - all metrics dropped returns empty structure" {
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
     const metrics =
-        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"metric1"},{"name":"metric2"}]}]}]}
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
+    ++
+        \\"metrics":[{"name":"metric1"},{"name":"metric2"}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -728,7 +772,7 @@ test "processMetrics - all metrics dropped returns empty structure" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -763,23 +807,23 @@ fn createTestProtobufMetrics(allocator: std.mem.Allocator, names: []const []cons
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var scope_metrics = ScopeMetrics{};
+    var scope_metrics: ScopeMetrics = .{};
     for (names) |name| {
-        var gauge = Gauge{};
-        try gauge.data_points.append(arena_alloc, NumberDataPoint{
+        var gauge: Gauge = .{};
+        try gauge.data_points.append(arena_alloc, .{
             .value = .{ .as_int = 42 },
         });
-        const metric = Metric{
+        const metric: Metric = .{
             .name = name,
             .data = .{ .gauge = gauge },
         };
         try scope_metrics.metrics.append(arena_alloc, metric);
     }
 
-    var resource_metrics = ResourceMetrics{};
+    var resource_metrics: ResourceMetrics = .{};
     try resource_metrics.scope_metrics.append(arena_alloc, scope_metrics);
 
-    var metrics_data = MetricsData{};
+    var metrics_data: MetricsData = .{};
     try metrics_data.resource_metrics.append(arena_alloc, resource_metrics);
 
     // Encode to protobuf - use main allocator for output since we return it
@@ -788,7 +832,138 @@ fn createTestProtobufMetrics(allocator: std.mem.Allocator, names: []const []cons
 
     try metrics_data.encode(&output_writer.writer, arena_alloc);
 
-    return try output_writer.toOwnedSlice();
+    return output_writer.toOwnedSlice();
+}
+
+const benchmark_metrics_pb = @embedFile("../../bench/scaling/payloads/otlp-metrics.pb");
+
+fn createRepeatedBenchmarkMetricsPayload(allocator: std.mem.Allocator, repetitions: usize) ![]u8 {
+    const payload = try allocator.alloc(u8, benchmark_metrics_pb.len * repetitions);
+    errdefer allocator.free(payload);
+
+    for (0..repetitions) |i| {
+        const start = i * benchmark_metrics_pb.len;
+        @memcpy(payload[start..][0..benchmark_metrics_pb.len], benchmark_metrics_pb);
+    }
+
+    return payload;
+}
+
+const HttpzFallbackResizeBugAllocator = struct {
+    fixed: std.heap.FixedBufferAllocator,
+    fallback: std.mem.Allocator,
+    fixed_resize_fail_count: usize = 0,
+    fixed_resize_freed_count: usize = 0,
+
+    fn init(fixed_buffer: []u8, fallback: std.mem.Allocator) HttpzFallbackResizeBugAllocator {
+        return .{
+            .fixed = std.heap.FixedBufferAllocator.init(fixed_buffer),
+            .fallback = fallback,
+        };
+    }
+
+    fn allocator(self: *HttpzFallbackResizeBugAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .free = free,
+                .remap = remap,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *HttpzFallbackResizeBugAllocator = @ptrCast(@alignCast(ctx));
+        const fixed = self.fixed.allocator();
+        return fixed.rawAlloc(len, alignment, ra) orelse self.fallback.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *HttpzFallbackResizeBugAllocator = @ptrCast(@alignCast(ctx));
+        if (self.fixed.ownsPtr(buf.ptr)) {
+            const fixed = self.fixed.allocator();
+            if (fixed.rawResize(buf, alignment, new_len, ra)) {
+                return true;
+            }
+            self.fixed_resize_fail_count += 1;
+            const before_end_index = self.fixed.end_index;
+            fixed.rawFree(buf, alignment, ra);
+            if (self.fixed.end_index != before_end_index) {
+                self.fixed_resize_freed_count += 1;
+            }
+            return false;
+        }
+        return self.fallback.rawResize(buf, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        _ = ctx;
+        _ = buf;
+        _ = alignment;
+        _ = ra;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        if (resize(ctx, memory, alignment, new_len, ra)) {
+            return memory.ptr;
+        }
+        return null;
+    }
+};
+
+test "processMetrics - benchmark protobuf exposes nested arena over httpz fallback allocator" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var keep_index_non_empty: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-never-match"),
+        .name = try allocator.dupe(u8, "drop-never-match"),
+        .enabled = true,
+        .target = .{ .metric = .{
+            .keep = false,
+        } },
+    };
+    try keep_index_non_empty.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "does-not-match") },
+    });
+    defer keep_index_non_empty.deinit(allocator);
+
+    try registry.updatePolicies(&.{keep_index_non_empty}, "file-provider", .file);
+
+    const repetitions = 64;
+    const proto_data = try createRepeatedBenchmarkMetricsPayload(allocator, repetitions);
+    defer allocator.free(proto_data);
+
+    var request_arena = std.heap.ArenaAllocator.init(allocator);
+    defer request_arena.deinit();
+
+    var fixed_buffer: [32 * 1024]u8 = undefined;
+    var httpz_allocator = HttpzFallbackResizeBugAllocator.init(&fixed_buffer, request_arena.allocator());
+
+    var in_reader = std.Io.Reader.fixed(proto_data);
+    var out_writer: std.Io.Writer.Allocating = .init(httpz_allocator.allocator());
+    defer out_writer.deinit();
+
+    const result = try processMetricsStream(
+        httpz_allocator.allocator(),
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/x-protobuf",
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 5 * repetitions), result.original_count);
+    try std.testing.expectEqual(@as(usize, 0), httpz_allocator.fixed_resize_fail_count);
+    try std.testing.expectEqual(@as(usize, 0), httpz_allocator.fixed_resize_freed_count);
 }
 
 test "processMetrics - protobuf parses and re-serializes" {
@@ -814,7 +989,7 @@ test "processMetrics - protobuf parses and re-serializes" {
         &out_writer.writer,
         "application/x-protobuf",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -837,7 +1012,7 @@ test "processMetrics - protobuf DROP policy filters metrics" {
     defer registry.deinit();
 
     // Create a DROP policy for metrics containing "debug"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -868,7 +1043,7 @@ test "processMetrics - protobuf DROP policy filters metrics" {
         &out_writer.writer,
         "application/x-protobuf",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -905,7 +1080,7 @@ test "processMetrics - protobuf all metrics dropped" {
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
@@ -936,7 +1111,7 @@ test "processMetrics - protobuf all metrics dropped" {
         &out_writer.writer,
         "application/x-protobuf",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,

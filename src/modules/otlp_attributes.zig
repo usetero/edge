@@ -73,7 +73,7 @@ pub fn findAttrIndex(attrs: []const KeyValue, key: []const u8) ?usize {
 // =============================================================================
 
 /// Remove the first attribute matching `key`.  Returns true if found.
-pub fn removeAttribute(attributes: *std.ArrayListUnmanaged(KeyValue), key: []const u8) bool {
+pub fn removeAttribute(attributes: *std.ArrayList(KeyValue), key: []const u8) bool {
     for (attributes.items, 0..) |kv, i| {
         if (std.mem.eql(u8, kv.key, key)) {
             _ = attributes.orderedRemove(i);
@@ -84,14 +84,19 @@ pub fn removeAttribute(attributes: *std.ArrayListUnmanaged(KeyValue), key: []con
 }
 
 /// Remove by path — currently only supports top-level keys.
-pub fn removeAttributeByPath(attributes: *std.ArrayListUnmanaged(KeyValue), path: []const []const u8) bool {
+pub fn removeAttributeByPath(attributes: *std.ArrayList(KeyValue), path: []const []const u8) bool {
     if (path.len == 0) return false;
     return removeAttribute(attributes, path[0]);
 }
 
 /// Set (or insert) a string attribute.  If the key already exists its
 /// value is overwritten; otherwise a new entry is appended.
-pub fn setAttribute(allocator: std.mem.Allocator, attributes: *std.ArrayListUnmanaged(KeyValue), key: []const u8, value: []const u8) bool {
+pub fn setAttribute(
+    allocator: std.mem.Allocator,
+    attributes: *std.ArrayList(KeyValue),
+    key: []const u8,
+    value: []const u8,
+) bool {
     for (attributes.items) |*kv| {
         if (std.mem.eql(u8, kv.key, key)) {
             kv.value = .{ .value = .{ .string_value = value } };
@@ -106,7 +111,12 @@ pub fn setAttribute(allocator: std.mem.Allocator, attributes: *std.ArrayListUnma
 }
 
 /// Set by path — currently only supports top-level keys.
-pub fn setAttributeByPath(allocator: std.mem.Allocator, attributes: *std.ArrayListUnmanaged(KeyValue), path: []const []const u8, value: []const u8) bool {
+pub fn setAttributeByPath(
+    allocator: std.mem.Allocator,
+    attributes: *std.ArrayList(KeyValue),
+    path: []const []const u8,
+    value: []const u8,
+) bool {
     if (path.len == 0) return false;
     return setAttribute(allocator, attributes, path[0], value);
 }
@@ -128,7 +138,10 @@ pub const ZimdjsonAnyValue = zimdjson.ondemand.FullParser(.default).AnyValue;
 /// Look up an attribute in a zimdjson extra fields HashMap.
 /// Supports multi-segment paths by joining segments with '.' to form a dotted key,
 /// which matches Datadog's flat attribute convention (e.g., "http.request.method").
-pub fn findExtraField(extra: *const std.StringHashMapUnmanaged(ZimdjsonAnyValue), path: []const []const u8) ?[]const u8 {
+pub fn findExtraField(
+    extra: *const std.StringHashMapUnmanaged(ZimdjsonAnyValue),
+    path: []const []const u8,
+) ?[]const u8 {
     if (path.len == 0) return null;
 
     // Try direct lookup of first segment
@@ -165,30 +178,30 @@ pub fn findExtraField(extra: *const std.StringHashMapUnmanaged(ZimdjsonAnyValue)
 // Tests
 // =============================================================================
 
-// ── Test helpers ─────────────────────────────────────────────────────
+// ── Test helpers ──────────
 
-fn makeKV(key: []const u8, str_val: []const u8) KeyValue {
+fn makeKv(key: []const u8, str_val: []const u8) KeyValue {
     return .{
         .key = key,
         .value = .{ .value = .{ .string_value = str_val } },
     };
 }
 
-fn makeIntKV(key: []const u8, int_val: i64) KeyValue {
+fn makeIntKv(key: []const u8, int_val: i64) KeyValue {
     return .{
         .key = key,
         .value = .{ .value = .{ .int_value = int_val } },
     };
 }
 
-fn makeNullKV(key: []const u8) KeyValue {
+fn makeNullKv(key: []const u8) KeyValue {
     return .{
         .key = key,
         .value = null,
     };
 }
 
-fn makeNestedKV(key: []const u8, children: []const KeyValue) KeyValue {
+fn makeNestedKv(key: []const u8, children: []const KeyValue) KeyValue {
     // We need a mutable copy of the children slice for the kvlist.
     // In tests the slice lives on the stack so this is fine.
     return .{
@@ -206,14 +219,14 @@ fn makeNestedKV(key: []const u8, children: []const KeyValue) KeyValue {
     };
 }
 
-fn makeMutableList(items: []const KeyValue) std.ArrayListUnmanaged(KeyValue) {
+fn makeMutableList(items: []const KeyValue) std.ArrayList(KeyValue) {
     return .{
         .items = @constCast(items),
         .capacity = items.len,
     };
 }
 
-// ── getStringValue ───────────────────────────────────────────────────
+// ── getStringValue ──────────
 
 test "getStringValue - string value" {
     const v: AnyValue = .{ .value = .{ .string_value = "hello" } };
@@ -244,165 +257,165 @@ test "getStringValue - empty string" {
     try std.testing.expectEqualStrings("", getStringValue(v).?);
 }
 
-// ── findAttribute ────────────────────────────────────────────────────
+// ── findAttribute ──────────
 
 test "findAttribute - found" {
     const attrs = [_]KeyValue{
-        makeKV("host", "server-1"),
-        makeKV("region", "us-east"),
+        makeKv("host", "server-1"),
+        makeKv("region", "us-east"),
     };
     try std.testing.expectEqualStrings("us-east", findAttribute(&attrs, "region").?);
 }
 
 test "findAttribute - not found" {
-    const attrs = [_]KeyValue{makeKV("host", "server-1")};
+    const attrs = [_]KeyValue{makeKv("host", "server-1")};
     try std.testing.expectEqual(@as(?[]const u8, null), findAttribute(&attrs, "missing"));
 }
 
 test "findAttribute - empty list" {
-    const attrs = [_]KeyValue{};
+    const attrs: [0]KeyValue = .{};
     try std.testing.expectEqual(@as(?[]const u8, null), findAttribute(&attrs, "any"));
 }
 
 test "findAttribute - first match wins" {
     const attrs = [_]KeyValue{
-        makeKV("key", "first"),
-        makeKV("key", "second"),
+        makeKv("key", "first"),
+        makeKv("key", "second"),
     };
     try std.testing.expectEqualStrings("first", findAttribute(&attrs, "key").?);
 }
 
 test "findAttribute - non-string value returns null" {
-    const attrs = [_]KeyValue{makeIntKV("count", 42)};
+    const attrs = [_]KeyValue{makeIntKv("count", 42)};
     try std.testing.expectEqual(@as(?[]const u8, null), findAttribute(&attrs, "count"));
 }
 
 test "findAttribute - null value returns null" {
-    const attrs = [_]KeyValue{makeNullKV("empty")};
+    const attrs = [_]KeyValue{makeNullKv("empty")};
     try std.testing.expectEqual(@as(?[]const u8, null), findAttribute(&attrs, "empty"));
 }
 
-// ── findNestedAttribute ──────────────────────────────────────────────
+// ── findNestedAttribute ──────────
 
 test "findNestedAttribute - single segment" {
-    const attrs = [_]KeyValue{makeKV("service.name", "api")};
+    const attrs = [_]KeyValue{makeKv("service.name", "api")};
     const path = [_][]const u8{"service.name"};
     try std.testing.expectEqualStrings("api", findNestedAttribute(&attrs, &path).?);
 }
 
 test "findNestedAttribute - two segments" {
-    const inner = [_]KeyValue{makeKV("method", "GET")};
-    const attrs = [_]KeyValue{makeNestedKV("http", &inner)};
+    const inner = [_]KeyValue{makeKv("method", "GET")};
+    const attrs = [_]KeyValue{makeNestedKv("http", &inner)};
     const path = [_][]const u8{ "http", "method" };
     try std.testing.expectEqualStrings("GET", findNestedAttribute(&attrs, &path).?);
 }
 
 test "findNestedAttribute - three segments" {
-    const deepest = [_]KeyValue{makeKV("code", "200")};
-    const mid = [_]KeyValue{makeNestedKV("response", &deepest)};
-    const attrs = [_]KeyValue{makeNestedKV("http", &mid)};
+    const deepest = [_]KeyValue{makeKv("code", "200")};
+    const mid = [_]KeyValue{makeNestedKv("response", &deepest)};
+    const attrs = [_]KeyValue{makeNestedKv("http", &mid)};
     const path = [_][]const u8{ "http", "response", "code" };
     try std.testing.expectEqualStrings("200", findNestedAttribute(&attrs, &path).?);
 }
 
 test "findNestedAttribute - empty path" {
-    const attrs = [_]KeyValue{makeKV("key", "val")};
-    const path = [_][]const u8{};
+    const attrs = [_]KeyValue{makeKv("key", "val")};
+    const path: [0][]const u8 = .{};
     try std.testing.expectEqual(@as(?[]const u8, null), findNestedAttribute(&attrs, &path));
 }
 
 test "findNestedAttribute - missing first segment" {
-    const attrs = [_]KeyValue{makeKV("host", "server-1")};
+    const attrs = [_]KeyValue{makeKv("host", "server-1")};
     const path = [_][]const u8{"missing"};
     try std.testing.expectEqual(@as(?[]const u8, null), findNestedAttribute(&attrs, &path));
 }
 
 test "findNestedAttribute - missing nested segment" {
-    const inner = [_]KeyValue{makeKV("method", "GET")};
-    const attrs = [_]KeyValue{makeNestedKV("http", &inner)};
+    const inner = [_]KeyValue{makeKv("method", "GET")};
+    const attrs = [_]KeyValue{makeNestedKv("http", &inner)};
     const path = [_][]const u8{ "http", "missing" };
     try std.testing.expectEqual(@as(?[]const u8, null), findNestedAttribute(&attrs, &path));
 }
 
 test "findNestedAttribute - non-kvlist at intermediate level" {
-    const attrs = [_]KeyValue{makeKV("http", "not-a-map")};
+    const attrs = [_]KeyValue{makeKv("http", "not-a-map")};
     const path = [_][]const u8{ "http", "method" };
     try std.testing.expectEqual(@as(?[]const u8, null), findNestedAttribute(&attrs, &path));
 }
 
 test "findNestedAttribute - null value at intermediate level" {
-    const attrs = [_]KeyValue{makeNullKV("http")};
+    const attrs = [_]KeyValue{makeNullKv("http")};
     const path = [_][]const u8{ "http", "method" };
     try std.testing.expectEqual(@as(?[]const u8, null), findNestedAttribute(&attrs, &path));
 }
 
 test "findNestedAttribute - non-string at leaf" {
-    const inner = [_]KeyValue{makeIntKV("status", 200)};
-    const attrs = [_]KeyValue{makeNestedKV("http", &inner)};
+    const inner = [_]KeyValue{makeIntKv("status", 200)};
+    const attrs = [_]KeyValue{makeNestedKv("http", &inner)};
     const path = [_][]const u8{ "http", "status" };
     try std.testing.expectEqual(@as(?[]const u8, null), findNestedAttribute(&attrs, &path));
 }
 
 test "findNestedAttribute - empty attributes" {
-    const attrs = [_]KeyValue{};
+    const attrs: [0]KeyValue = .{};
     const path = [_][]const u8{"key"};
     try std.testing.expectEqual(@as(?[]const u8, null), findNestedAttribute(&attrs, &path));
 }
 
 test "findNestedAttribute - multiple attributes picks correct one" {
-    const inner = [_]KeyValue{makeKV("method", "POST")};
+    const inner = [_]KeyValue{makeKv("method", "POST")};
     const attrs = [_]KeyValue{
-        makeKV("host", "server-1"),
-        makeNestedKV("http", &inner),
-        makeKV("region", "us-east"),
+        makeKv("host", "server-1"),
+        makeNestedKv("http", &inner),
+        makeKv("region", "us-east"),
     };
     const path = [_][]const u8{ "http", "method" };
     try std.testing.expectEqualStrings("POST", findNestedAttribute(&attrs, &path).?);
 }
 
-// ── findAttrIndex ────────────────────────────────────────────────────
+// ── findAttrIndex ──────────
 
 test "findAttrIndex - found" {
     const attrs = [_]KeyValue{
-        makeKV("a", "1"),
-        makeKV("b", "2"),
-        makeKV("c", "3"),
+        makeKv("a", "1"),
+        makeKv("b", "2"),
+        makeKv("c", "3"),
     };
     try std.testing.expectEqual(@as(?usize, 1), findAttrIndex(&attrs, "b"));
 }
 
 test "findAttrIndex - first element" {
-    const attrs = [_]KeyValue{makeKV("only", "val")};
+    const attrs = [_]KeyValue{makeKv("only", "val")};
     try std.testing.expectEqual(@as(?usize, 0), findAttrIndex(&attrs, "only"));
 }
 
 test "findAttrIndex - not found" {
-    const attrs = [_]KeyValue{makeKV("a", "1")};
+    const attrs = [_]KeyValue{makeKv("a", "1")};
     try std.testing.expectEqual(@as(?usize, null), findAttrIndex(&attrs, "z"));
 }
 
 test "findAttrIndex - empty list" {
-    const attrs = [_]KeyValue{};
+    const attrs: [0]KeyValue = .{};
     try std.testing.expectEqual(@as(?usize, null), findAttrIndex(&attrs, "any"));
 }
 
 test "findAttrIndex - duplicate keys returns first" {
     const attrs = [_]KeyValue{
-        makeKV("dup", "first"),
-        makeKV("dup", "second"),
+        makeKv("dup", "first"),
+        makeKv("dup", "second"),
     };
     try std.testing.expectEqual(@as(?usize, 0), findAttrIndex(&attrs, "dup"));
 }
 
-// ── removeAttribute ──────────────────────────────────────────────────
+// ── removeAttribute ──────────
 
 test "removeAttribute - removes existing key" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("a", "1"));
-    try list.append(alloc, makeKV("b", "2"));
-    try list.append(alloc, makeKV("c", "3"));
+    try list.append(alloc, makeKv("a", "1"));
+    try list.append(alloc, makeKv("b", "2"));
+    try list.append(alloc, makeKv("c", "3"));
 
     try std.testing.expect(removeAttribute(&list, "b"));
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
@@ -412,25 +425,25 @@ test "removeAttribute - removes existing key" {
 
 test "removeAttribute - missing key returns false" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("a", "1"));
+    try list.append(alloc, makeKv("a", "1"));
 
     try std.testing.expect(!removeAttribute(&list, "z"));
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
 }
 
 test "removeAttribute - empty list returns false" {
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     try std.testing.expect(!removeAttribute(&list, "any"));
 }
 
 test "removeAttribute - removes first of duplicates" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("x", "first"));
-    try list.append(alloc, makeKV("x", "second"));
+    try list.append(alloc, makeKv("x", "first"));
+    try list.append(alloc, makeKv("x", "second"));
 
     try std.testing.expect(removeAttribute(&list, "x"));
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
@@ -439,21 +452,21 @@ test "removeAttribute - removes first of duplicates" {
 
 test "removeAttribute - removes only element" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("only", "val"));
+    try list.append(alloc, makeKv("only", "val"));
 
     try std.testing.expect(removeAttribute(&list, "only"));
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
 }
 
-// ── removeAttributeByPath ────────────────────────────────────────────
+// ── removeAttributeByPath ──────────
 
 test "removeAttributeByPath - single segment" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("target", "val"));
+    try list.append(alloc, makeKv("target", "val"));
 
     const path = [_][]const u8{"target"};
     try std.testing.expect(removeAttributeByPath(&list, &path));
@@ -462,33 +475,33 @@ test "removeAttributeByPath - single segment" {
 
 test "removeAttributeByPath - empty path" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("a", "1"));
+    try list.append(alloc, makeKv("a", "1"));
 
-    const path = [_][]const u8{};
+    const path: [0][]const u8 = .{};
     try std.testing.expect(!removeAttributeByPath(&list, &path));
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
 }
 
 test "removeAttributeByPath - multi-segment removes top-level key" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("http", "nested"));
+    try list.append(alloc, makeKv("http", "nested"));
 
     const path = [_][]const u8{ "http", "method" };
     try std.testing.expect(removeAttributeByPath(&list, &path));
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
 }
 
-// ── setAttribute ─────────────────────────────────────────────────────
+// ── setAttribute ──────────
 
 test "setAttribute - updates existing key" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("key", "old"));
+    try list.append(alloc, makeKv("key", "old"));
 
     try std.testing.expect(setAttribute(alloc, &list, "key", "new"));
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
@@ -497,7 +510,7 @@ test "setAttribute - updates existing key" {
 
 test "setAttribute - inserts new key" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
 
     try std.testing.expect(setAttribute(alloc, &list, "new-key", "val"));
@@ -508,9 +521,9 @@ test "setAttribute - inserts new key" {
 
 test "setAttribute - inserts into non-empty list" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeKV("existing", "val"));
+    try list.append(alloc, makeKv("existing", "val"));
 
     try std.testing.expect(setAttribute(alloc, &list, "added", "new"));
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
@@ -520,9 +533,9 @@ test "setAttribute - inserts into non-empty list" {
 
 test "setAttribute - overwrites non-string value" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
-    try list.append(alloc, makeIntKV("count", 42));
+    try list.append(alloc, makeIntKv("count", 42));
 
     // Int value won't match string lookup, so it appends (key comparison still matches)
     try std.testing.expect(setAttribute(alloc, &list, "count", "100"));
@@ -530,11 +543,11 @@ test "setAttribute - overwrites non-string value" {
     try std.testing.expectEqualStrings("100", getStringValue(list.items[0].value).?);
 }
 
-// ── setAttributeByPath ───────────────────────────────────────────────
+// ── setAttributeByPath ──────────
 
 test "setAttributeByPath - single segment" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
 
     const path = [_][]const u8{"key"};
@@ -545,17 +558,17 @@ test "setAttributeByPath - single segment" {
 
 test "setAttributeByPath - empty path" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
 
-    const path = [_][]const u8{};
+    const path: [0][]const u8 = .{};
     try std.testing.expect(!setAttributeByPath(alloc, &list, &path, "val"));
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
 }
 
 test "setAttributeByPath - multi-segment uses first" {
     const alloc = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(KeyValue).empty;
+    var list = std.ArrayList(KeyValue).empty;
     defer list.deinit(alloc);
 
     const path = [_][]const u8{ "http", "method" };
@@ -564,7 +577,7 @@ test "setAttributeByPath - multi-segment uses first" {
     try std.testing.expectEqualStrings("http", list.items[0].key);
 }
 
-// ── getFirstPathSegment ──────────────────────────────────────────────
+// ── getFirstPathSegment ──────────
 
 test "getFirstPathSegment - non-empty" {
     const path = [_][]const u8{ "first", "second" };
@@ -577,15 +590,15 @@ test "getFirstPathSegment - single element" {
 }
 
 test "getFirstPathSegment - empty" {
-    const path = [_][]const u8{};
+    const path: [0][]const u8 = .{};
     try std.testing.expectEqual(@as(?[]const u8, null), getFirstPathSegment(&path));
 }
 
-// ── findExtraField ──────────────────────────────────────────────────
+// ── findExtraField ──────────
 
 test "findExtraField - empty path" {
     var map: std.StringHashMapUnmanaged(ZimdjsonAnyValue) = .empty;
-    const path = [_][]const u8{};
+    const path: [0][]const u8 = .{};
     try std.testing.expectEqual(@as(?[]const u8, null), findExtraField(&map, &path));
 }
 

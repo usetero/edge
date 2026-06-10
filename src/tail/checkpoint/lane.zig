@@ -1,9 +1,12 @@
 const std = @import("std");
+const tail_types = @import("../types.zig");
 const checkpoint_types = @import("types.zig");
 const queue_mod = @import("queue.zig");
 const store_mod = @import("store.zig");
 const wal_mod = @import("wal.zig");
 const snapshot_mod = @import("snapshot.zig");
+
+const log = std.log.scoped(.checkpoint_lane);
 
 pub const Update = checkpoint_types.Update;
 
@@ -49,7 +52,7 @@ pub const Lane = struct {
         const interval_ns = interval_ms * std.time.ns_per_ms;
         const ttl_ns = @as(i128, @intCast(ttl_ms)) * std.time.ns_per_ms;
 
-        var lane = Lane{
+        var lane: Lane = .{
             .allocator = allocator,
             .io = io,
             .queue = try queue_mod.UpdateQueue.init(allocator, io, capacity),
@@ -85,6 +88,7 @@ pub const Lane = struct {
         self.wal.deinit();
         self.store.deinit();
         self.queue.deinit();
+        self.* = undefined;
     }
 
     pub fn start(self: *Lane) !void {
@@ -105,7 +109,7 @@ pub const Lane = struct {
         return self.queue.push(update);
     }
 
-    pub fn getOffset(self: *Lane, identity: @import("../types.zig").FileIdentity) ?u64 {
+    pub fn getOffset(self: *Lane, identity: tail_types.FileIdentity) ?u64 {
         return self.store.getOffset(identity);
     }
 
@@ -127,20 +131,23 @@ pub const Lane = struct {
     fn workerMain(self: *Lane) void {
         while (true) {
             if (self.queue.pop()) |update| {
-                self.applyUpdate(update) catch {};
-                self.runMaintenance(false) catch {};
+                self.applyUpdate(update) catch |err| log.warn("applyUpdate failed: {}", .{err});
+                self.runMaintenance(false) catch |err| log.warn("runMaintenance failed: {}", .{err});
                 continue;
             }
 
             if (self.stop.load(.acquire)) {
-                self.runMaintenance(true) catch {};
-                while (self.queue.pop()) |update| self.applyUpdate(update) catch {};
-                self.runMaintenance(true) catch {};
+                self.runMaintenance(true) catch |err| log.warn("runMaintenance (drain) failed: {}", .{err});
+                while (self.queue.pop()) |update| self.applyUpdate(update) catch |err|
+                    log.warn("applyUpdate (drain) failed: {}", .{err});
+                self.runMaintenance(true) catch |err| log.warn("runMaintenance (final) failed: {}", .{err});
                 break;
             }
 
-            self.runMaintenance(false) catch {};
-            self.io.sleep(.fromNanoseconds(@intCast(@min(self.interval_ns, 10 * std.time.ns_per_ms))), .awake) catch {};
+            self.runMaintenance(false) catch |err| log.warn("runMaintenance failed: {}", .{err});
+            const sleep_ns = @min(self.interval_ns, 10 * std.time.ns_per_ms);
+            self.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch |err|
+                log.warn("worker sleep failed: {}", .{err});
         }
     }
 
@@ -189,7 +196,7 @@ pub const Lane = struct {
 
 const testing = std.testing;
 
-fn waitForOffset(lane: *Lane, id: @import("../types.zig").FileIdentity, expected: ?u64, max_tries: usize) !void {
+fn waitForOffset(lane: *Lane, id: tail_types.FileIdentity, expected: ?u64, max_tries: usize) !void {
     var tries: usize = 0;
     while (tries < max_tries and lane.getOffset(id) != expected) : (tries += 1) {
         std.Thread.sleep(2 * std.time.ns_per_ms);
@@ -225,8 +232,13 @@ test "checkpoint/lane: enqueue and observe offset" {
     defer lane.deinit();
     try lane.start();
 
-    const id = @import("../types.zig").FileIdentity{ .dev = 1, .inode = 2, .fingerprint = 3 };
-    try testing.expect(try lane.enqueue(.{ .identity = id, .byte_offset = 99, .last_seen_size = 99, .last_seen_ns = @intCast(std.time.nanoTimestamp()) }));
+    const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 2, .fingerprint = 3 };
+    try testing.expect(try lane.enqueue(.{
+        .identity = id,
+        .byte_offset = 99,
+        .last_seen_size = 99,
+        .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+    }));
     try waitForOffset(&lane, id, 99, 100);
 }
 
@@ -239,9 +251,14 @@ test "checkpoint/lane: queue is bounded" {
     var lane = try Lane.init(testing.allocator, state_dir, 1, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer lane.deinit();
 
-    const id = @import("../types.zig").FileIdentity{ .dev = 1, .inode = 1, .fingerprint = 1 };
+    const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 1, .fingerprint = 1 };
     try testing.expect(try lane.enqueue(.{ .identity = id, .byte_offset = 1, .last_seen_size = 1, .last_seen_ns = 1 }));
-    try testing.expect(!(try lane.enqueue(.{ .identity = id, .byte_offset = 2, .last_seen_size = 2, .last_seen_ns = 2 })));
+    try testing.expect(!(try lane.enqueue(.{
+        .identity = id,
+        .byte_offset = 2,
+        .last_seen_size = 2,
+        .last_seen_ns = 2,
+    })));
 }
 
 test "checkpoint/lane: recovers from wal and snapshot" {
@@ -250,12 +267,17 @@ test "checkpoint/lane: recovers from wal and snapshot" {
     const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(state_dir);
 
-    const id = @import("../types.zig").FileIdentity{ .dev = 7, .inode = 8, .fingerprint = 9 };
+    const id: tail_types.FileIdentity = .{ .dev = 7, .inode = 8, .fingerprint = 9 };
     {
         var lane = try Lane.init(testing.allocator, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
         defer lane.deinit();
         try lane.start();
-        _ = try lane.enqueue(.{ .identity = id, .byte_offset = 1234, .last_seen_size = 1234, .last_seen_ns = @intCast(std.time.nanoTimestamp()) });
+        _ = try lane.enqueue(.{
+            .identity = id,
+            .byte_offset = 1234,
+            .last_seen_size = 1234,
+            .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+        });
         try waitForOffset(&lane, id, 1234, 100);
     }
 
@@ -270,12 +292,17 @@ test "checkpoint/lane: corrupted wal is tolerated" {
     const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(state_dir);
 
-    const id = @import("../types.zig").FileIdentity{ .dev = 10, .inode = 11, .fingerprint = 12 };
+    const id: tail_types.FileIdentity = .{ .dev = 10, .inode = 11, .fingerprint = 12 };
     {
         var lane = try Lane.init(testing.allocator, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
         defer lane.deinit();
         try lane.start();
-        _ = try lane.enqueue(.{ .identity = id, .byte_offset = 55, .last_seen_size = 55, .last_seen_ns = @intCast(std.time.nanoTimestamp()) });
+        _ = try lane.enqueue(.{
+            .identity = id,
+            .byte_offset = 55,
+            .last_seen_size = 55,
+            .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+        });
         try waitForOffset(&lane, id, 55, 100);
     }
 
@@ -304,8 +331,8 @@ test "checkpoint/lane: corrupted snapshot falls back to wal replay" {
     const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(state_dir);
 
-    const id = @import("../types.zig").FileIdentity{ .dev = 20, .inode = 21, .fingerprint = 22 };
-    const value = checkpoint_types.Value{
+    const id: tail_types.FileIdentity = .{ .dev = 20, .inode = 21, .fingerprint = 22 };
+    const value: checkpoint_types.Value = .{
         .identity = id,
         .offset = 777,
         .last_seen_ns = @intCast(std.time.nanoTimestamp()),
@@ -344,8 +371,8 @@ test "checkpoint/lane: missing state files initialize cleanly" {
     var lane = try Lane.init(testing.allocator, state_dir, 8, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     lane.deinit();
 
-    std.fs.cwd().deleteFile(wal_path) catch {};
-    std.fs.cwd().deleteFile(snap_path) catch {};
+    std.fs.cwd().deleteFile(wal_path) catch |err| log.warn("deleteFile wal failed: {}", .{err});
+    std.fs.cwd().deleteFile(snap_path) catch |err| log.warn("deleteFile snap failed: {}", .{err});
 
     var recreated = try Lane.init(testing.allocator, state_dir, 8, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer recreated.deinit();

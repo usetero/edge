@@ -1,5 +1,8 @@
 const std = @import("std");
+const tail_types = @import("../types.zig");
 const checkpoint_types = @import("types.zig");
+
+const log = std.log.scoped(.checkpoint_store);
 
 const Oldest = struct {
     key: u64,
@@ -29,6 +32,7 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         self.by_identity.deinit();
         self.by_inode.deinit();
+        self.* = undefined;
     }
 
     pub fn upsert(self: *Store, value: checkpoint_types.Value) !void {
@@ -41,10 +45,10 @@ pub const Store = struct {
         }
 
         try self.by_identity.put(keys.identity, value);
-        self.by_inode.put(keys.inode, value) catch {};
+        self.by_inode.put(keys.inode, value) catch |err| log.warn("by_inode put failed (upsert): {}", .{err});
     }
 
-    pub fn getOffset(self: *Store, identity: @import("../types.zig").FileIdentity) ?u64 {
+    pub fn getOffset(self: *Store, identity: tail_types.FileIdentity) ?u64 {
         const keys = checkpoint_types.keysFor(identity);
         const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 
@@ -105,7 +109,7 @@ pub const Store = struct {
                 self.evictOldestLocked();
             }
             try self.by_identity.put(keys.identity, value);
-            self.by_inode.put(keys.inode, value) catch {};
+            self.by_inode.put(keys.inode, value) catch |err| log.warn("by_inode put failed (loadValues): {}", .{err});
         }
     }
 
@@ -113,7 +117,7 @@ pub const Store = struct {
         var oldest: ?Oldest = null;
         var it = self.by_identity.iterator();
         while (it.next()) |entry| {
-            const candidate = Oldest{ .key = entry.key_ptr.*, .last_seen_ns = entry.value_ptr.last_seen_ns };
+            const candidate: Oldest = .{ .key = entry.key_ptr.*, .last_seen_ns = entry.value_ptr.last_seen_ns };
             if (oldest == null or candidate.last_seen_ns < oldest.?.last_seen_ns) oldest = candidate;
         }
 

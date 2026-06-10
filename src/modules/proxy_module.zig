@@ -72,11 +72,11 @@ pub const ModuleRegistration = struct {
 };
 
 test "MethodBitmask.matches" {
-    const post_only = MethodBitmask{ .post = true };
+    const post_only: MethodBitmask = .{ .post = true };
     try std.testing.expect(post_only.matches(.POST));
     try std.testing.expect(!post_only.matches(.GET));
 
-    const get_post = MethodBitmask{ .get = true, .post = true };
+    const get_post: MethodBitmask = .{ .get = true, .post = true };
     try std.testing.expect(get_post.matches(.GET));
     try std.testing.expect(get_post.matches(.POST));
 

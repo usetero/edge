@@ -1,6 +1,8 @@
 const std = @import("std");
 const m = @import("metrics_zig");
 
+const log = std.log.scoped(.runtime_metrics);
+
 pub const DistributionLabel = enum {
     edge,
     datadog,
@@ -133,7 +135,7 @@ pub const RuntimeMetrics = struct {
     internal: InternalMetrics = m.initializeNoop(InternalMetrics),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, distribution: DistributionLabel) !RuntimeMetrics {
-        var metrics = RuntimeMetrics{
+        var metrics: RuntimeMetrics = .{
             .allocator = allocator,
             .distribution = distribution,
             .internal = .{
@@ -254,6 +256,7 @@ pub const RuntimeMetrics = struct {
         inline for (std.meta.fields(InternalMetrics)) |field| {
             @field(self.internal, field.name).deinit();
         }
+        self.* = undefined;
     }
 
     pub fn writePrometheus(self: *RuntimeMetrics, writer: *std.Io.Writer) !void {
@@ -268,7 +271,7 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_requests_total.incr(.{
             .method = method,
             .known_path = known_path,
-        }) catch {};
+        }) catch |err| log.debug("failed to record request metric: {}", .{err});
     }
 
     pub fn recordRequestDuration(
@@ -278,7 +281,7 @@ pub const RuntimeMetrics = struct {
     ) void {
         self.internal.edge_request_duration_seconds.observe(.{
             .known_path = known_path,
-        }, duration_seconds) catch {};
+        }, duration_seconds) catch |err| log.debug("failed to record request duration metric: {}", .{err});
     }
 
     pub fn recordResponse(
@@ -289,7 +292,7 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_responses_total.incr(.{
             .known_path = known_path,
             .status_class = status_class,
-        }) catch {};
+        }) catch |err| log.debug("failed to record response metric: {}", .{err});
     }
 
     pub fn recordPrefilterDecision(
@@ -300,7 +303,7 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_prefilter_decisions_total.incr(.{
             .route_kind = route_kind,
             .decision = decision,
-        }) catch {};
+        }) catch |err| log.debug("failed to record prefilter decision metric: {}", .{err});
     }
 
     pub fn recordRequestError(
@@ -311,7 +314,7 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_request_errors_total.incr(.{
             .known_path = known_path,
             .class = class,
-        }) catch {};
+        }) catch |err| log.debug("failed to record request error metric: {}", .{err});
     }
 
     pub fn recordPolicyBatch(
@@ -323,13 +326,13 @@ pub const RuntimeMetrics = struct {
         const kept_count = evaluated_count -| dropped_count;
         self.internal.edge_policy_records_evaluated_total.incrBy(.{
             .telemetry = telemetry,
-        }, evaluated_count) catch {};
+        }, evaluated_count) catch |err| log.debug("failed to record policy evaluated metric: {}", .{err});
         self.internal.edge_policy_records_kept_total.incrBy(.{
             .telemetry = telemetry,
-        }, kept_count) catch {};
+        }, kept_count) catch |err| log.debug("failed to record policy kept metric: {}", .{err});
         self.internal.edge_policy_records_dropped_total.incrBy(.{
             .telemetry = telemetry,
-        }, dropped_count) catch {};
+        }, dropped_count) catch |err| log.debug("failed to record policy dropped metric: {}", .{err});
     }
 
     pub fn setBuildInfo(self: *RuntimeMetrics, version: []const u8, commit: []const u8) void {
@@ -337,7 +340,7 @@ pub const RuntimeMetrics = struct {
             .version = version,
             .commit = commit,
             .distribution = self.distribution,
-        }, 1) catch {};
+        }, 1) catch |err| log.warn("failed to set build info metric: {}", .{err});
     }
 };
 

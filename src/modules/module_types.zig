@@ -34,7 +34,7 @@ pub const MethodBitmask = packed struct(u8) {
     options: bool = false,
     _unused: u1 = 0,
 
-    pub const all = MethodBitmask{
+    pub const all: MethodBitmask = .{
         .get = true,
         .post = true,
         .put = true,

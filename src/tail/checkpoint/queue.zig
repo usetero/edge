@@ -21,6 +21,7 @@ pub const UpdateQueue = struct {
 
     pub fn deinit(self: *UpdateQueue) void {
         self.allocator.free(self.buf);
+        self.* = undefined;
     }
 
     pub fn push(self: *UpdateQueue, update: checkpoint_types.Update) bool {
@@ -59,7 +60,7 @@ test "checkpoint/queue: push/pop is bounded" {
     var q = try UpdateQueue.init(testing.allocator, std.Options.debug_io, 1);
     defer q.deinit();
 
-    const id = tail_types.FileIdentity{ .dev = 1, .inode = 1, .fingerprint = 1 };
+    const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 1, .fingerprint = 1 };
     try testing.expect(q.push(.{ .identity = id, .byte_offset = 1, .last_seen_size = 1, .last_seen_ns = 1 }));
     try testing.expect(!q.push(.{ .identity = id, .byte_offset = 2, .last_seen_size = 2, .last_seen_ns = 2 }));
 

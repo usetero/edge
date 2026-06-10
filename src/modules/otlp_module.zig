@@ -133,8 +133,9 @@ pub const OtlpModule = struct {
         }
     }
 
-    pub fn deinit(_: *OtlpModule) void {
+    pub fn deinit(self: *OtlpModule) void {
         // Nothing to cleanup (stateless)
+        self.* = undefined;
     }
 };
 
@@ -211,9 +212,9 @@ test "OtlpModule processes POST requests" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -230,16 +231,15 @@ test "OtlpModule processes POST requests" {
     });
 
     // Test with POST request and JSON body (OTLP format)
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/v1/logs",
         .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body =
-        \\{"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"test"},"severityText":"INFO"}]}]}]}
-        ,
+        .body = "{\"resourceLogs\":[{\"resource\":{},\"scopeLogs\":[{\"scope\":{}," ++
+            "\"logRecords\":[{\"body\":{\"stringValue\":\"test\"},\"severityText\":\"INFO\"}]}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -260,9 +260,9 @@ test "OtlpModule ignores GET requests" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -278,7 +278,7 @@ test "OtlpModule ignores GET requests" {
         .module_data = @ptrCast(&otlp_config),
     });
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .GET,
         .path = "/v1/logs",
         .route_kind = .otlp_logs,
@@ -309,7 +309,7 @@ test "OtlpModule: DROP policy filters matching logs" {
     defer registry.deinit();
 
     // Create a DROP policy for logs with severity "DEBUG"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug-logs"),
         .enabled = true,
@@ -325,9 +325,9 @@ test "OtlpModule: DROP policy filters matching logs" {
 
     try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -345,16 +345,16 @@ test "OtlpModule: DROP policy filters matching logs" {
     defer module.deinit();
 
     // Request with DEBUG log (should be dropped) and INFO log (should be kept)
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/v1/logs",
         .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body =
-        \\{"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"debug message"},"severityText":"DEBUG"},{"body":{"stringValue":"info message"},"severityText":"INFO"}]}]}]}
-        ,
+        .body = "{\"resourceLogs\":[{\"resource\":{},\"scopeLogs\":[{\"scope\":{},\"logRecords\":[" ++
+            "{\"body\":{\"stringValue\":\"debug message\"},\"severityText\":\"DEBUG\"}," ++
+            "{\"body\":{\"stringValue\":\"info message\"},\"severityText\":\"INFO\"}]}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -381,7 +381,7 @@ test "OtlpModule: all logs dropped returns empty response" {
     defer registry.deinit();
 
     // Create a DROP policy that matches all logs
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all-logs"),
         .enabled = true,
@@ -397,9 +397,9 @@ test "OtlpModule: all logs dropped returns empty response" {
 
     try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -416,16 +416,15 @@ test "OtlpModule: all logs dropped returns empty response" {
     });
     defer module.deinit();
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/v1/logs",
         .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body =
-        \\{"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"test"},"severityText":"INFO"}]}]}]}
-        ,
+        .body = "{\"resourceLogs\":[{\"resource\":{},\"scopeLogs\":[{\"scope\":{}," ++
+            "\"logRecords\":[{\"body\":{\"stringValue\":\"test\"},\"severityText\":\"INFO\"}]}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -446,7 +445,7 @@ test "OtlpModule: filter logs by resource attribute" {
     defer registry.deinit();
 
     // Create a DROP policy for logs from "test-service"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-test-service"),
         .name = try allocator.dupe(u8, "drop-test-service-logs"),
         .enabled = true,
@@ -454,7 +453,7 @@ test "OtlpModule: filter logs by resource attribute" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
-    var attr_path = proto.policy.AttributePath{};
+    var attr_path: proto.policy.AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
     try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .resource_attribute = attr_path },
@@ -464,9 +463,9 @@ test "OtlpModule: filter logs by resource attribute" {
 
     try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -484,16 +483,19 @@ test "OtlpModule: filter logs by resource attribute" {
     defer module.deinit();
 
     // Request with logs from test-service (should be dropped) and prod-service (should be kept)
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/v1/logs",
         .route_kind = .otlp_logs,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body =
-        \\{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test-service"}}]},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"from test"},"severityText":"INFO"}]}]},{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"prod-service"}}]},"scopeLogs":[{"scope":{},"logRecords":[{"body":{"stringValue":"from prod"},"severityText":"INFO"}]}]}]}
-        ,
+        .body = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\"," ++
+            "\"value\":{\"stringValue\":\"test-service\"}}]},\"scopeLogs\":[{\"scope\":{}," ++
+            "\"logRecords\":[{\"body\":{\"stringValue\":\"from test\"},\"severityText\":\"INFO\"}]}]}," ++
+            "{\"resource\":{\"attributes\":[{\"key\":\"service.name\"," ++
+            "\"value\":{\"stringValue\":\"prod-service\"}}]},\"scopeLogs\":[{\"scope\":{}," ++
+            "\"logRecords\":[{\"body\":{\"stringValue\":\"from prod\"},\"severityText\":\"INFO\"}]}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -522,7 +524,7 @@ test "OtlpModule: DROP policy filters matching metrics" {
     defer registry.deinit();
 
     // Create a DROP policy for metrics with "debug" in the name
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug-metrics"),
         .name = try allocator.dupe(u8, "drop-debug-metrics"),
         .enabled = true,
@@ -538,9 +540,9 @@ test "OtlpModule: DROP policy filters matching metrics" {
 
     try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -558,16 +560,15 @@ test "OtlpModule: DROP policy filters matching metrics" {
     defer module.deinit();
 
     // Request with debug metric (should be dropped) and http metric (should be kept)
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/v1/metrics",
         .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body =
-        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"debug.internal"},{"name":"http.requests"}]}]}]}
-        ,
+        .body = "{\"resourceMetrics\":[{\"resource\":{},\"scopeMetrics\":[{\"scope\":{},\"metrics\":[" ++
+            "{\"name\":\"debug.internal\"},{\"name\":\"http.requests\"}]}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -593,7 +594,7 @@ test "OtlpModule: all metrics dropped returns empty response" {
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all-metrics"),
         .enabled = true,
@@ -609,9 +610,9 @@ test "OtlpModule: all metrics dropped returns empty response" {
 
     try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -628,16 +629,15 @@ test "OtlpModule: all metrics dropped returns empty response" {
     });
     defer module.deinit();
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/v1/metrics",
         .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body =
-        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"metric1"},{"name":"metric2"}]}]}]}
-        ,
+        .body = "{\"resourceMetrics\":[{\"resource\":{},\"scopeMetrics\":[{\"scope\":{},\"metrics\":[" ++
+            "{\"name\":\"metric1\"},{\"name\":\"metric2\"}]}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -660,7 +660,7 @@ test "OtlpModule: filter metrics by metric type" {
     const MetricType = proto.policy.MetricType;
 
     // Create a DROP policy for gauge metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-gauges"),
         .name = try allocator.dupe(u8, "drop-gauge-metrics"),
         .enabled = true,
@@ -675,9 +675,9 @@ test "OtlpModule: filter metrics by metric type" {
 
     try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -695,16 +695,16 @@ test "OtlpModule: filter metrics by metric type" {
     defer module.deinit();
 
     // Request with gauge metric (should be dropped) and sum metric (should be kept)
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/v1/metrics",
         .route_kind = .otlp_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body =
-        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"cpu.usage","gauge":{"dataPoints":[{"asDouble":0.5}]}},{"name":"http.requests","sum":{"dataPoints":[{"asInt":"100"}]}}]}]}]}
-        ,
+        .body = "{\"resourceMetrics\":[{\"resource\":{},\"scopeMetrics\":[{\"scope\":{},\"metrics\":[" ++
+            "{\"name\":\"cpu.usage\",\"gauge\":{\"dataPoints\":[{\"asDouble\":0.5}]}}," ++
+            "{\"name\":\"http.requests\",\"sum\":{\"dataPoints\":[{\"asInt\":\"100\"}]}}]}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -730,7 +730,7 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
     defer registry.deinit();
 
     // Create a DROP policy that won't match any metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-nonexistent"),
         .name = try allocator.dupe(u8, "drop-nonexistent"),
         .enabled = true,
@@ -746,9 +746,9 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
 
     try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
 
-    var otlp_config = OtlpConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var otlp_config: OtlpConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = OtlpModule{};
+    var module: OtlpModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -765,7 +765,7 @@ test "OtlpModule: metrics route unchanged when no matching policy" {
     });
     defer module.deinit();
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/v1/metrics",
         .route_kind = .otlp_metrics,

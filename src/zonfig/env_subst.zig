@@ -32,13 +32,17 @@ pub const SubstResult = struct {
 ///   - `${UNSET_VAR}` -> `` (empty string)
 ///   - `no variables here` -> `no variables here` (original, not copied)
 ///   - `$${ESCAPED}` -> `${ESCAPED}` (double $ escapes)
-pub fn substitute(allocator: std.mem.Allocator, input: []const u8, environ: *const std.process.Environ.Map) SubstError!SubstResult {
+pub fn substitute(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    environ: *const std.process.Environ.Map,
+) SubstError!SubstResult {
     // Quick scan to see if there are any potential variables
     if (std.mem.indexOf(u8, input, "${") == null) {
         return .{ .value = input, .was_substituted = false };
     }
 
-    var result: std.ArrayListUnmanaged(u8) = .empty;
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     var i: usize = 0;

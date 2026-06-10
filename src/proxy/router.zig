@@ -61,8 +61,8 @@ pub const Router = struct {
     /// Initialize router from module configurations
     pub fn init(allocator: std.mem.Allocator, modules: []const ModuleConfig) !Router {
         var exact_matches = std.AutoHashMapUnmanaged(u64, ExactMatchEntry).empty;
-        var prefix_list = std.ArrayListUnmanaged(PrefixRoute).empty;
-        var suffix_list = std.ArrayListUnmanaged(SuffixRoute).empty;
+        var prefix_list = std.ArrayList(PrefixRoute).empty;
+        var suffix_list = std.ArrayList(SuffixRoute).empty;
         var fallback: ?FallbackRoute = null;
 
         // Process all routes from all modules
@@ -123,6 +123,7 @@ pub const Router = struct {
         self.exact_matches.deinit(self.allocator);
         self.allocator.free(self.prefix_routes);
         self.allocator.free(self.suffix_routes);
+        self.* = undefined;
     }
 
     /// Route a request to the appropriate module
@@ -225,7 +226,7 @@ test "Router exact match" {
 test "Router exact hash hit requires path equality" {
     const allocator = std.testing.allocator;
 
-    var exact_matches = std.AutoHashMapUnmanaged(u64, Router.ExactMatchEntry){};
+    var exact_matches: std.AutoHashMapUnmanaged(u64, Router.ExactMatchEntry) = .{};
     defer exact_matches.deinit(allocator);
 
     const target_path = "/api/v2/logs";
@@ -242,7 +243,7 @@ test "Router exact hash hit requires path equality" {
     const empty_suffix = try allocator.alloc(SuffixRoute, 0);
     defer allocator.free(empty_suffix);
 
-    const router = Router{
+    const router: Router = .{
         .exact_matches = exact_matches,
         .prefix_routes = empty_prefix,
         .suffix_routes = empty_suffix,

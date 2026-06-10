@@ -1,16 +1,14 @@
 const std = @import("std");
-const zimdjson = @import("zimdjson");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const datadog_log = @import("datadog_log.zig");
-const otlp_attr = @import("otlp_attributes.zig");
 
 const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;
 const FilterDecision = policy.FilterDecision;
-const FieldRef = policy.FieldRef;
+pub const FieldRef = policy.FieldRef;
 const LogField = @import("proto").policy.LogField;
-const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
+const MAX_MATCHES_PER_SCAN = policy.max_matches_per_scan;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -91,7 +89,7 @@ fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try streamAll(reader, &out.writer);
-    return try out.toOwnedSlice();
+    return out.toOwnedSlice();
 }
 
 fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
@@ -148,7 +146,11 @@ pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
             else => null,
         },
         // All attribute types search the same Datadog flat namespace
-        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| lookupLogAttribute(log, field_ctx.allocator, attr_path.path.items),
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| lookupLogAttribute(
+            log,
+            field_ctx.allocator,
+            attr_path.path.items,
+        ),
     };
 }
 
@@ -245,9 +247,20 @@ const FilterLogResult = struct {
 
 /// Evaluate a single log against policies, applying transforms if matched.
 /// Returns whether to keep the log and whether it was mutated.
-fn filterLog(engine: *const PolicyEngine, log: *DatadogLog, allocator: std.mem.Allocator, policy_id_buf: [][]const u8) FilterLogResult {
-    var field_ctx = FieldAccessorContext{ .log = log, .allocator = allocator };
-    const result = engine.evaluate(.log, &log_accessor, &field_ctx, policy_id_buf, .{ .scratch = allocator, .io = engine.bus.io });
+fn filterLog(
+    engine: *const PolicyEngine,
+    log: *DatadogLog,
+    allocator: std.mem.Allocator,
+    policy_id_buf: [][]const u8,
+) FilterLogResult {
+    var field_ctx: FieldAccessorContext = .{ .log = log, .allocator = allocator };
+    const result = engine.evaluate(
+        .log,
+        &log_accessor,
+        &field_ctx,
+        policy_id_buf,
+        .{ .scratch = allocator, .io = engine.bus.io },
+    );
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
@@ -274,6 +287,7 @@ const FilterState = struct {
 
     fn deinit(self: *FilterState) void {
         self.arena.deinit();
+        self.* = undefined;
     }
 };
 
@@ -334,7 +348,12 @@ fn returnUnchanged(allocator: std.mem.Allocator, data: []const u8, original_coun
 
 /// Process JSON logs with filter evaluation using zimdjson ondemand parser
 /// Detects if input is an array or single object, applies filter to each log
-fn processJsonLogsWithFilter(allocator: std.mem.Allocator, registry: *const PolicyRegistry, bus: *EventBus, data: []const u8) !ProcessResult {
+fn processJsonLogsWithFilter(
+    allocator: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    data: []const u8,
+) !ProcessResult {
     var parser: Parser = .init;
     defer parser.deinit(allocator);
 
@@ -430,7 +449,7 @@ test "datadogFieldAccessor - extra field lookup" {
     try std.testing.expect(log.extra.contains("trace_id"));
 
     // Test the accessor directly
-    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Test known field
     const message_val = logValue(&field_ctx, .{ .log_field = .LOG_FIELD_BODY });
@@ -457,7 +476,7 @@ test "datadogFieldAccessor - resource_attribute searches log attributes" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // resource_attribute should find known fields
     const svc_val = logValue(&field_ctx, .{ .resource_attribute = testAttrPath("service") });
@@ -484,7 +503,7 @@ test "datadogFieldAccessor - scope_attribute searches log attributes" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // scope_attribute should find known fields
     const host_val = logValue(&field_ctx, .{ .scope_attribute = testAttrPath("hostname") });
@@ -507,10 +526,10 @@ test "datadogFieldAccessor - nested extra field access via dotted key" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Two-segment path should be joined with '.' to match dotted key
-    const method_path = proto.policy.AttributePath{
+    const method_path: proto.policy.AttributePath = .{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }), .capacity = 2 },
     };
     const method_val = logValue(&field_ctx, .{ .log_attribute = method_path });
@@ -532,10 +551,10 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Path to non-existent dotted key
-    const missing_path = proto.policy.AttributePath{
+    const missing_path: proto.policy.AttributePath = .{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "nonexistent" }), .capacity = 2 },
     };
     const val = logValue(&field_ctx, .{ .log_attribute = missing_path });
@@ -556,16 +575,16 @@ test "datadogFieldAccessor - nested object fallback via path segments" {
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
-    const status_path = proto.policy.AttributePath{
+    const status_path: proto.policy.AttributePath = .{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "status_code" }), .capacity = 2 },
     };
     const status_val = logValue(&field_ctx, .{ .log_attribute = status_path });
     try std.testing.expect(status_val != null);
     try std.testing.expectEqualStrings("200", status_val.?);
 
-    const region_path = proto.policy.AttributePath{
+    const region_path: proto.policy.AttributePath = .{
         .path = .{ .items = @constCast(&[_][]const u8{ "http", "meta", "region" }), .capacity = 3 },
     };
     const region_val = logValue(&field_ctx, .{ .log_attribute = region_path });
@@ -587,10 +606,10 @@ test "datadogFieldAccessor - multi-segment path with no matching dotted key retu
     var log = try DatadogLog.parse(allocator, doc.asValue());
     defer log.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{ .log = &log, .allocator = allocator };
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Multi-segment path that doesn't match any dotted key
-    const bad_path = proto.policy.AttributePath{
+    const bad_path: proto.policy.AttributePath = .{
         .path = .{ .items = @constCast(&[_][]const u8{ "flat_field", "nested" }), .capacity = 2 },
     };
     const val = logValue(&field_ctx, .{ .log_attribute = bad_path });
@@ -620,7 +639,7 @@ test "processLogs - no policies keeps all logs in array" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -644,7 +663,7 @@ test "processLogs - DROP policy filters logs from array" {
     defer registry.deinit();
 
     // Create a DROP policy for DEBUG logs
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -675,7 +694,7 @@ test "processLogs - DROP policy filters logs from array" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -699,7 +718,7 @@ test "processLogs - DROP policy drops single object" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -730,7 +749,7 @@ test "processLogs - DROP policy drops single object" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -764,7 +783,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -797,7 +816,7 @@ test "processLogs - non-JSON content type returns unchanged" {
         &out_writer.writer,
         "text/plain",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -818,8 +837,9 @@ test "processLogs - Datadog format with ddtags and service" {
     defer registry.deinit();
 
     const logs =
-        \\[{"message": "User login", "service": "auth-service", "hostname": "web-01", "ddsource": "nodejs", "ddtags": "env:prod", "status": "info", "timestamp": 1733946000000}]
-    ;
+        "[{\"message\": \"User login\", \"service\": \"auth-service\", \"hostname\": \"web-01\", " ++
+        "\"ddsource\": \"nodejs\", \"ddtags\": \"env:prod\", \"status\": \"info\", " ++
+        "\"timestamp\": 1733946000000}]";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -832,7 +852,7 @@ test "processLogs - Datadog format with ddtags and service" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -855,7 +875,7 @@ test "processLogs - filter on arbitrary custom field" {
     defer registry.deinit();
 
     // Create a DROP policy that matches on a custom field "environment"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-dev-env"),
         .name = try allocator.dupe(u8, "drop-dev-env"),
         .enabled = true,
@@ -863,7 +883,7 @@ test "processLogs - filter on arbitrary custom field" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
-    var attr_path_env = proto.policy.AttributePath{};
+    var attr_path_env: proto.policy.AttributePath = .{};
     try attr_path_env.path.append(allocator, try allocator.dupe(u8, "environment"));
     try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = attr_path_env },
@@ -875,8 +895,8 @@ test "processLogs - filter on arbitrary custom field" {
 
     // Logs with custom "environment" field - one dev, one prod
     const logs =
-        \\[{"message": "dev log", "environment": "development", "custom_field": "abc"}, {"message": "prod log", "environment": "production", "custom_field": "xyz"}]
-    ;
+        "[{\"message\": \"dev log\", \"environment\": \"development\", \"custom_field\": \"abc\"}, " ++
+        "{\"message\": \"prod log\", \"environment\": \"production\", \"custom_field\": \"xyz\"}]";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -889,7 +909,7 @@ test "processLogs - filter on arbitrary custom field" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -917,8 +937,8 @@ test "processLogs - extra fields are preserved when no logs dropped" {
 
     // Logs with extra fields not in the DatadogLog schema
     const logs =
-        \\[{"status": "info", "message": "kept log", "extra_field": "should_be_preserved", "nested": {"key": "value"}, "array_field": [1, 2, 3]}]
-    ;
+        "[{\"status\": \"info\", \"message\": \"kept log\", \"extra_field\": \"should_be_preserved\", " ++
+        "\"nested\": {\"key\": \"value\"}, \"array_field\": [1, 2, 3]}]";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -931,7 +951,7 @@ test "processLogs - extra fields are preserved when no logs dropped" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -958,7 +978,7 @@ test "processLogs - nested extra fields are preserved when reserializing after d
     defer registry.deinit();
 
     // Drop DEBUG logs so remaining logs are reserialized.
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -992,7 +1012,7 @@ test "processLogs - nested extra fields are preserved when reserializing after d
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1019,15 +1039,15 @@ test "processLogs - nested extra transform is ignored and payload is unchanged" 
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var transform = proto.policy.LogTransform{};
-    var nested_attr_path = proto.policy.AttributePath{};
+    var transform: proto.policy.LogTransform = .{};
+    var nested_attr_path: proto.policy.AttributePath = .{};
     try nested_attr_path.path.append(allocator, try allocator.dupe(u8, "nested"));
     try nested_attr_path.path.append(allocator, try allocator.dupe(u8, "status_code"));
     try transform.remove.append(allocator, .{
         .field = .{ .log_attribute = nested_attr_path },
     });
 
-    var test_policy = proto.policy.Policy{
+    var test_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "remove-nested"),
         .name = try allocator.dupe(u8, "remove-nested"),
         .enabled = true,
@@ -1059,7 +1079,7 @@ test "processLogs - nested extra transform is ignored and payload is unchanged" 
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1083,14 +1103,14 @@ test "processLogs - mutation triggers reserialization and removes field" {
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes the 'service' field
-    var transform = proto.policy.LogTransform{};
-    var remove_attr_path = proto.policy.AttributePath{};
+    var transform: proto.policy.LogTransform = .{};
+    var remove_attr_path: proto.policy.AttributePath = .{};
     try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
     try transform.remove.append(allocator, .{
         .field = .{ .log_attribute = remove_attr_path },
     });
 
-    var test_policy = proto.policy.Policy{
+    var test_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "remove-service-policy"),
         .name = try allocator.dupe(u8, "remove-service"),
         .enabled = true,
@@ -1124,7 +1144,7 @@ test "processLogs - mutation triggers reserialization and removes field" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1156,7 +1176,7 @@ test "processLogs - filter on dynamic extra field not in schema" {
     defer registry.deinit();
 
     // Create a DROP policy that matches on a dynamic field "trace_id" (not in schema)
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-trace"),
         .name = try allocator.dupe(u8, "drop-trace-logs"),
         .enabled = true,
@@ -1164,7 +1184,7 @@ test "processLogs - filter on dynamic extra field not in schema" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
-    var attr_path_trace = proto.policy.AttributePath{};
+    var attr_path_trace: proto.policy.AttributePath = .{};
     try attr_path_trace.path.append(allocator, try allocator.dupe(u8, "trace_id"));
     try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = attr_path_trace },
@@ -1177,8 +1197,9 @@ test "processLogs - filter on dynamic extra field not in schema" {
     // Logs with dynamic "trace_id" field - one matches pattern, one doesn't
     // Using unique message strings to avoid substring matching issues
     const logs =
-        \\[{"message": "first-log-match", "trace_id": "abc123-def456"}, {"message": "second-log-nomatch", "trace_id": "xyz789-other"}, {"message": "third-log-notrace"}]
-    ;
+        "[{\"message\": \"first-log-match\", \"trace_id\": \"abc123-def456\"}, " ++
+        "{\"message\": \"second-log-nomatch\", \"trace_id\": \"xyz789-other\"}, " ++
+        "{\"message\": \"third-log-notrace\"}]";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1191,7 +1212,7 @@ test "processLogs - filter on dynamic extra field not in schema" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1220,7 +1241,7 @@ test "processLogs - filter on nested extra field with exists" {
     defer registry.deinit();
 
     // Create a DROP policy that drops logs where "debug_info" field exists
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug-info"),
         .name = try allocator.dupe(u8, "drop-debug-info-logs"),
         .enabled = true,
@@ -1228,7 +1249,7 @@ test "processLogs - filter on nested extra field with exists" {
             .keep = try allocator.dupe(u8, "none"),
         } },
     };
-    var attr_path_debug = proto.policy.AttributePath{};
+    var attr_path_debug: proto.policy.AttributePath = .{};
     try attr_path_debug.path.append(allocator, try allocator.dupe(u8, "debug_info"));
     try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .log_attribute = attr_path_debug },
@@ -1254,7 +1275,7 @@ test "processLogs - filter on nested extra field with exists" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,

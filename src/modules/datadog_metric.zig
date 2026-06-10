@@ -13,7 +13,7 @@ pub const MetricIntakeType = enum(i32) {
     rate = 2,
     gauge = 3,
 
-    pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: *const MetricIntakeType, jws: *std.json.Stringify) !void {
         try jws.write(@intFromEnum(self.*));
     }
 };
@@ -26,7 +26,7 @@ pub const MetricPoint = struct {
     value: ?f64 = null,
 
     pub fn parse(value: Value) !MetricPoint {
-        var point = MetricPoint{};
+        var point: MetricPoint = .{};
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -43,7 +43,7 @@ pub const MetricPoint = struct {
         return point;
     }
 
-    pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: *const MetricPoint, jws: *std.json.Stringify) !void {
         try jws.beginObject();
         if (self.timestamp) |v| {
             try jws.objectField("timestamp");
@@ -65,7 +65,7 @@ pub const MetricResource = struct {
     type: ?[]const u8 = null,
 
     pub fn parse(value: Value) !MetricResource {
-        var resource = MetricResource{};
+        var resource: MetricResource = .{};
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -82,7 +82,7 @@ pub const MetricResource = struct {
         return resource;
     }
 
-    pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: *const MetricResource, jws: *std.json.Stringify) !void {
         try jws.beginObject();
         if (self.name) |v| {
             try jws.objectField("name");
@@ -106,7 +106,7 @@ pub const MetricOrigin = struct {
     service: ?i32 = null,
 
     pub fn parse(value: Value) !MetricOrigin {
-        var origin = MetricOrigin{};
+        var origin: MetricOrigin = .{};
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -125,7 +125,7 @@ pub const MetricOrigin = struct {
         return origin;
     }
 
-    pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: *const MetricOrigin, jws: *std.json.Stringify) !void {
         try jws.beginObject();
         if (self.metric_type) |v| {
             try jws.objectField("metric_type");
@@ -149,7 +149,7 @@ pub const MetricMetadata = struct {
     origin: ?MetricOrigin = null,
 
     pub fn parse(value: Value) !MetricMetadata {
-        var metadata = MetricMetadata{};
+        var metadata: MetricMetadata = .{};
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -164,7 +164,7 @@ pub const MetricMetadata = struct {
         return metadata;
     }
 
-    pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: *const MetricMetadata, jws: *std.json.Stringify) !void {
         try jws.beginObject();
         if (self.origin) |v| {
             try jws.objectField("origin");
@@ -204,11 +204,12 @@ pub const MetricSeries = struct {
             allocator.free(key.*);
         }
         self.extra.deinit(allocator);
+        self.* = undefined;
     }
 
     /// Parse a MetricSeries from a zimdjson Value (object)
     pub fn parse(allocator: std.mem.Allocator, value: Value) !MetricSeries {
-        var series = MetricSeries{};
+        var series: MetricSeries = .{};
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -229,7 +230,7 @@ pub const MetricSeries = struct {
                 series.metadata = try MetricMetadata.parse(field.value);
             } else if (std.mem.eql(u8, key, "points")) {
                 var points_arr = try field.value.asArray();
-                var points_list: std.ArrayListUnmanaged(MetricPoint) = .empty;
+                var points_list: std.ArrayList(MetricPoint) = .empty;
                 var points_it = points_arr.iterator();
                 while (try points_it.next()) |point_val| {
                     try points_list.append(allocator, try MetricPoint.parse(point_val));
@@ -237,7 +238,7 @@ pub const MetricSeries = struct {
                 series.points = try points_list.toOwnedSlice(allocator);
             } else if (std.mem.eql(u8, key, "resources")) {
                 var res_arr = try field.value.asArray();
-                var res_list: std.ArrayListUnmanaged(MetricResource) = .empty;
+                var res_list: std.ArrayList(MetricResource) = .empty;
                 var res_it = res_arr.iterator();
                 while (try res_it.next()) |res_val| {
                     try res_list.append(allocator, try MetricResource.parse(res_val));
@@ -245,7 +246,7 @@ pub const MetricSeries = struct {
                 series.resources = try res_list.toOwnedSlice(allocator);
             } else if (std.mem.eql(u8, key, "tags")) {
                 var tags_arr = try field.value.asArray();
-                var tags_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                var tags_list: std.ArrayList([]const u8) = .empty;
                 var tags_it = tags_arr.iterator();
                 while (try tags_it.next()) |tag_val| {
                     try tags_list.append(allocator, try tag_val.asString());
@@ -262,7 +263,7 @@ pub const MetricSeries = struct {
     }
 
     /// Custom JSON serialization for known fields only
-    pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: *const MetricSeries, jws: *std.json.Stringify) !void {
         try jws.beginObject();
 
         if (self.metric) |v| {
@@ -363,7 +364,7 @@ pub const MetricPayload = struct {
 
     /// Parse a MetricPayload from a zimdjson Value (object)
     pub fn parse(allocator: std.mem.Allocator, value: Value) !MetricPayload {
-        var payload = MetricPayload{};
+        var payload: MetricPayload = .{};
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -372,7 +373,7 @@ pub const MetricPayload = struct {
 
             if (std.mem.eql(u8, key, "series")) {
                 var series_arr = try field.value.asArray();
-                var series_list: std.ArrayListUnmanaged(MetricSeries) = .empty;
+                var series_list: std.ArrayList(MetricSeries) = .empty;
                 var series_it = series_arr.iterator();
                 while (try series_it.next()) |series_val| {
                     try series_list.append(allocator, try MetricSeries.parse(allocator, series_val));
@@ -384,7 +385,7 @@ pub const MetricPayload = struct {
         return payload;
     }
 
-    pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: *const MetricPayload, jws: *std.json.Stringify) !void {
         try jws.beginObject();
         if (self.series) |s| {
             try jws.objectField("series");
@@ -449,7 +450,8 @@ test "MetricSeries - parse basic fields" {
     defer parser.deinit(allocator);
 
     const json =
-        \\{"metric": "system.load.1", "type": 3, "points": [{"timestamp": 1636629071, "value": 0.7}], "tags": ["env:prod", "service:web"]}
+        \\{"metric": "system.load.1", "type": 3, "points": [{"timestamp": 1636629071, "value": 0.7}],
+        \\ "tags": ["env:prod", "service:web"]}
     ;
 
     const doc = try parser.parseFromSlice(allocator, json);
@@ -560,12 +562,12 @@ test "MetricPayload - parse series array" {
 test "MetricSeries - jsonStringify basic" {
     const allocator = std.testing.allocator;
 
-    const pt = MetricPoint{
+    const pt: MetricPoint = .{
         .timestamp = 1636629071,
         .value = 0.7,
     };
 
-    const series = MetricSeries{
+    const series: MetricSeries = .{
         .metric = "system.load.1",
         .type = 3,
         .points = @constCast(&[_]MetricPoint{pt}),
@@ -589,18 +591,18 @@ test "MetricSeries - jsonStringify basic" {
 test "MetricPayload - jsonStringify" {
     const allocator = std.testing.allocator;
 
-    const pt = MetricPoint{
+    const pt: MetricPoint = .{
         .timestamp = 1636629071,
         .value = 0.7,
     };
 
-    const series1 = MetricSeries{
+    const series1: MetricSeries = .{
         .metric = "system.load.1",
         .type = 3,
         .points = @constCast(&[_]MetricPoint{pt}),
     };
 
-    const payload = MetricPayload{
+    const payload: MetricPayload = .{
         .series = @constCast(&[_]MetricSeries{series1}),
     };
 
@@ -618,7 +620,7 @@ test "MetricPayload - jsonStringify" {
 test "MetricSeries - empty fields not serialized" {
     const allocator = std.testing.allocator;
 
-    const series = MetricSeries{
+    const series: MetricSeries = .{
         .metric = "test",
     };
 
@@ -639,7 +641,7 @@ test "MetricSeries - empty fields not serialized" {
 }
 
 test "MetricSeries - field mutation remove metric name" {
-    var series = MetricSeries{
+    var series: MetricSeries = .{
         .metric = "system.load.1",
         .type = 3,
     };
@@ -653,7 +655,7 @@ test "MetricSeries - field mutation remove metric name" {
 test "MetricSeries - field mutation set tags" {
     const allocator = std.testing.allocator;
 
-    var series = MetricSeries{
+    var series: MetricSeries = .{
         .metric = "system.load.1",
     };
 

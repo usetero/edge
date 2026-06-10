@@ -105,7 +105,7 @@ pub const LabelIterator = struct {
         // Skip closing quote
         self.pos += 1;
 
-        return Label{ .name = name, .value = value };
+        return .{ .name = name, .value = value };
     }
 
     /// Reset iterator to beginning
@@ -404,10 +404,10 @@ fn isMetricNameChar(c: u8) bool {
 // =============================================================================
 
 test "parseLine - empty lines" {
-    try std.testing.expectEqual(ParsedLine{ .empty = {} }, parseLine(""));
-    try std.testing.expectEqual(ParsedLine{ .empty = {} }, parseLine("   "));
-    try std.testing.expectEqual(ParsedLine{ .empty = {} }, parseLine("\t"));
-    try std.testing.expectEqual(ParsedLine{ .empty = {} }, parseLine("  \t  "));
+    try std.testing.expectEqual(.{ .empty = {} }, parseLine(""));
+    try std.testing.expectEqual(.{ .empty = {} }, parseLine("   "));
+    try std.testing.expectEqual(.{ .empty = {} }, parseLine("\t"));
+    try std.testing.expectEqual(.{ .empty = {} }, parseLine("  \t  "));
 }
 
 test "parseLine - comment lines" {
@@ -656,17 +656,17 @@ test "parseLine - unicode in label values" {
 
 test "parseLine - malformed lines" {
     // Missing value
-    try std.testing.expectEqual(ParsedLine{ .parse_error = {} }, parseLine("metric_name"));
-    try std.testing.expectEqual(ParsedLine{ .parse_error = {} }, parseLine("metric_name{}"));
+    try std.testing.expectEqual(.{ .parse_error = {} }, parseLine("metric_name"));
+    try std.testing.expectEqual(.{ .parse_error = {} }, parseLine("metric_name{}"));
 
     // Unclosed brace
-    try std.testing.expectEqual(ParsedLine{ .parse_error = {} }, parseLine("metric{label=\"value\" 123"));
+    try std.testing.expectEqual(.{ .parse_error = {} }, parseLine("metric{label=\"value\" 123"));
 
     // Empty TYPE
-    try std.testing.expectEqual(ParsedLine{ .parse_error = {} }, parseLine("# TYPE"));
+    try std.testing.expectEqual(.{ .parse_error = {} }, parseLine("# TYPE"));
 
     // Empty HELP
-    try std.testing.expectEqual(ParsedLine{ .parse_error = {} }, parseLine("# HELP"));
+    try std.testing.expectEqual(.{ .parse_error = {} }, parseLine("# HELP"));
 }
 
 test "parseLine - metric names with colons" {

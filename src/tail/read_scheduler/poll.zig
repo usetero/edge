@@ -10,7 +10,9 @@ pub const Scheduler = struct {
         return .{ .io = io };
     }
 
-    pub fn deinit(_: *Scheduler) void {}
+    pub fn deinit(self: *Scheduler) void {
+        self.* = undefined;
+    }
 
     pub fn processBatch(
         self: *Scheduler,

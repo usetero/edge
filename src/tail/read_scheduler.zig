@@ -5,8 +5,9 @@ const types = @import("types.zig");
 const watch_mod = @import("watch.zig");
 
 const poll_mod = @import("read_scheduler/poll.zig");
+const uring_linux_mod = @import("read_scheduler/uring_linux.zig");
 const uring_mod = if (builtin.os.tag == .linux)
-    @import("read_scheduler/uring_linux.zig")
+    uring_linux_mod
 else
     struct {
         pub const Scheduler = void;
@@ -38,6 +39,7 @@ pub const EngineScheduler = union(SchedulerEngine) {
             .poll => |*s| s.deinit(),
             .uring => if (builtin.os.tag == .linux) self.uring.deinit(),
         }
+        self.* = undefined;
     }
 
     pub fn processBatch(
@@ -60,7 +62,7 @@ pub const EngineScheduler = union(SchedulerEngine) {
 
 const testing = std.testing;
 
-fn keepAll(_: *anyopaque, _: []const u8, _: @import("types.zig").LineMeta) !bool {
+fn keepAll(_: *anyopaque, _: []const u8, _: types.LineMeta) !bool {
     return true;
 }
 

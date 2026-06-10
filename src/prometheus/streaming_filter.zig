@@ -51,7 +51,7 @@ pub const FilterStats = struct {
 /// Streaming filter for Prometheus exposition format.
 /// Processes data line-by-line, forwarding to an output writer.
 /// Internal implementation - use PolicyStreamingFilter for public API.
-const StreamingPrometheusFilter = struct {
+pub const StreamingPrometheusFilter = struct {
     // Configuration
     max_input_bytes: usize,
     max_output_bytes: usize,
@@ -426,7 +426,12 @@ pub const PolicyStreamingFilter = struct {
     };
 
     /// Update stored metadata for a metric
-    fn updateMetadata(self: *PolicyStreamingFilter, metric_name: []const u8, help: ?HelpMetadata, type_meta: ?TypeMetadata) void {
+    fn updateMetadata(
+        self: *PolicyStreamingFilter,
+        metric_name: []const u8,
+        help: ?HelpMetadata,
+        type_meta: ?TypeMetadata,
+    ) void {
         // Check if this is a new metric (compare against stored name in buffer)
         if (!std.mem.eql(u8, self.current_metric_name, metric_name)) {
             // New metric - copy name to stable buffer and reset state
@@ -490,7 +495,7 @@ pub const PolicyStreamingFilter = struct {
     /// Evaluate whether to keep a metric sample based on policy
     fn shouldKeepMetric(self: *PolicyStreamingFilter, sample: Sample, line: []const u8) bool {
         // Build the field context with metadata from HELP/TYPE lines
-        var ctx = PrometheusFieldContext{
+        var ctx: PrometheusFieldContext = .{
             .parsed = .{ .sample = sample },
             .line_buffer = line,
             .labels_cache = null,
@@ -608,7 +613,7 @@ pub const FilteringWriter = struct {
             self.interface.end = 0;
         }
         // Finish the filter (processes any partial line)
-        return try self.filter.finish(self.inner);
+        return self.filter.finish(self.inner);
     }
 
     /// Get current stats without finishing
@@ -684,7 +689,7 @@ pub const FilteringWriter = struct {
 
 /// Helper function to create an AttributePath from a simple key for tests
 fn testMakeAttrPath(allocator: std.mem.Allocator, key: []const u8) !AttributePath {
-    var attr_path = AttributePath{};
+    var attr_path: AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, key));
     return attr_path;
 }
@@ -1685,7 +1690,7 @@ test "PolicyStreamingFilter - DROP policy filters metrics by name" {
     defer registry.deinit();
 
     // Create DROP policy for metrics starting with "debug_"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -1749,7 +1754,7 @@ test "PolicyStreamingFilter - DROP policy to keep only non-matching metrics" {
 
     // Create DROP policy for metrics NOT starting with "important_"
     // This achieves "keep only important_* metrics"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-non-important"),
         .name = try allocator.dupe(u8, "drop-non-important"),
         .enabled = true,
@@ -1807,7 +1812,7 @@ test "PolicyStreamingFilter - filter by label value" {
     defer registry.deinit();
 
     // Create DROP policy for metrics with env="debug" label
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug-env"),
         .name = try allocator.dupe(u8, "drop-debug-env"),
         .enabled = true,
@@ -1865,7 +1870,7 @@ test "PolicyStreamingFilter - metadata excluded when all samples dropped" {
     defer registry.deinit();
 
     // Create DROP policy for all debug_ metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -1927,7 +1932,7 @@ test "PolicyStreamingFilter - metadata included when some samples kept" {
     defer registry.deinit();
 
     // Create DROP policy for instance="debug" label
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug-instance"),
         .name = try allocator.dupe(u8, "drop-debug-instance"),
         .enabled = true,
@@ -1986,7 +1991,7 @@ test "PolicyStreamingFilter - histogram buckets filtered together" {
     defer registry.deinit();
 
     // Create DROP policy for debug histograms
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug-histogram"),
         .name = try allocator.dupe(u8, "drop-debug-histogram"),
         .enabled = true,
@@ -2056,7 +2061,7 @@ test "PolicyStreamingFilter - comments preserved regardless of policy" {
     defer registry.deinit();
 
     // Create DROP policy for all metrics starting with "metric_"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
@@ -2115,7 +2120,7 @@ test "PolicyStreamingFilter - empty lines preserved regardless of policy" {
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -2167,7 +2172,7 @@ test "PolicyStreamingFilter - stats track dropped vs kept correctly" {
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -2228,7 +2233,7 @@ test "PolicyStreamingFilter - max_input_bytes truncation with policy" {
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -2318,7 +2323,7 @@ test "FilteringWriter - basic streaming with reader.stream() pattern" {
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,

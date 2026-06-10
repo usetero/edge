@@ -35,11 +35,12 @@ pub const DatadogLog = struct {
             allocator.free(raw.*);
         }
         self.extra_raw_json.deinit(allocator);
+        self.* = undefined;
     }
 
     /// Parse a DatadogLog from a zimdjson Value (object)
     pub fn parse(allocator: std.mem.Allocator, value: Value) !DatadogLog {
-        var log = DatadogLog{};
+        var log: DatadogLog = .{};
         errdefer log.deinit(allocator);
 
         var obj = try value.asObject();
@@ -87,7 +88,7 @@ pub const DatadogLog = struct {
 
     /// Custom JSON serialization for known fields only.
     /// Note: Extra fields are serialized via AnyValue while parser data is alive.
-    pub fn jsonStringify(self: *const @This(), jws: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: *const DatadogLog, jws: *std.json.Stringify) !void {
         try jws.beginObject();
 
         if (self.message) |v| {
@@ -147,7 +148,11 @@ pub const DatadogLog = struct {
     }
 
     /// Look up a string extra field value by single or dotted multi-segment path.
-    pub fn findExtraString(self: *const DatadogLog, allocator: std.mem.Allocator, path: []const []const u8) ?[]const u8 {
+    pub fn findExtraString(
+        self: *const DatadogLog,
+        allocator: std.mem.Allocator,
+        path: []const []const u8,
+    ) ?[]const u8 {
         if (path.len == 0) return null;
 
         if (self.extra.get(path[0])) |value| {
@@ -181,7 +186,11 @@ pub const DatadogLog = struct {
         return null;
     }
 
-    fn findNestedStringInRaw(allocator: std.mem.Allocator, raw_json: []const u8, remaining: []const []const u8) ?[]const u8 {
+    fn findNestedStringInRaw(
+        allocator: std.mem.Allocator,
+        raw_json: []const u8,
+        remaining: []const []const u8,
+    ) ?[]const u8 {
         if (remaining.len == 0) return null;
 
         const Parsed = std.json.Parsed(std.json.Value);
@@ -208,7 +217,7 @@ pub const DatadogLog = struct {
             .options = .{},
         };
         try writeAnyValue(&jws, value);
-        return try out.toOwnedSlice();
+        return out.toOwnedSlice();
     }
 
     /// Write a zimdjson AnyValue to a JSON writer
@@ -274,8 +283,10 @@ test "DatadogLog - parse all known fields" {
     defer parser.deinit(allocator);
 
     const json =
-        \\{"message": "log body", "status": "error", "level": "ERROR", "service": "api", "hostname": "host1", "ddsource": "nginx", "ddtags": "env:prod", "timestamp": 1703001234, "environment": "production", "custom_field": "custom_value"}
-    ;
+        "{\"message\": \"log body\", \"status\": \"error\", \"level\": \"ERROR\", " ++
+        "\"service\": \"api\", \"hostname\": \"host1\", \"ddsource\": \"nginx\", " ++
+        "\"ddtags\": \"env:prod\", \"timestamp\": 1703001234, " ++
+        "\"environment\": \"production\", \"custom_field\": \"custom_value\"}";
 
     const doc = try parser.parseFromSlice(allocator, json);
     const log = try DatadogLog.parse(allocator, doc.asValue());
@@ -333,7 +344,7 @@ test "DatadogLog - parse empty object" {
 test "DatadogLog - jsonStringify basic fields" {
     const allocator = std.testing.allocator;
 
-    const log = DatadogLog{
+    const log: DatadogLog = .{
         .message = "test message",
         .status = "info",
         .service = "my-service",
@@ -359,7 +370,7 @@ test "DatadogLog - jsonStringify basic fields" {
 test "DatadogLog - jsonStringify all fields" {
     const allocator = std.testing.allocator;
 
-    const log = DatadogLog{
+    const log: DatadogLog = .{
         .message = "body",
         .status = "error",
         .level = "ERROR",
@@ -394,7 +405,7 @@ test "DatadogLog - jsonStringify all fields" {
 test "DatadogLog - jsonStringify empty log" {
     const allocator = std.testing.allocator;
 
-    const log = DatadogLog{};
+    const log: DatadogLog = .{};
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -407,7 +418,7 @@ test "DatadogLog - jsonStringify empty log" {
 test "DatadogLog - jsonStringify with timestamp" {
     const allocator = std.testing.allocator;
 
-    const log = DatadogLog{
+    const log: DatadogLog = .{
         .timestamp = 1703001234567,
     };
 
@@ -420,7 +431,7 @@ test "DatadogLog - jsonStringify with timestamp" {
 }
 
 test "DatadogLog - field mutation remove message" {
-    var log = DatadogLog{
+    var log: DatadogLog = .{
         .message = "test message",
         .status = "info",
     };
@@ -433,7 +444,7 @@ test "DatadogLog - field mutation remove message" {
 }
 
 test "DatadogLog - field mutation set message" {
-    var log = DatadogLog{
+    var log: DatadogLog = .{
         .message = "original",
     };
 
@@ -444,7 +455,7 @@ test "DatadogLog - field mutation set message" {
 }
 
 test "DatadogLog - field mutation remove all fields" {
-    var log = DatadogLog{
+    var log: DatadogLog = .{
         .message = "body",
         .status = "error",
         .level = "ERROR",
@@ -541,7 +552,7 @@ test "DatadogLog - parse mutate and reserialize" {
 test "DatadogLog - special characters in strings" {
     const allocator = std.testing.allocator;
 
-    const log_out = DatadogLog{
+    const log_out: DatadogLog = .{
         .message = "line1\nline2\ttab\"quote\\backslash",
         .service = "service-with-dash",
     };
@@ -565,7 +576,7 @@ test "DatadogLog - special characters in strings" {
 test "DatadogLog - unicode in strings" {
     const allocator = std.testing.allocator;
 
-    const log_out = DatadogLog{
+    const log_out: DatadogLog = .{
         .message = "Hello 世界 🌍",
         .service = "サービス",
     };

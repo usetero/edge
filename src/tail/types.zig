@@ -103,13 +103,13 @@ pub fn normalizeIoEngine(engine: IoEngine) IoEngine {
 const testing = std.testing;
 
 test "types public API: validateConfig rejects zero limits" {
-    var cfg = TailConfig{};
+    var cfg: TailConfig = .{};
     cfg.read_buf = 0;
     try testing.expectError(error.InvalidReadBuffer, validateConfig(cfg));
 }
 
 test "types public API: identity hash helpers are stable" {
-    const id = FileIdentity{ .dev = 42, .inode = 9, .fingerprint = 1234 };
+    const id: FileIdentity = .{ .dev = 42, .inode = 9, .fingerprint = 1234 };
     try testing.expect(identityHash(id) != 0);
     try testing.expect(inodeIdentityHash(id) != 0);
 }

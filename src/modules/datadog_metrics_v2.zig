@@ -1,5 +1,4 @@
 const std = @import("std");
-const zimdjson = @import("zimdjson");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const datadog_metric = @import("datadog_metric.zig");
@@ -8,9 +7,9 @@ const otlp_attr = @import("otlp_attributes.zig");
 const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;
 const FilterDecision = policy.FilterDecision;
-const MetricFieldRef = policy.MetricFieldRef;
+pub const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = @import("proto").policy.MetricField;
-const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
+const MAX_MATCHES_PER_SCAN = policy.max_matches_per_scan;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -92,7 +91,7 @@ fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try streamAll(reader, &out.writer);
-    return try out.toOwnedSlice();
+    return out.toOwnedSlice();
 }
 
 fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
@@ -176,7 +175,11 @@ pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
             _ => null,
         },
         // All attribute types search the same Datadog flat namespace
-        .datapoint_attribute, .resource_attribute, .scope_attribute => |attr_path| lookupMetricAttribute(series, field_ctx.tags_cache, attr_path.path.items),
+        .datapoint_attribute, .resource_attribute, .scope_attribute => |attr_path| lookupMetricAttribute(
+            series,
+            field_ctx.tags_cache,
+            attr_path.path.items,
+        ),
         .metric_type => getDatadogMetricTypeString(series),
         .aggregation_temporality => null,
     };
@@ -219,7 +222,7 @@ fn filterMetric(
     const tags_cache = buildTagsCache(allocator, series.tags) catch null;
     defer if (tags_cache) |tc| allocator.free(tc);
 
-    var field_ctx = FieldAccessorContext{
+    var field_ctx: FieldAccessorContext = .{
         .series = series,
         .tags_cache = tags_cache,
     };
@@ -277,6 +280,7 @@ const FilterState = struct {
 
     fn deinit(self: *FilterState) void {
         self.arena.deinit();
+        self.* = undefined;
     }
 };
 
@@ -314,7 +318,7 @@ fn buildResult(
     // Serialize kept metrics as a payload
     var out: std.Io.Writer.Allocating = .init(allocator);
 
-    const payload = MetricPayload{
+    const payload: MetricPayload = .{
         .series = state.kept.items,
     };
     try std.json.Stringify.value(payload, .{}, &out.writer);
@@ -414,7 +418,7 @@ test "datadogMetricFieldAccessor - extra field lookup" {
     const tags_cache = try buildTagsCache(allocator, series.tags);
     defer if (tags_cache) |tc| allocator.free(tc);
 
-    var field_ctx = FieldAccessorContext{
+    var field_ctx: FieldAccessorContext = .{
         .series = &series,
         .tags_cache = tags_cache,
     };
@@ -458,7 +462,7 @@ test "processMetrics - no policies keeps all metrics" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -481,7 +485,7 @@ test "processMetrics - DROP policy filters metrics by name" {
     defer registry.deinit();
 
     // Create a DROP policy for debug metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug-metrics"),
         .name = try allocator.dupe(u8, "drop-debug-metrics"),
         .enabled = true,
@@ -517,7 +521,7 @@ test "processMetrics - DROP policy filters metrics by name" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -542,7 +546,7 @@ test "processMetrics - returns 202-compatible response when all metrics dropped"
     defer registry.deinit();
 
     // Create a DROP policy that matches the test metric
-    var drop_all = proto.policy.Policy{
+    var drop_all: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
@@ -575,7 +579,7 @@ test "processMetrics - returns 202-compatible response when all metrics dropped"
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -608,7 +612,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -641,7 +645,7 @@ test "processMetrics - non-JSON content type returns unchanged" {
         &out_writer.writer,
         "text/plain",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -662,7 +666,7 @@ test "processMetrics - filter on tags" {
     defer registry.deinit();
 
     // Create a DROP policy that matches on tags containing "env:dev"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-dev-env"),
         .name = try allocator.dupe(u8, "drop-dev-env"),
         .enabled = true,
@@ -672,7 +676,7 @@ test "processMetrics - filter on tags" {
             },
         },
     };
-    var attr_path_tags = proto.policy.AttributePath{};
+    var attr_path_tags: proto.policy.AttributePath = .{};
     try attr_path_tags.path.append(allocator, try allocator.dupe(u8, "tags"));
     try drop_policy.target.?.metric.match.append(allocator, .{
         .field = .{ .datapoint_attribute = attr_path_tags },
@@ -684,8 +688,10 @@ test "processMetrics - filter on tags" {
 
     const metrics =
         \\{"series": [
-        \\  {"metric": "dev.metric", "type": 3, "points": [{"timestamp": 1, "value": 1.0}], "tags": ["env:dev", "service:test"]},
-        \\  {"metric": "prod.metric", "type": 3, "points": [{"timestamp": 1, "value": 1.0}], "tags": ["env:prod", "service:web"]}
+        \\  {"metric": "dev.metric", "type": 3, "points": [{"timestamp": 1, "value": 1.0}],
+        \\   "tags": ["env:dev", "service:test"]},
+        \\  {"metric": "prod.metric", "type": 3, "points": [{"timestamp": 1, "value": 1.0}],
+        \\   "tags": ["env:prod", "service:web"]}
         \\]}
     ;
 
@@ -700,7 +706,7 @@ test "processMetrics - filter on tags" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -726,7 +732,9 @@ test "processMetrics - preserves all fields when no metrics dropped" {
     // No policies - all metrics kept, original data returned unchanged
 
     const metrics =
-        \\{"series": [{"metric": "system.load.1", "type": 3, "interval": 60, "unit": "percent", "points": [{"timestamp": 1636629071, "value": 0.7}], "tags": ["env:prod"], "resources": [{"name": "host1", "type": "host"}]}]}
+        \\{"series": [{"metric": "system.load.1", "type": 3, "interval": 60, "unit": "percent",
+        \\ "points": [{"timestamp": 1636629071, "value": 0.7}], "tags": ["env:prod"],
+        \\ "resources": [{"name": "host1", "type": "host"}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -740,7 +748,7 @@ test "processMetrics - preserves all fields when no metrics dropped" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -768,7 +776,8 @@ test "processMetrics - extra fields are preserved when no metrics dropped" {
 
     // Metrics with extra fields not in the MetricSeries schema
     const metrics =
-        \\{"series": [{"metric": "test", "type": 3, "points": [], "extra_field": "should_be_preserved", "nested": {"key": "value"}}]}
+        \\{"series": [{"metric": "test", "type": 3, "points": [],
+        \\ "extra_field": "should_be_preserved", "nested": {"key": "value"}}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -782,7 +791,7 @@ test "processMetrics - extra fields are preserved when no metrics dropped" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -808,7 +817,7 @@ test "processMetrics - filter on metric type" {
     defer registry.deinit();
 
     // Create a DROP policy that matches on metric type "count"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-count-metrics"),
         .name = try allocator.dupe(u8, "drop-count-metrics"),
         .enabled = true,
@@ -844,7 +853,7 @@ test "processMetrics - filter on metric type" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -866,7 +875,8 @@ test "datadogMetricFieldAccessor - scope_attribute searches metric attributes" {
     defer parser.deinit(allocator);
 
     const json =
-        \\{"metric": "system.load.1", "type": 3, "tags": ["env:prod", "service:web"], "resources": [{"type": "host", "name": "web-01"}]}
+        \\{"metric": "system.load.1", "type": 3, "tags": ["env:prod", "service:web"],
+        \\ "resources": [{"type": "host", "name": "web-01"}]}
     ;
 
     const doc = try parser.parseFromSlice(allocator, json);
@@ -877,7 +887,7 @@ test "datadogMetricFieldAccessor - scope_attribute searches metric attributes" {
     const tags_cache = try buildTagsCache(allocator, series.tags);
     defer if (tags_cache) |tc| allocator.free(tc);
 
-    var field_ctx = FieldAccessorContext{
+    var field_ctx: FieldAccessorContext = .{
         .series = &series,
         .tags_cache = tags_cache,
     };
@@ -907,13 +917,13 @@ test "datadogMetricFieldAccessor - resource with nested path" {
     var series = try MetricSeries.parse(allocator, doc.asValue());
     defer allocator.free(series.resources.?);
 
-    var field_ctx = FieldAccessorContext{
+    var field_ctx: FieldAccessorContext = .{
         .series = &series,
         .tags_cache = null,
     };
 
     // Two-segment path ["host", "name"] should find resource type=host and return name
-    const nested_path = proto.policy.AttributePath{
+    const nested_path: proto.policy.AttributePath = .{
         .path = .{ .items = @constCast(&[_][]const u8{ "host", "name" }), .capacity = 2 },
     };
     const name_val = metricValue(&field_ctx, .{ .resource_attribute = nested_path });
@@ -921,7 +931,7 @@ test "datadogMetricFieldAccessor - resource with nested path" {
     try std.testing.expectEqualStrings("web-01", name_val.?);
 
     // Two-segment path ["host", "type"] should return the type
-    const type_path = proto.policy.AttributePath{
+    const type_path: proto.policy.AttributePath = .{
         .path = .{ .items = @constCast(&[_][]const u8{ "host", "type" }), .capacity = 2 },
     };
     const type_val = metricValue(&field_ctx, .{ .resource_attribute = type_path });
@@ -944,13 +954,13 @@ test "datadogMetricFieldAccessor - nested extra field via dotted key" {
     var series = try MetricSeries.parse(allocator, doc.asValue());
     defer series.deinit(allocator);
 
-    var field_ctx = FieldAccessorContext{
+    var field_ctx: FieldAccessorContext = .{
         .series = &series,
         .tags_cache = null,
     };
 
     // Two-segment path joined with '.' to match dotted key
-    const nested_path = proto.policy.AttributePath{
+    const nested_path: proto.policy.AttributePath = .{
         .path = .{ .items = @constCast(&[_][]const u8{ "custom_data", "region" }), .capacity = 2 },
     };
     const val = metricValue(&field_ctx, .{ .datapoint_attribute = nested_path });
@@ -978,7 +988,7 @@ test "buildTagsCache - returns null for null tags" {
 test "buildTagsCache - returns null for empty tags" {
     const allocator = std.testing.allocator;
 
-    var tags = [_][]const u8{};
+    var tags: [0][]const u8 = .{};
     const cache = try buildTagsCache(allocator, &tags);
     try std.testing.expect(cache == null);
 }

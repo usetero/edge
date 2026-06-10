@@ -219,13 +219,13 @@ fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8,
     var decompressed = try allocator.alloc(u8, decompressed_capacity);
     errdefer allocator.free(decompressed);
 
-    var in_buffer = c.ZSTD_inBuffer{
+    var in_buffer: c.ZSTD_inBuffer = .{
         .src = compressed.ptr,
         .size = compressed.len,
         .pos = 0,
     };
 
-    var out_buffer = c.ZSTD_outBuffer{
+    var out_buffer: c.ZSTD_outBuffer = .{
         .dst = decompressed.ptr,
         .size = decompressed_capacity,
         .pos = 0,
@@ -400,7 +400,12 @@ test "decompress actual gzip command output" {
 
     // This is a real gzip compressed "Hello World\n" for testing
     // Generated with: echo "Hello World" | gzip | xxd -i
-    const gzip_data = [_]u8{ 0x1f, 0x8b, 0x08, 0x00, 0xb4, 0x6a, 0x1f, 0x69, 0x00, 0x03, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x08, 0xcf, 0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00, 0xe3, 0xe5, 0x95, 0xb0, 0x0c, 0x00, 0x00, 0x00 };
+    const gzip_data = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0xb4, 0x6a, 0x1f, 0x69,
+        0x00, 0x03, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57,
+        0x08, 0xcf, 0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00,
+        0xe3, 0xe5, 0x95, 0xb0, 0x0c, 0x00, 0x00, 0x00,
+    };
 
     const decompressed = try decompressGzip(allocator, &gzip_data, 0);
     defer allocator.free(decompressed);

@@ -1,4 +1,3 @@
-const std = @import("std");
 const policy = @import("policy_zig");
 
 pub const ProviderConfig = policy.ProviderConfig;

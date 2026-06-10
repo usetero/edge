@@ -19,6 +19,8 @@ const policy = edge.policy;
 
 const ProxyConfig = config_types.ProxyConfig;
 
+const log = std.log.scoped(.app);
+
 const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 const StdLogAdapter = o11y.StdLogAdapter;
@@ -177,6 +179,7 @@ fn setShutdownState(
     const previous: ShutdownState = @enumFromInt(state.swap(@intFromEnum(next), .acq_rel));
     if (previous == next) return;
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ShutdownStateTransition{
         .from = stateName(previous),
         .to = stateName(next),
@@ -192,6 +195,7 @@ fn installSignalWaiter(
     shutdown_waiter: *std.atomic.Value(bool),
 ) anyerror!SignalWaiterHandle {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.warn(SignalHandlingNotSupported{ .platform = @tagName(builtin.os.tag) });
         return error.UnsupportedPlatform;
     }
@@ -227,6 +231,7 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
         const count = ctx.signal_count.fetchAdd(1, .acq_rel) + 1;
 
         if (count == 1) {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             ctx.bus.info(ShutdownSignalReceived{
                 .signal = signal_name,
                 .count = count,
@@ -242,6 +247,7 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
             continue;
         }
 
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.info(ShutdownForceExit{
             .signal = signal_name,
             .count = count,
@@ -278,7 +284,7 @@ fn handleSegfault(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr:
 fn installSegfaultHandler() void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
 
-    const segv_act = std.posix.Sigaction{
+    const segv_act: std.posix.Sigaction = .{
         .handler = .{ .sigaction = handleSegfault },
         .mask = std.posix.sigemptyset(),
         .flags = std.posix.SA.SIGINFO,
@@ -303,7 +309,9 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     _ = args.skip();
     const config_path = args.next() orelse distribution.defaultConfigPath();
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ServerStarting{});
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ConfigurationLoaded{ .path = config_path });
 
     const config = zonfig.load(ProxyConfig, allocator, io, .{
@@ -311,6 +319,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         .env_prefix = "TERO",
         .environ = init.environ_map,
     }) catch |err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.err(ConfigLoadError{ .err = @errorName(err) });
         return err;
     };
@@ -324,7 +333,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     const instance_id_copy = try allocator.dupe(u8, instance_id);
     defer allocator.free(instance_id_copy);
 
-    const service_metadata = policy.ServiceMetadata{
+    const service_metadata: policy.ServiceMetadata = .{
         .name = config.service.name,
         .namespace = config.service.namespace,
         .version = config.service.version,
@@ -340,14 +349,19 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         config.listen_address[3],
     });
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(UpstreamConfigured{ .url = config.upstream_url });
     if (config.logs_url) |logs_url| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.info(LogsUpstreamConfigured{ .url = logs_url });
     }
     if (config.metrics_url) |metrics_url| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.info(MetricsUpstreamConfigured{ .url = metrics_url });
     }
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ServiceConfigured{
         .namespace = service_metadata.namespace,
         .name = service_metadata.name,
@@ -372,19 +386,19 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
 
     const server_allocator = allocator;
 
-    var datadog_config = DatadogConfig{
+    var datadog_config: DatadogConfig = .{
         .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
 
-    var otlp_config = OtlpConfig{
+    var otlp_config: OtlpConfig = .{
         .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
     };
 
-    var prometheus_config = PrometheusConfig{
+    var prometheus_config: PrometheusConfig = .{
         .registry = &registry,
         .bus = bus,
         .metrics = &runtime_metrics,
@@ -395,14 +409,14 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     const logs_upstream = config.logs_url orelse config.upstream_url;
     const metrics_upstream = config.metrics_url orelse config.upstream_url;
 
-    var health_module = HealthModule{};
-    var datadog_logs_module = DatadogModule{};
-    var datadog_metrics_module = DatadogModule{};
-    var otlp_module = OtlpModule{};
-    var prometheus_module = PrometheusModule{};
-    var passthrough_module = PassthroughModule{};
+    var health_module: HealthModule = .{};
+    var datadog_logs_module: DatadogModule = .{};
+    var datadog_metrics_module: DatadogModule = .{};
+    var otlp_module: OtlpModule = .{};
+    var prometheus_module: PrometheusModule = .{};
+    var passthrough_module: PassthroughModule = .{};
 
-    var module_registrations = std.ArrayListUnmanaged(ModuleRegistration).empty;
+    var module_registrations = std.ArrayList(ModuleRegistration).empty;
     defer module_registrations.deinit(allocator);
 
     try module_registrations.append(allocator, .{
@@ -497,8 +511,10 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         else => return err,
     }
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ServerReady{});
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.info(ShutdownHint{ .pid = std.c.getpid() });
     }
 
@@ -509,10 +525,12 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
 
     if (signal_waiter) |waiter| {
         shutdown_waiter.store(true, .release);
-        std.posix.kill(std.c.getpid(), std.posix.SIG.USR1) catch {};
+        std.posix.kill(std.c.getpid(), std.posix.SIG.USR1) catch |err|
+            log.warn("failed to send shutdown signal: {}", .{err});
         waiter.thread.join();
         std.posix.sigprocmask(std.posix.SIG.SETMASK, &waiter.previous_mask, null);
     }
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ServerStopped{});
 }

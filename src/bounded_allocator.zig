@@ -48,6 +48,7 @@ pub const BoundedAllocator = struct {
     /// Free the pre-allocated memory region.
     pub fn deinit(self: *BoundedAllocator) void {
         std.heap.page_allocator.free(self.backing_memory);
+        self.* = undefined;
     }
 
     /// Reset the allocator, freeing all allocations.

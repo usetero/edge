@@ -55,6 +55,7 @@ pub const UpstreamTransport = struct {
         );
         const uri = try std.Uri.parse(upstream_uri_str);
 
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         self.ctx.bus.debug(UpstreamRequest{
             .method = @tagName(method),
             .url = upstream_uri_str,
@@ -68,6 +69,7 @@ pub const UpstreamTransport = struct {
             .extra_headers = headers,
             .headers = .{ .accept_encoding = .omit },
         }) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             self.ctx.bus.err(UpstreamConnectionError{
                 .err = @errorName(err),
                 .phase = "connect",
@@ -80,6 +82,7 @@ pub const UpstreamTransport = struct {
             upstream_req.transfer_encoding = .{ .content_length = prepared_body.len };
             var request_write_buffer: [8192]u8 = undefined;
             var request_body_writer = upstream_req.sendBodyUnflushed(&request_write_buffer) catch |err| {
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
                 self.ctx.bus.err(UpstreamConnectionError{
                     .err = @errorName(err),
                     .phase = "send_body",
@@ -95,6 +98,7 @@ pub const UpstreamTransport = struct {
                 &request_body_writer.writer,
                 prepared_body.len,
             ) catch |err| {
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
                 self.ctx.bus.err(UpstreamStreamError{
                     .err = @errorName(err),
                     .bytes_streamed = prepared_reader.seek,
@@ -115,6 +119,7 @@ pub const UpstreamTransport = struct {
             upstream_req.transfer_encoding = .{ .content_length = 0 };
             var empty_write_buffer: [64]u8 = undefined;
             var empty_body_writer = upstream_req.sendBodyUnflushed(&empty_write_buffer) catch |err| {
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
                 self.ctx.bus.err(UpstreamConnectionError{
                     .err = @errorName(err),
                     .phase = "send_body",
@@ -145,6 +150,7 @@ pub const UpstreamTransport = struct {
         const response_writer = res.writer();
 
         var response_filter = module.createResponseFilter(response_writer, req.arena) catch |err| blk: {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             self.ctx.bus.warn(ModuleError{ .err = @errorName(err) });
             break :blk null;
         };
@@ -196,7 +202,11 @@ pub fn buildHeadersArray(req: *httpz.Request, buffer: []std.http.Header) ![]std.
     return buffer[0..count];
 }
 
-pub fn streamReaderToWriter(reader: *std.Io.Reader, writer: *std.Io.Writer, max_bytes: usize) std.Io.Reader.StreamError!usize {
+pub fn streamReaderToWriter(
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    max_bytes: usize,
+) std.Io.Reader.StreamError!usize {
     var total_bytes: usize = 0;
     while (total_bytes < max_bytes) {
         const bytes = reader.stream(

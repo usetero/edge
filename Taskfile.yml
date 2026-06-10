@@ -94,11 +94,19 @@ tasks:
       - zig fmt --check src/
       - zig fmt --check build.zig
 
+  lint:zig:
+    desc: "Run ziglint on handwritten Zig sources (paths from .ziglint.zon)"
+    aliases: [lz]
+    dir: "{{.TASKFILE_DIR}}"
+    cmds:
+      - ziglint
+
   lint:
     desc: "Run linting checks"
     aliases: [l]
     cmds:
       - task: format:check
+      - task: lint:zig
       - echo "✅ Linting complete"
 
   clean:

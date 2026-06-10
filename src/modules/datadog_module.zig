@@ -139,8 +139,9 @@ pub const DatadogModule = struct {
         }
     }
 
-    pub fn deinit(_: *DatadogModule) void {
+    pub fn deinit(self: *DatadogModule) void {
         // Nothing to cleanup (stateless)
+        self.* = undefined;
     }
 };
 
@@ -226,9 +227,9 @@ test "DatadogModule processes POST requests to /api/v2/logs" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var dd_config: DatadogConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = DatadogModule{};
+    var module: DatadogModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -245,7 +246,7 @@ test "DatadogModule processes POST requests to /api/v2/logs" {
     });
 
     // Test with POST request and JSON body
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/api/v2/logs",
         .route_kind = .datadog_logs,
@@ -273,9 +274,9 @@ test "DatadogModule processes POST requests to /api/v2/series" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var dd_config: DatadogConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = DatadogModule{};
+    var module: DatadogModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -292,14 +293,15 @@ test "DatadogModule processes POST requests to /api/v2/series" {
     });
 
     // Test with POST request and JSON body for metrics
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/api/v2/series",
         .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body = "{\"series\": [{\"metric\": \"system.load.1\", \"type\": 3, \"points\": [{\"timestamp\": 1636629071, \"value\": 0.7}]}]}",
+        .body = "{\"series\": [{\"metric\": \"system.load.1\", \"type\": 3, " ++
+            "\"points\": [{\"timestamp\": 1636629071, \"value\": 0.7}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -320,9 +322,9 @@ test "DatadogModule ignores GET requests" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var dd_config: DatadogConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = DatadogModule{};
+    var module: DatadogModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -338,7 +340,7 @@ test "DatadogModule ignores GET requests" {
         .module_data = @ptrCast(&dd_config),
     });
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .GET,
         .path = "/api/v2/logs",
         .route_kind = .datadog_logs,
@@ -365,7 +367,7 @@ test "DatadogModule filters logs with DROP policy" {
     defer registry.deinit();
 
     // Create DROP policy for DEBUG logs
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -381,9 +383,9 @@ test "DatadogModule filters logs with DROP policy" {
 
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
-    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var dd_config: DatadogConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = DatadogModule{};
+    var module: DatadogModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -400,7 +402,7 @@ test "DatadogModule filters logs with DROP policy" {
     });
 
     // Request with one DEBUG and one ERROR log
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/api/v2/logs",
         .route_kind = .datadog_logs,
@@ -432,7 +434,7 @@ test "DatadogModule filters metrics with DROP policy" {
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug-metrics"),
         .name = try allocator.dupe(u8, "drop-debug-metrics"),
         .enabled = true,
@@ -450,9 +452,9 @@ test "DatadogModule filters metrics with DROP policy" {
 
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
-    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var dd_config: DatadogConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = DatadogModule{};
+    var module: DatadogModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -469,14 +471,16 @@ test "DatadogModule filters metrics with DROP policy" {
     });
 
     // Request with one debug and one system metric
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/api/v2/series",
         .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body = "{\"series\": [{\"metric\": \"debug.internal\", \"type\": 3, \"points\": [{\"timestamp\": 1, \"value\": 1.0}]}, {\"metric\": \"system.load.1\", \"type\": 3, \"points\": [{\"timestamp\": 1, \"value\": 0.7}]}]}",
+        .body = "{\"series\": [{\"metric\": \"debug.internal\", \"type\": 3, " ++
+            "\"points\": [{\"timestamp\": 1, \"value\": 1.0}]}, " ++
+            "{\"metric\": \"system.load.1\", \"type\": 3, \"points\": [{\"timestamp\": 1, \"value\": 0.7}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };
@@ -501,7 +505,7 @@ test "DatadogModule returns 202 when all logs dropped" {
     defer registry.deinit();
 
     // Create DROP policy that matches INFO logs (test data uses INFO)
-    var drop_all = proto.policy.Policy{
+    var drop_all: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
@@ -517,9 +521,9 @@ test "DatadogModule returns 202 when all logs dropped" {
 
     try registry.updatePolicies(&.{drop_all}, "file-provider", .file);
 
-    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var dd_config: DatadogConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = DatadogModule{};
+    var module: DatadogModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -535,7 +539,7 @@ test "DatadogModule returns 202 when all logs dropped" {
         .module_data = @ptrCast(&dd_config),
     });
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/api/v2/logs",
         .route_kind = .datadog_logs,
@@ -565,7 +569,7 @@ test "DatadogModule returns 202 when all metrics dropped" {
     defer registry.deinit();
 
     // Create DROP policy that matches the test metric
-    var drop_all = proto.policy.Policy{
+    var drop_all: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all-metrics"),
         .name = try allocator.dupe(u8, "drop-all-metrics"),
         .enabled = true,
@@ -583,9 +587,9 @@ test "DatadogModule returns 202 when all metrics dropped" {
 
     try registry.updatePolicies(&.{drop_all}, "file-provider", .file);
 
-    var dd_config = DatadogConfig{ .registry = &registry, .bus = noop_bus.eventBus() };
+    var dd_config: DatadogConfig = .{ .registry = &registry, .bus = noop_bus.eventBus() };
 
-    var module = DatadogModule{};
+    var module: DatadogModule = .{};
 
     try module.init(allocator, .{
         .id = @enumFromInt(0),
@@ -601,14 +605,15 @@ test "DatadogModule returns 202 when all metrics dropped" {
         .module_data = @ptrCast(&dd_config),
     });
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .POST,
         .path = "/api/v2/series",
         .route_kind = .datadog_metrics,
         .query = "",
         .upstream = undefined,
         .module_ctx = null,
-        .body = "{\"series\": [{\"metric\": \"system.load.1\", \"type\": 3, \"points\": [{\"timestamp\": 1, \"value\": 0.7}]}]}",
+        .body = "{\"series\": [{\"metric\": \"system.load.1\", \"type\": 3, " ++
+            "\"points\": [{\"timestamp\": 1, \"value\": 0.7}]}]}",
         .headers_ctx = null,
         .get_header_fn = null,
     };

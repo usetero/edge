@@ -9,6 +9,8 @@ const transport_mod = @import("../io/transport.zig");
 const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 
+const log = std.log.scoped(.proxy_server);
+
 const ModuleId = proxy_module.ModuleId;
 const ModuleConfig = proxy_module.ModuleConfig;
 const ModuleRequest = proxy_module.ModuleRequest;
@@ -88,7 +90,7 @@ pub const CompressionEncoding = enum {
 };
 
 /// Module entry in the registry
-const ModuleEntry = struct {
+pub const ModuleEntry = struct {
     id: ModuleId,
     instance: ProxyModule,
     route_kind: RouteKind,
@@ -112,6 +114,7 @@ const ModuleRegistry = struct {
             instance.deinit();
         }
         self.modules.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -182,13 +185,14 @@ const ServerContext = struct {
     /// Handle all requests directly - we do our own routing
     pub fn handle(self: *ServerContext, req: *httpz.Request, res: *httpz.Response) void {
         const start_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
-        var metric_ctx = RequestMetricContext{
+        var metric_ctx: RequestMetricContext = .{
             .known_path = classifyKnownPath(req.url.path, toHttpMethod(req.method)),
             .route_kind = .passthrough,
             .prefilter = .none,
         };
 
         // Start request span
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         var span = self.bus.started(.debug, RequestStarted{
             .method = @tagName(req.method),
             .path = req.url.path,
@@ -214,6 +218,7 @@ const ServerContext = struct {
         );
 
         // Complete span with response info
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         span.completed(RequestCompleted{
             .status = res.status,
             .response_bytes = response_bytes,
@@ -240,6 +245,7 @@ const ServerContext = struct {
             stack_trace_str = writer.buffered();
         }
 
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         self.bus.err(RequestError{
             .method = @tagName(req.method),
             .path = req.url.path,
@@ -286,7 +292,7 @@ pub const ProxyServer = struct {
         errdefer ctx.modules.deinit(allocator);
 
         // Build module configs for router
-        var module_configs = std.ArrayListUnmanaged(ModuleConfig).empty;
+        var module_configs = std.ArrayList(ModuleConfig).empty;
         defer module_configs.deinit(allocator);
 
         // Initialize modules
@@ -303,7 +309,7 @@ pub const ProxyServer = struct {
 
             const upstream_config = ctx.upstreams.getUpstreamConfig(module_id);
 
-            const module_config = ModuleConfig{
+            const module_config: ModuleConfig = .{
                 .id = module_id,
                 .routes = reg.routes,
                 .upstream = upstream_config,
@@ -362,9 +368,11 @@ pub const ProxyServer = struct {
         self.server.deinit();
         self.allocator.destroy(self.context);
         self.allocator.destroy(self.server);
+        self.* = undefined;
     }
 
     pub fn listen(self: *ProxyServer) !void {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         self.context.bus.info(ServerListening{
             .address = self.context.listen_address,
             .port = self.context.listen_port,
@@ -373,6 +381,7 @@ pub const ProxyServer = struct {
     }
 
     pub fn listenInNewThread(self: *ProxyServer) !std.Thread {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         self.context.bus.info(ServerListening{
             .address = self.context.listen_address,
             .port = self.context.listen_port,
@@ -381,7 +390,7 @@ pub const ProxyServer = struct {
     }
 
     fn formatAddress(allocator: std.mem.Allocator, addr: [4]u8) ![]const u8 {
-        return try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
+        return std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{
             addr[0],
             addr[1],
             addr[2],
@@ -443,7 +452,8 @@ fn classifyKnownPath(path: []const u8, method: HttpMethod) KnownPathLabel {
     if (method == .POST and std.mem.endsWith(u8, path, "/v1/logs")) return .v1_logs;
     if (method == .POST and std.mem.endsWith(u8, path, "/v1/metrics")) return .v1_metrics;
     if (method == .POST and std.mem.endsWith(u8, path, "/v1/traces")) return .v1_traces;
-    if (method == .GET and (std.mem.eql(u8, path, "/metrics") or std.mem.startsWith(u8, path, "/metrics/"))) return .metrics;
+    if (method == .GET and
+        (std.mem.eql(u8, path, "/metrics") or std.mem.startsWith(u8, path, "/metrics/"))) return .metrics;
     if (method == .GET and std.mem.eql(u8, path, "/_health")) return .health;
     if (method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) return .edge_metrics;
     return .other;
@@ -506,7 +516,7 @@ fn proxyHandler(
 
     const http_method = toHttpMethod(req.method);
 
-    const module_req = ModuleRequest{
+    const module_req: ModuleRequest = .{
         .method = http_method,
         .route_kind = plan.route_kind,
         .path = req.url.path,
@@ -553,7 +563,7 @@ fn proxyToUpstreamStreaming(
         .forwarded => {},
     }
 
-    const transport = UpstreamTransport{ .ctx = .{
+    const transport: UpstreamTransport = .{ .ctx = .{
         .upstreams = &ctx.upstreams,
         .bus = ctx.bus,
     } };
@@ -589,7 +599,7 @@ fn prepareOutboundFastPath(req: *httpz.Request) !PreparedOutbound {
         &request_reader.interface,
         &captured_writer.writer,
         std.math.maxInt(usize),
-    ) catch {};
+    ) catch |err| log.warn("fast-path request body stream copy failed: {}", .{err});
 
     const body = try captured_writer.toOwnedSlice();
     return .{
@@ -619,9 +629,14 @@ fn prepareOutboundBody(
             req.arena,
         ) catch |err| blk: {
             // Fail open: forward original body bytes if module stream processing fails.
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             ctx.bus.warn(ModuleError{ .err = @errorName(err) });
             ctx.metrics.recordRequestError(metric_ctx.known_path, .module);
-            _ = transport_mod.streamReaderToWriter(&request_reader.interface, &captured_writer.writer, std.math.maxInt(usize)) catch {};
+            _ = transport_mod.streamReaderToWriter(
+                &request_reader.interface,
+                &captured_writer.writer,
+                std.math.maxInt(usize),
+            ) catch |stream_err| log.warn("fail-open request body stream copy failed: {}", .{stream_err});
             break :blk ModuleStreamResult.forwarded();
         };
 
@@ -654,6 +669,7 @@ fn prepareOutboundBody(
         &discarding.writer,
         req.arena,
     ) catch |err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.warn(ModuleError{ .err = @errorName(err) });
         ctx.metrics.recordRequestError(metric_ctx.known_path, .module);
         return .{ .action = .forwarded, .has_body = false };

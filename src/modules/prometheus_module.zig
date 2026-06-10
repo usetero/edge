@@ -73,7 +73,7 @@ const PrometheusResponseFilter = struct {
     metadata_buffer: [2048]u8,
     writer_buffer: [8192]u8,
 
-    const Self = @This();
+    const Self = PrometheusResponseFilter;
 
     pub fn create(
         config: *const PrometheusConfig,
@@ -115,6 +115,7 @@ const PrometheusResponseFilter = struct {
         const stats = try self.filtering_writer.finish();
 
         // Log filter stats
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         self.bus.debug(PrometheusFilterStats{
             .bytes_processed = stats.bytes_processed,
             .bytes_forwarded = stats.bytes_forwarded,
@@ -135,7 +136,7 @@ const PrometheusResponseFilter = struct {
     }
 
     // ResponseFilter vtable implementation
-    const vtable = ResponseFilter.VTable{
+    const vtable: ResponseFilter.VTable = .{
         .getWriter = getWriterVtable,
         .finish = finishVtable,
         .destroy = destroyVtable,
@@ -206,7 +207,9 @@ pub const PrometheusModule = struct {
         return filter.asResponseFilter();
     }
 
-    pub fn deinit(_: *PrometheusModule) void {}
+    pub fn deinit(self: *PrometheusModule) void {
+        self.* = undefined;
+    }
 };
 
 pub const default_routes = [_]RoutePattern{
@@ -221,7 +224,7 @@ pub const default_routes = [_]RoutePattern{
 const testing = std.testing;
 
 test "PrometheusModule - processRequestStream forwards body" {
-    var module = PrometheusModule{};
+    var module: PrometheusModule = .{};
 
     try module.init(testing.allocator, .{
         .id = @enumFromInt(0),
@@ -238,7 +241,7 @@ test "PrometheusModule - processRequestStream forwards body" {
     });
     defer module.deinit();
 
-    const req = ModuleRequest{
+    const req: ModuleRequest = .{
         .method = .GET,
         .path = "/metrics",
         .query = "",
@@ -257,7 +260,7 @@ test "PrometheusModule - processRequestStream forwards body" {
 }
 
 test "PrometheusModule - createResponseFilter returns null without config" {
-    var module = PrometheusModule{};
+    var module: PrometheusModule = .{};
 
     try module.init(testing.allocator, .{
         .id = @enumFromInt(0),
@@ -289,14 +292,14 @@ test "PrometheusModule - createResponseFilter with config" {
     var registry = PolicyRegistry.init(testing.allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var config = PrometheusConfig{
+    var config: PrometheusConfig = .{
         .registry = &registry,
         .bus = noop_bus.eventBus(),
         .max_input_bytes_per_scrape = 1024 * 1024,
         .max_output_bytes_per_scrape = 1024 * 1024,
     };
 
-    var module = PrometheusModule{};
+    var module: PrometheusModule = .{};
 
     try module.init(testing.allocator, .{
         .id = @enumFromInt(0),
@@ -344,7 +347,7 @@ test "PrometheusModule - response filter with DROP policy" {
     defer registry.deinit();
 
     // Create DROP policy for debug metrics
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try testing.allocator.dupe(u8, "drop-debug"),
         .name = try testing.allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -362,14 +365,14 @@ test "PrometheusModule - response filter with DROP policy" {
 
     try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
 
-    var config = PrometheusConfig{
+    var config: PrometheusConfig = .{
         .registry = &registry,
         .bus = noop_bus.eventBus(),
         .max_input_bytes_per_scrape = 1024 * 1024,
         .max_output_bytes_per_scrape = 1024 * 1024,
     };
 
-    var module = PrometheusModule{};
+    var module: PrometheusModule = .{};
 
     try module.init(testing.allocator, .{
         .id = @enumFromInt(0),

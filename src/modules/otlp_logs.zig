@@ -15,10 +15,10 @@ const InstrumentationScope = proto.common.InstrumentationScope;
 const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;
 const FilterDecision = policy.FilterDecision;
-const FieldRef = policy.FieldRef;
+pub const FieldRef = policy.FieldRef;
 const LogAccessor = policy.LogAccessor;
 const LogField = proto.policy.LogField;
-const MAX_MATCHES_PER_SCAN = policy.MAX_MATCHES_PER_SCAN;
+const MAX_MATCHES_PER_SCAN = policy.max_matches_per_scan;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
@@ -148,7 +148,7 @@ fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try streamAll(reader, &out.writer);
-    return try out.toOwnedSlice();
+    return out.toOwnedSlice();
 }
 
 fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
@@ -194,7 +194,7 @@ fn stringFieldRef(log_ctx: *OtlpLogContext, lf: LogField) ?*[]const u8 {
 /// Attribute list backing a `FieldRef` attribute variant, or null when the
 /// resource/scope wrapper is absent on this record. `log_field` returns
 /// null — fixed fields are not stored as attributes.
-fn attributeList(log_ctx: *OtlpLogContext, field: FieldRef) ?*std.ArrayListUnmanaged(KeyValue) {
+fn attributeList(log_ctx: *OtlpLogContext, field: FieldRef) ?*std.ArrayList(KeyValue) {
     return switch (field) {
         .log_attribute => &log_ctx.log_record.attributes,
         .resource_attribute => if (log_ctx.resource_logs.resource) |*res| &res.attributes else null,
@@ -355,14 +355,20 @@ fn filterLogsInPlace(
             // Filter log records in place by shrinking the list
             var write_idx: usize = 0;
             for (scope_logs.log_records.items) |*log_record| {
-                var ctx = OtlpLogContext{
+                var ctx: OtlpLogContext = .{
                     .log_record = log_record,
                     .resource_logs = resource_logs,
                     .scope_logs = scope_logs,
                     .allocator = allocator,
                 };
 
-                const result = engine.evaluate(.log, &log_accessor, &ctx, &policy_id_buf, .{ .scratch = allocator, .io = bus.io });
+                const result = engine.evaluate(
+                    .log,
+                    &log_accessor,
+                    &ctx,
+                    &policy_id_buf,
+                    .{ .scratch = allocator, .io = bus.io },
+                );
 
                 if (result.was_transformed) {
                     was_transformed = true;
@@ -575,9 +581,12 @@ test "processLogs - parses and re-serializes JSON" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"logs-integration-test"}}]},"scopeLogs":[{"scope":{"name":"my-target","version":""},"logRecords":[{"observedTimeUnixNano":"1715753202587469939","severityNumber":9,"severityText":"INFO","body":{"stringValue":"hello from banana. My price is 2.99."},"traceId":"","spanId":""}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"va" ++
+        "lue\":{\"stringValue\":\"logs-integration-test\"}}]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"my-target\",\"version\":\"\"},\"logRecords\":[{\"observedTimeUnixNano" ++
+        "\":\"1715753202587469939\",\"severityNumber\":9,\"severityText\":\"INFO\",\"body" ++
+        "\":{\"stringValue\":\"hello from banana. My price is 2.99.\"},\"traceId\":\"\"," ++
+        "\"spanId\":\"\"}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -590,7 +599,7 @@ test "processLogs - parses and re-serializes JSON" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -624,7 +633,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -657,7 +666,7 @@ test "processLogs - unknown content type returns unchanged" {
         &out_writer.writer,
         "text/plain",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -690,7 +699,7 @@ test "processLogs - malformed protobuf returns unchanged (fail-open)" {
         &out_writer.writer,
         "application/x-protobuf",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -710,9 +719,10 @@ test "processLogs - no policies keeps all logs" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"severityText":"INFO","body":{"stringValue":"msg1"}},{"severityText":"DEBUG","body":{"stringValue":"msg2"}}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"severityText\":\"INFO\",\"body\":{\"string" ++
+        "Value\":\"msg1\"}},{\"severityText\":\"DEBUG\",\"body\":{\"stringValue\":\"msg2" ++
+        "\"}}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -725,7 +735,7 @@ test "processLogs - no policies keeps all logs" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -750,7 +760,7 @@ test "processLogs - DROP policy filters logs by severity" {
     defer registry.deinit();
 
     // Create a DROP policy for DEBUG logs
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-debug"),
         .name = try allocator.dupe(u8, "drop-debug"),
         .enabled = true,
@@ -766,9 +776,10 @@ test "processLogs - DROP policy filters logs by severity" {
 
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"severityText":"INFO","body":{"stringValue":"info msg"}},{"severityText":"DEBUG","body":{"stringValue":"debug msg"}}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"severityText\":\"INFO\",\"body\":{\"string" ++
+        "Value\":\"info msg\"}},{\"severityText\":\"DEBUG\",\"body\":{\"stringValue\":\"d" ++
+        "ebug msg\"}}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -781,7 +792,7 @@ test "processLogs - DROP policy filters logs by severity" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -806,7 +817,7 @@ test "processLogs - DROP policy filters logs by body content" {
     defer registry.deinit();
 
     // Create a DROP policy for logs containing "secret"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-secret"),
         .name = try allocator.dupe(u8, "drop-secret"),
         .enabled = true,
@@ -822,9 +833,10 @@ test "processLogs - DROP policy filters logs by body content" {
 
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"severityText":"INFO","body":{"stringValue":"normal message"}},{"severityText":"INFO","body":{"stringValue":"contains secret data"}}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"severityText\":\"INFO\",\"body\":{\"string" ++
+        "Value\":\"normal message\"}},{\"severityText\":\"INFO\",\"body\":{\"stringValue" ++
+        "\":\"contains secret data\"}}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -837,7 +849,7 @@ test "processLogs - DROP policy filters logs by body content" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -860,7 +872,7 @@ test "processLogs - DROP policy filters logs by resource attribute" {
     defer registry.deinit();
 
     // Create a DROP policy for logs from "test-service"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-test-service"),
         .name = try allocator.dupe(u8, "drop-test-service"),
         .enabled = true,
@@ -869,7 +881,7 @@ test "processLogs - DROP policy filters logs by resource attribute" {
         } },
     };
     // Create AttributePath with "service.name" as single path segment
-    var attr_path = proto.policy.AttributePath{};
+    var attr_path: proto.policy.AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
     try drop_policy.target.?.log.match.append(allocator, .{
         .field = .{ .resource_attribute = attr_path },
@@ -879,9 +891,13 @@ test "processLogs - DROP policy filters logs by resource attribute" {
 
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test-service"}}]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"severityText":"INFO","body":{"stringValue":"from test service"}}]}]},{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"prod-service"}}]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"severityText":"INFO","body":{"stringValue":"from prod service"}}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"va" ++
+        "lue\":{\"stringValue\":\"test-service\"}}]},\"scopeLogs\":[{\"scope\":{\"name\":" ++
+        "\"test\"},\"logRecords\":[{\"severityText\":\"INFO\",\"body\":{\"stringValue\":" ++
+        "\"from test service\"}}]}]},{\"resource\":{\"attributes\":[{\"key\":\"service.na" ++
+        "me\",\"value\":{\"stringValue\":\"prod-service\"}}]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"severityText\":\"INFO\",\"body\":{\"string" ++
+        "Value\":\"from prod service\"}}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -894,7 +910,7 @@ test "processLogs - DROP policy filters logs by resource attribute" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -917,17 +933,17 @@ test "logExists - empty body string treated as not present (spec)" {
     // string as a non-null view and reported exists=true.
     const allocator = std.testing.allocator;
 
-    const empty_body = proto.common.AnyValue{ .value = .{ .string_value = "" } };
-    const non_empty_body = proto.common.AnyValue{ .value = .{ .string_value = "x" } };
-    const int_body = proto.common.AnyValue{ .value = .{ .int_value = 42 } };
+    const empty_body: proto.common.AnyValue = .{ .value = .{ .string_value = "" } };
+    const non_empty_body: proto.common.AnyValue = .{ .value = .{ .string_value = "x" } };
+    const int_body: proto.common.AnyValue = .{ .value = .{ .int_value = 42 } };
 
-    var record_empty = proto.logs.LogRecord{ .body = empty_body };
-    var record_nonempty = proto.logs.LogRecord{ .body = non_empty_body };
-    var record_int = proto.logs.LogRecord{ .body = int_body };
-    var record_missing = proto.logs.LogRecord{};
-    var resource_logs = proto.logs.ResourceLogs{};
+    var record_empty: proto.logs.LogRecord = .{ .body = empty_body };
+    var record_nonempty: proto.logs.LogRecord = .{ .body = non_empty_body };
+    var record_int: proto.logs.LogRecord = .{ .body = int_body };
+    var record_missing: proto.logs.LogRecord = .{};
+    var resource_logs: proto.logs.ResourceLogs = .{};
     defer resource_logs.deinit(allocator);
-    var scope_logs = proto.logs.ScopeLogs{};
+    var scope_logs: proto.logs.ScopeLogs = .{};
     defer scope_logs.deinit(allocator);
 
     inline for (.{
@@ -936,7 +952,7 @@ test "logExists - empty body string treated as not present (spec)" {
         .{ &record_int, true },
         .{ &record_missing, false },
     }) |case| {
-        var ctx = OtlpLogContext{
+        var ctx: OtlpLogContext = .{
             .log_record = case[0],
             .resource_logs = &resource_logs,
             .scope_logs = &scope_logs,
@@ -956,7 +972,7 @@ test "processLogs - all logs dropped returns empty structure" {
     defer registry.deinit();
 
     // Create a DROP policy that matches all logs (using body pattern that matches both messages)
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
@@ -972,9 +988,10 @@ test "processLogs - all logs dropped returns empty structure" {
 
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"severityText":"INFO","body":{"stringValue":"msg1"}},{"severityText":"DEBUG","body":{"stringValue":"msg2"}}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"severityText\":\"INFO\",\"body\":{\"string" ++
+        "Value\":\"msg1\"}},{\"severityText\":\"DEBUG\",\"body\":{\"stringValue\":\"msg2" ++
+        "\"}}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -987,7 +1004,7 @@ test "processLogs - all logs dropped returns empty structure" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1011,19 +1028,19 @@ fn createTestProtobufLogs(allocator: std.mem.Allocator, messages: []const []cons
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var scope_logs = ScopeLogs{};
+    var scope_logs: ScopeLogs = .{};
     for (messages) |msg| {
-        const log_record = LogRecord{
+        const log_record: LogRecord = .{
             .severity_text = "INFO",
             .body = .{ .value = .{ .string_value = msg } },
         };
         try scope_logs.log_records.append(arena_alloc, log_record);
     }
 
-    var resource_logs = ResourceLogs{};
+    var resource_logs: ResourceLogs = .{};
     try resource_logs.scope_logs.append(arena_alloc, scope_logs);
 
-    var logs_data = LogsData{};
+    var logs_data: LogsData = .{};
     try logs_data.resource_logs.append(arena_alloc, resource_logs);
 
     // Encode to protobuf - use main allocator for output since we return it
@@ -1032,7 +1049,7 @@ fn createTestProtobufLogs(allocator: std.mem.Allocator, messages: []const []cons
 
     try logs_data.encode(&output_writer.writer, arena_alloc);
 
-    return try output_writer.toOwnedSlice();
+    return output_writer.toOwnedSlice();
 }
 
 test "processLogs - protobuf parses and re-serializes" {
@@ -1058,7 +1075,7 @@ test "processLogs - protobuf parses and re-serializes" {
         &out_writer.writer,
         "application/x-protobuf",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1081,7 +1098,7 @@ test "processLogs - protobuf DROP policy filters logs" {
     defer registry.deinit();
 
     // Create a DROP policy for logs containing "secret"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-secret"),
         .name = try allocator.dupe(u8, "drop-secret"),
         .enabled = true,
@@ -1112,7 +1129,7 @@ test "processLogs - protobuf DROP policy filters logs" {
         &out_writer.writer,
         "application/x-protobuf",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1149,7 +1166,7 @@ test "processLogs - protobuf all logs dropped" {
     defer registry.deinit();
 
     // Create a DROP policy that matches all logs
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-all"),
         .name = try allocator.dupe(u8, "drop-all"),
         .enabled = true,
@@ -1180,7 +1197,7 @@ test "processLogs - protobuf all logs dropped" {
         &out_writer.writer,
         "application/x-protobuf",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1210,12 +1227,12 @@ test "processLogs - JSON transform removes severity_text field" {
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes the severity_text field
-    var transform = proto.policy.LogTransform{};
+    var transform: proto.policy.LogTransform = .{};
     try transform.remove.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
     });
 
-    var test_policy = proto.policy.Policy{
+    var test_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "remove-severity-policy"),
         .name = try allocator.dupe(u8, "remove-severity"),
         .enabled = true,
@@ -1234,9 +1251,9 @@ test "processLogs - JSON transform removes severity_text field" {
     try registry.updatePolicies(&.{test_policy}, "test", .file);
 
     // Log with severityText that should be removed
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"severityText":"INFO","body":{"stringValue":"test message"}}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"severityText\":\"INFO\",\"body\":{\"string" ++
+        "Value\":\"test message\"}}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1249,7 +1266,7 @@ test "processLogs - JSON transform removes severity_text field" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1278,14 +1295,14 @@ test "processLogs - JSON transform removes log attribute" {
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes a log attribute
-    var transform = proto.policy.LogTransform{};
-    var remove_attr_path = proto.policy.AttributePath{};
+    var transform: proto.policy.LogTransform = .{};
+    var remove_attr_path: proto.policy.AttributePath = .{};
     try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "sensitive.data"));
     try transform.remove.append(allocator, .{
         .field = .{ .log_attribute = remove_attr_path },
     });
 
-    var test_policy = proto.policy.Policy{
+    var test_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "remove-attr-policy"),
         .name = try allocator.dupe(u8, "remove-attr"),
         .enabled = true,
@@ -1304,9 +1321,10 @@ test "processLogs - JSON transform removes log attribute" {
     try registry.updatePolicies(&.{test_policy}, "test", .file);
 
     // Log with a sensitive attribute that should be removed
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"body":{"stringValue":"test message"},"attributes":[{"key":"sensitive.data","value":{"stringValue":"secret123"}},{"key":"safe.data","value":{"stringValue":"public"}}]}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"body\":{\"stringValue\":\"test message\"}," ++
+        "\"attributes\":[{\"key\":\"sensitive.data\",\"value\":{\"stringValue\":\"secret1" ++
+        "23\"}},{\"key\":\"safe.data\",\"value\":{\"stringValue\":\"public\"}}]}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1319,7 +1337,7 @@ test "processLogs - JSON transform removes log attribute" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1349,7 +1367,7 @@ test "processLogs - DROP policy filters logs by event_name" {
     defer registry.deinit();
 
     // Create a DROP policy for logs with event_name matching "user.login"
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-login-events"),
         .name = try allocator.dupe(u8, "drop-login-events"),
         .enabled = true,
@@ -1366,9 +1384,10 @@ test "processLogs - DROP policy filters logs by event_name" {
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
     // Two logs: one with event_name "user.login" (should be dropped), one with "user.logout" (should be kept)
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"eventName":"user.login","body":{"stringValue":"login event"}},{"eventName":"user.logout","body":{"stringValue":"logout event"}}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"eventName\":\"user.login\",\"body\":{\"str" ++
+        "ingValue\":\"login event\"}},{\"eventName\":\"user.logout\",\"body\":{\"stringVa" ++
+        "lue\":\"logout event\"}}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1381,7 +1400,7 @@ test "processLogs - DROP policy filters logs by event_name" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1405,12 +1424,12 @@ test "processLogs - JSON transform removes event_name field" {
     defer registry.deinit();
 
     // Create a policy with keep=all and a transform that removes event_name
-    var transform = proto.policy.LogTransform{};
+    var transform: proto.policy.LogTransform = .{};
     try transform.remove.append(allocator, .{
         .field = .{ .log_field = .LOG_FIELD_EVENT_NAME },
     });
 
-    var transform_policy = proto.policy.Policy{
+    var transform_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "remove-event-name"),
         .name = try allocator.dupe(u8, "remove-event-name"),
         .enabled = true,
@@ -1428,9 +1447,9 @@ test "processLogs - JSON transform removes event_name field" {
 
     try registry.updatePolicies(&.{transform_policy}, "file-provider", .file);
 
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[{"eventName":"sensitive.event","body":{"stringValue":"test message"}}]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[{\"eventName\":\"sensitive.event\",\"body\":{" ++
+        "\"stringValue\":\"test message\"}}]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1443,7 +1462,7 @@ test "processLogs - JSON transform removes event_name field" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1467,7 +1486,7 @@ test "processLogs - JSON transform removes event_name field" {
 
 test "findNestedAttribute - single segment path" {
     // Test that single-segment paths work correctly
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var attrs: std.ArrayList(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1482,7 +1501,7 @@ test "findNestedAttribute - single segment path" {
 
 test "findNestedAttribute - two segment path through kvlist" {
     // Test path ["http", "method"] where http contains a kvlist
-    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var inner_attrs: std.ArrayList(KeyValue) = .empty;
     defer inner_attrs.deinit(std.testing.allocator);
 
     try inner_attrs.append(std.testing.allocator, .{
@@ -1494,7 +1513,7 @@ test "findNestedAttribute - two segment path through kvlist" {
         .value = .{ .value = .{ .string_value = "200" } },
     });
 
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var attrs: std.ArrayList(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1515,7 +1534,7 @@ test "findNestedAttribute - two segment path through kvlist" {
 
 test "findNestedAttribute - three segment deep path" {
     // Test path ["request", "headers", "content-type"]
-    var headers_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var headers_attrs: std.ArrayList(KeyValue) = .empty;
     defer headers_attrs.deinit(std.testing.allocator);
 
     try headers_attrs.append(std.testing.allocator, .{
@@ -1523,7 +1542,7 @@ test "findNestedAttribute - three segment deep path" {
         .value = .{ .value = .{ .string_value = "application/json" } },
     });
 
-    var request_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var request_attrs: std.ArrayList(KeyValue) = .empty;
     defer request_attrs.deinit(std.testing.allocator);
 
     try request_attrs.append(std.testing.allocator, .{
@@ -1531,7 +1550,7 @@ test "findNestedAttribute - three segment deep path" {
         .value = .{ .value = .{ .kvlist_value = .{ .values = headers_attrs } } },
     });
 
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var attrs: std.ArrayList(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1545,7 +1564,7 @@ test "findNestedAttribute - three segment deep path" {
 }
 
 test "findNestedAttribute - path segment not found" {
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var attrs: std.ArrayList(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1564,7 +1583,7 @@ test "findNestedAttribute - path segment not found" {
 
 test "findNestedAttribute - path longer than nesting depth" {
     // Path ["http", "method", "extra"] but http.method is a string, not kvlist
-    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var inner_attrs: std.ArrayList(KeyValue) = .empty;
     defer inner_attrs.deinit(std.testing.allocator);
 
     try inner_attrs.append(std.testing.allocator, .{
@@ -1572,7 +1591,7 @@ test "findNestedAttribute - path longer than nesting depth" {
         .value = .{ .value = .{ .string_value = "GET" } },
     });
 
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var attrs: std.ArrayList(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1587,7 +1606,7 @@ test "findNestedAttribute - path longer than nesting depth" {
 
 test "findNestedAttribute - intermediate segment is not kvlist" {
     // Path ["service", "name"] but service is a string, not a kvlist
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var attrs: std.ArrayList(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1601,7 +1620,7 @@ test "findNestedAttribute - intermediate segment is not kvlist" {
 }
 
 test "findNestedAttribute - empty path returns null" {
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var attrs: std.ArrayList(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1615,7 +1634,7 @@ test "findNestedAttribute - empty path returns null" {
 
 test "findNestedAttribute - intermediate segment missing" {
     // Path ["http", "request", "method"] but http only has "response"
-    var inner_attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var inner_attrs: std.ArrayList(KeyValue) = .empty;
     defer inner_attrs.deinit(std.testing.allocator);
 
     try inner_attrs.append(std.testing.allocator, .{
@@ -1623,7 +1642,7 @@ test "findNestedAttribute - intermediate segment missing" {
         .value = .{ .value = .{ .string_value = "ok" } },
     });
 
-    var attrs: std.ArrayListUnmanaged(KeyValue) = .empty;
+    var attrs: std.ArrayList(KeyValue) = .empty;
     defer attrs.deinit(std.testing.allocator);
 
     try attrs.append(std.testing.allocator, .{
@@ -1645,7 +1664,7 @@ test "processLogs - DROP policy with nested attribute path" {
     defer registry.deinit();
 
     // Create a DROP policy matching nested path http.method = GET
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-get-requests"),
         .name = try allocator.dupe(u8, "drop-get-requests"),
         .enabled = true,
@@ -1655,7 +1674,7 @@ test "processLogs - DROP policy with nested attribute path" {
     };
 
     // Create AttributePath with ["http", "method"]
-    var attr_path = proto.policy.AttributePath{};
+    var attr_path: proto.policy.AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "http"));
     try attr_path.path.append(allocator, try allocator.dupe(u8, "method"));
 
@@ -1669,12 +1688,18 @@ test "processLogs - DROP policy with nested attribute path" {
 
     // OTLP log with nested attribute: attributes containing http.method
     // The structure uses kvlist_value for nested objects
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[
-        \\{"body":{"stringValue":"GET request"},"attributes":[{"key":"http","value":{"kvlistValue":{"values":[{"key":"method","value":{"stringValue":"GET"}}]}}}]},
-        \\{"body":{"stringValue":"POST request"},"attributes":[{"key":"http","value":{"kvlistValue":{"values":[{"key":"method","value":{"stringValue":"POST"}}]}}}]}
-        \\]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[" ++
+        "\n" ++
+        "{\"body\":{\"stringValue\":\"GET request\"},\"attributes\":[{\"key\":\"http\",\"" ++
+        "value\":{\"kvlistValue\":{\"values\":[{\"key\":\"method\",\"value\":{\"stringVal" ++
+        "ue\":\"GET\"}}]}}}]}," ++
+        "\n" ++
+        "{\"body\":{\"stringValue\":\"POST request\"},\"attributes\":[{\"key\":\"http\"," ++
+        "\"value\":{\"kvlistValue\":{\"values\":[{\"key\":\"method\",\"value\":{\"stringV" ++
+        "alue\":\"POST\"}}]}}}]}" ++
+        "\n" ++
+        "]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1687,7 +1712,7 @@ test "processLogs - DROP policy with nested attribute path" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
@@ -1712,7 +1737,7 @@ test "processLogs - policy with misaligned nested path returns no match" {
 
     // Create a DROP policy matching nested path http.request.method
     // but the actual data only has http.method (one level less)
-    var drop_policy = proto.policy.Policy{
+    var drop_policy: proto.policy.Policy = .{
         .id = try allocator.dupe(u8, "drop-misaligned"),
         .name = try allocator.dupe(u8, "drop-misaligned"),
         .enabled = true,
@@ -1722,7 +1747,7 @@ test "processLogs - policy with misaligned nested path returns no match" {
     };
 
     // Create AttributePath with ["http", "request", "method"] - 3 levels deep
-    var attr_path = proto.policy.AttributePath{};
+    var attr_path: proto.policy.AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "http"));
     try attr_path.path.append(allocator, try allocator.dupe(u8, "request"));
     try attr_path.path.append(allocator, try allocator.dupe(u8, "method"));
@@ -1736,11 +1761,14 @@ test "processLogs - policy with misaligned nested path returns no match" {
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
     // OTLP log with only 2 levels: http.method (no "request" in between)
-    const logs =
-        \\{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"scope":{"name":"test"},"logRecords":[
-        \\{"body":{"stringValue":"GET request"},"attributes":[{"key":"http","value":{"kvlistValue":{"values":[{"key":"method","value":{"stringValue":"GET"}}]}}}]}
-        \\]}]}]}
-    ;
+    const logs = "{\"resourceLogs\":[{\"resource\":{\"attributes\":[]},\"scopeLogs\":[{\"scope\":{" ++
+        "\"name\":\"test\"},\"logRecords\":[" ++
+        "\n" ++
+        "{\"body\":{\"stringValue\":\"GET request\"},\"attributes\":[{\"key\":\"http\",\"" ++
+        "value\":{\"kvlistValue\":{\"values\":[{\"key\":\"method\",\"value\":{\"stringVal" ++
+        "ue\":\"GET\"}}]}}}]}" ++
+        "\n" ++
+        "]}]}]}";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1753,7 +1781,7 @@ test "processLogs - policy with misaligned nested path returns no match" {
         &out_writer.writer,
         "application/json",
     );
-    const result = ProcessResult{
+    const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
         .dropped_count = stream_result.dropped_count,
         .original_count = stream_result.original_count,
