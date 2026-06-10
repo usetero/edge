@@ -12,6 +12,13 @@ pub const policy = policy_zig;
 // Config modules (non-policy configuration)
 pub const config_types = @import("config/types.zig");
 
+// Core runtime substrate (0.16 rewrite, PLAN.md §5)
+pub const core_limits = @import("core/limits.zig");
+pub const core_io_select = @import("core/io_select.zig");
+pub const core_conn_slab = @import("core/conn_slab.zig");
+pub const core_arena_pool = @import("core/arena_pool.zig");
+pub const core_lifecycle = @import("core/lifecycle.zig");
+
 // Proxy modules
 pub const server = @import("proxy/server.zig");
 
@@ -72,6 +79,11 @@ test "basic add functionality" {
 // Import modules to include their tests
 test {
     _ = @import("config/types.zig");
+    _ = @import("core/limits.zig");
+    _ = @import("core/io_select.zig");
+    _ = @import("core/conn_slab.zig");
+    _ = @import("core/arena_pool.zig");
+    _ = @import("core/lifecycle.zig");
     _ = @import("modules/proxy_module.zig");
     _ = @import("proxy/compress.zig");
     _ = @import("proxy/router.zig");

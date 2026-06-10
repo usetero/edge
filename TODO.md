@@ -5,20 +5,20 @@ Every phase ends with: `zig build test` green, `task lint` green, all six distro
 builds green, test-parity diff clean (PLAN.md §0), one commit.
 
 ## Phase 0 — Baseline + scaffolding
-- [ ] 0.1 Verify toolchain: `zig version` is 0.16.x; `zig build test` green on HEAD
-- [ ] 0.2 Capture baseline: `.rewrite/tests-baseline.txt`, `.rewrite/test-counts-baseline.txt`, `.rewrite/test-run-baseline.txt`
-- [ ] 0.3 Create `.rewrite/zigdoc-notes.md` + `.rewrite/test-exceptions.md` (empty scaffolds)
-- [ ] 0.4 Create new dirs: `src/core`, `src/http`, `src/pipeline`, `src/signals/{datadog,otlp,prometheus}`, `src/service`
-- [ ] 0.5 Commit Phase 0
+- [x] 0.1 Verify toolchain: zig 0.16.0; baseline = 364/365 pass (1 known failure from USER's uncommitted otlp_metrics.zig edit — see .rewrite/test-run-baseline.txt; do not "fix")
+- [x] 0.2 Capture baseline: `.rewrite/tests-baseline.txt` (403 tests), `.rewrite/test-counts-baseline.txt`, `.rewrite/test-run-baseline.txt`
+- [x] 0.3 Create `.rewrite/zigdoc-notes.md` + `.rewrite/test-exceptions.md` (empty scaffolds)
+- [x] 0.4 Create new dirs: `src/core`, `src/http`, `src/pipeline`, `src/signals/{datadog,otlp,prometheus}`, `src/service`
+- [x] 0.5 Commit Phase 0 (ce7dcea). NOTE: PLAN.md is gitignored by repo convention — it lives untracked in the worktree; read it before resuming.
 
-## Phase 1 — src/core/
-- [ ] 1.1 `core/limits.zig` (all bounds + `Limits.fromConfig` + `steadyStateBytes` + budget test)
-- [ ] 1.2 `core/io_select.zig` (`IoBackend`, `IoRuntime`, env-driven selection)
-- [ ] 1.3 `core/conn_slab.zig` (SoA slab, ConnId+generation, free list, buffer slicing; tests: claim/release/ABA/exhaustion/single-allocation)
-- [ ] 1.4 `core/arena_pool.zig` (reset-retain pool; tests)
-- [ ] 1.5 `core/lifecycle.zig` (Io.Group + shutdown flag + sigwait integration; zigdoc Io.Group first)
-- [ ] 1.6 Register core tests in `src/root.zig` test block
-- [ ] 1.7 Phase 1 gate + commit
+## Phase 1 — src/core/  ✅ DONE
+- [x] 1.1 `core/limits.zig` (bounds + fromConfig + steadyStateBytes + locked budget test; TERO_MAX_CONNECTIONS env override)
+- [x] 1.2 `core/io_select.zig` (IoBackend enum incl. reserved evented/uring → error.IoBackendUnavailable; TERO_IO_BACKEND env; IoRuntime pins owned Threaded)
+- [x] 1.3 `core/conn_slab.zig` (MultiArrayList SoA; ConnId packs gen<<16|slot; ConnState machine asserted; 4 tests)
+- [x] 1.4 `core/arena_pool.zig` (reset .retain_capacity; reserve high-water warn)
+- [x] 1.5 `core/lifecycle.zig` (Io.Group + Io.Event; spawn = Group.concurrent ONLY — Group.async tasks may never run, see zigdoc-notes; sigwait wiring deferred to Phase 5 app.zig as planned)
+- [x] 1.6 Registered in src/root.zig test block (+ pub exports core_*)
+- [x] 1.7 Gate: 378/379 pass (the 1 fail is the pre-existing user-WIP otlp_metrics failure), lint green, 6 distros build. Committed.
 
 ## Phase 2 — src/pipeline/ (pure, no network)
 - [ ] 2.1 zigdoc pre-work: confirm std.Io.Reader/Writer vtable shape for custom reader/writer impls; note in `.rewrite/zigdoc-notes.md`
