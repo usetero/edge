@@ -389,8 +389,13 @@ fn processProtobufMetrics(
         return error.DataLooksLikeJson;
     }
 
-    // Use an arena for the protobuf decode/filter/encode cycle
-    var arena: std.heap.ArenaAllocator = .init(allocator);
+    // Use an arena for the protobuf decode/filter/encode cycle. Back it with the
+    // page allocator rather than the caller's allocator: the arena grows its
+    // nodes via resize, and some caller allocators (e.g. httpz's fixed-buffer
+    // fallback allocator) corrupt memory on the resize-then-free path. Keeping
+    // this transient scratch off the caller's allocator avoids that entirely;
+    // the caller is only touched by the single exact-size dupe at the end.
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
@@ -403,14 +408,14 @@ fn processProtobufMetrics(
     // Filter metrics in-place
     const counts = filterMetricsInPlace(&metrics_data, registry, bus);
 
-    // Re-serialize to protobuf - use main allocator for output since we return it
-    var output_writer = std.Io.Writer.Allocating.init(allocator);
-    errdefer output_writer.deinit();
+    // Re-serialize to protobuf into the arena (same reasoning as above).
+    var output_writer = std.Io.Writer.Allocating.init(arena_alloc);
+    // No deinit: the backing memory is owned by the arena.
 
     try metrics_data.encode(&output_writer.writer, arena_alloc);
 
-    // Transfer ownership of the written data to caller
-    const output = try output_writer.toOwnedSlice();
+    // Hand the caller a single exact-size allocation it owns.
+    const output = try allocator.dupe(u8, output_writer.written());
 
     return .{
         .data = output,
@@ -426,8 +431,13 @@ fn processProtobufMetricsStream(
     in_reader: *std.Io.Reader,
     out_writer: *std.Io.Writer,
 ) !StreamProcessResult {
-    const data = try readAll(allocator, in_reader);
-    defer allocator.free(data);
+    // Read the request body into a scratch arena backed by the page allocator,
+    // not the caller's allocator. readAll grows its buffer incrementally
+    // (resize), which is unsafe on some caller allocators (e.g. httpz's
+    // fixed-buffer fallback allocator). See processProtobufMetrics below.
+    var read_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer read_arena.deinit();
+    const data = try readAll(read_arena.allocator(), in_reader);
 
     const result = try processProtobufMetrics(allocator, registry, bus, data);
     defer allocator.free(result.data);
@@ -835,7 +845,7 @@ fn createTestProtobufMetrics(allocator: std.mem.Allocator, names: []const []cons
     return output_writer.toOwnedSlice();
 }
 
-const benchmark_metrics_pb = @embedFile("../../bench/scaling/payloads/otlp-metrics.pb");
+const benchmark_metrics_pb = @embedFile("otlp_metrics_benchmark_pb");
 
 fn createRepeatedBenchmarkMetricsPayload(allocator: std.mem.Allocator, repetitions: usize) ![]u8 {
     const payload = try allocator.alloc(u8, benchmark_metrics_pb.len * repetitions);

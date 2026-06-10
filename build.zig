@@ -153,6 +153,12 @@ pub fn build(b: *std.Build) void {
     mod_tests.root_module.linkSystemLibrary("zstd", .{});
     mod_tests.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
     mod_tests.root_module.addOptions("build_options", build_options);
+    // Benchmark fixture embedded by test-only code in src/modules/otlp_metrics.zig.
+    // It lives under bench/ (outside the src package), so @embedFile needs it wired
+    // in as a named module import rather than a relative path.
+    mod_tests.root_module.addAnonymousImport("otlp_metrics_benchmark_pb", .{
+        .root_source_file = b.path("bench/scaling/payloads/otlp-metrics.pb"),
+    });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
