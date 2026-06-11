@@ -22,3 +22,18 @@ Record every verified std API here with the zigdoc snippet that justifies it.
   Group.cancel is called" → connection tasks MUST use Group.concurrent;
   error.ConcurrencyUnavailable is a load-shed signal (503).
 - Per-task resources released when the task returns (long-lived groups OK).
+
+## Phase 2 findings
+- 0.16 std has BOTH flate.Compress and flate.Decompress (compression is back)
+  with .raw/.gzip/.zlib containers, plus zstd.Decompress. Only zstd ENCODE
+  needs libzstd (ZSTD_compressStream2 behind a custom Writer drain).
+- flate.Compress.init asserts inner writer buffer > 8 bytes; flate buffers
+  must be >= flate.max_window_len (64 KiB); zstd decode buffer >=
+  window_len + zstd.block_size_max (128 KiB); Options.window_len is u32.
+- Reader.stream returning 0 does NOT mean EOF (vtable contract); loop until
+  error.EndOfStream.
+- LATENT BUG found & fixed in compress_buffered.zig (NOT in old proxy copy):
+  decompressGzip only updated total_out on Z_BUF_ERROR; Z_OK with a full
+  output buffer (multi-block streams from any *streaming* gzip compressor)
+  rewound next_out to 0 and overwrote earlier output. Old tests never caught
+  it because one-shot-compressed fixtures decode in a single inflate call.

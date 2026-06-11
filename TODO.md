@@ -20,18 +20,18 @@ builds green, test-parity diff clean (PLAN.md §0), one commit.
 - [x] 1.6 Registered in src/root.zig test block (+ pub exports core_*)
 - [x] 1.7 Gate: 378/379 pass (the 1 fail is the pre-existing user-WIP otlp_metrics failure), lint green, 6 distros build. Committed.
 
-## Phase 2 — src/pipeline/ (pure, no network)
-- [ ] 2.1 zigdoc pre-work: confirm std.Io.Reader/Writer vtable shape for custom reader/writer impls; note in `.rewrite/zigdoc-notes.md`
-- [ ] 2.2 Port `proxy/compress.zig` → `pipeline/compress_buffered.zig` (tests verbatim; old file untouched until Phase 5)
-- [ ] 2.3 `pipeline/encoding.zig`: ContentEncoding enum + streaming GzipStream/ZstdStream decoders+encoders (C streaming APIs); round-trip tests vs compress_buffered
-- [ ] 2.4 `pipeline/framer.zig`: WireFormat enum + Framer union + RecordSink type
-- [ ] 2.5 `pipeline/frame_ndjson.zig` (SIMD scanner lifted from tail/framer.zig) + chunk-sweep tests
-- [ ] 2.6 `pipeline/frame_json_array.zig` (depth/string-state scanner) + chunk-sweep + malformed-fixture tests
-- [ ] 2.7 `pipeline/frame_protobuf.zig` (varint length-delimited top-level framing) + tests incl. otlp-metrics.pb fixture
-- [ ] 2.8 `pipeline/frame_prom_text.zig` (adapter over prometheus streaming_filter)
-- [ ] 2.9 `pipeline/pipeline.zig`: PipelineSpec, PipelineCtx, `run()` over fixed readers/writers; port `streamReaderToWriter` + pure transport tests; failure-semantics tests (PLAN §6.5)
-- [ ] 2.10 Register pipeline tests in root.zig
-- [ ] 2.11 Phase 2 gate + commit
+## Phase 2 — src/pipeline/ (pure, no network)  ✅ DONE
+- [x] 2.1 zigdoc: Reader vtable = stream(r,w,limit); Writer vtable = drain(w,data,splat); stream() returning 0 ≠ EOF. Findings in zigdoc-notes.md
+- [x] 2.2 Ported compress.zig → compress_buffered.zig. FIXED LATENT BUG in decompressGzip (total_out only updated on Z_BUF_ERROR → Z_OK-with-full-buffer overwrote output; triggered by multi-block streams from any streaming compressor). Old proxy copy untouched.
+- [x] 2.3 encoding.zig: 0.16 std has flate.Compress AND Decompress natively + zstd.Decompress — only zstd ENCODE uses libzstd (ZstdCompressor = custom Writer drain over ZSTD_compressStream2). Oracle-verified round trips at chunk 1/7/4096.
+- [x] 2.4 framer.zig: WireFormat enum + Framer union(WireFormat) with inline-else dispatch. Sinks are COMPTIME DUCK-TYPED (anytype, onRecord(bytes)!Decision) not vtables. Framers own all wire syntax; keep-all sink reproduces input.
+- [x] 2.5 frame_ndjson.zig: SIMD scanner; eval bound enforced even on the zero-copy fast path (deterministic vs chunk boundaries)
+- [x] 2.6 frame_json_array.zig: depth/string state machine; canonical re-emission; desync→verbatim
+- [x] 2.7 frame_protobuf.zig: incremental varint tag/len; non-LEN fields copy verbatim; byte-fidelity keep-all (synthetic fixtures; .pb fixture deferred — it's a module import not embeddable here)
+- [x] 2.8 prom_text = NdjsonFramer alias in Framer union (line framing identical; prometheus sink semantics live in signals/, Phase 4/5). No separate file needed.
+- [x] 2.9 pipeline.zig: PipelineSpec/Buffers/run() + streamReaderToWriter ported with test; §6.5 tests (bomb bound abort, corrupt-gzip ReadFailed)
+- [x] 2.10 Registered in root.zig (test block + pub exports)
+- [x] 2.11 Gate: 426/426 tests pass (user's otlp_metrics rework also landed → known failure gone), lint green, 6 distros build. Committed.
 
 ## Phase 3 — src/signals/ (ports, test-heaviest)
 - [ ] 3.1 `git mv src/modules/datadog_log.zig src/signals/datadog/log.zig` (+imports fix)
