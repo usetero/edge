@@ -329,7 +329,10 @@ fn execForwardRaw(
     fwd: service_mod.Forward,
 ) !void {
     const arena = ctx.arenas.allocator(arena_slot);
-    var upstream_req = try openUpstream(ctx, request, arena, fwd.upstream);
+    var upstream_req = openUpstream(ctx, request, arena, fwd.upstream) catch {
+        try request.respond("", .{ .status = .bad_gateway });
+        return;
+    };
     defer upstream_req.deinit();
 
     const head = request.head;
@@ -365,7 +368,10 @@ fn execPipeStream(
     pipe: service_mod.PipeStream,
 ) !void {
     const arena = ctx.arenas.allocator(arena_slot);
-    var upstream_req = try openUpstream(ctx, request, arena, pipe.upstream);
+    var upstream_req = openUpstream(ctx, request, arena, pipe.upstream) catch {
+        try request.respond("", .{ .status = .bad_gateway });
+        return;
+    };
     defer upstream_req.deinit();
 
     const body_reader = try request.readerExpectContinue(ctx.slab.bodyBuf(conn_id));
@@ -438,7 +444,10 @@ fn execPipeBuffered(
         return;
     }
 
-    var upstream_req = try openUpstream(ctx, request, arena, pipe.upstream);
+    var upstream_req = openUpstream(ctx, request, arena, pipe.upstream) catch {
+        try request.respond("", .{ .status = .bad_gateway });
+        return;
+    };
     defer upstream_req.deinit();
     upstream_req.transfer_encoding = .{ .content_length = processed.body.len };
     var body_writer = try upstream_req.sendBodyUnflushed(ctx.slab.upstreamBuf(conn_id));
@@ -522,7 +531,10 @@ fn execFetchFiltered(
     fetch: service_mod.FetchFiltered,
 ) !void {
     const arena = ctx.arenas.allocator(arena_slot);
-    var upstream_req = try openUpstream(ctx, request, arena, fetch.upstream);
+    var upstream_req = openUpstream(ctx, request, arena, fetch.upstream) catch {
+        try request.respond("", .{ .status = .bad_gateway });
+        return;
+    };
     defer upstream_req.deinit();
     try upstream_req.sendBodiless();
 

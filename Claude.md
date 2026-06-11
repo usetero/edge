@@ -285,6 +285,13 @@ Remember: **Optimize for data locality first, algorithmic complexity second.**
 ---
 # Zig 0.15.x std.io Breaking Changes Reference
 
+> **HISTORICAL (2026-06):** the codebase is now fully Zig 0.16-native — std.Io
+> is an injected interface (io parameter everywhere), the HTTP data plane rides
+> std.Io.net + std.http.Server with structured cancellation (Io.Group), and
+> request bodies stream through src/pipeline/. The notes below describe the
+> 0.14→0.15 migration era and are kept for context only; verify any API against
+> zigdoc before relying on it.
+
 **Zig 0.15.x introduced "Writergate"—a complete redesign of std.io Reader and Writer interfaces that fundamentally changes how I/O operations work.** The new interfaces replace generic `anytype`-based APIs with concrete types that integrate buffering directly into the interface itself. This change delivers 45-49% performance improvements but requires explicit buffer management and manual flushing. All existing code using std.io readers and writers will break and must be migrated.
 
 ## Why this matters for Tero Edge

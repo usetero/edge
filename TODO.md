@@ -68,14 +68,14 @@ builds green, test-parity diff clean (PLAN.md §0), one commit.
 - [x] 5.13 Budget emitted as DataPlaneBudget bus event; slab buffers via page_allocator; ReleaseFast RSS = 4.5 MiB idle / 6.2 MiB under traffic (438 MiB is virtual reservation; Debug RSS inflated by 0xaa memset)
 - [x] 5.14 Phase 5 COMPLETE: 416/416 tests, lint green, 6 distros httpz-free, smoke green. Exceptions table finalized.
 
-## Phase 6 — Tail convergence
+## Phase 6 — Tail convergence  (DEFERRED by user — resume here)
 - [ ] 6.1 uring scheduler takes `io` in init; tail framer retires in favor of pipeline/frame_ndjson
 - [ ] 6.2 Checkpoint Lane worker → io.concurrent task in Lifecycle.group
 - [ ] 6.3 Tail smoke test (grow file + policy + SIGTERM)
 - [ ] 6.4 Phase 6 gate + commit
 
-## Phase 7 — Cleanup
-- [ ] 7.1 Remove httpz from build.zig + build.zig.zon (verify nothing imports)
-- [ ] 7.2 Bench comparison vs baseline → `.rewrite/bench-results.md`
-- [ ] 7.3 Claude.md note (0.16-native pointer)
-- [ ] 7.4 Verify `-old` referenced nowhere; final full gate; commit
+## Phase 7 — Cleanup  ✅ DONE (run before Phase 6 at user request)
+- [x] 7.1 httpz removed from build.zig.zon (build.zig + sources were already clean); supersedes the user's WIP hash bump. zig-pkg/httpz-* vendor dirs left in place (prune whenever).
+- [x] 7.2 Bench vs old stack (worktree @ dba3aaf, same old-echo upstream, user's exact oha scenario): NEW +24% throughput (66.2k vs 53.6k rps), p99 4.6x tighter (2.7ms vs 12.5ms), 100%/100% success. Three production fixes found via the user's failing c=150 run: 502 on upstream-open failure (was silent close → reconnect storm), kernel_backlog 128→1024 (edge + echo), std.http.Client pool free_size 32→max_connections (root cause: ephemeral port exhaustion / AddressUnavailable). Full write-up in .rewrite/bench-results.md.
+- [x] 7.3 Claude.md: 0.15 reference section marked HISTORICAL with 0.16-native pointer
+- [x] 7.4 -old dirs verified unreferenced (kept on disk per original instruction); final gate 416/416 + lint + 7 binaries. Committed.

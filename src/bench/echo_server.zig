@@ -340,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
     }, null);
 
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-    var listener = try address.listen(init.io, .{ .reuse_address = true });
+    var listener = try address.listen(init.io, .{ .reuse_address = true, .kernel_backlog = 1024 });
     defer listener.deinit(init.io);
 
     std.debug.print("Echo server listening on http://127.0.0.1:{d}\n", .{port});

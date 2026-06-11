@@ -26,6 +26,10 @@ pub const HttpServer = struct {
         const address = try std.Io.net.IpAddress.parse(addr_str, listen_port);
         const listener = try address.listen(ctx.io, .{
             .reuse_address = true,
+            // Default 128 overflows instantly when a load spike (or error
+            // storm) makes many clients redial at once; connection refused
+            // at the kernel turns one failure into a reconnect avalanche.
+            .kernel_backlog = 1024,
         });
         return .{
             .listener = listener,

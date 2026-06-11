@@ -258,7 +258,7 @@ pub const Engine = struct {
         self.arenas = try .init(allocator, self.limits);
         errdefer self.arenas.deinit(allocator);
 
-        self.upstreams = upstream_mod.UpstreamManager.init(io, allocator);
+        self.upstreams = upstream_mod.UpstreamManager.init(io, allocator, self.limits.max_connections);
         errdefer self.upstreams.deinit();
         const max_body = options.max_body_size;
         const upstream_ids: conn_mod.UpstreamIds = .{
