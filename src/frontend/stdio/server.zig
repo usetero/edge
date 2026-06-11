@@ -62,6 +62,14 @@ pub const HttpServer = struct {
         self.* = undefined;
     }
 
+    /// No-op: Lifecycle cancellation already unblocks the accept loop
+    /// (accept() returns error.Canceled). Part of the frontend interface
+    /// shape shared with the httpz frontend, whose listen loop is NOT
+    /// Io-cancelable and needs this hook.
+    pub fn stopAccepting(self: *HttpServer) void {
+        _ = self;
+    }
+
     /// The accept loop; itself spawned into the lifecycle group, so
     /// cancellation lands here as error.Canceled out of accept().
     pub fn run(self: *HttpServer) std.Io.Cancelable!void {

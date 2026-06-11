@@ -1,14 +1,24 @@
 const std = @import("std");
 
+pub const Frontend = enum { stdio, httpz };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
     const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
+    // Interim default is stdio; Phase D of PLAN-FRONTEND-SWAP.md flips it to
+    // httpz once the bench gates pass. CI must build both.
+    const frontend = b.option(
+        Frontend,
+        "frontend",
+        "Inbound HTTP frontend (stdio = std.Io-native, httpz = event loop + worker pool)",
+    ) orelse .stdio;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "commit", commit);
+    build_options.addOption(Frontend, "frontend", frontend);
 
     // ==========================================================================
     // Dependencies
@@ -26,6 +36,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const httpz_dep = b.dependency("httpz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const httpz_mod = httpz_dep.module("httpz");
 
     // Shared modules from policy-zig ensure type identity across boundaries.
     const proto_mod = policy_dep.module("proto");
@@ -44,6 +59,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "policy_zig", .module = policy_dep.module("policy_zig") },
             .{ .name = "o11y", .module = o11y_mod },
             .{ .name = "metrics_zig", .module = metrics_dep.module("metrics") },
+            .{ .name = "httpz", .module = httpz_mod },
         },
     });
     mod.addOptions("build_options", build_options);
@@ -68,6 +84,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
     exe.root_module.addImport("o11y", o11y_mod);
     exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
+    exe.root_module.addImport("httpz", httpz_mod);
     exe.root_module.addOptions("build_options", build_options);
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("z", .{});
@@ -106,6 +123,7 @@ pub fn build(b: *std.Build) void {
         dist_exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
         dist_exe.root_module.addImport("o11y", o11y_mod);
         dist_exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
+        dist_exe.root_module.addImport("httpz", httpz_mod);
         dist_exe.root_module.addOptions("build_options", build_options);
         dist_exe.root_module.link_libc = true;
         dist_exe.root_module.linkSystemLibrary("z", .{});

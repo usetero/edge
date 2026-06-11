@@ -29,8 +29,10 @@ pub const pipeline_compress_buffered = @import("pipeline/compress_buffered.zig")
 // transport-neutral outcome executor shared by every frontend.
 pub const frontend_exec = @import("frontend/exec.zig");
 pub const frontend_upstream = @import("frontend/upstream.zig");
+pub const frontend_select = @import("frontend/select.zig");
 pub const frontend_stdio_server = @import("frontend/stdio/server.zig");
 pub const frontend_stdio_conn = @import("frontend/stdio/conn.zig");
+pub const frontend_httpz_server = @import("frontend/httpz/server.zig");
 pub const service_router = @import("service/router.zig");
 
 // Services + distro composition (PLAN.md §8)
@@ -104,6 +106,10 @@ test {
     _ = @import("frontend/upstream.zig");
     _ = @import("frontend/exec.zig");
     _ = @import("frontend/stdio/conn.zig");
+    // Both frontends compile in every test build regardless of -Dfrontend,
+    // so the unselected one can't rot (PLAN-FRONTEND-SWAP.md §6).
+    _ = @import("frontend/stdio/server.zig");
+    _ = @import("frontend/httpz/server.zig");
     _ = @import("runtime/distro.zig");
     _ = @import("signals/prometheus/root.zig");
     _ = @import("lambda/root.zig");

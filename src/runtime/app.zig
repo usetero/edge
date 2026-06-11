@@ -21,7 +21,7 @@ const service_mod = @import("../service/service.zig");
 const router_mod = @import("../service/router.zig");
 const upstream_mod = @import("../frontend/upstream.zig");
 const exec_mod = @import("../frontend/exec.zig");
-const http_server_mod = @import("../frontend/stdio/server.zig");
+const frontend_select = @import("../frontend/select.zig");
 
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
@@ -230,7 +230,7 @@ pub const Engine = struct {
     router: router_mod.Router,
     lifecycle: lifecycle_mod.Lifecycle,
     shared_ctx: exec_mod.SharedCtx,
-    server: http_server_mod.HttpServer,
+    server: frontend_select.Server,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -310,7 +310,7 @@ pub const Engine = struct {
 
     /// Spawns the accept loop. Pair with `stop` then `destroy`.
     pub fn start(self: *Engine) !void {
-        try self.lifecycle.spawn(self.io, http_server_mod.HttpServer.run, .{&self.server});
+        try self.lifecycle.spawn(self.io, frontend_select.Server.run, .{&self.server});
     }
 
     pub fn requestShutdown(self: *Engine) void {
@@ -326,7 +326,10 @@ pub const Engine = struct {
     }
 
     /// Cancels the accept loop and all connection tasks and waits for them.
+    /// stopAccepting first: the httpz frontend blocks in its own event loop,
+    /// which Io cancellation can't interrupt (stdio's is a no-op).
     pub fn stop(self: *Engine) void {
+        self.server.stopAccepting();
         self.lifecycle.shutdown(self.io);
     }
 
