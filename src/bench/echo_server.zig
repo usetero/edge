@@ -1,5 +1,4 @@
 const std = @import("std");
-const httpz = @import("httpz");
 
 const EndpointStats = struct {
     requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -221,82 +220,104 @@ fn shutdown(_: std.posix.SIG) callconv(.c) void {
     std.process.exit(0);
 }
 
-fn handleRequest(ctx: *ServerContext, req: *httpz.Request, res: *httpz.Response) !void {
-    const path = req.url.path;
+fn handleRequest(ctx: *ServerContext, request: *std.http.Server.Request, gpa: std.mem.Allocator) !void {
+    const target = request.head.target;
+    const query_start = std.mem.findScalar(u8, target, '?');
+    const path = if (query_start) |i| target[0..i] else target;
+    const query = if (query_start) |i| target[i + 1 ..] else "";
 
-    // Handle stats endpoint
+    const json_headers = [_]std.http.Header{
+        .{ .name = "content-type", .value = "application/json" },
+    };
+
     if (std.mem.eql(u8, path, "/stats")) {
-        res.status = 200;
-        res.content_type = .JSON;
-        var buf: std.Io.Writer.Allocating = .init(ctx.allocator);
+        var buf: std.Io.Writer.Allocating = .init(gpa);
         defer buf.deinit();
         try ctx.writeStats(&buf.writer);
-        res.body = try buf.toOwnedSlice();
+        try request.respond(buf.written(), .{ .extra_headers = &json_headers });
         return;
     }
 
-    // Handle reset endpoint
     if (std.mem.eql(u8, path, "/reset")) {
         ctx.reset();
-        res.status = 200;
-        res.body = "{\"status\":\"reset\"}";
+        try request.respond("{\"status\":\"reset\"}", .{ .extra_headers = &json_headers });
         return;
     }
 
-    // Handle capture start endpoint: /capture/start?name=<name>
     if (std.mem.eql(u8, path, "/capture/start")) {
-        const query = req.url.query;
-        // Parse name from query string (format: name=value or just value)
         const capture_name = if (query.len == 0)
             "capture"
         else if (std.mem.find(u8, query, "name=")) |idx|
             query[idx + 5 ..]
         else
             query;
-
         ctx.startCapture(capture_name) catch |err| {
-            res.status = 500;
-            res.body = @errorName(err);
+            try request.respond(@errorName(err), .{ .status = .internal_server_error });
             return;
         };
-        res.status = 200;
-        res.content_type = .JSON;
-        res.body = "{\"status\":\"capture_started\"}";
+        try request.respond("{\"status\":\"capture_started\"}", .{ .extra_headers = &json_headers });
         return;
     }
 
-    // Handle capture stop endpoint
     if (std.mem.eql(u8, path, "/capture/stop")) {
         const count = ctx.stopCapture() catch |err| {
-            res.status = 500;
-            res.body = @errorName(err);
+            try request.respond(@errorName(err), .{ .status = .internal_server_error });
             return;
         };
-        res.status = 200;
-        res.content_type = .JSON;
-
         var buf: [128]u8 = undefined;
-        const json = std.fmt.bufPrint(&buf, "{{\"status\":\"capture_stopped\",\"count\":{d}}}", .{count}) catch {
-            res.body = "{\"status\":\"capture_stopped\"}";
-            return;
-        };
-        res.body = try ctx.allocator.dupe(u8, json);
+        const json = std.fmt.bufPrint(&buf, "{{\"status\":\"capture_stopped\",\"count\":{d}}}", .{count}) catch
+            "{\"status\":\"capture_stopped\"}";
+        try request.respond(json, .{ .extra_headers = &json_headers });
         return;
     }
 
-    // Record stats for all other requests
-    const body = req.body();
-    const body_len = if (body) |b| b.len else 0;
-    ctx.recordRequest(path, body_len);
+    // All other requests: read body (5 MiB cap, matching the old config),
+    // record stats, optionally capture, answer 202.
+    const content_type_copy: ?[]const u8 = if (request.head.content_type) |ct|
+        try gpa.dupe(u8, ct)
+    else
+        null;
+    defer if (content_type_copy) |ct| gpa.free(ct);
 
-    // Capture payload if capture mode is enabled
-    if (body) |b| {
-        const content_type = req.header("content-type") orelse "application/octet-stream";
-        ctx.capturePayload(path, content_type, b);
+    var body_buf: [16 * 1024]u8 = undefined;
+    const body_reader = try request.readerExpectContinue(&body_buf);
+    var captured: std.Io.Writer.Allocating = .init(gpa);
+    defer captured.deinit();
+    while (true) {
+        const n = body_reader.stream(&captured.writer, .limited(5 * 1024 * 1024)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
     }
+    const body = captured.written();
 
-    res.status = 202;
-    res.body = "{}";
+    ctx.recordRequest(path, body.len);
+    if (body.len > 0) {
+        ctx.capturePayload(path, content_type_copy orelse "application/octet-stream", body);
+    }
+    try request.respond("{}", .{ .status = .accepted, .extra_headers = &json_headers });
+}
+
+fn serveConnection(ctx: *ServerContext, gpa: std.mem.Allocator, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+    defer stream.close(ctx.io);
+
+    var recv_buf: [32 * 1024]u8 = undefined;
+    var send_buf: [32 * 1024]u8 = undefined;
+    var net_reader = std.Io.net.Stream.Reader.init(stream, ctx.io, &recv_buf);
+    var net_writer = std.Io.net.Stream.Writer.init(stream, ctx.io, &send_buf);
+    var server = std.http.Server.init(&net_reader.interface, &net_writer.interface);
+
+    while (server.reader.state == .ready) {
+        var request = server.receiveHead() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return,
+        };
+        handleRequest(ctx, &request, gpa) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return,
+        };
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -324,21 +345,9 @@ pub fn main(init: std.process.Init) !void {
         .flags = 0,
     }, null);
 
-    var server = try httpz.Server(*ServerContext).init(init.io, allocator, .{
-        .address = .{ .ip = .{ .ip4 = .{ .bytes = [4]u8{ 127, 0, 0, 1 }, .port = port } } },
-        .request = .{
-            .max_body_size = 5194304,
-        },
-    }, &ctx);
-
-    var router = try server.router(.{});
-    router.get("/stats", handleRequest, .{});
-    router.post("/reset", handleRequest, .{});
-    router.get("/capture/start", handleRequest, .{});
-    router.post("/capture/start", handleRequest, .{});
-    router.get("/capture/stop", handleRequest, .{});
-    router.post("/capture/stop", handleRequest, .{});
-    router.post("/*", handleRequest, .{});
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var listener = try address.listen(init.io, .{ .reuse_address = true });
+    defer listener.deinit(init.io);
 
     std.debug.print("Echo server listening on http://127.0.0.1:{d}\n", .{port});
     std.debug.print("Output directory: {s}\n", .{output_dir});
@@ -350,5 +359,15 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  GET  /capture/stop - Stop capturing and save to file\n", .{});
     std.debug.print("Press Ctrl+C to stop\n", .{});
 
-    try server.listen();
+    var group: std.Io.Group = .init;
+    defer group.cancel(init.io);
+    while (true) {
+        const stream = listener.accept(init.io) catch |err| switch (err) {
+            error.Canceled => return,
+            else => continue,
+        };
+        group.concurrent(init.io, serveConnection, .{ &ctx, allocator, stream }) catch {
+            stream.close(init.io);
+        };
+    }
 }

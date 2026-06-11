@@ -167,6 +167,30 @@ pub const ConnSlab = struct {
         return self.bufRegion(id, offset, self.limits.record_scratch);
     }
 
+    pub fn decodeBuf(self: *ConnSlab, id: ConnId) []u8 {
+        return self.bufRegion(id, self.offsetAfterScratch(), self.limits.decode_buf);
+    }
+
+    pub fn encodeBuf(self: *ConnSlab, id: ConnId) []u8 {
+        return self.bufRegion(id, self.offsetAfterScratch() + self.limits.decode_buf, self.limits.encode_buf);
+    }
+
+    pub fn bodyBuf(self: *ConnSlab, id: ConnId) []u8 {
+        const offset = self.offsetAfterScratch() + self.limits.decode_buf + self.limits.encode_buf;
+        return self.bufRegion(id, offset, self.limits.body_buf);
+    }
+
+    pub fn chunkBuf(self: *ConnSlab, id: ConnId) []u8 {
+        const offset = self.offsetAfterScratch() + self.limits.decode_buf +
+            self.limits.encode_buf + self.limits.body_buf;
+        return self.bufRegion(id, offset, self.limits.chunk_buf);
+    }
+
+    fn offsetAfterScratch(self: *const ConnSlab) usize {
+        return self.limits.recv_buf + self.limits.send_buf +
+            self.limits.upstream_write_buf + self.limits.record_scratch;
+    }
+
     pub fn inUse(self: *ConnSlab, io: std.Io) usize {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -199,6 +223,11 @@ fn testLimits() limits_mod.Limits {
         .recv_buf = 64,
         .send_buf = 64,
         .upstream_write_buf = 64,
+        .decode_buf = 128,
+        .encode_buf = 128,
+        .body_buf = 32,
+        .chunk_buf = 32,
+        .zstd_window_len = 64,
         .conn_arena_reserve = 64,
     };
 }

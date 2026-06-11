@@ -59,6 +59,15 @@ pub const ArenaPool = struct {
         return self.arenas[slot].allocator();
     }
 
+    /// Resets a held slot between keep-alive requests without returning it
+    /// to the pool. Same retain-capacity semantics as release.
+    pub fn reset(self: *ArenaPool, slot: u16) void {
+        std.debug.assert(slot < self.arenas.len);
+        if (!self.arenas[slot].reset(.retain_capacity)) {
+            log.warn("arena reset failed for slot {d}", .{slot});
+        }
+    }
+
     /// Reset-don't-free: retained capacity makes steady-state claims
     /// allocation-free. A connection that out-grows the reserve is a cold-path
     /// budget leak — warn so it shows up in logs before it shows up in RSS.
@@ -94,6 +103,11 @@ fn testLimits() limits_mod.Limits {
         .recv_buf = 64,
         .send_buf = 64,
         .upstream_write_buf = 64,
+        .decode_buf = 128,
+        .encode_buf = 128,
+        .body_buf = 32,
+        .chunk_buf = 32,
+        .zstd_window_len = 64,
         .conn_arena_reserve = 4096,
     };
 }

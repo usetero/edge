@@ -379,6 +379,19 @@ test "identity passes bytes through untouched" {
     try testing.expectEqualStrings(fixture, decoded);
 }
 
+test "limits regions satisfy codec buffer requirements" {
+    // core/limits.zig can't import pipeline (layering), so the contract is
+    // enforced here: the slab regions must fit every codec's needs.
+    const limits = @import("../core/limits.zig");
+    inline for (@typeInfo(ContentEncoding).@"enum".fields) |field| {
+        const enc: ContentEncoding = @enumFromInt(field.value);
+        try testing.expect(limits.ENCODE_BUF_BYTES >= enc.encoderBufferLen());
+        // Decoder region = window + slack; the non-window part must cover
+        // flate's whole requirement and zstd's block.
+        try testing.expect(limits.DECODE_SLACK_BYTES >= enc.decoderBufferLen(0));
+    }
+}
+
 test "ContentEncoding.fromHeader" {
     try testing.expectEqual(ContentEncoding.identity, ContentEncoding.fromHeader("").?);
     try testing.expectEqual(ContentEncoding.identity, ContentEncoding.fromHeader("identity").?);

@@ -17,12 +17,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 
 const edge = @import("root.zig");
-const server_mod = edge.server;
 const runtime_metrics_mod = @import("runtime/runtime_metrics.zig");
-const proxy_module = edge.proxy_module;
-const passthrough_mod = edge.passthrough_module;
-const datadog_mod = edge.datadog_module;
-const health_mod = edge.health_module;
+const app = @import("runtime/app.zig");
 const policy = edge.policy;
 const zonfig = edge.zonfig;
 
@@ -34,13 +30,13 @@ const EventBus = o11y.EventBus;
 const StdLogAdapter = o11y.StdLogAdapter;
 const Level = o11y.Level;
 
-const ProxyServer = server_mod.ProxyServer;
-const ModuleRegistration = proxy_module.ModuleRegistration;
-const PassthroughModule = passthrough_mod.PassthroughModule;
-const DatadogModule = datadog_mod.DatadogModule;
-const DatadogConfig = datadog_mod.DatadogConfig;
-const HealthModule = health_mod.HealthModule;
 const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
+
+/// Lambda ships the datadog service set: health + datadog logs/metrics +
+/// passthrough, same composition the old module wiring built by hand.
+const lambda_service_kinds = [_]edge.distro.ServiceKind{
+    .health, .datadog_logs, .datadog_metrics, .passthrough,
+};
 
 // =============================================================================
 // Lambda Configuration
@@ -111,31 +107,8 @@ const StaticPoliciesError = struct { err: []const u8 };
 // Global State
 // =============================================================================
 
-var server_instance: ?*ProxyServer = null;
 var global_event_bus: ?*EventBus = null;
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-// =============================================================================
-// Server Thread
-// =============================================================================
-
-const ServerThreadContext = struct {
-    proxy: *ProxyServer,
-    bus: *EventBus,
-};
-
-fn serverThread(ctx: *ServerThreadContext) void {
-    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-    ctx.bus.info(ProxyServerStarted{ .port = ctx.proxy.context.listen_port });
-
-    ctx.proxy.listen() catch |err| {
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.err(LambdaExtensionError{ .err = @errorName(err) });
-    };
-
-    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-    ctx.bus.info(ProxyServerStopped{});
-}
 
 // =============================================================================
 // Main Entry Point
@@ -277,80 +250,19 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Create Datadog module configuration
-    var datadog_config: DatadogConfig = .{
-        .registry = &registry,
-        .bus = bus,
-        .metrics = &runtime_metrics,
-    };
-
-    // Create modules
-    var health_module: HealthModule = .{};
-    var datadog_logs_module: DatadogModule = .{};
-    var datadog_metrics_module: DatadogModule = .{};
-    var passthrough_module: PassthroughModule = .{};
-
-    // Register modules (order matters - first match wins)
-    const module_registrations = [_]ModuleRegistration{
-        // Health module - reserved /_health endpoint
-        .{
-            .module = .{ .health = &health_module },
-            .routes = &health_mod.routes,
-            .upstream_url = logs_url,
-            .max_request_body = 0,
-            .max_response_body = 0,
-            .module_data = null,
-        },
-        // Datadog logs module - handles /api/v2/logs with filtering
-        .{
-            .module = .{ .datadog = &datadog_logs_module },
-            .routes = &datadog_mod.logs_routes,
-            .upstream_url = logs_url,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = @ptrCast(&datadog_config),
-        },
-        // Datadog metrics module - handles /api/v2/series with filtering
-        .{
-            .module = .{ .datadog = &datadog_metrics_module },
-            .routes = &datadog_mod.metrics_routes,
-            .upstream_url = metrics_url,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = @ptrCast(&datadog_config),
-        },
-        // Passthrough module - handles all other requests
-        .{
-            .module = .{ .passthrough = &passthrough_module },
-            .routes = &passthrough_mod.default_routes,
-            .upstream_url = logs_url,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = null,
-        },
-    };
-
-    // Create proxy server
-    var proxy = try ProxyServer.init(
-        allocator,
-        io,
-        bus,
-        &runtime_metrics,
-        config.listen_address,
-        config.listen_port,
-        config.max_body_size,
-        &module_registrations,
-    );
-    defer proxy.deinit();
-
-    server_instance = &proxy;
-    defer server_instance = null;
-
-    // Start proxy server in background thread
-    var server_ctx: ServerThreadContext = .{
-        .proxy = &proxy,
-        .bus = bus,
-    };
-    const server_thread = try std.Thread.spawn(.{}, serverThread, .{&server_ctx});
+    const kinds: []const edge.distro.ServiceKind = &lambda_service_kinds;
+    const engine = try app.Engine.create(allocator, io, init.environ_map, bus, &registry, &runtime_metrics, kinds, .{
+        .listen_address = config.listen_address,
+        .listen_port = config.listen_port,
+        .max_body_size = config.max_body_size,
+        .upstream_url = config.upstream_url,
+        .logs_url = config.logs_url,
+        .metrics_url = config.metrics_url,
+    });
+    defer engine.destroy();
+    try engine.start();
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    bus.info(ProxyServerStarted{ .port = config.listen_port });
 
     // Initialize Lambda Extensions API client
     var extension = try ExtensionClient.init(allocator, io, bus, init.environ_map, "tero-edge");
@@ -391,14 +303,15 @@ pub fn main(init: std.process.Init) !void {
 
                 // Stop proxy server gracefully
                 shutdown_requested.store(true, .release);
-                proxy.server.stop();
+                engine.requestShutdown();
                 break;
             },
         }
     }
 
-    // Wait for server thread to finish
-    server_thread.join();
+    // Cancel the accept loop and every connection task, then wait.
+    engine.requestShutdown();
+    engine.stop();
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStopped{});

@@ -14,10 +14,6 @@ pub fn build(b: *std.Build) void {
     // Dependencies
     // ==========================================================================
 
-    const httpz = b.dependency("httpz", .{
-        .target = target,
-        .optimize = optimize,
-    });
     const zimdjson = b.dependency("zimdjson", .{
         .target = target,
         .optimize = optimize,
@@ -67,7 +63,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.addImport("httpz", httpz.module("httpz"));
     exe.root_module.addImport("proto", proto_mod);
     exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
     exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
@@ -106,7 +101,6 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        dist_exe.root_module.addImport("httpz", httpz.module("httpz"));
         dist_exe.root_module.addImport("proto", proto_mod);
         dist_exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
         dist_exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
@@ -153,7 +147,7 @@ pub fn build(b: *std.Build) void {
     mod_tests.root_module.linkSystemLibrary("zstd", .{});
     mod_tests.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
     mod_tests.root_module.addOptions("build_options", build_options);
-    // Benchmark fixture embedded by test-only code in src/modules/otlp_metrics.zig.
+    // Benchmark fixture embedded by test-only code in src/signals/otlp/metrics.zig.
     // It lives under bench/ (outside the src package), so @embedFile needs it wired
     // in as a named module import rather than a relative path.
     mod_tests.root_module.addAnonymousImport("otlp_metrics_benchmark_pb", .{
@@ -176,7 +170,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    echo_server.root_module.addImport("httpz", httpz.module("httpz"));
 
     const echo_step = b.step("echo-server", "Build the echo server for benchmarking");
     echo_step.dependOn(&b.addInstallArtifact(echo_server, .{}).step);

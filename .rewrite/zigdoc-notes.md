@@ -37,3 +37,19 @@ Record every verified std API here with the zigdoc snippet that justifies it.
   output buffer (multi-block streams from any *streaming* gzip compressor)
   rewound next_out to 0 and overwrote earlier output. Old tests never caught
   it because one-shot-compressed fixtures decode in a single inflate call.
+
+## Phase 5 net/http server APIs (verified)
+- net: `IpAddress.parse(text, port)`; `address.listen(io, options) !net.Server`;
+  `server.accept(io) !Stream`; `Stream.Reader.init(stream, io, buf)` /
+  `Stream.Writer.init(...)` each expose `.interface`; `stream.close(io)`.
+- std.http.Server: `init(in: *Io.Reader, out: *Io.Writer)` — plain reader/writer,
+  no net dependency. `receiveHead() !Request`.
+- Request.Head: method, target, version, content_type, content_length,
+  transfer_encoding, transfer_compression (http.ContentEncoding), keep_alive.
+  Head.parse can fail CompressionUnsupported/UnknownHttpMethod/etc.
+- Body in: `request.readerExpectContinue(buffer)` (handles 100-continue) /
+  `readerExpectNone(buffer)`. Body out: `request.respond(bytes, options)` or
+  `request.respondStreaming(buffer, .{ .content_length = null → chunked })`
+  returning http.BodyWriter (has .writer iface; must call .end() then flush).
+- HEAD handled transparently via eliding BodyWriter.
+- `request.iterateHeaders()` for header passthrough.

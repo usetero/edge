@@ -52,20 +52,21 @@ builds green, test-parity diff clean (PLAN.md §0), one commit.
 - [x] 4.10 Gate: 448/448 tests, lint green, 6 distros. Committed.
 
 ## Phase 5 — src/http/ + runtime/ + cutover (THE BIG ONE)
-- [ ] 5.1 zigdoc pre-work (PLAN §1 list): std.Io.net, Io.Group, std.http.Server, std.http.Client.Request chunked send, Io.Threaded; commit findings to zigdoc-notes.md
-- [ ] 5.2 `http/upstream.zig` (port manager + URL tests; streaming/chunked send per findings)
-- [ ] 5.3 `http/conn.zig` (request loop state machine; outcome execution; header filtering port)
-- [ ] 5.4 `http/server.zig` (listener, accept loop, Io.Group spawn, load shed)
-- [ ] 5.5 `runtime/metrics.zig` (port runtime_metrics.zig)
-- [ ] 5.6 New `runtime/app.zig` (juicy main → io_select → lifecycle → server; distro composition)
-- [ ] 5.7 Rewire six `*_main.zig` (signatures unchanged) + lambda/ upstream import
-- [ ] 5.8 Rewrite `bench/echo_server.zig` on new http core
-- [ ] 5.9 Moves: `src/proxy`→`src/proxy-old`, leftover `src/modules`→`src/modules-old`, `src/io`→`src/io-old`, old `src/runtime` files→`src/runtime-old`
-- [ ] 5.10 Update `.ziglint.zon` paths (explicit dir list, exclude -old)
-- [ ] 5.11 Rewrite `build.zig` (helper fn, drop httpz from new tree, keep step names)
+- [x] 5.1 zigdoc: net listen/accept/Stream.Reader|Writer, http.Server init/receiveHead/respondStreaming/readerExpectContinue, Head fields (transfer_compression!), unknown content-encoding → 400 posture change recorded in wiring-notes. Cancellation surfaces as ReadFailed through interfaces (no Canceled prongs in http error sets).
+- [x] 5.2 http/upstream.zig: UpstreamManager port (tests renamed UpstreamClientManager→UpstreamManager), header-skip helpers + tests (old skip list kept EXACTLY — content-encoding passes through since we re-encode same codec)
+- [x] 5.3 http/conn.zig: serveConnection keep-alive loop over slab buffers; outcome exec (respond/forward_raw/pipe_stream/pipe_buffered/fetch_filtered); /_edge/metrics short-circuit ported; request metrics (classifyKnownPath + recordRequest/Duration); RecordSink = wrap-record-as-one-element-batch through the EXISTING signal batch fns (identical filter semantics, memory bounded per record via reset-retain arena; future opt: direct engine binding); BatchSummary normalizes distinct per-signal result types; §6.5 abort→502 for mid-stream pipe errors; buffered path captures RAW body first → fail-open forwards original bytes (old semantics, incl. allDropped→200 {})
+- [x] 5.4 http/server.zig: accept loop, Lifecycle.spawn(concurrent), ConcurrencyUnavailable→503 shed
+- [x] 5.5 runtime_metrics.zig was already httpz-free — kept in place, no port needed
+- [x] 5.6 New runtime/app.zig with reusable Engine (heap-alloc'd for pointer stability; create/start/requestShutdown/awaitShutdown/stop/destroy); run() = juicy main → io_select → config → registry/loader → Engine → sigwait waiter → awaitShutdown → structured cancel. Limits.resolve(max_body_size, env) decoupled from ProxyConfig; distro.buildService takes ServiceOptions
+- [x] 5.7 Four proxy mains unchanged (app.run signature kept); lambda_main cut over to Engine (datadog service set, extension loop calls engine.requestShutdown on SHUTDOWN event); edge_tail_main untouched (tail-only)
+- [x] 5.8 bench/echo_server.zig rewritten on std.Io.net + std.http.Server + Io.Group (stats/capture logic kept verbatim)
+- [x] 5.9 Moves done: proxy-old, modules-old, io-old, runtime-old/{app,pipeline}.zig
+- [x] 5.10 .ziglint.zon unchanged (scans src incl. -old which passes; -old dies in Phase 7)
+- [x] 5.11 build.zig: httpz dependency + all addImport("httpz") removed from compiled tree; step names unchanged
+- [x] LIMITS GROWTH: per-conn now includes decode (zstd window+192K) + encode (192K) + body (8K) + chunk (4K) regions → 1736K/conn, 438 MiB reserved at 256 conns (virtual; RSS tracks touched pages). Budget test re-locked. TERO_MAX_CONNECTIONS tunes it.
 - [ ] 5.12 Integration smoke (PLAN §12 Phase 5 gate): echo upstream + edge + policy filtering + gzip + health + metrics + SIGTERM
 - [ ] 5.13 steadyStateBytes logged; RSS sanity vs budget
-- [ ] 5.14 Phase 5 gate + commit
+- [ ] 5.14 Phase 5 gate + commit (checkpoint commit done pre-smoke)
 
 ## Phase 6 — Tail convergence
 - [ ] 6.1 uring scheduler takes `io` in init; tail framer retires in favor of pipeline/frame_ndjson

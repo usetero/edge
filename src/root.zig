@@ -25,18 +25,17 @@ pub const pipeline_encoding = @import("pipeline/encoding.zig");
 pub const pipeline_framer = @import("pipeline/framer.zig");
 pub const pipeline_compress_buffered = @import("pipeline/compress_buffered.zig");
 
-// Proxy modules
-pub const server = @import("proxy/server.zig");
+// HTTP core (0.16 rewrite, PLAN.md §9)
+pub const http_server = @import("http/server.zig");
+pub const http_conn = @import("http/conn.zig");
+pub const http_router = @import("http/router.zig");
+pub const http_upstream = @import("http/upstream.zig");
 
-// Module implementations
-pub const proxy_module = @import("modules/proxy_module.zig");
-pub const passthrough_module = @import("modules/passthrough_module.zig");
-pub const datadog_module = @import("modules/datadog_module.zig");
-pub const otlp_module = @import("modules/otlp_module.zig");
-pub const health_module = @import("modules/health_module.zig");
-pub const prometheus_module = @import("modules/prometheus_module.zig");
+// Services + distro composition (PLAN.md §8)
+pub const service = @import("service/service.zig");
+pub const distro = @import("runtime/distro.zig");
 
-// Prometheus module
+// Prometheus signal codecs
 pub const prometheus = @import("signals/prometheus/root.zig");
 
 // =============================================================================
@@ -61,8 +60,6 @@ pub const lambda = @import("lambda/root.zig");
 
 /// Zonfig - comptime configuration with environment overrides
 pub const zonfig = @import("zonfig/root.zig");
-pub const runtime_pipeline = @import("runtime/pipeline.zig");
-pub const io_transport = @import("io/transport.zig");
 
 pub fn bufferedPrint() !void {
     var stdout_buffer: [1024]u8 = undefined;
@@ -94,27 +91,18 @@ test {
     _ = @import("pipeline/encoding.zig");
     _ = @import("pipeline/framer.zig");
     _ = @import("pipeline/pipeline.zig");
-    _ = @import("modules/proxy_module.zig");
-    _ = @import("proxy/compress.zig");
-    _ = @import("proxy/router.zig");
-    _ = @import("proxy/upstream_client.zig");
-    _ = @import("modules/passthrough_module.zig");
-    _ = @import("modules/datadog_module.zig");
     _ = @import("signals/datadog/logs.zig");
     _ = @import("signals/datadog/metrics.zig");
-    _ = @import("modules/otlp_module.zig");
     _ = @import("signals/otlp/attributes.zig");
     _ = @import("signals/otlp/logs.zig");
     _ = @import("signals/otlp/metrics.zig");
     _ = @import("signals/otlp/traces.zig");
-    _ = @import("modules/health_module.zig");
     _ = @import("service/service.zig");
     _ = @import("http/router.zig");
+    _ = @import("http/upstream.zig");
+    _ = @import("http/conn.zig");
     _ = @import("runtime/distro.zig");
     _ = @import("signals/prometheus/root.zig");
-    _ = @import("modules/prometheus_module.zig");
-    _ = @import("runtime/pipeline.zig");
-    _ = @import("io/transport.zig");
     _ = @import("lambda/root.zig");
     _ = @import("zonfig/root.zig");
     _ = @import("tail/mod.zig");

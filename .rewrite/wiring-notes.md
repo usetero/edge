@@ -20,3 +20,10 @@ prometheus text (prom_text), passthrough (raw).
 Buffered fallback (Outcome.pipe_buffered): datadog metrics (object body),
 OTLP JSON (object body). These keep batch-fn semantics until object-keyed
 framing is added later.
+
+## Phase 5 behavior notes
+- std.http.Server rejects unknown Content-Encoding values at head parse
+  (HttpTransferEncodingUnsupported) → conn driver answers a raw 400 and
+  closes. Old httpz stack forwarded exotic encodings opaquely. zstd/gzip/
+  x-gzip/deflate/compress/identity all parse fine, so agent traffic is
+  unaffected; recorded as a known posture change for e.g. brotli.

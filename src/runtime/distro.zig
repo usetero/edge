@@ -8,7 +8,6 @@
 const std = @import("std");
 const mode = @import("mode.zig");
 const service_mod = @import("../service/service.zig");
-const config_types = @import("../config/types.zig");
 
 pub const ServiceKind = service_mod.ServiceKind;
 
@@ -21,10 +20,16 @@ pub fn servicesFor(comptime distribution: mode.Distribution) []const ServiceKind
     };
 }
 
-/// Instantiates one service's plan-state from frozen config. Pure data; the
-/// heavier runtime deps (policy registry, event bus, metrics) bind in the
-/// connection driver, not here.
-pub fn buildService(kind: ServiceKind, config: *const config_types.ProxyConfig) service_mod.Service {
+/// Per-service plan-state inputs that come from config. Primitive fields so
+/// any config shape (ProxyConfig, LambdaConfig) can feed them.
+pub const ServiceOptions = struct {
+    prometheus_max_input_bytes: usize = 0,
+    prometheus_max_output_bytes: usize = 0,
+};
+
+/// Instantiates one service's plan-state. Pure data; the heavier runtime
+/// deps (policy registry, event bus, metrics) bind in the connection driver.
+pub fn buildService(kind: ServiceKind, options: ServiceOptions) service_mod.Service {
     return switch (kind) {
         .health => .{ .health = .{} },
         .passthrough => .{ .passthrough = .{} },
@@ -32,8 +37,8 @@ pub fn buildService(kind: ServiceKind, config: *const config_types.ProxyConfig) 
         .datadog_metrics => .{ .datadog_metrics = .{} },
         .otlp => .{ .otlp = .{} },
         .prometheus => .{ .prometheus = .{
-            .max_input_bytes_per_scrape = config.prometheus.max_input_bytes_per_scrape,
-            .max_output_bytes_per_scrape = config.prometheus.max_output_bytes_per_scrape,
+            .max_input_bytes_per_scrape = options.prometheus_max_input_bytes,
+            .max_output_bytes_per_scrape = options.prometheus_max_output_bytes,
         } },
     };
 }
@@ -62,11 +67,10 @@ test "edge distro composes all services; focused distros stay focused" {
 }
 
 test "buildService wires prometheus scrape budgets from config" {
-    var config: config_types.ProxyConfig = .{};
-    config.prometheus.max_input_bytes_per_scrape = 2048;
-    config.prometheus.max_output_bytes_per_scrape = 1024;
-
-    const svc = buildService(.prometheus, &config);
+    const svc = buildService(.prometheus, .{
+        .prometheus_max_input_bytes = 2048,
+        .prometheus_max_output_bytes = 1024,
+    });
     try testing.expectEqual(@as(usize, 2048), svc.prometheus.max_input_bytes_per_scrape);
     try testing.expectEqual(@as(usize, 1024), svc.prometheus.max_output_bytes_per_scrape);
 }

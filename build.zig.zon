@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .httpz = .{
-            .url = "git+https://github.com/karlseguin/http.zig?ref=master#f39f1ed803fcf080a01a3ab9c11b3cf9e0ff9aa8",
-            .hash = "httpz-0.0.0-PNVzrLLOCAD99G3Q3N-nDSsL40Yl7bAJ0_et7PXeWgsa",
+            .url = "git+https://github.com/karlseguin/http.zig?ref=master#5f60277d3b3beffef86321869b13c57f7acc3c5b",
+            .hash = "httpz-0.0.0-PNVzrJrbCACyokt2AARAG7Ul7h7xlZxL7BYAdpsAs1_-",
         },
         .zimdjson = .{
             .path = "../zimdjson",

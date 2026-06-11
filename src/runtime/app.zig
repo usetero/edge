@@ -1,64 +1,51 @@
+//! Composition root for the proxy distributions (PLAN.md §10).
+//!
+//! Juicy main hands us io/gpa/environ; everything below is wired here and
+//! NOWHERE else: Io selection, limits, slab, arena pool, upstreams, services,
+//! router, lifecycle, HTTP server. Shutdown is structured — the signal
+//! watcher calls Lifecycle.requestShutdown and Lifecycle.shutdown cancels
+//! the accept loop and every connection task together.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const mode = @import("mode.zig");
-const edge = @import("../root.zig");
-
-const config_types = edge.config_types;
-const zonfig = edge.zonfig;
-const server_mod = edge.server;
+const distro = @import("distro.zig");
 const runtime_metrics_mod = @import("runtime_metrics.zig");
-const proxy_module = edge.proxy_module;
-const passthrough_mod = edge.passthrough_module;
-const datadog_mod = edge.datadog_module;
-const otlp_mod = edge.otlp_module;
-const prometheus_mod = edge.prometheus_module;
-const health_mod = edge.health_module;
-const policy = edge.policy;
+const config_types = @import("../config/types.zig");
+const zonfig = @import("../zonfig/root.zig");
+const limits_mod = @import("../core/limits.zig");
+const io_select = @import("../core/io_select.zig");
+const conn_slab_mod = @import("../core/conn_slab.zig");
+const arena_pool_mod = @import("../core/arena_pool.zig");
+const lifecycle_mod = @import("../core/lifecycle.zig");
+const service_mod = @import("../service/service.zig");
+const router_mod = @import("../http/router.zig");
+const upstream_mod = @import("../http/upstream.zig");
+const conn_mod = @import("../http/conn.zig");
+const http_server_mod = @import("../http/server.zig");
 
-const ProxyConfig = config_types.ProxyConfig;
-
-const log = std.log.scoped(.app);
-
+const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 const StdLogAdapter = o11y.StdLogAdapter;
 const Level = o11y.Level;
 
-const ProxyServer = server_mod.ProxyServer;
-const ModuleRegistration = proxy_module.ModuleRegistration;
-const PassthroughModule = passthrough_mod.PassthroughModule;
-const DatadogModule = datadog_mod.DatadogModule;
-const DatadogConfig = datadog_mod.DatadogConfig;
-const OtlpModule = otlp_mod.OtlpModule;
-const OtlpConfig = otlp_mod.OtlpConfig;
-const PrometheusModule = prometheus_mod.PrometheusModule;
-const PrometheusConfig = prometheus_mod.PrometheusConfig;
-const HealthModule = health_mod.HealthModule;
+const ProxyConfig = config_types.ProxyConfig;
 const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
+
+const log = std.log.scoped(.app);
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
     .logFn = StdLogAdapter.logFn,
 };
 
-const ShutdownSignalReceived = struct { signal: []const u8, count: u32 };
-const ShutdownForceExit = struct { signal: []const u8, count: u32 };
-const ShutdownStateTransition = struct {
-    from: []const u8,
-    to: []const u8,
-    reason: []const u8,
-};
-const SignalHandlingNotSupported = struct { platform: []const u8 };
-
+// Named event payloads: the type name is the telemetry event name.
 const ServerStarting = struct {};
 const ConfigurationLoaded = struct { path: []const u8 };
 const ConfigLoadError = struct { err: []const u8 };
-const ListenAddressConfigured = struct {
-    address: []const u8,
-    port: u16,
-};
+const ListenAddressConfigured = struct { address: []const u8, port: u16 };
 const UpstreamConfigured = struct { url: []const u8 };
 const LogsUpstreamConfigured = struct { url: []const u8 };
 const MetricsUpstreamConfigured = struct { url: []const u8 };
@@ -68,58 +55,12 @@ const ServiceConfigured = struct {
     instance_id: []const u8,
     version: []const u8,
 };
-
 const ServerReady = struct {};
 const ShutdownHint = struct { pid: c_int };
 const ServerStopped = struct {};
-
-const RouteBundle = enum {
-    datadog_logs,
-    datadog_metrics,
-    otlp,
-    prometheus,
-};
-
-const edge_bundles = [_]RouteBundle{
-    .datadog_logs,
-    .datadog_metrics,
-    .otlp,
-    .prometheus,
-};
-const datadog_bundles = [_]RouteBundle{
-    .datadog_logs,
-    .datadog_metrics,
-};
-const otlp_bundles = [_]RouteBundle{.otlp};
-const prometheus_bundles = [_]RouteBundle{.prometheus};
-
-const ShutdownState = enum(u8) {
-    running,
-    shutdown_requested,
-    stopping,
-    stopped,
-    force_exit,
-};
-
-const SignalWaiterContext = struct {
-    bus: *EventBus,
-    server: *ProxyServer,
-    signal_count: *std.atomic.Value(u32),
-    shutdown_state: *std.atomic.Value(u8),
-    shutdown_waiter: *std.atomic.Value(bool),
-    signal_set: std.posix.sigset_t,
-};
-
-const SignalWaiterHandle = struct {
-    thread: std.Thread,
-    previous_mask: std.posix.sigset_t,
-};
-
-const StopWorkerContext = struct {
-    bus: *EventBus,
-    server: *ProxyServer,
-    shutdown_state: *std.atomic.Value(u8),
-};
+const ShutdownSignalReceived = struct { signal: []const u8, count: u32 };
+const ShutdownForceExit = struct { signal: []const u8, count: u32 };
+const SignalHandlingNotSupported = struct { platform: []const u8 };
 
 fn supportedStagesFor(distribution: mode.Distribution) []const policy.proto.policy.PolicyStage {
     return switch (distribution) {
@@ -144,15 +85,6 @@ fn supportedStagesFor(distribution: mode.Distribution) []const policy.proto.poli
     };
 }
 
-fn bundlesFor(distribution: mode.Distribution) []const RouteBundle {
-    return switch (distribution) {
-        .edge => &edge_bundles,
-        .datadog => &datadog_bundles,
-        .otlp => &otlp_bundles,
-        .prometheus => &prometheus_bundles,
-    };
-}
-
 fn distributionLabel(distribution: mode.Distribution) runtime_metrics_mod.DistributionLabel {
     return switch (distribution) {
         .edge => .edge,
@@ -162,36 +94,31 @@ fn distributionLabel(distribution: mode.Distribution) runtime_metrics_mod.Distri
     };
 }
 
-fn stateName(state: ShutdownState) []const u8 {
-    return @tagName(state);
-}
+// =============================================================================
+// Signal handling: sigwait thread; first INT/TERM requests structured
+// shutdown, second force-exits. USR1 wakes the waiter for clean teardown.
+// Ported from the pre-rewrite app.zig.
+// =============================================================================
 
-fn loadShutdownState(state: *const std.atomic.Value(u8)) ShutdownState {
-    return @enumFromInt(state.load(.acquire));
-}
-
-fn setShutdownState(
+const SignalWaiterContext = struct {
     bus: *EventBus,
-    state: *std.atomic.Value(u8),
-    next: ShutdownState,
-    reason: []const u8,
-) void {
-    const previous: ShutdownState = @enumFromInt(state.swap(@intFromEnum(next), .acq_rel));
-    if (previous == next) return;
+    io: std.Io,
+    lifecycle: *lifecycle_mod.Lifecycle,
+    signal_count: *std.atomic.Value(u32),
+    shutdown_waiter: *std.atomic.Value(bool),
+    signal_set: std.posix.sigset_t,
+};
 
-    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-    bus.info(ShutdownStateTransition{
-        .from = stateName(previous),
-        .to = stateName(next),
-        .reason = reason,
-    });
-}
+const SignalWaiterHandle = struct {
+    thread: std.Thread,
+    previous_mask: std.posix.sigset_t,
+};
 
 fn installSignalWaiter(
     bus: *EventBus,
-    server: *ProxyServer,
+    io: std.Io,
+    lifecycle: *lifecycle_mod.Lifecycle,
     signal_count: *std.atomic.Value(u32),
-    shutdown_state: *std.atomic.Value(u8),
     shutdown_waiter: *std.atomic.Value(bool),
 ) anyerror!SignalWaiterHandle {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
@@ -209,9 +136,9 @@ fn installSignalWaiter(
 
     const waiter = try std.Thread.spawn(.{}, signalWaiterThread, .{SignalWaiterContext{
         .bus = bus,
-        .server = server,
+        .io = io,
+        .lifecycle = lifecycle,
         .signal_count = signal_count,
-        .shutdown_state = shutdown_state,
         .shutdown_waiter = shutdown_waiter,
         .signal_set = signal_set,
     }});
@@ -232,34 +159,15 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
 
         if (count == 1) {
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            ctx.bus.info(ShutdownSignalReceived{
-                .signal = signal_name,
-                .count = count,
-            });
-            setShutdownState(ctx.bus, ctx.shutdown_state, .shutdown_requested, "signal.received");
-
-            const stop_worker = std.Thread.spawn(.{}, stopWorkerThread, .{StopWorkerContext{
-                .bus = ctx.bus,
-                .server = ctx.server,
-                .shutdown_state = ctx.shutdown_state,
-            }}) catch continue;
-            stop_worker.detach();
+            ctx.bus.info(ShutdownSignalReceived{ .signal = signal_name, .count = count });
+            ctx.lifecycle.requestShutdown(ctx.io);
             continue;
         }
 
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.info(ShutdownForceExit{
-            .signal = signal_name,
-            .count = count,
-        });
-        setShutdownState(ctx.bus, ctx.shutdown_state, .force_exit, "second.signal");
+        ctx.bus.info(ShutdownForceExit{ .signal = signal_name, .count = count });
         std.process.exit(1);
     }
-}
-
-fn stopWorkerThread(ctx: StopWorkerContext) void {
-    setShutdownState(ctx.bus, ctx.shutdown_state, .stopping, "server.stop.begin");
-    ctx.server.server.stop();
 }
 
 fn handleSegfault(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
@@ -292,12 +200,167 @@ fn installSegfaultHandler() void {
     std.posix.sigaction(std.posix.SIG.SEGV, &segv_act, null);
 }
 
+// =============================================================================
+// Engine: the assembled data plane. Heap-allocated so the internal pointers
+// (SharedCtx -> router/slab/...) stay stable. Shared by app.run and the
+// Lambda extension main.
+// =============================================================================
+
+pub const EngineOptions = struct {
+    listen_address: [4]u8,
+    listen_port: u16,
+    max_body_size: u32,
+    upstream_url: []const u8,
+    logs_url: ?[]const u8 = null,
+    metrics_url: ?[]const u8 = null,
+    service_options: distro.ServiceOptions = .{},
+};
+
+pub const Engine = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    limits: limits_mod.Limits,
+    slab: conn_slab_mod.ConnSlab,
+    arenas: arena_pool_mod.ArenaPool,
+    upstreams: upstream_mod.UpstreamManager,
+    services_buf: [8]service_mod.Service,
+    services_len: usize,
+    router: router_mod.Router,
+    lifecycle: lifecycle_mod.Lifecycle,
+    shared_ctx: conn_mod.SharedCtx,
+    server: http_server_mod.HttpServer,
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environ_map: *const std.process.Environ.Map,
+        bus: *EventBus,
+        registry: *policy.Registry,
+        metrics: ?*RuntimeMetrics,
+        kinds: []const distro.ServiceKind,
+        options: EngineOptions,
+    ) !*Engine {
+        const self = try allocator.create(Engine);
+        errdefer allocator.destroy(self);
+
+        self.allocator = allocator;
+        self.io = io;
+        self.limits = .resolve(options.max_body_size, environ_map);
+        self.limits.logStartup();
+
+        self.slab = try .init(allocator, self.limits);
+        errdefer self.slab.deinit(allocator);
+        self.arenas = try .init(allocator, self.limits);
+        errdefer self.arenas.deinit(allocator);
+
+        self.upstreams = upstream_mod.UpstreamManager.init(io, allocator);
+        errdefer self.upstreams.deinit();
+        const max_body = options.max_body_size;
+        const upstream_ids: conn_mod.UpstreamIds = .{
+            .default = try self.upstreams.createUpstream(options.upstream_url, 2048, max_body, max_body),
+            .logs = try self.upstreams.createUpstream(
+                options.logs_url orelse options.upstream_url,
+                2048,
+                max_body,
+                max_body,
+            ),
+            .metrics = try self.upstreams.createUpstream(
+                options.metrics_url orelse options.upstream_url,
+                2048,
+                max_body,
+                max_body,
+            ),
+        };
+
+        std.debug.assert(kinds.len <= self.services_buf.len);
+        for (kinds, 0..) |kind, i| {
+            self.services_buf[i] = distro.buildService(kind, options.service_options);
+        }
+        self.services_len = kinds.len;
+
+        var route_sets_buf: [8]router_mod.RouteSet = undefined;
+        for (self.services_buf[0..self.services_len], 0..) |*svc, i| {
+            route_sets_buf[i] = .{
+                .service = @enumFromInt(@as(u16, @intCast(i))),
+                .routes = svc.routes(),
+            };
+        }
+        self.router = try .init(allocator, route_sets_buf[0..self.services_len]);
+        errdefer self.router.deinit();
+
+        self.lifecycle = .init;
+        self.shared_ctx = .{
+            .io = io,
+            .gpa = allocator,
+            .router = &self.router,
+            .services = self.services_buf[0..self.services_len],
+            .upstreams = &self.upstreams,
+            .upstream_ids = upstream_ids,
+            .registry = registry,
+            .bus = bus,
+            .metrics = metrics,
+            .limits = self.limits,
+            .slab = &self.slab,
+            .arenas = &self.arenas,
+        };
+
+        self.server = try .init(
+            &self.shared_ctx,
+            &self.lifecycle,
+            options.listen_address,
+            options.listen_port,
+        );
+        return self;
+    }
+
+    /// Spawns the accept loop. Pair with `stop` then `destroy`.
+    pub fn start(self: *Engine) !void {
+        try self.lifecycle.spawn(self.io, http_server_mod.HttpServer.run, .{&self.server});
+    }
+
+    pub fn requestShutdown(self: *Engine) void {
+        self.lifecycle.requestShutdown(self.io);
+    }
+
+    /// Blocks until requestShutdown is called (from a signal thread or the
+    /// Lambda event loop).
+    pub fn awaitShutdown(self: *Engine) void {
+        self.lifecycle.awaitShutdown(self.io) catch |err| switch (err) {
+            error.Canceled => {},
+        };
+    }
+
+    /// Cancels the accept loop and all connection tasks and waits for them.
+    pub fn stop(self: *Engine) void {
+        self.lifecycle.shutdown(self.io);
+    }
+
+    pub fn destroy(self: *Engine) void {
+        const allocator = self.allocator;
+        self.server.deinit();
+        self.router.deinit();
+        self.upstreams.deinit();
+        self.arenas.deinit(allocator);
+        self.slab.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+pub fn serviceKindsFor(distribution: mode.Distribution) []const distro.ServiceKind {
+    return switch (distribution) {
+        inline else => |d| comptime distro.servicesFor(d),
+    };
+}
+
+// =============================================================================
+// run
+// =============================================================================
+
 pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     const allocator = init.gpa;
-    const io = init.io;
 
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init(io);
+    stdio_bus.init(init.io);
     const bus = stdio_bus.eventBus();
 
     bus.setLevel(Level.parseFromEnv(init.environ_map, "TERO_LOG_LEVEL", .info));
@@ -313,6 +376,11 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     bus.info(ServerStarting{});
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ConfigurationLoaded{ .path = config_path });
+
+    // The selected Io backend; everything below uses io, never init.io.
+    var io_runtime = try io_select.IoRuntime.fromEnv(init.io, init.environ_map);
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
 
     const config = zonfig.load(ProxyConfig, allocator, io, .{
         .json_path = config_path,
@@ -341,13 +409,77 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         .supported_stages = supportedStagesFor(distribution),
     };
 
+    logStartupConfig(bus, config, service_metadata);
+
+    var registry = policy.Registry.init(allocator, bus);
+    defer registry.deinit();
+
+    var runtime_metrics = try RuntimeMetrics.init(allocator, io, distributionLabel(distribution));
+    defer runtime_metrics.deinit();
+    runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
+
+    var loader = try policy.Loader.init(allocator, io, bus, &registry, config.policy_providers, service_metadata);
+    defer loader.deinit();
+    try loader.startAsync(io);
+    installSegfaultHandler();
+
+    const kinds = serviceKindsFor(distribution);
+    const engine = try Engine.create(allocator, io, init.environ_map, bus, &registry, &runtime_metrics, kinds, .{
+        .listen_address = config.listen_address,
+        .listen_port = config.listen_port,
+        .max_body_size = config.max_body_size,
+        .upstream_url = config.upstream_url,
+        .logs_url = config.logs_url,
+        .metrics_url = config.metrics_url,
+        .service_options = .{
+            .prometheus_max_input_bytes = config.prometheus.max_input_bytes_per_scrape,
+            .prometheus_max_output_bytes = config.prometheus.max_output_bytes_per_scrape,
+        },
+    });
+    defer engine.destroy();
+
+    var signal_count = std.atomic.Value(u32).init(0);
+    var shutdown_waiter = std.atomic.Value(bool).init(false);
+    var signal_waiter: ?SignalWaiterHandle = null;
+    if (installSignalWaiter(bus, io, &engine.lifecycle, &signal_count, &shutdown_waiter)) |waiter| {
+        signal_waiter = waiter;
+    } else |err| switch (err) {
+        error.UnsupportedPlatform => {},
+        else => return err,
+    }
+
+    try engine.start();
+
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    bus.info(ServerReady{});
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        bus.info(ShutdownHint{ .pid = std.c.getpid() });
+    }
+
+    engine.awaitShutdown();
+    engine.stop();
+
+    if (signal_waiter) |waiter| {
+        shutdown_waiter.store(true, .release);
+        std.posix.kill(std.c.getpid(), std.posix.SIG.USR1) catch |err|
+            log.warn("failed to send shutdown signal: {}", .{err});
+        waiter.thread.join();
+        std.posix.sigprocmask(std.posix.SIG.SETMASK, &waiter.previous_mask, null);
+    }
+
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    bus.info(ServerStopped{});
+}
+
+fn logStartupConfig(bus: *EventBus, config: *const ProxyConfig, service_metadata: policy.ServiceMetadata) void {
     var addr_buf: [64]u8 = undefined;
-    const addr_str = try std.fmt.bufPrint(&addr_buf, "{}.{}.{}.{}", .{
+    const addr_str = std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
         config.listen_address[0],
         config.listen_address[1],
         config.listen_address[2],
         config.listen_address[3],
-    });
+    }) catch "?";
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ListenAddressConfigured{ .address = addr_str, .port = config.listen_port });
@@ -368,169 +500,4 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         .instance_id = service_metadata.instance_id,
         .version = service_metadata.version,
     });
-
-    // policy-zig v0.3.1+: the registry is accessor-agnostic; each consumer
-    // module passes its own accessor at evaluate time. One registry +
-    // one loader services every bundle in this distribution.
-    var registry = policy.Registry.init(allocator, bus);
-    defer registry.deinit();
-
-    var runtime_metrics = try RuntimeMetrics.init(allocator, io, distributionLabel(distribution));
-    defer runtime_metrics.deinit();
-    runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
-
-    var loader = try policy.Loader.init(allocator, io, bus, &registry, config.policy_providers, service_metadata);
-    defer loader.deinit();
-    try loader.startAsync(io);
-    installSegfaultHandler();
-
-    const server_allocator = allocator;
-
-    var datadog_config: DatadogConfig = .{
-        .registry = &registry,
-        .bus = bus,
-        .metrics = &runtime_metrics,
-    };
-
-    var otlp_config: OtlpConfig = .{
-        .registry = &registry,
-        .bus = bus,
-        .metrics = &runtime_metrics,
-    };
-
-    var prometheus_config: PrometheusConfig = .{
-        .registry = &registry,
-        .bus = bus,
-        .metrics = &runtime_metrics,
-        .max_input_bytes_per_scrape = config.prometheus.max_input_bytes_per_scrape,
-        .max_output_bytes_per_scrape = config.prometheus.max_output_bytes_per_scrape,
-    };
-
-    const logs_upstream = config.logs_url orelse config.upstream_url;
-    const metrics_upstream = config.metrics_url orelse config.upstream_url;
-
-    var health_module: HealthModule = .{};
-    var datadog_logs_module: DatadogModule = .{};
-    var datadog_metrics_module: DatadogModule = .{};
-    var otlp_module: OtlpModule = .{};
-    var prometheus_module: PrometheusModule = .{};
-    var passthrough_module: PassthroughModule = .{};
-
-    var module_registrations = std.ArrayList(ModuleRegistration).empty;
-    defer module_registrations.deinit(allocator);
-
-    try module_registrations.append(allocator, .{
-        .module = .{ .health = &health_module },
-        .route_kind = .health,
-        .routes = &health_mod.routes,
-        .upstream_url = config.upstream_url,
-        .max_request_body = 0,
-        .max_response_body = 0,
-        .module_data = null,
-    });
-
-    for (bundlesFor(distribution)) |bundle| {
-        switch (bundle) {
-            .datadog_logs => {
-                try module_registrations.append(allocator, .{
-                    .module = .{ .datadog = &datadog_logs_module },
-                    .route_kind = .datadog_logs,
-                    .routes = &datadog_mod.logs_routes,
-                    .upstream_url = logs_upstream,
-                    .max_request_body = config.max_body_size,
-                    .max_response_body = config.max_body_size,
-                    .module_data = @ptrCast(&datadog_config),
-                });
-            },
-            .datadog_metrics => {
-                try module_registrations.append(allocator, .{
-                    .module = .{ .datadog = &datadog_metrics_module },
-                    .route_kind = .datadog_metrics,
-                    .routes = &datadog_mod.metrics_routes,
-                    .upstream_url = metrics_upstream,
-                    .max_request_body = config.max_body_size,
-                    .max_response_body = config.max_body_size,
-                    .module_data = @ptrCast(&datadog_config),
-                });
-            },
-            .otlp => {
-                try module_registrations.append(allocator, .{
-                    .module = .{ .otlp = &otlp_module },
-                    .route_kind = .otlp_logs,
-                    .routes = &otlp_mod.routes,
-                    .upstream_url = config.upstream_url,
-                    .max_request_body = config.max_body_size,
-                    .max_response_body = config.max_body_size,
-                    .module_data = @ptrCast(&otlp_config),
-                });
-            },
-            .prometheus => {
-                try module_registrations.append(allocator, .{
-                    .module = .{ .prometheus = &prometheus_module },
-                    .route_kind = .prometheus_metrics,
-                    .routes = &prometheus_mod.default_routes,
-                    .upstream_url = metrics_upstream,
-                    .max_request_body = 1024,
-                    .max_response_body = config.max_body_size,
-                    .module_data = @ptrCast(&prometheus_config),
-                });
-            },
-        }
-    }
-
-    try module_registrations.append(allocator, .{
-        .module = .{ .passthrough = &passthrough_module },
-        .route_kind = .passthrough,
-        .routes = &passthrough_mod.default_routes,
-        .upstream_url = config.upstream_url,
-        .max_request_body = config.max_body_size,
-        .max_response_body = config.max_body_size,
-        .module_data = null,
-    });
-
-    var proxy = try ProxyServer.init(
-        server_allocator,
-        io,
-        bus,
-        &runtime_metrics,
-        config.listen_address,
-        config.listen_port,
-        config.max_body_size,
-        module_registrations.items,
-    );
-    defer proxy.deinit();
-
-    var signal_count = std.atomic.Value(u32).init(0);
-    var shutdown_state = std.atomic.Value(u8).init(@intFromEnum(ShutdownState.running));
-    var shutdown_waiter = std.atomic.Value(bool).init(false);
-    var signal_waiter: ?SignalWaiterHandle = null;
-    if (installSignalWaiter(bus, &proxy, &signal_count, &shutdown_state, &shutdown_waiter)) |waiter| {
-        signal_waiter = waiter;
-    } else |err| switch (err) {
-        error.UnsupportedPlatform => {},
-        else => return err,
-    }
-
-    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-    bus.info(ServerReady{});
-    if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        bus.info(ShutdownHint{ .pid = std.c.getpid() });
-    }
-
-    const listen_thread = try proxy.listenInNewThread();
-    listen_thread.join();
-
-    setShutdownState(bus, &shutdown_state, .stopped, "listen.returned");
-
-    if (signal_waiter) |waiter| {
-        shutdown_waiter.store(true, .release);
-        std.posix.kill(std.c.getpid(), std.posix.SIG.USR1) catch |err|
-            log.warn("failed to send shutdown signal: {}", .{err});
-        waiter.thread.join();
-        std.posix.sigprocmask(std.posix.SIG.SETMASK, &waiter.previous_mask, null);
-    }
-
-    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-    bus.info(ServerStopped{});
 }

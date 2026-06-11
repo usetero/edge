@@ -250,6 +250,25 @@ test {
     _ = prometheus;
 }
 
+test "MethodBitmask.matches" {
+    const post_only: MethodBitmask = .{ .post = true };
+    try std.testing.expect(post_only.matches(.POST));
+    try std.testing.expect(!post_only.matches(.GET));
+
+    const get_post: MethodBitmask = .{ .get = true, .post = true };
+    try std.testing.expect(get_post.matches(.GET));
+    try std.testing.expect(get_post.matches(.POST));
+
+    try std.testing.expect(MethodBitmask.all.matches(.DELETE));
+}
+
+test "RoutePattern.exact" {
+    const route = RoutePattern.exact("/api/v2/logs", .{ .post = true });
+    try std.testing.expectEqual(RoutePattern.PatternType.exact, route.pattern_type);
+    try std.testing.expectEqual(std.hash.Wyhash.hash(0, "/api/v2/logs"), route.hash);
+    try std.testing.expectEqualStrings("/api/v2/logs", route.pattern);
+}
+
 test "HttpMethod.fromStd" {
     // Parity with the old proxy/server.zig toHttpMethod test.
     try std.testing.expectEqual(HttpMethod.GET, HttpMethod.fromStd(.GET));
