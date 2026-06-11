@@ -37,7 +37,7 @@ pub const health_module = @import("modules/health_module.zig");
 pub const prometheus_module = @import("modules/prometheus_module.zig");
 
 // Prometheus module
-pub const prometheus = @import("prometheus/root.zig");
+pub const prometheus = @import("signals/prometheus/root.zig");
 
 // =============================================================================
 // Distribution entry points
@@ -100,12 +100,15 @@ test {
     _ = @import("proxy/upstream_client.zig");
     _ = @import("modules/passthrough_module.zig");
     _ = @import("modules/datadog_module.zig");
-    _ = @import("modules/datadog_logs_v2.zig");
+    _ = @import("signals/datadog/logs.zig");
+    _ = @import("signals/datadog/metrics.zig");
     _ = @import("modules/otlp_module.zig");
-    _ = @import("modules/otlp_attributes.zig");
-    _ = @import("modules/otlp_logs.zig");
+    _ = @import("signals/otlp/attributes.zig");
+    _ = @import("signals/otlp/logs.zig");
+    _ = @import("signals/otlp/metrics.zig");
+    _ = @import("signals/otlp/traces.zig");
     _ = @import("modules/health_module.zig");
-    _ = @import("prometheus/root.zig");
+    _ = @import("signals/prometheus/root.zig");
     _ = @import("modules/prometheus_module.zig");
     _ = @import("runtime/pipeline.zig");
     _ = @import("io/transport.zig");

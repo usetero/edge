@@ -24,7 +24,7 @@ const std = @import("std");
 const proto = @import("proto");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
-const otlp_attr = @import("otlp_attributes.zig");
+const otlp_attr = @import("attributes.zig");
 
 const log = std.log.scoped(.otlp_traces);
 

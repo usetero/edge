@@ -1,7 +1,7 @@
 const std = @import("std");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
-const datadog_log = @import("datadog_log.zig");
+const datadog_log = @import("log.zig");
 
 const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;

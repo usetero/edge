@@ -1,8 +1,8 @@
 const std = @import("std");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
-const datadog_metric = @import("datadog_metric.zig");
-const otlp_attr = @import("otlp_attributes.zig");
+const datadog_metric = @import("metric.zig");
+const otlp_attr = @import("../otlp/attributes.zig");
 
 const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;

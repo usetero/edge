@@ -33,18 +33,11 @@ builds green, test-parity diff clean (PLAN.md §0), one commit.
 - [x] 2.10 Registered in root.zig (test block + pub exports)
 - [x] 2.11 Gate: 426/426 tests pass (user's otlp_metrics rework also landed → known failure gone), lint green, 6 distros build. Committed.
 
-## Phase 3 — src/signals/ (ports, test-heaviest)
-- [ ] 3.1 `git mv src/modules/datadog_log.zig src/signals/datadog/log.zig` (+imports fix)
-- [ ] 3.2 `git mv src/modules/datadog_metric.zig src/signals/datadog/metric.zig`
-- [ ] 3.3 `git mv src/modules/otlp_attributes.zig src/signals/otlp/attributes.zig`
-- [ ] 3.4 Move + restructure `datadog_logs_v2.zig` → `signals/datadog/logs.zig` (strata split per PLAN §7.2; batch fns preserved; readAll wrappers deleted → exceptions table)
-- [ ] 3.5 Move + restructure `datadog_metrics_v2.zig` → `signals/datadog/metrics.zig`
-- [ ] 3.6 Move + restructure `otlp_logs.zig` → `signals/otlp/logs.zig`
-- [ ] 3.7 Move + restructure `otlp_metrics.zig` → `signals/otlp/metrics.zig` (update build.zig anonymous import path)
-- [ ] 3.8 Move + restructure `otlp_traces.zig` → `signals/otlp/traces.zig`
-- [ ] 3.9 `git mv src/prometheus/* src/signals/prometheus/` (verbatim; fix imports incl. prometheus_module reference)
-- [ ] 3.10 Update root.zig test block; test-parity diff vs baseline; record exceptions
-- [ ] 3.11 Phase 3 gate + commit
+## Phase 3 — src/signals/ (ports)  ✅ DONE
+- [x] 3.1–3.9 All moves done via git mv (history preserved); intra-signal imports fixed; old-tree wrappers (datadog_module/otlp_module/prometheus_module) repointed at ../signals/ so old tree keeps compiling until Phase 5
+- [x] SCOPE DECISION: kept the moved files' public APIs intact (incl. processXxxStream readAll wrappers) because old modules/ wrappers still call them until Phase 5; the strata split / record-level sink API extraction happens in Phase 4/5 when service sinks define the exact shape needed. readAll wrappers die with modules-old in Phase 5.
+- [x] 3.10 Parity diff: 1 missing test = removed by USER's own otlp_metrics rework (recorded in test-exceptions.md). build.zig anonymous import unchanged (name-based, path-independent).
+- [x] 3.11 Gate: 426/426 tests, lint green, 6 distros build. Committed (includes user's in-flight otlp_metrics.zig rework which travels with the rename).
 
 ## Phase 4 — src/service/ + http/router
 - [ ] 4.1 Read runtime/app.zig:389-489 wiring; record authoritative route/service map in `.rewrite/wiring-notes.md`

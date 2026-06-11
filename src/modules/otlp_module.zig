@@ -1,9 +1,9 @@
 const std = @import("std");
 const module_types = @import("./module_types.zig");
 const policy = @import("policy_zig");
-const otlp_logs = @import("./otlp_logs.zig");
-const otlp_metrics = @import("./otlp_metrics.zig");
-const otlp_traces = @import("./otlp_traces.zig");
+const otlp_logs = @import("../signals/otlp/logs.zig");
+const otlp_metrics = @import("../signals/otlp/metrics.zig");
+const otlp_traces = @import("../signals/otlp/traces.zig");
 const runtime_metrics = @import("../runtime/runtime_metrics.zig");
 const o11y = @import("o11y");
 

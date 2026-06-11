@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const module_types = @import("./module_types.zig");
-const prometheus = @import("../prometheus/root.zig");
+const prometheus = @import("../signals/prometheus/root.zig");
 const policy = @import("policy_zig");
 const runtime_metrics = @import("../runtime/runtime_metrics.zig");
 const o11y = @import("o11y");

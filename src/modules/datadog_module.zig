@@ -1,8 +1,8 @@
 const std = @import("std");
 const module_types = @import("./module_types.zig");
 const policy = @import("policy_zig");
-const logs_v2 = @import("./datadog_logs_v2.zig");
-const metrics_v2 = @import("./datadog_metrics_v2.zig");
+const logs_v2 = @import("../signals/datadog/logs.zig");
+const metrics_v2 = @import("../signals/datadog/metrics.zig");
 const runtime_metrics = @import("../runtime/runtime_metrics.zig");
 const o11y = @import("o11y");
 
