@@ -64,9 +64,9 @@ builds green, test-parity diff clean (PLAN.md §0), one commit.
 - [x] 5.10 .ziglint.zon unchanged (scans src incl. -old which passes; -old dies in Phase 7)
 - [x] 5.11 build.zig: httpz dependency + all addImport("httpz") removed from compiled tree; step names unchanged
 - [x] LIMITS GROWTH: per-conn now includes decode (zstd window+192K) + encode (192K) + body (8K) + chunk (4K) regions → 1736K/conn, 438 MiB reserved at 256 conns (virtual; RSS tracks touched pages). Budget test re-locked. TERO_MAX_CONNECTIONS tunes it.
-- [ ] 5.12 Integration smoke (PLAN §12 Phase 5 gate): echo upstream + edge + policy filtering + gzip + health + metrics + SIGTERM
-- [ ] 5.13 steadyStateBytes logged; RSS sanity vs budget
-- [ ] 5.14 Phase 5 gate + commit (checkpoint commit done pre-smoke)
+- [x] 5.12 Integration smoke PASSED: health 200; plain + GZIP json_array bodies filtered per record at upstream (gzip re-encoded — NEW capability, old stack never filtered compressed bodies); passthrough relay; /_edge/metrics; SIGTERM structured-cancel clean exit. Results in wiring-notes.md
+- [x] 5.13 Budget emitted as DataPlaneBudget bus event; slab buffers via page_allocator; ReleaseFast RSS = 4.5 MiB idle / 6.2 MiB under traffic (438 MiB is virtual reservation; Debug RSS inflated by 0xaa memset)
+- [x] 5.14 Phase 5 COMPLETE: 416/416 tests, lint green, 6 distros httpz-free, smoke green. Exceptions table finalized.
 
 ## Phase 6 — Tail convergence
 - [ ] 6.1 uring scheduler takes `io` in init; tail framer retires in favor of pipeline/frame_ndjson

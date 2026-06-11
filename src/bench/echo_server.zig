@@ -309,14 +309,8 @@ fn serveConnection(ctx: *ServerContext, gpa: std.mem.Allocator, stream: std.Io.n
     var server = std.http.Server.init(&net_reader.interface, &net_writer.interface);
 
     while (server.reader.state == .ready) {
-        var request = server.receiveHead() catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => return,
-        };
-        handleRequest(ctx, &request, gpa) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => return,
-        };
+        var request = server.receiveHead() catch return;
+        handleRequest(ctx, &request, gpa) catch return;
     }
 }
 

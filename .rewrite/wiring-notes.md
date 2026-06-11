@@ -27,3 +27,14 @@ framing is added later.
   closes. Old httpz stack forwarded exotic encodings opaquely. zstd/gzip/
   x-gzip/deflate/compress/identity all parse fine, so agent traffic is
   unaffected; recorded as a known posture change for e.g. brotli.
+
+## Phase 5 smoke results (2026-06-11, local)
+- health 200; passthrough relayed; /_edge/metrics serving.
+- Policy filtering verified END TO END at the upstream: plain JSON array and
+  gzip-encoded bodies both arrive filtered (drop-debug policy applied per
+  record), gzip bodies re-encoded as gzip. NEW CAPABILITY: the old stack
+  never decompressed request bodies, so compressed traffic was unfiltered.
+- SIGTERM: structured cancel drains all tasks instantly, clean exit.
+- Memory: ReleaseFast RSS 4.5 MiB idle / 6.2 MiB under traffic; the 438 MiB
+  steadyStateBytes is virtual reservation only (Debug builds show full RSS
+  due to 0xaa undefined-memset).

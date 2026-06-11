@@ -56,6 +56,11 @@ const ServiceConfigured = struct {
     version: []const u8,
 };
 const ServerReady = struct {};
+const DataPlaneBudget = struct {
+    max_connections: usize,
+    per_conn_bytes: usize,
+    steady_state_bytes: usize,
+};
 const ShutdownHint = struct { pid: c_int };
 const ServerStopped = struct {};
 const ShutdownSignalReceived = struct { signal: []const u8, count: u32 };
@@ -450,6 +455,12 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
 
     try engine.start();
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    bus.info(DataPlaneBudget{
+        .max_connections = engine.limits.max_connections,
+        .per_conn_bytes = engine.limits.perConnBytes(),
+        .steady_state_bytes = engine.limits.steadyStateBytes(),
+    });
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ServerReady{});
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {

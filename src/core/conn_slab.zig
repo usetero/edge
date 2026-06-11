@@ -82,8 +82,11 @@ pub const ConnSlab = struct {
         try hot.resize(gpa, n);
         for (0..n) |i| hot.set(i, .{ .state = .free, .generation = 0 });
 
-        const buffers = try gpa.alignedAlloc(u8, .@"64", n * limits.perConnBytes());
-        errdefer gpa.free(buffers);
+        // The buffer region is page-granular and process-lifetime; going
+        // through page_allocator keeps reserved-but-untouched pages out of
+        // RSS (a debug gpa would memset the whole reservation).
+        const buffers = try std.heap.page_allocator.alignedAlloc(u8, .@"64", n * limits.perConnBytes());
+        errdefer std.heap.page_allocator.free(buffers);
 
         const free_list = try gpa.alloc(u16, n);
         errdefer gpa.free(free_list);
@@ -103,7 +106,7 @@ pub const ConnSlab = struct {
 
     pub fn deinit(self: *ConnSlab, gpa: std.mem.Allocator) void {
         self.hot.deinit(gpa);
-        gpa.free(self.buffers);
+        std.heap.page_allocator.free(self.buffers);
         gpa.free(self.free_list);
         self.* = undefined;
     }
