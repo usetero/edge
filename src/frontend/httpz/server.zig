@@ -257,6 +257,12 @@ pub const Handler = struct {
         pipe: service_mod.PipeStream,
     ) !void {
         const ctx = self.ctx;
+        // No policy targets this signal: the pipe is an identity transform,
+        // so skip the framer/codec/chunked overhead and relay the raw bytes
+        // (master's prefilter "forward unchanged" decision).
+        if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
+            return self.execForwardRaw(req, res, .{ .upstream = pipe.upstream });
+        }
         const bufs = try threadBufs(ctx.gpa, ctx.limits);
         var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
             res.status = 502;

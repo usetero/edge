@@ -79,3 +79,17 @@ builds green, test-parity diff clean (PLAN.md §0), one commit.
 - [x] 7.2 Bench vs old stack (worktree @ dba3aaf, same old-echo upstream, user's exact oha scenario): NEW +24% throughput (66.2k vs 53.6k rps), p99 4.6x tighter (2.7ms vs 12.5ms), 100%/100% success. Three production fixes found via the user's failing c=150 run: 502 on upstream-open failure (was silent close → reconnect storm), kernel_backlog 128→1024 (edge + echo), std.http.Client pool free_size 32→max_connections (root cause: ephemeral port exhaustion / AddressUnavailable). Full write-up in .rewrite/bench-results.md.
 - [x] 7.3 Claude.md: 0.15 reference section marked HISTORICAL with 0.16-native pointer
 - [x] 7.4 -old dirs verified unreferenced (kept on disk per original instruction); final gate 416/416 + lint + 7 binaries. Committed.
+
+## Frontend swap (PLAN-FRONTEND-SWAP.md) — phases A–D done 2026-06-11
+- [x] httpz pinned @ 5f60277 (0.16-clean); frontend/ restructure; exec.zig seam
+- [x] httpz frontend behind `-Dfrontend` (default httpz; stdio kept green in CI)
+- [x] empty-registry fast paths (policiesActiveFor) in RecordSink /
+      processBuffered / pipe_stream→forward_raw degradation
+- [ ] Port the old runtime prefilter: per-record short-circuit while policies
+      ARE loaded (hyperscan over raw record bytes before decode). This is the
+      remaining gap to master's ~80k rps with 4000 policies (currently 51.9k;
+      profile shows decode→eval→encode per record dominates).
+- [ ] Upstream relay concurrency: the synchronous upstream round-trip occupies
+      a handler-pool thread (~0.49 ms/request → ~64k ceiling at 32 threads).
+      Candidates: client pipelining, decoupled relay, or revisit pool sizing
+      with contention fixed (64 threads measurably regressed today).

@@ -376,6 +376,11 @@ zig build run-datadog
 zig build run-otlp
 zig build run-prometheus
 zig build run-tail
+
+# Inbound HTTP frontend (comptime; default httpz)
+zig build otlp -Dfrontend=httpz   # httpz event loop + worker pool (default)
+zig build otlp -Dfrontend=stdio   # std.Io-native; becomes the default again
+                                  # when std.Io ships evented networking
 ```
 
 ## Installation

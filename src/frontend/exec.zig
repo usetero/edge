@@ -176,6 +176,21 @@ pub fn collectUpstreamResponseHeaders(
     return buffer[0..count];
 }
 
+/// One atomic snapshot load per request: when no loaded policy targets the
+/// signal, both execution paths forward records verbatim instead of paying
+/// the decode → evaluate → re-encode round-trip. Same observable output —
+/// zero policies transform nothing — minus all the per-record work. (The
+/// old stack's prefilter went further and short-circuited per record even
+/// with policies loaded; that port is tracked in TODO.md.)
+pub fn policiesActiveFor(registry: *policy.Registry, signal: service_mod.Signal) bool {
+    const snapshot = registry.getSnapshot() orelse return false;
+    return switch (signal) {
+        .log => snapshot.getLogTargetIndices().len > 0,
+        .metric => snapshot.getMetricTargetIndices().len > 0,
+        .trace => snapshot.trace_target_indices.len > 0,
+    };
+}
+
 pub const BufferedResult = struct {
     body: []const u8,
     all_dropped: bool,
@@ -204,6 +219,9 @@ pub fn processBuffered(
     arena: std.mem.Allocator,
     raw_body: []const u8,
 ) !BufferedResult {
+    if (!policiesActiveFor(ctx.registry, pipe.signal)) {
+        return .{ .body = raw_body, .all_dropped = false };
+    }
     var raw_reader = std.Io.Reader.fixed(raw_body);
     const decode_buf = try arena.alloc(u8, pipe.codec.decoderBufferLen(ctx.limits.zstd_window_len));
     var decoder: encoding_mod.Decoder = .init(pipe.codec, &raw_reader, decode_buf, ctx.limits.zstd_window_len);
@@ -250,6 +268,9 @@ pub const RecordSink = struct {
     signal: service_mod.Signal,
     format: framer_mod.WireFormat,
     record_arena: std.heap.ArenaAllocator,
+    /// Snapshot emptiness for this request's signal, resolved once at init;
+    /// false short-circuits onRecord to .keep without decoding.
+    active: bool,
     /// Batch totals for recordPolicyBatch.
     records: u64 = 0,
     dropped: u64 = 0,
@@ -260,6 +281,7 @@ pub const RecordSink = struct {
             .signal = signal,
             .format = format,
             .record_arena = .init(ctx.gpa),
+            .active = policiesActiveFor(ctx.registry, signal),
         };
     }
 
@@ -269,11 +291,13 @@ pub const RecordSink = struct {
     }
 
     pub fn onRecord(self: *RecordSink, bytes: []const u8) !framer_mod.Decision {
+        self.records += 1;
+        if (!self.active) return .keep;
+
         // Replace bytes from the PREVIOUS record die here; the framer has
         // already written them (emit happens before the next onRecord).
         _ = self.record_arena.reset(.retain_capacity);
         const arena = self.record_arena.allocator();
-        self.records += 1;
 
         return switch (self.format) {
             .json_array => self.evalJsonRecord(arena, bytes),
@@ -424,6 +448,20 @@ test "stripLenField unwraps single-field messages" {
     // Wrong tag -> null
     const wrong = [_]u8{ 0x12, 0x01, 'x' };
     try testing.expectEqual(@as(?[]const u8, null), stripLenField(&wrong));
+}
+
+test "policiesActiveFor is false on an empty registry" {
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = policy.Registry.init(testing.allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // No snapshot loaded at all, and after that no policies per signal:
+    // every signal must short-circuit so empty deployments skip the
+    // per-record decode entirely.
+    try testing.expect(!policiesActiveFor(&registry, .log));
+    try testing.expect(!policiesActiveFor(&registry, .metric));
+    try testing.expect(!policiesActiveFor(&registry, .trace));
 }
 
 test "classifyKnownPath matches core routes" {

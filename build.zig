@@ -7,13 +7,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
     const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
-    // Interim default is stdio; Phase D of PLAN-FRONTEND-SWAP.md flips it to
-    // httpz once the bench gates pass. CI must build both.
+    // httpz is the default until std.Io has an evented implementation that
+    // serves sockets (PLAN-FRONTEND-SWAP.md §6 swap-back criteria). CI must
+    // keep building both.
     const frontend = b.option(
         Frontend,
         "frontend",
-        "Inbound HTTP frontend (stdio = std.Io-native, httpz = event loop + worker pool)",
-    ) orelse .stdio;
+        "Inbound HTTP frontend (httpz = event loop + worker pool, stdio = std.Io-native)",
+    ) orelse .httpz;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);

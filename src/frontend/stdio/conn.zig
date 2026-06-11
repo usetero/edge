@@ -268,6 +268,12 @@ fn execPipeStream(
     pipe: service_mod.PipeStream,
 ) !void {
     const ctx = env.shared;
+    // No policy targets this signal: the pipe is an identity transform, so
+    // skip the framer/codec/chunked overhead and relay the raw bytes
+    // (master's prefilter "forward unchanged" decision).
+    if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
+        return execForwardRaw(env, conn_id, arena_slot, request, .{ .upstream = pipe.upstream });
+    }
     const arena = env.arenas.allocator(arena_slot);
     var upstream_req = openUpstream(env, request, arena, pipe.upstream) catch {
         try request.respond("", .{ .status = .bad_gateway });
