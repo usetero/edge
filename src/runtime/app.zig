@@ -1,8 +1,8 @@
 //! Composition root for the proxy distributions (PLAN.md §10).
 //!
 //! Juicy main hands us io/gpa/environ; everything below is wired here and
-//! NOWHERE else: Io selection, limits, slab, arena pool, upstreams, services,
-//! router, lifecycle, HTTP server. Shutdown is structured — the signal
+//! NOWHERE else: Io selection, limits, upstreams, services, router,
+//! lifecycle, HTTP frontend. Shutdown is structured — the signal
 //! watcher calls Lifecycle.requestShutdown and Lifecycle.shutdown cancels
 //! the accept loop and every connection task together.
 const std = @import("std");
@@ -16,14 +16,12 @@ const config_types = @import("../config/types.zig");
 const zonfig = @import("../zonfig/root.zig");
 const limits_mod = @import("../core/limits.zig");
 const io_select = @import("../core/io_select.zig");
-const conn_slab_mod = @import("../core/conn_slab.zig");
-const arena_pool_mod = @import("../core/arena_pool.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
 const service_mod = @import("../service/service.zig");
-const router_mod = @import("../http/router.zig");
-const upstream_mod = @import("../http/upstream.zig");
-const conn_mod = @import("../http/conn.zig");
-const http_server_mod = @import("../http/server.zig");
+const router_mod = @import("../service/router.zig");
+const upstream_mod = @import("../frontend/upstream.zig");
+const exec_mod = @import("../frontend/exec.zig");
+const http_server_mod = @import("../frontend/stdio/server.zig");
 
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
@@ -207,8 +205,9 @@ fn installSegfaultHandler() void {
 
 // =============================================================================
 // Engine: the assembled data plane. Heap-allocated so the internal pointers
-// (SharedCtx -> router/slab/...) stay stable. Shared by app.run and the
-// Lambda extension main.
+// (SharedCtx -> router/upstreams/...) stay stable. Shared by app.run and the
+// Lambda extension main. Frontend-specific state (the stdio conn slab and
+// arena pool) is owned by the frontend server, not the Engine.
 // =============================================================================
 
 pub const EngineOptions = struct {
@@ -225,14 +224,12 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     limits: limits_mod.Limits,
-    slab: conn_slab_mod.ConnSlab,
-    arenas: arena_pool_mod.ArenaPool,
     upstreams: upstream_mod.UpstreamManager,
     services_buf: [8]service_mod.Service,
     services_len: usize,
     router: router_mod.Router,
     lifecycle: lifecycle_mod.Lifecycle,
-    shared_ctx: conn_mod.SharedCtx,
+    shared_ctx: exec_mod.SharedCtx,
     server: http_server_mod.HttpServer,
 
     pub fn create(
@@ -253,15 +250,10 @@ pub const Engine = struct {
         self.limits = .resolve(options.max_body_size, environ_map);
         self.limits.logStartup();
 
-        self.slab = try .init(allocator, self.limits);
-        errdefer self.slab.deinit(allocator);
-        self.arenas = try .init(allocator, self.limits);
-        errdefer self.arenas.deinit(allocator);
-
         self.upstreams = upstream_mod.UpstreamManager.init(io, allocator, self.limits.max_connections);
         errdefer self.upstreams.deinit();
         const max_body = options.max_body_size;
-        const upstream_ids: conn_mod.UpstreamIds = .{
+        const upstream_ids: exec_mod.UpstreamIds = .{
             .default = try self.upstreams.createUpstream(options.upstream_url, 2048, max_body, max_body),
             .logs = try self.upstreams.createUpstream(
                 options.logs_url orelse options.upstream_url,
@@ -305,8 +297,6 @@ pub const Engine = struct {
             .bus = bus,
             .metrics = metrics,
             .limits = self.limits,
-            .slab = &self.slab,
-            .arenas = &self.arenas,
         };
 
         self.server = try .init(
@@ -345,8 +335,6 @@ pub const Engine = struct {
         self.server.deinit();
         self.router.deinit();
         self.upstreams.deinit();
-        self.arenas.deinit(allocator);
-        self.slab.deinit(allocator);
         allocator.destroy(self);
     }
 };

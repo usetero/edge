@@ -4,7 +4,7 @@
 //! routes, then the wildcard fallback. Matches resolve to a ServiceIndex
 //! into the distro's service table instead of a ModuleId.
 const std = @import("std");
-const service_mod = @import("../service/service.zig");
+const service_mod = @import("service.zig");
 
 const ServiceIndex = service_mod.ServiceIndex;
 const RoutePattern = service_mod.RoutePattern;

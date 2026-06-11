@@ -25,11 +25,13 @@ pub const pipeline_encoding = @import("pipeline/encoding.zig");
 pub const pipeline_framer = @import("pipeline/framer.zig");
 pub const pipeline_compress_buffered = @import("pipeline/compress_buffered.zig");
 
-// HTTP core (0.16 rewrite, PLAN.md §9)
-pub const http_server = @import("http/server.zig");
-pub const http_conn = @import("http/conn.zig");
-pub const http_router = @import("http/router.zig");
-pub const http_upstream = @import("http/upstream.zig");
+// HTTP frontends (PLAN.md §9, PLAN-FRONTEND-SWAP.md): exec is the
+// transport-neutral outcome executor shared by every frontend.
+pub const frontend_exec = @import("frontend/exec.zig");
+pub const frontend_upstream = @import("frontend/upstream.zig");
+pub const frontend_stdio_server = @import("frontend/stdio/server.zig");
+pub const frontend_stdio_conn = @import("frontend/stdio/conn.zig");
+pub const service_router = @import("service/router.zig");
 
 // Services + distro composition (PLAN.md §8)
 pub const service = @import("service/service.zig");
@@ -98,9 +100,10 @@ test {
     _ = @import("signals/otlp/metrics.zig");
     _ = @import("signals/otlp/traces.zig");
     _ = @import("service/service.zig");
-    _ = @import("http/router.zig");
-    _ = @import("http/upstream.zig");
-    _ = @import("http/conn.zig");
+    _ = @import("service/router.zig");
+    _ = @import("frontend/upstream.zig");
+    _ = @import("frontend/exec.zig");
+    _ = @import("frontend/stdio/conn.zig");
     _ = @import("runtime/distro.zig");
     _ = @import("signals/prometheus/root.zig");
     _ = @import("lambda/root.zig");

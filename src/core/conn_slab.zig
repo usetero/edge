@@ -175,7 +175,10 @@ pub const ConnSlab = struct {
                 else => return,
             };
             const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(self.buffers[aligned_base..].ptr);
-            std.posix.madvise(ptr, aligned_end - aligned_base, advice) catch {};
+            std.posix.madvise(ptr, aligned_end - aligned_base, advice) catch |err| {
+                // Advisory only: the slot stays usable, RSS just won't shrink.
+                log.warn("madvise failed for slot {d}: {s}", .{ slot, @errorName(err) });
+            };
         }
     }
 

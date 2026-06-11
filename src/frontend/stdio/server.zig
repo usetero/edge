@@ -1,24 +1,39 @@
-//! Accept loop on std.Io.net (PLAN.md §9). One concurrent task per
-//! connection via Lifecycle.spawn; the Io implementation decides what
-//! "concurrent" means. Shutdown is structured: Lifecycle.shutdown cancels
-//! the accept task and every connection task together.
+//! std.Io-native frontend: accept loop on std.Io.net (PLAN.md §9). One
+//! concurrent task per connection via Lifecycle.spawn; the Io implementation
+//! decides what "concurrent" means. Shutdown is structured:
+//! Lifecycle.shutdown cancels the accept task and every connection task
+//! together.
+//!
+//! Owns the frontend-specific per-connection state — the conn slab and the
+//! arena pool (PLAN-FRONTEND-SWAP.md §2) — so composing a different frontend
+//! never pays this one's memory reservation.
 const std = @import("std");
 const conn_mod = @import("conn.zig");
-const lifecycle_mod = @import("../core/lifecycle.zig");
+const exec = @import("../exec.zig");
+const lifecycle_mod = @import("../../core/lifecycle.zig");
+const conn_slab_mod = @import("../../core/conn_slab.zig");
+const arena_pool_mod = @import("../../core/arena_pool.zig");
 
 const log = std.log.scoped(.http_server);
 
 pub const HttpServer = struct {
     listener: std.Io.net.Server,
-    ctx: *conn_mod.SharedCtx,
+    ctx: *exec.SharedCtx,
     lifecycle: *lifecycle_mod.Lifecycle,
+    slab: conn_slab_mod.ConnSlab,
+    arenas: arena_pool_mod.ArenaPool,
 
     pub fn init(
-        ctx: *conn_mod.SharedCtx,
+        ctx: *exec.SharedCtx,
         lifecycle: *lifecycle_mod.Lifecycle,
         listen_address: [4]u8,
         listen_port: u16,
     ) !HttpServer {
+        var slab: conn_slab_mod.ConnSlab = try .init(ctx.gpa, ctx.limits);
+        errdefer slab.deinit(ctx.gpa);
+        var arenas: arena_pool_mod.ArenaPool = try .init(ctx.gpa, ctx.limits);
+        errdefer arenas.deinit(ctx.gpa);
+
         var addr_buf: [64]u8 = undefined;
         const addr_str = try std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
             listen_address[0], listen_address[1], listen_address[2], listen_address[3],
@@ -35,11 +50,15 @@ pub const HttpServer = struct {
             .listener = listener,
             .ctx = ctx,
             .lifecycle = lifecycle,
+            .slab = slab,
+            .arenas = arenas,
         };
     }
 
     pub fn deinit(self: *HttpServer) void {
         self.listener.deinit(self.ctx.io);
+        self.arenas.deinit(self.ctx.gpa);
+        self.slab.deinit(self.ctx.gpa);
         self.* = undefined;
     }
 
@@ -57,7 +76,9 @@ pub const HttpServer = struct {
                     continue;
                 },
             };
-            self.lifecycle.spawn(io, conn_mod.serveConnection, .{ self.ctx, stream }) catch |err| switch (err) {
+            self.lifecycle.spawn(io, conn_mod.serveConnection, .{
+                self.ctx, &self.slab, &self.arenas, stream,
+            }) catch |err| switch (err) {
                 error.ConcurrencyUnavailable => {
                     // The Io implementation is at its task limit; the slab
                     // would also have shed. Tell the client to back off.

@@ -53,3 +53,18 @@ Record every verified std API here with the zigdoc snippet that justifies it.
   returning http.BodyWriter (has .writer iface; must call .end() then flush).
 - HEAD handled transparently via eliding BodyWriter.
 - `request.iterateHeaders()` for header passthrough.
+
+## httpz on Zig 0.16 (Phase A of PLAN-FRONTEND-SWAP.md, 2026-06-11)
+
+- karlseguin/http.zig master @ 5f60277d3b3beffef86321869b13c57f7acc3c5b builds clean on
+  Zig 0.16.0; all 125 upstream tests pass (`zig build test` in a bare clone).
+- `res.writer()` returns `*std.Io.Writer` (httpz is on the new Io interface) — no
+  adapter needed at the exec.zig seam.
+- `req.body()` returns `?[]const u8`; `req.arena`/`res.arena` is the same per-request
+  arena, reset between requests.
+- `Config.workers.count`, `Config.request.max_body_size` are the tuning knobs to derive
+  from limits.zig.
+- Pinned via tarball URL (zig fetch git+https failed with EndOfStream on this network):
+  hash httpz-0.0.0-PNVzrJrbCACyokt2AARAG7Ul7h7xlZxL7BYAdpsAs1_-
+- 5f60277 includes "fix fallbackallocator resize so not to corrupt arenaallocator" —
+  the very bug class that forced signals' transient arenas onto page_allocator.
