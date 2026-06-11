@@ -4,6 +4,7 @@
 //! allocation, which is what makes the data-plane memory budget closed-form
 //! (see limits.zig).
 const std = @import("std");
+const builtin = @import("builtin");
 const limits_mod = @import("limits.zig");
 
 const log = std.log.scoped(.conn_slab);
@@ -63,7 +64,8 @@ const ConnHot = struct {
 pub const ConnSlab = struct {
     hot: std.MultiArrayList(ConnHot),
     /// Contiguous buffer arena sliced per slot; the only large allocation.
-    buffers: []align(64) u8,
+    /// Page-aligned so madvise can address individual connection slots.
+    buffers: []align(std.heap.page_size_min) u8,
     /// Stack of free slot indexes; claim pops, release pushes.
     free_list: []u16,
     free_count: usize,
@@ -84,8 +86,13 @@ pub const ConnSlab = struct {
 
         // The buffer region is page-granular and process-lifetime; going
         // through page_allocator keeps reserved-but-untouched pages out of
-        // RSS (a debug gpa would memset the whole reservation).
-        const buffers = try std.heap.page_allocator.alignedAlloc(u8, .@"64", n * limits.perConnBytes());
+        // RSS (a debug gpa would memset the whole reservation). Alignment
+        // must be at least page_size_min so madvise() can address any slot.
+        const buffers = try std.heap.page_allocator.alignedAlloc(
+            u8,
+            .fromByteUnits(std.heap.page_size_min),
+            n * limits.perConnBytes(),
+        );
         errdefer std.heap.page_allocator.free(buffers);
 
         const free_list = try gpa.alloc(u16, n);
@@ -129,18 +136,47 @@ pub const ConnSlab = struct {
 
     /// Releases a slot back to the free list, bumping the generation so any
     /// stale ConnId held elsewhere asserts instead of aliasing the new owner.
+    /// After releasing the lock, advises the OS to decommit the buffer pages
+    /// so idle RSS returns to near zero between connections.
     pub fn release(self: *ConnSlab, io: std.Io, id: ConnId) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        const slot: u16 = blk: {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
 
-        const slot = self.checkedIndex(id);
-        const entry = self.hot.get(slot);
-        std.debug.assert(entry.state != .free);
-        self.hot.set(slot, .{ .state = .free, .generation = entry.generation +% 1 });
+            const s = self.checkedIndex(id);
+            const entry = self.hot.get(s);
+            std.debug.assert(entry.state != .free);
+            self.hot.set(s, .{ .state = .free, .generation = entry.generation +% 1 });
 
-        std.debug.assert(self.free_count < self.free_list.len);
-        self.free_list[self.free_count] = slot;
-        self.free_count += 1;
+            std.debug.assert(self.free_count < self.free_list.len);
+            self.free_list[self.free_count] = s;
+            self.free_count += 1;
+            break :blk s;
+        };
+
+        // One madvise per connection close: tell the OS these pages are no
+        // longer needed. On Linux (DONTNEED) pages are immediately zeroed and
+        // deducted from RSS. On macOS (FREE_REUSABLE) they're immediately
+        // reclaimable and drop from the physical footprint. Pages are re-faulted
+        // as zeroed on next use — the slab's zero-alloc hot path is preserved.
+        //
+        // madvise requires page-aligned address and length. In production all
+        // buffer size constants are multiples of 4 KiB, so the slot region is
+        // naturally aligned. Tests use tiny buffer sizes where it isn't; the
+        // aligned_end ≤ aligned_base guard skips the call safely.
+        const page = std.heap.page_size_min;
+        const base = @as(usize, slot) * self.limits.perConnBytes();
+        const aligned_base = std.mem.alignForward(usize, base, page);
+        const aligned_end = std.mem.alignBackward(usize, base + self.limits.perConnBytes(), page);
+        if (aligned_end > aligned_base) {
+            const advice: u32 = switch (builtin.os.tag) {
+                .linux => std.c.MADV.DONTNEED,
+                .macos, .ios => std.c.MADV.FREE_REUSABLE,
+                else => return,
+            };
+            const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(self.buffers[aligned_base..].ptr);
+            std.posix.madvise(ptr, aligned_end - aligned_base, advice) catch {};
+        }
     }
 
     pub fn setState(self: *ConnSlab, io: std.Io, id: ConnId, next: ConnState) void {

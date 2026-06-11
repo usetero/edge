@@ -504,9 +504,7 @@ fn processProtobufLogs(
 
     // Use an arena for the protobuf decode/filter/encode cycle.
     // This ensures all allocations (including dropped log records) are freed together.
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    _ = try arena.allocator().alloc(u8, data.len * 10); // Pre-warm
-    _ = arena.reset(.retain_capacity); // Reset but keep capacity
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 

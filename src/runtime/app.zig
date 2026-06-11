@@ -361,7 +361,25 @@ pub fn serviceKindsFor(distribution: mode.Distribution) []const distro.ServiceKi
 // run
 // =============================================================================
 
+fn raiseOpenFileLimit() void {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
+    // A proxy holding max_connections inbound sockets + 3 upstream pools of the
+    // same size can easily consume 1000+ FDs. The OS default soft limit (256 on
+    // older macOS, 1024 on many Linux systems) is far too low. Raise to the hard
+    // limit, or to a known-sufficient value, whichever is smaller.
+    const want: std.posix.rlim_t = 65536;
+    const current = std.posix.getrlimit(.NOFILE) catch return;
+    if (current.cur >= want) return;
+    const new: std.posix.rlimit = .{
+        .cur = if (current.max == std.posix.RLIM.INFINITY) want else @min(want, current.max),
+        .max = current.max,
+    };
+    std.posix.setrlimit(.NOFILE, new) catch |err|
+        log.warn("could not raise RLIMIT_NOFILE to {d}: {s}", .{ want, @errorName(err) });
+}
+
 pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
+    raiseOpenFileLimit();
     const allocator = init.gpa;
 
     var stdio_bus: o11y.StdioEventBus = undefined;

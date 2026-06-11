@@ -512,7 +512,7 @@ fn processProtobufTraces(
     }
 
     // Use an arena for the protobuf decode/filter/encode cycle
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 

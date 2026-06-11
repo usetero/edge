@@ -395,7 +395,7 @@ fn processProtobufMetrics(
     // fallback allocator) corrupt memory on the resize-then-free path. Keeping
     // this transient scratch off the caller's allocator avoids that entirely;
     // the caller is only touched by the single exact-size dupe at the end.
-    var arena: std.heap.ArenaAllocator = .init(allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
@@ -435,7 +435,7 @@ fn processProtobufMetricsStream(
     // not the caller's allocator. readAll grows its buffer incrementally
     // (resize), which is unsafe on some caller allocators (e.g. httpz's
     // fixed-buffer fallback allocator). See processProtobufMetrics below.
-    var read_arena: std.heap.ArenaAllocator = .init(allocator);
+    var read_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer read_arena.deinit();
     const data = try readAll(read_arena.allocator(), in_reader);
 
