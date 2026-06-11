@@ -108,6 +108,9 @@ test {
     _ = @import("signals/otlp/metrics.zig");
     _ = @import("signals/otlp/traces.zig");
     _ = @import("modules/health_module.zig");
+    _ = @import("service/service.zig");
+    _ = @import("http/router.zig");
+    _ = @import("runtime/distro.zig");
     _ = @import("signals/prometheus/root.zig");
     _ = @import("modules/prometheus_module.zig");
     _ = @import("runtime/pipeline.zig");

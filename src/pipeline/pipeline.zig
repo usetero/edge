@@ -253,6 +253,19 @@ test "corrupt gzip input propagates a read error" {
     );
 }
 
+test "streamReaderToWriter streams full payload" {
+    const input = "hello world";
+    var input_reader = std.Io.Reader.fixed(input);
+
+    var out_buf: [64]u8 = undefined;
+    var output_writer = std.Io.Writer.fixed(&out_buf);
+
+    const bytes = try streamReaderToWriter(&input_reader, &output_writer, input.len);
+
+    try std.testing.expectEqual(input.len, bytes);
+    try std.testing.expectEqualStrings(input, out_buf[0..bytes]);
+}
+
 test "streamReaderToWriter respects limit" {
     var in_reader = std.Io.Reader.fixed("abcdef");
     var out_buf: [16]u8 = undefined;

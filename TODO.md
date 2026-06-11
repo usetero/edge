@@ -39,17 +39,17 @@ builds green, test-parity diff clean (PLAN.md §0), one commit.
 - [x] 3.10 Parity diff: 1 missing test = removed by USER's own otlp_metrics rework (recorded in test-exceptions.md). build.zig anonymous import unchanged (name-based, path-independent).
 - [x] 3.11 Gate: 426/426 tests, lint green, 6 distros build. Committed (includes user's in-flight otlp_metrics.zig rework which travels with the rename).
 
-## Phase 4 — src/service/ + http/router
-- [ ] 4.1 Read runtime/app.zig:389-489 wiring; record authoritative route/service map in `.rewrite/wiring-notes.md`
-- [ ] 4.2 Port `proxy/router.zig` → `http/router.zig` (tests verbatim)
-- [ ] 4.3 `service/service.zig`: ServiceKind, Service union, Route, Outcome, PlanError
-- [ ] 4.4 `service/health.zig` + `service/passthrough.zig` (+ported tests)
-- [ ] 4.5 `service/datadog.zig` (+ported dispatch tests)
-- [ ] 4.6 `service/otlp.zig` (+ported tests)
-- [ ] 4.7 `service/prometheus.zig` (fetch_filtered outcome; +ported tests)
-- [ ] 4.8 `runtime/distro.zig` (comptime DistroSpec per distribution)
-- [ ] 4.9 Port route-plan classification tests from proxy/server.zig
-- [ ] 4.10 Register in root.zig; Phase 4 gate + commit
+## Phase 4 — src/service/ + http/router  ✅ DONE
+- [x] 4.1 Wiring recorded in `.rewrite/wiring-notes.md` (health first, passthrough last; logs_url/metrics_url fallbacks; prometheus scrape caps; req-body caps)
+- [x] 4.2 http/router.zig ported keyed by ServiceIndex (RouteSet replaces ModuleConfig); all 6 router tests ported with assertions unchanged
+- [x] 4.3 service/service.zig: ServiceKind, Service union (inline-else plan dispatch), RoutePattern/HttpMethod/MethodBitmask ported, Outcome = respond | forward_raw | pipe_stream | pipe_buffered | fetch_filtered, Signal, UpstreamChoice, BufferedKind
+- [x] 4.4–4.7 All five service files with plan() + tests. KEY DESIGN NOTES:
+      * pipe_buffered covers JSON OBJECT bodies (datadog series {"series":[...]}, OTLP/JSON) that top-level-array/protobuf framers don't; streaming covers datadog logs (json_array), OTLP protobuf, prom text, passthrough
+      * fail-open: unknown content-type or content-encoding → forward_raw (matches old module gates)
+      * BEHAVIOR CHANGE (streaming only): old "all records dropped → respond 200 {} without forwarding" can't exist when streaming — empty filtered batch is forwarded instead. Buffered path keeps old semantics. Documented in wiring-notes.
+- [x] 4.8 runtime/distro.zig: comptime servicesFor(distribution) + buildService; mirrors bundlesFor exactly
+- [x] 4.9 Old server.zig test parity: toHttpMethod → HttpMethod.fromStd test; CompressionEncoding → ContentEncoding tests (already); streamReaderToWriter both tests in pipeline.zig; header-skip tests port with conn.zig in 5.3
+- [x] 4.10 Gate: 448/448 tests, lint green, 6 distros. Committed.
 
 ## Phase 5 — src/http/ + runtime/ + cutover (THE BIG ONE)
 - [ ] 5.1 zigdoc pre-work (PLAN §1 list): std.Io.net, Io.Group, std.http.Server, std.http.Client.Request chunked send, Io.Threaded; commit findings to zigdoc-notes.md
