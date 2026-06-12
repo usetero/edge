@@ -72,11 +72,11 @@ test "read scheduler public API: processes event batch" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("s.log", .{});
-        defer f.close();
-        try f.writeAll("a\n");
+        const f = try tmp.dir.createFile(io, "s.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "a\n");
     }
-    const abs = try tmp.dir.realpathAlloc(testing.allocator, "s.log");
+    const abs = try tmp.dir.realPathFileAlloc(io, "s.log", testing.allocator);
     defer testing.allocator.free(abs);
     const file = try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_only });
     defer file.close(io);

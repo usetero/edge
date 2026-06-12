@@ -5,6 +5,7 @@ const queue_mod = @import("queue.zig");
 const store_mod = @import("store.zig");
 const wal_mod = @import("wal.zig");
 const snapshot_mod = @import("snapshot.zig");
+const lifecycle_mod = @import("../../core/lifecycle.zig");
 
 const log = std.log.scoped(.checkpoint_lane);
 
@@ -17,8 +18,7 @@ pub const Lane = struct {
     store: store_mod.Store,
     wal: wal_mod.Wal,
     snapshot: snapshot_mod.Snapshot,
-    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    worker: ?std.Thread = null,
+    started: bool = false,
 
     interval_ns: u64,
     ttl_ns: i128,
@@ -82,8 +82,10 @@ pub const Lane = struct {
         return lane;
     }
 
+    /// Resource teardown only. When `start` was used, the owning runtime
+    /// MUST run `Lifecycle.shutdown` (joining the worker task) and then
+    /// `finalize` before calling this.
     pub fn deinit(self: *Lane) void {
-        self.stopWorker();
         self.snapshot.deinit();
         self.wal.deinit();
         self.store.deinit();
@@ -91,18 +93,23 @@ pub const Lane = struct {
         self.* = undefined;
     }
 
-    pub fn start(self: *Lane) !void {
-        if (self.worker != null) return;
-        self.stop.store(false, .release);
-        self.worker = try std.Thread.spawn(.{}, workerMain, .{self});
+    /// Spawns the worker as a concurrent task in the caller's lifecycle
+    /// group (PLAN.md §9 Phase 6): shutdown is the group's collective
+    /// cancel, not a Lane-owned thread join.
+    pub fn start(self: *Lane, lifecycle: *lifecycle_mod.Lifecycle) !void {
+        if (self.started) return;
+        try lifecycle.spawn(self.io, workerMain, .{self});
+        self.started = true;
     }
 
-    pub fn stopWorker(self: *Lane) void {
-        if (self.worker) |thread| {
-            self.stop.store(true, .release);
-            thread.join();
-            self.worker = null;
-        }
+    /// Post-shutdown drain, called by the owner AFTER Lifecycle.shutdown has
+    /// joined the worker task (the canceled task can't reliably run final
+    /// file IO itself). Applies whatever the poll loop enqueued last, then
+    /// syncs the WAL and rewrites the snapshot so recovery sees everything.
+    pub fn finalize(self: *Lane) void {
+        while (self.queue.pop()) |update| self.applyUpdate(update) catch |err|
+            log.warn("applyUpdate (drain) failed: {}", .{err});
+        self.runMaintenance(true) catch |err| log.warn("runMaintenance (final) failed: {}", .{err});
     }
 
     pub fn enqueue(self: *Lane, update: Update) !bool {
@@ -128,7 +135,10 @@ pub const Lane = struct {
         try self.persistSnapshotAndResetWal();
     }
 
-    fn workerMain(self: *Lane) void {
+    /// Concurrent task in the runtime's lifecycle group. Cancellation lands
+    /// here as error.Canceled out of the cadence sleep; the final drain runs
+    /// in `finalize` on the shutdown thread, where file IO is not canceled.
+    fn workerMain(self: *Lane) std.Io.Cancelable!void {
         while (true) {
             if (self.queue.pop()) |update| {
                 self.applyUpdate(update) catch |err| log.warn("applyUpdate failed: {}", .{err});
@@ -136,18 +146,9 @@ pub const Lane = struct {
                 continue;
             }
 
-            if (self.stop.load(.acquire)) {
-                self.runMaintenance(true) catch |err| log.warn("runMaintenance (drain) failed: {}", .{err});
-                while (self.queue.pop()) |update| self.applyUpdate(update) catch |err|
-                    log.warn("applyUpdate (drain) failed: {}", .{err});
-                self.runMaintenance(true) catch |err| log.warn("runMaintenance (final) failed: {}", .{err});
-                break;
-            }
-
             self.runMaintenance(false) catch |err| log.warn("runMaintenance failed: {}", .{err});
             const sleep_ns = @min(self.interval_ns, 10 * std.time.ns_per_ms);
-            self.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch |err|
-                log.warn("worker sleep failed: {}", .{err});
+            try self.io.sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake);
         }
     }
 
@@ -199,45 +200,51 @@ const testing = std.testing;
 fn waitForOffset(lane: *Lane, id: tail_types.FileIdentity, expected: ?u64, max_tries: usize) !void {
     var tries: usize = 0;
     while (tries < max_tries and lane.getOffset(id) != expected) : (tries += 1) {
-        std.Thread.sleep(2 * std.time.ns_per_ms);
+        try testing.io.sleep(.fromNanoseconds(2 * std.time.ns_per_ms), .awake);
     }
     try testing.expectEqual(expected, lane.getOffset(id));
 }
 
-fn corruptByte(path: []const u8, at: u64) !void {
-    var f = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer f.close();
+/// Started lanes need the lifecycle drained then the final persist before
+/// deinit — same contract the runtime follows.
+fn shutdownLane(lane: *Lane, lifecycle: *lifecycle_mod.Lifecycle, io: std.Io) void {
+    lifecycle.requestShutdown(io);
+    lifecycle.shutdown(io);
+    lane.finalize();
+}
+
+fn corruptByte(io: std.Io, path: []const u8, at: u64) !void {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+    defer f.close(io);
 
     var b: [1]u8 = undefined;
-    const n = try std.posix.pread(f.handle, &b, at);
+    const n = try f.readPositionalAll(io, &b, at);
     if (n != 1) return error.Unexpected;
 
     b[0] ^= 0x5a;
-    var written: usize = 0;
-    while (written < b.len) {
-        const k = try std.posix.pwrite(f.handle, b[written..], at + written);
-        if (k == 0) return error.Unexpected;
-        written += k;
-    }
-    try f.sync();
+    try f.writePositionalAll(io, &b, at);
+    try f.sync(io);
 }
 
 test "checkpoint/lane: enqueue and observe offset" {
+    const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
 
-    var lane = try Lane.init(testing.allocator, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var lifecycle: lifecycle_mod.Lifecycle = .init;
+    var lane = try Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer lane.deinit();
-    try lane.start();
+    try lane.start(&lifecycle);
+    defer shutdownLane(&lane, &lifecycle, io);
 
     const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 2, .fingerprint = 3 };
     try testing.expect(try lane.enqueue(.{
         .identity = id,
         .byte_offset = 99,
         .last_seen_size = 99,
-        .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+        .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
     }));
     try waitForOffset(&lane, id, 99, 100);
 }
@@ -245,10 +252,10 @@ test "checkpoint/lane: enqueue and observe offset" {
 test "checkpoint/lane: queue is bounded" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
 
-    var lane = try Lane.init(testing.allocator, state_dir, 1, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var lane = try Lane.init(testing.allocator, testing.io, state_dir, 1, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer lane.deinit();
 
     const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 1, .fingerprint = 1 };
@@ -264,24 +271,27 @@ test "checkpoint/lane: queue is bounded" {
 test "checkpoint/lane: recovers from wal and snapshot" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
 
     const id: tail_types.FileIdentity = .{ .dev = 7, .inode = 8, .fingerprint = 9 };
     {
-        var lane = try Lane.init(testing.allocator, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+        const io = testing.io;
+        var lifecycle: lifecycle_mod.Lifecycle = .init;
+        var lane = try Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
         defer lane.deinit();
-        try lane.start();
+        try lane.start(&lifecycle);
+        defer shutdownLane(&lane, &lifecycle, io);
         _ = try lane.enqueue(.{
             .identity = id,
             .byte_offset = 1234,
             .last_seen_size = 1234,
-            .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+            .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
         });
         try waitForOffset(&lane, id, 1234, 100);
     }
 
-    var recovered = try Lane.init(testing.allocator, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var recovered = try Lane.init(testing.allocator, testing.io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer recovered.deinit();
     try testing.expectEqual(@as(?u64, 1234), recovered.getOffset(id));
 }
@@ -289,19 +299,22 @@ test "checkpoint/lane: recovers from wal and snapshot" {
 test "checkpoint/lane: corrupted wal is tolerated" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
 
     const id: tail_types.FileIdentity = .{ .dev = 10, .inode = 11, .fingerprint = 12 };
     {
-        var lane = try Lane.init(testing.allocator, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+        const io = testing.io;
+        var lifecycle: lifecycle_mod.Lifecycle = .init;
+        var lane = try Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
         defer lane.deinit();
-        try lane.start();
+        try lane.start(&lifecycle);
+        defer shutdownLane(&lane, &lifecycle, io);
         _ = try lane.enqueue(.{
             .identity = id,
             .byte_offset = 55,
             .last_seen_size = 55,
-            .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+            .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
         });
         try waitForOffset(&lane, id, 55, 100);
     }
@@ -309,18 +322,13 @@ test "checkpoint/lane: corrupted wal is tolerated" {
     const wal_path = try std.fs.path.join(testing.allocator, &.{ state_dir, "checkpoint.wal" });
     defer testing.allocator.free(wal_path);
 
-    var wal_file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
-    defer wal_file.close();
+    const wal_file = try std.Io.Dir.openFileAbsolute(testing.io, wal_path, .{ .mode = .read_write });
+    defer wal_file.close(testing.io);
     const junk: [3]u8 = .{ 0xaa, 0xbb, 0xcc };
-    var written: usize = 0;
-    while (written < junk.len) {
-        const n = try std.posix.pwrite(wal_file.handle, junk[written..], written);
-        if (n == 0) return error.Unexpected;
-        written += n;
-    }
-    try wal_file.sync();
+    try wal_file.writePositionalAll(testing.io, &junk, 0);
+    try wal_file.sync(testing.io);
 
-    var recovered = try Lane.init(testing.allocator, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var recovered = try Lane.init(testing.allocator, testing.io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer recovered.deinit();
     try testing.expectEqual(@as(?u64, 55), recovered.getOffset(id));
 }
@@ -328,31 +336,31 @@ test "checkpoint/lane: corrupted wal is tolerated" {
 test "checkpoint/lane: corrupted snapshot falls back to wal replay" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
 
     const id: tail_types.FileIdentity = .{ .dev = 20, .inode = 21, .fingerprint = 22 };
     const value: checkpoint_types.Value = .{
         .identity = id,
         .offset = 777,
-        .last_seen_ns = @intCast(std.time.nanoTimestamp()),
+        .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
     };
 
-    var snap = try snapshot_mod.Snapshot.init(testing.allocator, state_dir);
+    var snap = try snapshot_mod.Snapshot.init(testing.allocator, testing.io, state_dir);
     defer snap.deinit();
     var vals: [1]checkpoint_types.Value = .{value};
     try snap.write(vals[0..]);
 
     const snap_path = try std.fs.path.join(testing.allocator, &.{ state_dir, "checkpoint.snap" });
     defer testing.allocator.free(snap_path);
-    try corruptByte(snap_path, 0);
+    try corruptByte(testing.io, snap_path, 0);
 
-    var wal = try wal_mod.Wal.init(testing.allocator, state_dir);
+    var wal = try wal_mod.Wal.init(testing.allocator, testing.io, state_dir);
     defer wal.deinit();
     try wal.append(1, value);
     try wal.sync();
 
-    var recovered = try Lane.init(testing.allocator, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var recovered = try Lane.init(testing.allocator, testing.io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer recovered.deinit();
     try testing.expectEqual(@as(?u64, 777), recovered.getOffset(id));
 }
@@ -360,7 +368,7 @@ test "checkpoint/lane: corrupted snapshot falls back to wal replay" {
 test "checkpoint/lane: missing state files initialize cleanly" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
 
     const wal_path = try std.fs.path.join(testing.allocator, &.{ state_dir, "checkpoint.wal" });
@@ -368,12 +376,12 @@ test "checkpoint/lane: missing state files initialize cleanly" {
     const snap_path = try std.fs.path.join(testing.allocator, &.{ state_dir, "checkpoint.snap" });
     defer testing.allocator.free(snap_path);
 
-    var lane = try Lane.init(testing.allocator, state_dir, 8, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var lane = try Lane.init(testing.allocator, testing.io, state_dir, 8, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     lane.deinit();
 
-    std.fs.cwd().deleteFile(wal_path) catch |err| log.warn("deleteFile wal failed: {}", .{err});
-    std.fs.cwd().deleteFile(snap_path) catch |err| log.warn("deleteFile snap failed: {}", .{err});
+    std.Io.Dir.deleteFileAbsolute(testing.io, wal_path) catch |err| log.warn("deleteFile wal failed: {}", .{err});
+    std.Io.Dir.deleteFileAbsolute(testing.io, snap_path) catch |err| log.warn("deleteFile snap failed: {}", .{err});
 
-    var recreated = try Lane.init(testing.allocator, state_dir, 8, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var recreated = try Lane.init(testing.allocator, testing.io, state_dir, 8, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer recreated.deinit();
 }

@@ -68,11 +68,34 @@ builds green, test-parity diff clean (PLAN.md §0), one commit.
 - [x] 5.13 Budget emitted as DataPlaneBudget bus event; slab buffers via page_allocator; ReleaseFast RSS = 4.5 MiB idle / 6.2 MiB under traffic (438 MiB is virtual reservation; Debug RSS inflated by 0xaa memset)
 - [x] 5.14 Phase 5 COMPLETE: 416/416 tests, lint green, 6 distros httpz-free, smoke green. Exceptions table finalized.
 
-## Phase 6 — Tail convergence  (DEFERRED by user — resume here)
-- [ ] 6.1 uring scheduler takes `io` in init; tail framer retires in favor of pipeline/frame_ndjson
-- [ ] 6.2 Checkpoint Lane worker → io.concurrent task in Lifecycle.group
-- [ ] 6.3 Tail smoke test (grow file + policy + SIGTERM)
-- [ ] 6.4 Phase 6 gate + commit
+## Phase 6 — Tail convergence  ✅ DONE 2026-06-12
+- [x] 6.1 uring scheduler takes `io` in init (was bit-rotted: called common/readRange
+      without the io they now require — Linux-only code nothing compiled; verified via
+      x86_64-linux cross-compile, fails only at system-lib link as expected). Tail
+      LineFramer retired onto pipeline/frame_ndjson (one SIMD scanner in the tree);
+      BEHAVIOR CHANGE recorded in test-exceptions.md: over-max_line lines now fail OPEN
+      (forwarded verbatim, unevaluated, §6.5.3) instead of truncated — nothing consumed
+      the truncated flag and truncation mutated log data. Trailing no-newline lines now
+      byte-exact.
+- [x] 6.2 Checkpoint Lane worker → Lifecycle concurrent task (cancelable cadence sleep;
+      final WAL sync/snapshot moved to Lane.finalize on the post-shutdown thread, since
+      a canceled task can't reliably do file IO). Poll loop → PollLoop lifecycle task;
+      raw signal handler + polled atomic replaced by the app.zig sigwait-waiter pattern
+      (first INT/TERM = structured shutdown, second = force exit).
+- [x] BONUS: the entire tail subtree's tests were DARK (tail/mod.zig had no test
+      block). Lit 32 tests (419 → 451), fixing the bit-rot that hid there: stale
+      pre-Io.Dir test idioms across 7 files, and a REAL bug in eval_parse.parseLine
+      (message was set before parsing, so json/logfmt message extraction never ran —
+      the dark test documented the intended contract).
+- [x] 6.3 Tail smoke green: drop-debug policy filters appended lines live; checkpoint
+      .wal/.snap written; SIGTERM drains via lifecycle ("all tasks drained") and exits
+      clean. 17 repeat runs clean; ONE unreproduced duplicate emission of an appended
+      range on the very first run (at-least-once posture; see open item below).
+- [x] 6.4 Gate: 451/451 tests, lint green, six distros build both frontends. Committed.
+- [ ] OPEN: single unreproduced duplicate of one appended range in the first-ever smoke
+      run (out.log had batch2 twice; 17 subsequent runs at two timings clean). Watcher
+      offset advance looks correct; suspect a discovery/refresh race predating Phase 6.
+      Repro harness: bench loop in this commit's message; investigate if seen again.
 
 ## Phase 7 — Cleanup  ✅ DONE (run before Phase 6 at user request)
 - [x] 7.1 httpz removed from build.zig.zon (build.zig + sources were already clean); supersedes the user's WIP hash bump. zig-pkg/httpz-* vendor dirs left in place (prune whenever).

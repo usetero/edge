@@ -123,11 +123,12 @@ pub const StreamEvaluator = struct {
 
 const testing = std.testing;
 
-fn writePolicyFile(tmp: *std.testing.TmpDir, json: []const u8) ![]u8 {
-    const f = try tmp.dir.createFile("policies.json", .{ .truncate = true });
-    defer f.close();
-    try f.writeAll(json);
-    return tmp.dir.realpathAlloc(testing.allocator, "policies.json");
+fn writePolicyFile(tmp: *std.testing.TmpDir, json: []const u8) ![:0]u8 {
+    const io = std.Options.debug_io;
+    const f = try tmp.dir.createFile(io, "policies.json", .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, json);
+    return tmp.dir.realPathFileAlloc(io, "policies.json", testing.allocator);
 }
 
 fn testBus() o11y.StdioEventBus {

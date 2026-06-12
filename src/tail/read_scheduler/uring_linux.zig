@@ -15,6 +15,10 @@ const Op = struct {
 
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
+    /// The raw ring owns reads (registered buffers + fixed files are beyond
+    /// std's PoC uring Io); `io` drives the scalar fallbacks through the
+    /// shared framer so both paths emit identically (PLAN.md §9).
+    io: std.Io,
     ring: std.os.linux.IoUring,
     ops: std.ArrayList(Op) = .empty,
     scratch: std.ArrayList(u8) = .empty,
@@ -26,9 +30,10 @@ pub const Scheduler = struct {
     fixed_enabled: bool = true,
     fixed_buf_size: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator) !Scheduler {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Scheduler {
         return .{
             .allocator = allocator,
+            .io = io,
             .ring = try std.os.linux.IoUring.init(256, 0),
         };
     }
@@ -93,7 +98,7 @@ pub const Scheduler = struct {
                     @intCast(op_idx),
                 ) catch {
                     self.fixed_enabled = false;
-                    return common.processBatchScalar(framer, writer, events, filter_ctx, filter_fn);
+                    return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
                 };
                 sqe.flags |= std.os.linux.IOSQE_FIXED_FILE;
             } else {
@@ -101,7 +106,7 @@ pub const Scheduler = struct {
                 try self.scratch.resize(self.allocator, off + to_read);
                 const slot = self.scratch.items[off .. off + to_read];
                 _ = self.ring.read(user_data, evt.file.handle, .{ .buffer = slot }, evt.start_offset) catch {
-                    return common.processBatchScalar(framer, writer, events, filter_ctx, filter_fn);
+                    return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
                 };
                 buf_off = off;
             }
@@ -118,12 +123,12 @@ pub const Scheduler = struct {
         if (use_fixed) {
             self.ring.register_files_update(0, self.fixed_fds.items[0..self.ops.items.len]) catch {
                 self.fixed_enabled = false;
-                return common.processBatchScalar(framer, writer, events, filter_ctx, filter_fn);
+                return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
             };
         }
 
         _ = self.ring.submit_and_wait(@intCast(self.ops.items.len)) catch {
-            return common.processBatchScalar(framer, writer, events, filter_ctx, filter_fn);
+            return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
         };
 
         try self.cqes.resize(self.allocator, self.ops.items.len);
@@ -147,6 +152,7 @@ pub const Scheduler = struct {
         for (self.ops.items) |op| {
             if (op.result < 0) {
                 try framer.readRange(
+                    self.io,
                     op.event.file,
                     op.event.start_offset,
                     op.event.end_offset,
@@ -166,6 +172,7 @@ pub const Scheduler = struct {
             const next_off: u64 = op.event.start_offset + n;
             if (next_off < op.event.end_offset) {
                 try common.readTailScalar(
+                    self.io,
                     framer,
                     op.event.file,
                     next_off,

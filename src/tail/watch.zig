@@ -716,27 +716,28 @@ test "watch public API: collect emits appended file bytes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    const io = std.Options.debug_io;
     {
-        const f = try tmp.dir.createFile("tail.log", .{});
-        defer f.close();
-        try f.writeAll("seed\n");
+        const f = try tmp.dir.createFile(io, "tail.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "seed\n");
     }
-    const abs = try tmp.dir.realpathAlloc(testing.allocator, "tail.log");
+    const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
     var w = try Watcher.init(testing.allocator, std.Options.debug_io, .poll, &.{abs}, "-", .tail, 1000, 50, 1000);
     defer w.deinit();
 
-    var events: std.ArrayList(Event) = .{};
+    var events: std.ArrayList(Event) = .empty;
     defer events.deinit(testing.allocator);
     try w.collect(&events, .tail, null);
     try testing.expectEqual(@as(usize, 0), events.items.len);
 
     {
-        const f = try tmp.dir.openFile("tail.log", .{ .mode = .read_write });
-        defer f.close();
-        try f.seekFromEnd(0);
-        try f.writeAll("next\n");
+        const f = try tmp.dir.openFile(io, "tail.log", .{ .mode = .read_write });
+        defer f.close(io);
+        const size = (try f.stat(io)).size;
+        try f.writePositionalAll(io, "next\n", size);
     }
 
     try w.collect(&events, .tail, null);

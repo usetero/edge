@@ -154,12 +154,12 @@ test "io public API: file output writes bytes through std.Io.Writer" {
 
     const path = "out.log";
     {
-        const seed = try tmp.dir.createFile(path, .{ .truncate = true });
-        defer seed.close();
-        try seed.writeAll("old\n");
+        const seed = try tmp.dir.createFile(io, path, .{ .truncate = true });
+        defer seed.close(io);
+        try seed.writeStreamingAll(io, "old\n");
     }
 
-    const abs = try tmp.dir.realpathAlloc(testing.allocator, path);
+    const abs = try tmp.dir.realPathFileAlloc(io, path, testing.allocator);
     defer testing.allocator.free(abs);
 
     var out = try Output.initFileAppend(testing.allocator, io, abs, 1024);
@@ -167,7 +167,7 @@ test "io public API: file output writes bytes through std.Io.Writer" {
     try out.writer().writeAll("new\n");
     try out.flush();
 
-    const read_back = try tmp.dir.readFileAlloc(testing.allocator, path, 4096);
+    const read_back = try tmp.dir.readFileAlloc(io, path, testing.allocator, .limited(4096));
     defer testing.allocator.free(read_back);
     try testing.expectEqualStrings("old\nnew\n", read_back);
 }

@@ -9,3 +9,4 @@
 | toHttpMethod | proxy-old/server.zig | renamed | "HttpMethod.fromStd" in service/service.zig |
 | Router fallback match / prefix priority | proxy-old/router.zig | renamed ports | "Router wildcard fallback and registration order" / "Router longest prefix wins" in service/router.zig |
 | UpstreamClientManager ×5 | proxy-old/upstream_client.zig | renamed type | Same tests as "UpstreamManager ..." in frontend/upstream.zig |
+| framer public API: enforces max line cap | tail/framer.zig | Phase 6: tail LineFramer retired onto pipeline/frame_ndjson; over-cap lines now FAIL OPEN (forwarded verbatim, unevaluated, PLAN §6.5.3) instead of being truncated — nothing consumed the truncated flag, and truncation mutated log data | Same test name, assertions updated to fail-open semantics |

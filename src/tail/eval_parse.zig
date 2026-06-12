@@ -12,13 +12,16 @@ pub fn parseLine(
         .raw => {
             ctx.message = line;
         },
+        // Structured formats: the parsers extract message/body when present
+        // (their `ctx.message == null` guard requires running them first);
+        // the raw line is only the fallback.
         .logfmt => {
-            ctx.message = line;
             try parseLogfmtAttrs(&ctx, line);
+            if (ctx.message == null) ctx.message = line;
         },
         .json => {
-            ctx.message = line;
             try parseJsonAttrs(&ctx, line);
+            if (ctx.message == null) ctx.message = line;
         },
     }
     return ctx;
