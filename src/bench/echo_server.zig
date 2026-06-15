@@ -230,17 +230,27 @@ fn handleRequest(ctx: *ServerContext, request: *std.http.Server.Request, gpa: st
         .{ .name = "content-type", .value = "application/json" },
     };
 
+    // A request with neither Content-Length nor Transfer-Encoding has an
+    // empty body (RFC 9112 §6.3), but std.http frames it as read-until-close
+    // for body-bearing methods, so any body read — including respond()'s
+    // internal discard — blocks until the client hangs up. Skip body reads
+    // and disable keep-alive so respond() never drains the socket.
+    const unframed_body = request.head.method.requestHasBody() and
+        request.head.transfer_encoding == .none and
+        request.head.content_length == null;
+    const keep_alive = !unframed_body;
+
     if (std.mem.eql(u8, path, "/stats")) {
         var buf: std.Io.Writer.Allocating = .init(gpa);
         defer buf.deinit();
         try ctx.writeStats(&buf.writer);
-        try request.respond(buf.written(), .{ .extra_headers = &json_headers });
+        try request.respond(buf.written(), .{ .keep_alive = keep_alive, .extra_headers = &json_headers });
         return;
     }
 
     if (std.mem.eql(u8, path, "/reset")) {
         ctx.reset();
-        try request.respond("{\"status\":\"reset\"}", .{ .extra_headers = &json_headers });
+        try request.respond("{\"status\":\"reset\"}", .{ .keep_alive = keep_alive, .extra_headers = &json_headers });
         return;
     }
 
@@ -252,27 +262,31 @@ fn handleRequest(ctx: *ServerContext, request: *std.http.Server.Request, gpa: st
         else
             query;
         ctx.startCapture(capture_name) catch |err| {
-            try request.respond(@errorName(err), .{ .status = .internal_server_error });
+            try request.respond(@errorName(err), .{ .keep_alive = keep_alive, .status = .internal_server_error });
             return;
         };
-        try request.respond("{\"status\":\"capture_started\"}", .{ .extra_headers = &json_headers });
+        try request.respond("{\"status\":\"capture_started\"}", .{ .keep_alive = keep_alive, .extra_headers = &json_headers });
         return;
     }
 
     if (std.mem.eql(u8, path, "/capture/stop")) {
         const count = ctx.stopCapture() catch |err| {
-            try request.respond(@errorName(err), .{ .status = .internal_server_error });
+            try request.respond(@errorName(err), .{ .keep_alive = keep_alive, .status = .internal_server_error });
             return;
         };
         var buf: [128]u8 = undefined;
         const json = std.fmt.bufPrint(&buf, "{{\"status\":\"capture_stopped\",\"count\":{d}}}", .{count}) catch
             "{\"status\":\"capture_stopped\"}";
-        try request.respond(json, .{ .extra_headers = &json_headers });
+        try request.respond(json, .{ .keep_alive = keep_alive, .extra_headers = &json_headers });
         return;
     }
 
     // All other requests: read body (5 MiB cap, matching the old config),
     // record stats, optionally capture, answer 202.
+    // path and content_type point into the head buffer, which the body read
+    // below reuses — copy them first or they get clobbered with body bytes.
+    const path_copy = try gpa.dupe(u8, path);
+    defer gpa.free(path_copy);
     const content_type_copy: ?[]const u8 = if (request.head.content_type) |ct|
         try gpa.dupe(u8, ct)
     else
@@ -280,23 +294,25 @@ fn handleRequest(ctx: *ServerContext, request: *std.http.Server.Request, gpa: st
     defer if (content_type_copy) |ct| gpa.free(ct);
 
     var body_buf: [16 * 1024]u8 = undefined;
-    const body_reader = try request.readerExpectContinue(&body_buf);
     var captured: std.Io.Writer.Allocating = .init(gpa);
     defer captured.deinit();
-    while (true) {
-        const n = body_reader.stream(&captured.writer, .limited(5 * 1024 * 1024)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) break;
+    if (!unframed_body) {
+        const body_reader = try request.readerExpectContinue(&body_buf);
+        while (true) {
+            const n = body_reader.stream(&captured.writer, .limited(5 * 1024 * 1024)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (n == 0) break;
+        }
     }
     const body = captured.written();
 
-    ctx.recordRequest(path, body.len);
+    ctx.recordRequest(path_copy, body.len);
     if (body.len > 0) {
-        ctx.capturePayload(path, content_type_copy orelse "application/octet-stream", body);
+        ctx.capturePayload(path_copy, content_type_copy orelse "application/octet-stream", body);
     }
-    try request.respond("{}", .{ .status = .accepted, .extra_headers = &json_headers });
+    try request.respond("{}", .{ .keep_alive = keep_alive, .status = .accepted, .extra_headers = &json_headers });
 }
 
 fn serveConnection(ctx: *ServerContext, gpa: std.mem.Allocator, stream: std.Io.net.Stream) std.Io.Cancelable!void {

@@ -33,10 +33,12 @@
     // internet connectivity.
     .dependencies = .{
         .zimdjson = .{
-            .path = "../zimdjson",
+            .url = "git+https://github.com/jaronoff97/zimdjson?ref=main#6199cafec64280fcd9fd1df70b52809fc5a70052",
+            .hash = "zimdjson-0.1.1-89pgxQlXBgAl5hBPQrMFdumnb9Z36oftC7qkURHJwLEG",
         },
         .policy_zig = .{
-            .path = "../policy-zig",
+            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.4.0.tar.gz",
+            .hash = "policy_zig-0.1.7-5_dp3mBWEQCMgFeFVWrd57P_E0joBbvmzQR9ivHHSNVg",
         },
         .metrics = .{
             .url = "git+https://github.com/karlseguin/metrics.zig?ref=master#1621f82e7ecf2b3dddf5730bf52761af354a7080",
