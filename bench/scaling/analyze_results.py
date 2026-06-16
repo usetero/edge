@@ -133,7 +133,7 @@ class PlotStyle:
 # =============================================================================
 
 
-def load_results(pattern: str = "results/*.results.csv") -> pd.DataFrame:
+def load_results(pattern: str = "results/*/results.csv") -> pd.DataFrame:
     """
     Load all CSV files matching pattern and combine into single DataFrame.
 
@@ -162,22 +162,6 @@ def load_results(pattern: str = "results/*.results.csv") -> pd.DataFrame:
             "edge-datadog": "edge",
         }
     )
-
-    # # Filter out otelcol/tero-collector DD Logs (20x slower than OTLP, skews aggregations)
-    # combined = combined[
-    #     ~(
-    #         (combined["binary"].isin(["otelcol", "tero-collector"]))
-    #         & (combined["telemetry_type"] == "DD Logs")
-    #     )
-    # ]
-
-    # # Filter out tero-collector OTLP Metrics (10x higher memory, skews aggregations)
-    # combined = combined[
-    #     ~(
-    #         (combined["binary"] == "tero-collector")
-    #         & (combined["telemetry_type"] == "OTLP Metrics")
-    #     )
-    # ]
 
     # Filter out OTLP Traces entirely
     combined = combined[combined["telemetry_type"] != "OTLP Traces"]
