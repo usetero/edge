@@ -265,7 +265,10 @@ fn handleRequest(ctx: *ServerContext, request: *std.http.Server.Request, gpa: st
             try request.respond(@errorName(err), .{ .keep_alive = keep_alive, .status = .internal_server_error });
             return;
         };
-        try request.respond("{\"status\":\"capture_started\"}", .{ .keep_alive = keep_alive, .extra_headers = &json_headers });
+        try request.respond("{\"status\":\"capture_started\"}", .{
+            .keep_alive = keep_alive,
+            .extra_headers = &json_headers,
+        });
         return;
     }
 

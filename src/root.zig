@@ -1,5 +1,4 @@
 //! By convention, root.zig is the root source file when making a library.
-const std = @import("std");
 const policy_zig = @import("policy_zig");
 
 // =============================================================================
@@ -64,7 +63,6 @@ pub const lambda = @import("lambda/root.zig");
 
 /// Zonfig - comptime configuration with environment overrides
 pub const zonfig = @import("zonfig/root.zig");
-
 
 // Import modules to include their tests
 test {
