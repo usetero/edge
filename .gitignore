@@ -40,3 +40,5 @@ equivalence-test-*/
 plots/
 PLAN*.md
 sample*
+.rewrite/
+.venv/
