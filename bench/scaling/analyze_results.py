@@ -19,6 +19,7 @@ Setup:
 """
 
 import glob
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -138,9 +139,10 @@ def load_results(pattern: str = "results/*.results.csv") -> pd.DataFrame:
 
     Adds a 'run' column to identify which file each row came from.
     """
-    files = sorted(glob.glob(pattern))
+    cutoff = "2026-06-15T13-24-42"
+    files = sorted(f for f in glob.glob(pattern) if os.path.basename(os.path.dirname(f)) >= cutoff)
     if not files:
-        raise FileNotFoundError(f"No files matching pattern: {pattern}")
+        raise FileNotFoundError(f"No files matching pattern: {pattern} after {cutoff}")
 
     dfs = []
     for i, f in enumerate(files, start=1):
