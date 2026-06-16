@@ -13,6 +13,7 @@
 .zig-cache-global/
 *.pyc
 zig-out/
+zig-pkg/
 /release/
 /debug/
 /build/
@@ -37,4 +38,7 @@ zig-cache/
 bench/scaling/proto_gen
 equivalence-test-*/
 plots/
-PLAN.md
+PLAN*.md
+sample*
+.rewrite/
+.venv/

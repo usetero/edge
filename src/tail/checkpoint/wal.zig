@@ -30,36 +30,40 @@ pub const ReplayResult = struct {
 
     pub fn deinit(self: *ReplayResult, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);
+        self.* = undefined;
     }
 };
 
 pub const Wal = struct {
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    io: std.Io,
+    file: std.Io.File,
     path: []u8,
     write_offset: u64,
 
-    pub fn init(allocator: std.mem.Allocator, state_dir: []const u8) !Wal {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8) !Wal {
         const path = try std.fs.path.join(allocator, &.{ state_dir, "checkpoint.wal" });
         errdefer allocator.free(path);
 
-        const file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false }),
+        const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false }),
             else => return err,
         };
-        errdefer file.close();
+        errdefer file.close(io);
 
         return .{
             .allocator = allocator,
+            .io = io,
             .file = file,
             .path = path,
-            .write_offset = try file.getEndPos(),
+            .write_offset = try file.length(io),
         };
     }
 
     pub fn deinit(self: *Wal) void {
-        self.file.close();
+        self.file.close(self.io);
         self.allocator.free(self.path);
+        self.* = undefined;
     }
 
     pub fn append(self: *Wal, lsn: u64, value: checkpoint_types.Value) !void {
@@ -74,20 +78,20 @@ pub const Wal = struct {
         rec.last_seen_ns = value.last_seen_ns;
         rec.checksum = recordChecksum(rec);
 
-        try pwriteAll(self.file, std.mem.asBytes(&rec), self.write_offset);
+        try self.file.writePositionalAll(self.io, std.mem.asBytes(&rec), self.write_offset);
         self.write_offset += @sizeOf(WalRecord);
     }
 
     pub fn sync(self: *Wal) !void {
-        try std.posix.fdatasync(self.file.handle);
+        try self.file.sync(self.io);
     }
 
     pub fn replay(self: *Wal, allocator: std.mem.Allocator) !ReplayResult {
-        const end = try self.file.getEndPos();
+        const end = try self.file.length(self.io);
         const rec_size = @sizeOf(WalRecord);
 
-        var out = ReplayResult{
-            .entries = .{},
+        var out: ReplayResult = .{
+            .entries = .empty,
             .next_lsn = 1,
         };
         errdefer out.deinit(allocator);
@@ -95,7 +99,7 @@ pub const Wal = struct {
         var off: u64 = 0;
         while (off + rec_size <= end) : (off += rec_size) {
             var rec: WalRecord = undefined;
-            const n = try std.posix.pread(self.file.handle, std.mem.asBytes(&rec), off);
+            const n = try self.file.readPositionalAll(self.io, std.mem.asBytes(&rec), off);
             if (n != rec_size) break;
             if (rec.magic != WAL_MAGIC or rec.version != WAL_VERSION) continue;
             if (rec.checksum != recordChecksum(rec)) continue;
@@ -120,7 +124,7 @@ pub const Wal = struct {
     }
 
     pub fn reset(self: *Wal) !void {
-        try self.file.setEndPos(0);
+        try self.file.setLength(self.io, 0);
         self.write_offset = 0;
         try self.sync();
     }
@@ -130,13 +134,4 @@ fn recordChecksum(record: WalRecord) u32 {
     var tmp = record;
     tmp.checksum = 0;
     return std.hash.Crc32.hash(std.mem.asBytes(&tmp));
-}
-
-fn pwriteAll(file: std.fs.File, bytes: []const u8, offset: u64) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const n = try std.posix.pwrite(file.handle, bytes[written..], offset + written);
-        if (n == 0) return error.Unexpected;
-        written += n;
-    }
 }

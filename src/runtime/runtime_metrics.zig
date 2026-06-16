@@ -1,6 +1,8 @@
 const std = @import("std");
 const m = @import("metrics_zig");
 
+const log = std.log.scoped(.runtime_metrics);
+
 pub const DistributionLabel = enum {
     edge,
     datadog,
@@ -132,61 +134,70 @@ pub const RuntimeMetrics = struct {
     distribution: DistributionLabel,
     internal: InternalMetrics = m.initializeNoop(InternalMetrics),
 
-    pub fn init(allocator: std.mem.Allocator, distribution: DistributionLabel) !RuntimeMetrics {
-        var metrics = RuntimeMetrics{
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, distribution: DistributionLabel) !RuntimeMetrics {
+        var metrics: RuntimeMetrics = .{
             .allocator = allocator,
             .distribution = distribution,
             .internal = .{
                 .edge_requests_total = try InternalMetrics.RequestsTotal.init(
                     allocator,
+                    io,
                     "edge_requests_total",
                     .{ .help = "Total number of HTTP requests handled by edge." },
                     .{},
                 ),
                 .edge_request_duration_seconds = try InternalMetrics.RequestDurationSeconds.init(
                     allocator,
+                    io,
                     "edge_request_duration_seconds",
                     .{ .help = "HTTP request latency in seconds." },
                     .{},
                 ),
                 .edge_responses_total = try InternalMetrics.ResponsesTotal.init(
                     allocator,
+                    io,
                     "edge_responses_total",
                     .{ .help = "Total number of HTTP responses produced by edge." },
                     .{},
                 ),
                 .edge_prefilter_decisions_total = try InternalMetrics.PrefilterDecisionsTotal.init(
                     allocator,
+                    io,
                     "edge_prefilter_decisions_total",
                     .{ .help = "Total number of prefilter routing decisions." },
                     .{},
                 ),
                 .edge_request_errors_total = try InternalMetrics.RequestErrorsTotal.init(
                     allocator,
+                    io,
                     "edge_request_errors_total",
                     .{ .help = "Total number of request-level errors." },
                     .{},
                 ),
                 .edge_policy_records_evaluated_total = try InternalMetrics.PolicyRecordsEvaluatedTotal.init(
                     allocator,
+                    io,
                     "edge_policy_records_evaluated_total",
                     .{ .help = "Total number of telemetry records evaluated by the policy engine." },
                     .{},
                 ),
                 .edge_policy_records_kept_total = try InternalMetrics.PolicyRecordsKeptTotal.init(
                     allocator,
+                    io,
                     "edge_policy_records_kept_total",
                     .{ .help = "Total number of telemetry records kept after policy evaluation." },
                     .{},
                 ),
                 .edge_policy_records_dropped_total = try InternalMetrics.PolicyRecordsDroppedTotal.init(
                     allocator,
+                    io,
                     "edge_policy_records_dropped_total",
                     .{ .help = "Total number of telemetry records dropped after policy evaluation." },
                     .{},
                 ),
                 .edge_build_info = try InternalMetrics.BuildInfo.init(
                     allocator,
+                    io,
                     "edge_build_info",
                     .{ .help = "Build metadata for this edge process." },
                     .{},
@@ -239,10 +250,13 @@ pub const RuntimeMetrics = struct {
     }
 
     pub fn deinit(self: *RuntimeMetrics) void {
-        _ = self;
-        // Intentionally no-op at process shutdown.
-        // These metric vectors may still be touched by worker threads during teardown,
-        // and freeing them has caused shutdown-time memory corruption.
+        // Free each metric vector's per-series allocations. Safe at shutdown:
+        // callers deinit RuntimeMetrics only after the server has stopped
+        // (listen thread joined), so no worker threads touch the metrics here.
+        inline for (std.meta.fields(InternalMetrics)) |field| {
+            @field(self.internal, field.name).deinit();
+        }
+        self.* = undefined;
     }
 
     pub fn writePrometheus(self: *RuntimeMetrics, writer: *std.Io.Writer) !void {
@@ -257,7 +271,7 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_requests_total.incr(.{
             .method = method,
             .known_path = known_path,
-        }) catch {};
+        }) catch |err| log.debug("failed to record request metric: {}", .{err});
     }
 
     pub fn recordRequestDuration(
@@ -267,7 +281,7 @@ pub const RuntimeMetrics = struct {
     ) void {
         self.internal.edge_request_duration_seconds.observe(.{
             .known_path = known_path,
-        }, duration_seconds) catch {};
+        }, duration_seconds) catch |err| log.debug("failed to record request duration metric: {}", .{err});
     }
 
     pub fn recordResponse(
@@ -278,7 +292,7 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_responses_total.incr(.{
             .known_path = known_path,
             .status_class = status_class,
-        }) catch {};
+        }) catch |err| log.debug("failed to record response metric: {}", .{err});
     }
 
     pub fn recordPrefilterDecision(
@@ -289,7 +303,7 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_prefilter_decisions_total.incr(.{
             .route_kind = route_kind,
             .decision = decision,
-        }) catch {};
+        }) catch |err| log.debug("failed to record prefilter decision metric: {}", .{err});
     }
 
     pub fn recordRequestError(
@@ -300,7 +314,7 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_request_errors_total.incr(.{
             .known_path = known_path,
             .class = class,
-        }) catch {};
+        }) catch |err| log.debug("failed to record request error metric: {}", .{err});
     }
 
     pub fn recordPolicyBatch(
@@ -312,13 +326,13 @@ pub const RuntimeMetrics = struct {
         const kept_count = evaluated_count -| dropped_count;
         self.internal.edge_policy_records_evaluated_total.incrBy(.{
             .telemetry = telemetry,
-        }, evaluated_count) catch {};
+        }, evaluated_count) catch |err| log.debug("failed to record policy evaluated metric: {}", .{err});
         self.internal.edge_policy_records_kept_total.incrBy(.{
             .telemetry = telemetry,
-        }, kept_count) catch {};
+        }, kept_count) catch |err| log.debug("failed to record policy kept metric: {}", .{err});
         self.internal.edge_policy_records_dropped_total.incrBy(.{
             .telemetry = telemetry,
-        }, dropped_count) catch {};
+        }, dropped_count) catch |err| log.debug("failed to record policy dropped metric: {}", .{err});
     }
 
     pub fn setBuildInfo(self: *RuntimeMetrics, version: []const u8, commit: []const u8) void {
@@ -326,7 +340,7 @@ pub const RuntimeMetrics = struct {
             .version = version,
             .commit = commit,
             .distribution = self.distribution,
-        }, 1) catch {};
+        }, 1) catch |err| log.warn("failed to set build info metric: {}", .{err});
     }
 };
 

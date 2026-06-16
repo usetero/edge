@@ -6,21 +6,23 @@ const context = @import("eval_context.zig");
 const parse = @import("eval_parse.zig");
 
 const FilterDecision = policy.FilterDecision;
-const PolicyResult = policy.PolicyResult;
+pub const PolicyResult = policy.PolicyResult;
 
 const DisabledEvaluator = struct {};
 
 const ActiveEvaluator = struct {
     registry: *policy.Registry,
     engine: policy.PolicyEngine,
-    policy_id_buf: [policy.MAX_MATCHES_PER_SCAN][]const u8 = undefined,
+    policy_id_buf: [policy.max_matches_per_scan][]const u8 = undefined,
     arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
+    io: std.Io,
 
     fn deinit(self: *ActiveEvaluator) void {
         self.registry.deinit();
         self.allocator.destroy(self.registry);
         self.arena.deinit();
+        self.* = undefined;
     }
 };
 
@@ -51,7 +53,15 @@ pub const StreamEvaluator = struct {
         registry.* = policy.Registry.init(allocator, bus);
         errdefer registry.deinit();
 
-        const policies = try policy.parser.parsePoliciesFile(allocator, policy_path.?);
+        const policies = blk: {
+            const file_io = bus.io;
+            const file = try std.Io.Dir.cwd().openFile(file_io, policy_path.?, .{});
+            defer file.close(file_io);
+            var file_reader = file.reader(file_io, &.{});
+            const contents = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+            defer allocator.free(contents);
+            break :blk try policy.parser.parsePoliciesBytes(allocator, contents);
+        };
         defer {
             for (policies) |*p| p.deinit(allocator);
             allocator.free(policies);
@@ -67,6 +77,7 @@ pub const StreamEvaluator = struct {
                     .engine = policy.PolicyEngine.init(bus, registry),
                     .arena = std.heap.ArenaAllocator.init(allocator),
                     .allocator = allocator,
+                    .io = bus.io,
                 },
             },
         };
@@ -77,6 +88,7 @@ pub const StreamEvaluator = struct {
             .disabled => {},
             .active => |*active| active.deinit(),
         }
+        self.* = undefined;
     }
 
     pub fn evalLine(self: *StreamEvaluator, line: []const u8) !bool {
@@ -101,7 +113,7 @@ pub const StreamEvaluator = struct {
                     &context.log_accessor,
                     &ctx,
                     &active.policy_id_buf,
-                    .{ .scratch = line_alloc },
+                    .{ .scratch = line_alloc, .io = active.engine.bus.io },
                 );
                 break :blk result;
             },
@@ -111,16 +123,17 @@ pub const StreamEvaluator = struct {
 
 const testing = std.testing;
 
-fn writePolicyFile(tmp: *std.testing.TmpDir, json: []const u8) ![]u8 {
-    const f = try tmp.dir.createFile("policies.json", .{ .truncate = true });
-    defer f.close();
-    try f.writeAll(json);
-    return try tmp.dir.realpathAlloc(testing.allocator, "policies.json");
+fn writePolicyFile(tmp: *std.testing.TmpDir, json: []const u8) ![:0]u8 {
+    const io = std.Options.debug_io;
+    const f = try tmp.dir.createFile(io, "policies.json", .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, json);
+    return tmp.dir.realPathFileAlloc(io, "policies.json", testing.allocator);
 }
 
 fn testBus() o11y.StdioEventBus {
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init();
+    stdio_bus.init(std.Options.debug_io);
     stdio_bus.eventBus().setLevel(.err);
     return stdio_bus;
 }

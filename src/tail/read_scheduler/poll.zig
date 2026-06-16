@@ -4,20 +4,24 @@ const watch_mod = @import("../watch.zig");
 const common = @import("common.zig");
 
 pub const Scheduler = struct {
-    pub fn init(_: std.mem.Allocator) !Scheduler {
-        return .{};
+    io: std.Io,
+
+    pub fn init(_: std.mem.Allocator, io: std.Io) !Scheduler {
+        return .{ .io = io };
     }
 
-    pub fn deinit(_: *Scheduler) void {}
+    pub fn deinit(self: *Scheduler) void {
+        self.* = undefined;
+    }
 
     pub fn processBatch(
-        _: *Scheduler,
+        self: *Scheduler,
         framer: *framer_mod.LineFramer,
         writer: *std.Io.Writer,
         events: []const watch_mod.Event,
         filter_ctx: *anyopaque,
         filter_fn: *const framer_mod.LineFramer.LineFilterFn,
     ) !usize {
-        return common.processBatchScalar(framer, writer, events, filter_ctx, filter_fn);
+        return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
     }
 };

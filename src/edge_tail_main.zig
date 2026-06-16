@@ -39,12 +39,13 @@ const CliOptions = struct {
         if (self.state_dir_override) |path| allocator.free(path);
         for (self.inputs.items) |input| allocator.free(input);
         self.inputs.deinit(allocator);
+        self.* = undefined;
     }
 };
 
-fn printUsage() !void {
+fn printUsage(io: std.Io) !void {
     var stderr_buf: [2300]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
     try stderr.writeAll(
@@ -107,59 +108,53 @@ fn parseIoEngine(value: []const u8) !IoEngine {
     return error.InvalidIoEngine;
 }
 
-fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+fn parseCliOptions(init: std.process.Init) !CliOptions {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    var opts = CliOptions{ .inputs = .{} };
+    var it = init.minimal.args.iterate();
+    _ = it.skip(); // program name
+
+    var opts: CliOptions = .{ .inputs = .empty };
     errdefer opts.deinit(allocator);
 
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-
+    while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            try printUsage();
+            try printUsage(io);
             return error.HelpRequested;
         }
 
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
+            const v = it.next() orelse return error.MissingOptionValue;
             if (opts.config_path) |old| allocator.free(old);
-            opts.config_path = try allocator.dupe(u8, args[i]);
+            opts.config_path = try allocator.dupe(u8, v);
             continue;
         }
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
+            const v = it.next() orelse return error.MissingOptionValue;
             if (opts.output_override) |old| allocator.free(old);
-            opts.output_override = try allocator.dupe(u8, args[i]);
+            opts.output_override = try allocator.dupe(u8, v);
             continue;
         }
         if (std.mem.eql(u8, arg, "--read-from")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.read_from_override = try parseReadFrom(args[i]);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.read_from_override = try parseReadFrom(v);
             continue;
         }
         if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--format")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.format_override = try parseInputFormat(args[i]);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.format_override = try parseInputFormat(v);
             continue;
         }
         if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--policy")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
+            const v = it.next() orelse return error.MissingOptionValue;
             if (opts.policy_path_override) |old| allocator.free(old);
-            opts.policy_path_override = try allocator.dupe(u8, args[i]);
+            opts.policy_path_override = try allocator.dupe(u8, v);
             continue;
         }
         if (std.mem.eql(u8, arg, "--io-engine")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.io_engine_override = try parseIoEngine(args[i]);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.io_engine_override = try parseIoEngine(v);
             continue;
         }
         if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
@@ -167,94 +162,79 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
             continue;
         }
         if (std.mem.eql(u8, arg, "--poll-ms")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.poll_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.poll_ms_override = try std.fmt.parseInt(u64, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--glob-interval-ms")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.glob_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.glob_interval_ms_override = try std.fmt.parseInt(u64, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--rotate-wait-ms")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.rotate_wait_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.rotate_wait_ms_override = try std.fmt.parseInt(u64, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--removed-expire-ms")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.removed_expire_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.removed_expire_ms_override = try std.fmt.parseInt(u64, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--checkpoint-interval-ms")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.checkpoint_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.checkpoint_interval_ms_override = try std.fmt.parseInt(u64, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--checkpoint-sync-batch")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.checkpoint_sync_batch_override = try std.fmt.parseInt(u32, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.checkpoint_sync_batch_override = try std.fmt.parseInt(u32, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--checkpoint-snapshot-interval-ms")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.checkpoint_snapshot_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.checkpoint_snapshot_interval_ms_override = try std.fmt.parseInt(u64, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--checkpoint-ttl-ms")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.checkpoint_ttl_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.checkpoint_ttl_ms_override = try std.fmt.parseInt(u64, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--checkpoint-max-slots")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.checkpoint_max_slots_override = try std.fmt.parseInt(usize, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.checkpoint_max_slots_override = try std.fmt.parseInt(usize, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--state-dir")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
+            const v = it.next() orelse return error.MissingOptionValue;
             if (opts.state_dir_override) |old| allocator.free(old);
-            opts.state_dir_override = try allocator.dupe(u8, args[i]);
+            opts.state_dir_override = try allocator.dupe(u8, v);
             continue;
         }
         if (std.mem.eql(u8, arg, "--read-buf")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.read_buf_override = try std.fmt.parseInt(usize, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.read_buf_override = try std.fmt.parseInt(usize, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--max-line")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.max_line_override = try std.fmt.parseInt(usize, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.max_line_override = try std.fmt.parseInt(usize, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--write-buf")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.write_buf_override = try std.fmt.parseInt(usize, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.write_buf_override = try std.fmt.parseInt(usize, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--flush-interval-ms")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.flush_interval_ms_override = try std.fmt.parseInt(u64, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.flush_interval_ms_override = try std.fmt.parseInt(u64, v, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--flush-lines")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOptionValue;
-            opts.flush_line_threshold_override = try std.fmt.parseInt(usize, args[i], 10);
+            const v = it.next() orelse return error.MissingOptionValue;
+            opts.flush_line_threshold_override = try std.fmt.parseInt(usize, v, 10);
             continue;
         }
 
@@ -285,21 +265,21 @@ fn validate(opts: CliOptions, cfg: RuntimeTailConfig) !void {
     try tail_mod.types.validateConfig(cfg);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    var opts = parseCliOptions(allocator) catch |err| switch (err) {
+    var opts = parseCliOptions(init) catch |err| switch (err) {
         error.HelpRequested => return,
         else => return err,
     };
     defer opts.deinit(allocator);
 
-    const loaded_cfg = zonfig.load(RuntimeTailConfig, allocator, .{
+    const loaded_cfg = zonfig.load(RuntimeTailConfig, allocator, io, .{
         .json_path = opts.config_path,
         .env_prefix = "TERO",
         .allow_env_only = opts.config_path == null,
+        .environ = init.environ_map,
     }) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
@@ -333,10 +313,11 @@ pub fn main() !void {
 
     if (opts.verbose_increment > 0) {
         var stderr_buf: [1024]u8 = undefined;
-        var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+        var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
         const stderr = &stderr_writer.interface;
         try stderr.print(
-            "edge-tail: read_from={s} format={s} io_engine={s} poll_ms={d} glob_interval_ms={d} state_dir={s} policy={s}\n",
+            "edge-tail: read_from={s} format={s} io_engine={s} poll_ms={d} " ++
+                "glob_interval_ms={d} state_dir={s} policy={s}\n",
             .{
                 @tagName(cfg.read_from),
                 @tagName(cfg.input_format),
@@ -351,9 +332,9 @@ pub fn main() !void {
     }
 
     if (useStdinMode(opts.inputs.items)) {
-        try tail_mod.runtime.runStdinToOutput(allocator, cfg);
+        try tail_mod.runtime.runStdinToOutput(allocator, io, init.environ_map, cfg);
         return;
     }
 
-    try tail_mod.runtime.runFilesToOutput(allocator, cfg, opts.inputs.items);
+    try tail_mod.runtime.runFilesToOutput(allocator, io, init.environ_map, cfg, opts.inputs.items);
 }

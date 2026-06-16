@@ -1,4 +1,3 @@
-const std = @import("std");
 const policy = @import("policy_zig");
 
 pub const ProviderConfig = policy.ProviderConfig;
@@ -42,9 +41,6 @@ pub const ProxyConfig = struct {
     log_level: LogLevel = .info,
 
     max_body_size: u32 = 1024 * 1024, // 1MB
-
-    // Retry config
-    max_upstream_retries: u8 = 10,
 
     // Policy providers - array of provider configurations
     policy_providers: []ProviderConfig = &.{},

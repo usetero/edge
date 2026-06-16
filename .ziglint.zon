@@ -1,0 +1,26 @@
+.{
+    // Default set of paths ziglint scans when invoked with no CLI arguments
+    // (see `task lint:zig`). These are the project's handwritten Zig sources.
+    // The `proto` module is provided by the policy_zig dependency rather than a
+    // generated `src/proto` tree, so there is nothing to exclude here today.
+    .paths = .{
+        "src",
+        "build.zig",
+    },
+    .rules = .{
+        // Z006 flags `const` bindings that are not snake_case. This conflicts
+        // with our documented convention of SCREAMING_SNAKE_CASE for constants
+        // (see AGENTS.md / CLAUDE.md), which accounts for nearly every hit
+        // (e.g. WAL_MAGIC, MAX_MATCHES_PER_SCAN, KQUEUE_EV_ADD). Disable it so
+        // the linter does not fight our own style guide.
+        .Z006 = .{ .enabled = false },
+        // Z023 wants the allocator parameter to precede all other parameters.
+        // Our module streaming interface (ProxyModule.processRequestStream and
+        // every concrete module implementation) intentionally orders the
+        // allocator last, mirroring the positional style of std.Io.Reader /
+        // std.Io.Writer. Reordering would ripple through the tagged-union
+        // dispatch, every module impl, and all call sites for zero functional
+        // gain, so the rule is disabled rather than fought instance by instance.
+        .Z023 = .{ .enabled = false },
+    },
+}

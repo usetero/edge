@@ -5,8 +5,9 @@ const types = @import("types.zig");
 const watch_mod = @import("watch.zig");
 
 const poll_mod = @import("read_scheduler/poll.zig");
+const uring_linux_mod = @import("read_scheduler/uring_linux.zig");
 const uring_mod = if (builtin.os.tag == .linux)
-    @import("read_scheduler/uring_linux.zig")
+    uring_linux_mod
 else
     struct {
         pub const Scheduler = void;
@@ -22,13 +23,13 @@ pub const EngineScheduler = union(SchedulerEngine) {
     poll: poll_mod.Scheduler,
     uring: uring_mod.Scheduler,
 
-    pub fn init(allocator: std.mem.Allocator, io_engine: types.IoEngine) !EngineScheduler {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, io_engine: types.IoEngine) !EngineScheduler {
         return switch (types.normalizeIoEngine(io_engine)) {
             .uring => if (builtin.os.tag == .linux)
-                .{ .uring = try uring_mod.Scheduler.init(allocator) }
+                .{ .uring = try uring_mod.Scheduler.init(allocator, io) }
             else
-                .{ .poll = try poll_mod.Scheduler.init(allocator) },
-            .kqueue, .poll => .{ .poll = try poll_mod.Scheduler.init(allocator) },
+                .{ .poll = try poll_mod.Scheduler.init(allocator, io) },
+            .kqueue, .poll => .{ .poll = try poll_mod.Scheduler.init(allocator, io) },
             .auto, .inotify, .epoll => unreachable,
         };
     }
@@ -38,6 +39,7 @@ pub const EngineScheduler = union(SchedulerEngine) {
             .poll => |*s| s.deinit(),
             .uring => if (builtin.os.tag == .linux) self.uring.deinit(),
         }
+        self.* = undefined;
     }
 
     pub fn processBatch(
@@ -60,29 +62,30 @@ pub const EngineScheduler = union(SchedulerEngine) {
 
 const testing = std.testing;
 
-fn keepAll(_: *anyopaque, _: []const u8, _: @import("types.zig").LineMeta) !bool {
+fn keepAll(_: *anyopaque, _: []const u8, _: types.LineMeta) !bool {
     return true;
 }
 
 test "read scheduler public API: processes event batch" {
+    const io = std.Options.debug_io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("s.log", .{});
-        defer f.close();
-        try f.writeAll("a\n");
+        const f = try tmp.dir.createFile(io, "s.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "a\n");
     }
-    const abs = try tmp.dir.realpathAlloc(testing.allocator, "s.log");
+    const abs = try tmp.dir.realPathFileAlloc(io, "s.log", testing.allocator);
     defer testing.allocator.free(abs);
-    const file = try std.fs.openFileAbsolute(abs, .{ .mode = .read_only });
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_only });
+    defer file.close(io);
 
     var framer = try framer_mod.LineFramer.init(testing.allocator, 16, 1024);
     defer framer.deinit();
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    var scheduler = try EngineScheduler.init(testing.allocator, .auto);
+    var scheduler = try EngineScheduler.init(testing.allocator, io, .auto);
     defer scheduler.deinit();
 
     const n = try scheduler.processBatch(&framer, &out.writer, &.{

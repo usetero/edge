@@ -5,15 +5,16 @@
 # Usage: ./bench/scaling/run.sh [OPTIONS]
 #
 # Options:
-#   -n, --requests NUM    Number of requests per test (default: 10000)
-#   -c, --connections NUM Number of concurrent connections (default: 50)
-#   --skip-build          Skip building binaries
-#   --edge-only           Only run Edge benchmarks
-#   --otelcol-only        Only run otelcol benchmarks
-#   --vector-only         Only run Vector benchmarks
-#   --tero-collector-only Only run tero-collector benchmarks
-#   --debug               Save server logs
-#   -h, --help            Show this help message
+#   -n, --requests NUM       Number of requests per test (default: 10000)
+#   -c, --connections NUM    Number of concurrent connections (default: 50)
+#   --skip-build             Skip building binaries
+#   --edge-only              Only run Edge benchmarks
+#   --otelcol-only           Only run otelcol benchmarks
+#   --vector-only            Only run Vector benchmarks
+#   --tero-vector-only       Only run Tero Vector benchmarks
+#   --tero-collector-only    Only run tero-collector benchmarks
+#   --debug                  Save server logs
+#   -h, --help               Show this help message
 #
 set -euo pipefail
 
@@ -25,6 +26,7 @@ DEBUG_MODE=false
 RUN_EDGE=true
 RUN_OTELCOL=true
 RUN_VECTOR=true
+RUN_TERO_VECTOR=true
 RUN_TERO_COLLECTOR=true
 
 # For initial testing, only test 0 and 1 policies
@@ -34,9 +36,10 @@ POLICY_COUNTS=(0 1 5 10 50 100 500 1000 2000 4000)
 # Quick 1000 test:
 # POLICY_COUNTS=(0 1000)
 
-# otelcol, vector, and tero-collector binary locations
+# otelcol, vector, tero-vector, and tero-collector binary locations
 OTELCOL_BIN=""
 VECTOR_BIN=""
+TERO_VECTOR_BIN=""
 TERO_COLLECTOR_BIN=""
 
 # Ports
@@ -57,6 +60,7 @@ CONFIGS_DIR="$SCRIPT_DIR/configs"
 # PIDs for cleanup
 ECHO_PID=""
 VECTOR_PID=""
+TERO_VECTOR_PID=""
 EDGE_PID=""
 OTELCOL_PID=""
 TERO_COLLECTOR_PID=""
@@ -105,9 +109,25 @@ find_vector() {
     echo ""
 }
 
-# Find tero-collector binary
+# Find tero-vector binary (https://github.com/usetero/vector/releases/)
+find_tero_vector() {
+    # Check in bench/bin first
+    if [[ -x "$PROJECT_ROOT/bench/bin/tero-vector" ]]; then
+        echo "$PROJECT_ROOT/bench/bin/tero-vector"
+        return
+    fi
+    # Check in PATH
+    if command -v tero-vector >/dev/null 2>&1; then
+        command -v tero-vector
+        return
+    fi
+    # Not found
+    echo ""
+}
+
+# Find tero-collector binary (expected: v0.12.0 from https://github.com/usetero/tero-collector-distro/releases/)
 find_tero_collector() {
-    # Check known location first
+    # Check known local build location
     local known_path="/Users/jea/Code/tero/tero-collector-distro/collector/_build/tero-collector"
     if [[ -x "$known_path" ]]; then
         echo "$known_path"
@@ -201,6 +221,43 @@ stop_vector() {
     fi
 }
 
+# Start Tero Vector
+start_tero_vector() {
+    local config=$1
+    local scenario_name=$2
+    local wait_port=$3
+
+    stop_tero_vector
+
+    mkdir -p "$SCRIPT_DIR/data"
+
+    log_info "Starting tero-vector..."
+
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        local log_file="$DEBUG_DIR/tero-vector-$(echo "$scenario_name" | tr ' ' '-').log"
+        "$TERO_VECTOR_BIN" --config "$config" > "$log_file" 2>&1 &
+    else
+        "$TERO_VECTOR_BIN" --config "$config" >/dev/null 2>&1 &
+    fi
+    TERO_VECTOR_PID=$!
+    wait_for_server "$wait_port" "tero-vector" 120
+}
+
+# Stop Tero Vector
+stop_tero_vector() {
+    if [[ -n "$TERO_VECTOR_PID" ]]; then
+        sleep 2
+        kill "$TERO_VECTOR_PID" 2>/dev/null || true
+        for i in {1..20}; do
+            kill -0 "$TERO_VECTOR_PID" 2>/dev/null || break
+            sleep 0.3
+        done
+        kill -9 "$TERO_VECTOR_PID" 2>/dev/null || true
+        sleep 0.3
+        TERO_VECTOR_PID=""
+    fi
+}
+
 # Start tero-collector
 start_tero_collector() {
     local config=$1
@@ -239,6 +296,7 @@ cleanup() {
     [[ -n "$EDGE_PID" ]] && kill -9 "$EDGE_PID" 2>/dev/null || true
     [[ -n "$OTELCOL_PID" ]] && kill -9 "$OTELCOL_PID" 2>/dev/null || true
     [[ -n "$VECTOR_PID" ]] && kill -9 "$VECTOR_PID" 2>/dev/null || true
+    [[ -n "$TERO_VECTOR_PID" ]] && kill -9 "$TERO_VECTOR_PID" 2>/dev/null || true
     [[ -n "$TERO_COLLECTOR_PID" ]] && kill -9 "$TERO_COLLECTOR_PID" 2>/dev/null || true
     # Then pkill to catch any orphans
     pkill -9 -f "echo-server" 2>/dev/null || true
@@ -246,6 +304,7 @@ cleanup() {
     pkill -9 -f "edge-datadog" 2>/dev/null || true
     pkill -9 -f "otelcol" 2>/dev/null || true
     pkill -9 -f "tero-collector" 2>/dev/null || true
+    pkill -9 -f "tero-vector.*--config" 2>/dev/null || true
     pkill -9 -f "vector.*--config" 2>/dev/null || true
     sleep 0.5
 }
@@ -293,12 +352,24 @@ check_dependencies() {
         fi
     fi
 
-    # Check for tero-collector if needed
+    # Check for tero-vector if needed
+    if [[ "$RUN_TERO_VECTOR" == "true" ]]; then
+        TERO_VECTOR_BIN=$(find_tero_vector)
+        if [[ -z "$TERO_VECTOR_BIN" ]]; then
+            log_warn "tero-vector not found, skipping Tero Vector benchmarks"
+            log_warn "Download from https://github.com/usetero/vector/releases/ to bench/bin/tero-vector"
+            RUN_TERO_VECTOR=false
+        else
+            log_success "Found tero-vector: $TERO_VECTOR_BIN"
+        fi
+    fi
+
+    # Check for tero-collector if needed (expected: v0.12.0)
     if [[ "$RUN_TERO_COLLECTOR" == "true" ]]; then
         TERO_COLLECTOR_BIN=$(find_tero_collector)
         if [[ -z "$TERO_COLLECTOR_BIN" ]]; then
             log_warn "tero-collector not found, skipping tero-collector benchmarks"
-            log_warn "Build tero-collector or install to bench/bin/tero-collector"
+            log_warn "Build tero-collector (v0.12.0) or install to bench/bin/tero-collector"
             RUN_TERO_COLLECTOR=false
         else
             log_success "Found tero-collector: $TERO_COLLECTOR_BIN"
@@ -311,13 +382,13 @@ check_dependencies() {
 wait_for_server() {
     local port=$1
     local name=$2
-    local max_attempts=${3:-60}  # Default 60 attempts = 6 seconds
+    local max_attempts=${3:-600}  # Default 600 attempts = 60s (curl may retry on port exhaustion)
     local attempt=0
 
     while ! curl -s --max-time 1 "http://127.0.0.1:$port" >/dev/null 2>&1; do
         attempt=$((attempt + 1))
         if [[ $attempt -ge $max_attempts ]]; then
-            log_error "$name failed to start on port $port"
+            log_error "$name failed to start on port $port after ${max_attempts}x0.1s"
             return 1
         fi
         sleep 0.1
@@ -337,11 +408,26 @@ start_echo_server() {
 }
 
 reset_echo_stats() {
-    curl -s -X POST "http://127.0.0.1:$ECHO_SERVER_PORT/reset" >/dev/null
+    local attempt=0
+    while [[ $attempt -lt 60 ]]; do
+        # -d '' forces Content-Length: 0; without it std.http waits for connection close.
+        curl -s --max-time 3 -X POST -d '' "http://127.0.0.1:$ECHO_SERVER_PORT/reset" >/dev/null && return 0
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    log_warn "Could not reset echo stats after 60s (port exhaustion?), continuing"
 }
 
 get_echo_stats() {
-    curl -s "http://127.0.0.1:$ECHO_SERVER_PORT/stats"
+    local attempt=0
+    while [[ $attempt -lt 60 ]]; do
+        local result
+        result=$(curl -s --max-time 3 "http://127.0.0.1:$ECHO_SERVER_PORT/stats") && echo "$result" && return 0
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    log_warn "Could not get echo stats after 60s, returning empty"
+    echo '{"total_requests":0,"total_bytes":0}'
 }
 
 start_edge_proxy() {
@@ -528,10 +614,11 @@ main() {
             -c|--connections) CONNECTIONS="$2"; shift 2 ;;
             --skip-build) SKIP_BUILD=true; shift ;;
             --debug) DEBUG_MODE=true; shift ;;
-            --edge-only) RUN_EDGE=true; RUN_OTELCOL=false; RUN_VECTOR=false; RUN_TERO_COLLECTOR=false; shift ;;
-            --otelcol-only) RUN_EDGE=false; RUN_OTELCOL=true; RUN_VECTOR=false; RUN_TERO_COLLECTOR=false; shift ;;
-            --vector-only) RUN_EDGE=false; RUN_OTELCOL=false; RUN_VECTOR=true; RUN_TERO_COLLECTOR=false; shift ;;
-            --tero-collector-only) RUN_EDGE=false; RUN_OTELCOL=false; RUN_VECTOR=false; RUN_TERO_COLLECTOR=true; shift ;;
+            --edge-only) RUN_EDGE=true; RUN_OTELCOL=false; RUN_VECTOR=false; RUN_TERO_VECTOR=false; RUN_TERO_COLLECTOR=false; shift ;;
+            --otelcol-only) RUN_EDGE=false; RUN_OTELCOL=true; RUN_VECTOR=false; RUN_TERO_VECTOR=false; RUN_TERO_COLLECTOR=false; shift ;;
+            --vector-only) RUN_EDGE=false; RUN_OTELCOL=false; RUN_VECTOR=true; RUN_TERO_VECTOR=false; RUN_TERO_COLLECTOR=false; shift ;;
+            --tero-vector-only) RUN_EDGE=false; RUN_OTELCOL=false; RUN_VECTOR=false; RUN_TERO_VECTOR=true; RUN_TERO_COLLECTOR=false; shift ;;
+            --tero-collector-only) RUN_EDGE=false; RUN_OTELCOL=false; RUN_VECTOR=false; RUN_TERO_VECTOR=false; RUN_TERO_COLLECTOR=true; shift ;;
             -h|--help) usage ;;
             *) log_error "Unknown option: $1"; usage ;;
         esac
@@ -543,6 +630,7 @@ main() {
     [[ "$RUN_EDGE" == "true" ]] && components+=("Edge")
     [[ "$RUN_OTELCOL" == "true" ]] && components+=("otelcol")
     [[ "$RUN_VECTOR" == "true" ]] && components+=("Vector")
+    [[ "$RUN_TERO_VECTOR" == "true" ]] && components+=("tero-vector")
     [[ "$RUN_TERO_COLLECTOR" == "true" ]] && components+=("tero-collector")
     run_what=$(IFS=" + "; echo "${components[*]}")
 
@@ -565,8 +653,8 @@ main() {
         log_success "Build complete"
     fi
 
-    # Generate protobuf payloads for OTLP tests (used by Edge, otelcol, Vector, and tero-collector)
-    if [[ "$RUN_EDGE" == "true" ]] || [[ "$RUN_OTELCOL" == "true" ]] || [[ "$RUN_VECTOR" == "true" ]] || [[ "$RUN_TERO_COLLECTOR" == "true" ]]; then
+    # Generate protobuf payloads for OTLP tests
+    if [[ "$RUN_EDGE" == "true" ]] || [[ "$RUN_OTELCOL" == "true" ]] || [[ "$RUN_VECTOR" == "true" ]] || [[ "$RUN_TERO_VECTOR" == "true" ]] || [[ "$RUN_TERO_COLLECTOR" == "true" ]]; then
         log_info "Generating protobuf OTLP payloads..."
         python3 "$SCRIPT_DIR/generate-protobuf-payloads.py"
         log_success "Protobuf payloads generated"
@@ -786,6 +874,62 @@ main() {
                 log_success "$name: ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, echo: ${echo_requests} reqs"
 
                 # Write to CSV
+                echo "$binary,$name,$count,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,$echo_requests,$echo_bytes" >> "$results_file"
+            done
+        fi
+
+        # ========== Tero Vector Benchmarks ==========
+        if [[ "$RUN_TERO_VECTOR" == "true" ]]; then
+            local tero_vector_config="$CONFIGS_DIR/generated/tero-vector-${count}.yaml"
+
+            # Tero Vector scenarios: same ports/endpoints as vanilla Vector but with policy transform
+            # - OTLP HTTP on port 4326 (opentelemetry source, protobuf)
+            # - Datadog HTTP on port 4327 (http_server source, JSON)
+            # - Datadog Metrics on port 4328 (http_server source, JSON)
+            # Format: binary|name|port|endpoint|payload|content_type
+            local tero_vector_scenarios=(
+                "tero-vector|OTLP Logs|4326|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
+                "tero-vector|OTLP Metrics|4326|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
+                "tero-vector|DD Logs|4327|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "tero-vector|DD Metrics|4328|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
+            )
+
+            for scenario in "${tero_vector_scenarios[@]}"; do
+                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
+
+                local payload_size=$(wc -c < "$payload" | tr -d ' ')
+                local output_json="$OUTPUT_DIR/${binary}-${name// /-}-${count}.json"
+                local url="http://127.0.0.1:$port$endpoint"
+
+                start_tero_vector "$tero_vector_config" "${name}-${count}" "$port"
+
+                reset_echo_stats
+                start_resource_monitor "$TERO_VECTOR_PID"
+
+                log_info "Running: $name ($binary, $count policies)..."
+                run_benchmark "$url" "$payload" "$output_json" "$content_type"
+
+                local resource_metrics=$(stop_resource_monitor)
+
+                stop_tero_vector
+
+                local echo_stats=$(get_echo_stats)
+                local echo_requests=$(echo "$echo_stats" | jq -r '.total_requests')
+                local echo_bytes=$(echo "$echo_stats" | jq -r '.total_bytes')
+
+                local metrics=$(extract_metrics "$output_json")
+                IFS=',' read -r rps p50 p99 success <<< "$metrics"
+                IFS=',' read -r cpu_percent peak_mem <<< "$resource_metrics"
+
+                if [[ "$count" -eq 0 ]]; then
+                    verify_request_count "$REQUESTS" "$echo_stats" "$name" || true
+                fi
+
+                local success_color="${GREEN}"
+                [[ "$success" != "100" ]] && success_color="${RED}"
+
+                log_success "$name: ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, echo: ${echo_requests} reqs"
+
                 echo "$binary,$name,$count,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,$echo_requests,$echo_bytes" >> "$results_file"
             done
         fi

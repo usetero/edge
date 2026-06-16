@@ -715,6 +715,146 @@ YAML_SINKS
     fi
 }
 
+# Generate Tero Vector config with policy transform
+# Tero Vector is a Vector fork that adds a native policy transform reading from the Edge policy file.
+# Port 4326 for OTLP HTTP, 4327 for Datadog logs, 4328 for Datadog metrics.
+generate_tero_vector_config() {
+    local count=$1
+    local policy_file="$OUTPUT_DIR/policies-$count.json"
+    local data_dir="$SCRIPT_DIR/data"
+
+    cat <<YAML_HEAD
+data_dir: "$data_dir"
+
+sources:
+  otel_source:
+    type: opentelemetry
+    grpc:
+      address: "127.0.0.1:4329"
+    http:
+      address: "127.0.0.1:4326"
+
+  datadog_logs_source:
+    type: http_server
+    address: "127.0.0.1:4327"
+    decoding:
+      codec: json
+    path: "/api/v2/logs"
+
+  datadog_metrics_source:
+    type: http_server
+    address: "127.0.0.1:4328"
+    decoding:
+      codec: json
+    path: "/api/v2/series"
+
+transforms:
+  apply_policy_otlp_logs:
+    type: policy
+    inputs:
+      - "otel_source.logs"
+    mode: otel
+    policy_providers:
+      - type: file
+        id: bench
+        path: "$policy_file"
+
+  apply_policy_otlp_metrics:
+    type: policy
+    inputs:
+      - "otel_source.metrics"
+    mode: otel
+    policy_providers:
+      - type: file
+        id: bench
+        path: "$policy_file"
+
+  apply_policy_otlp_traces:
+    type: policy
+    inputs:
+      - "otel_source.traces"
+    mode: otel
+    policy_providers:
+      - type: file
+        id: bench
+        path: "$policy_file"
+
+  apply_policy_dd_logs:
+    type: policy
+    inputs:
+      - "datadog_logs_source"
+    policy_providers:
+      - type: file
+        id: bench
+        path: "$policy_file"
+
+  apply_policy_dd_metrics:
+    type: policy
+    inputs:
+      - "datadog_metrics_source"
+    policy_providers:
+      - type: file
+        id: bench
+        path: "$policy_file"
+
+sinks:
+  otlp_logs_out:
+    type: http
+    inputs:
+      - "apply_policy_otlp_logs"
+    uri: "http://127.0.0.1:9999/v1/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  otlp_metrics_out:
+    type: http
+    inputs:
+      - "apply_policy_otlp_metrics"
+    uri: "http://127.0.0.1:9999/v1/metrics"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  otlp_traces_out:
+    type: http
+    inputs:
+      - "apply_policy_otlp_traces"
+    uri: "http://127.0.0.1:9999/v1/traces"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  datadog_logs_out:
+    type: http
+    inputs:
+      - "apply_policy_dd_logs"
+    uri: "http://127.0.0.1:9999/api/v2/logs"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+
+  datadog_metrics_out:
+    type: http
+    inputs:
+      - "apply_policy_dd_metrics"
+    uri: "http://127.0.0.1:9999/api/v2/series"
+    encoding:
+      codec: json
+    batch:
+      max_bytes: 1048576
+      timeout_secs: 1
+YAML_HEAD
+}
+
 # Generate tero-collector config with policy processor
 # tero-collector uses the same policy file as Edge
 # Port 4323 for OTLP HTTP, exports to echo server via debug exporter replaced with otlphttp
@@ -798,6 +938,9 @@ generate_otelcol_config "$COUNT" > "$OUTPUT_DIR/otelcol-$COUNT.yaml"
 # Generate Vector config
 generate_vector_config "$COUNT" > "$OUTPUT_DIR/vector-$COUNT.yaml"
 
+# Generate Tero Vector config
+generate_tero_vector_config "$COUNT" > "$OUTPUT_DIR/tero-vector-$COUNT.yaml"
+
 # Generate tero-collector config
 generate_tero_collector_config "$COUNT" > "$OUTPUT_DIR/tero-collector-$COUNT.yaml"
 
@@ -805,6 +948,7 @@ echo "Generated:"
 echo "  - $OUTPUT_DIR/policies-$COUNT.json"
 echo "  - $OUTPUT_DIR/otelcol-$COUNT.yaml"
 echo "  - $OUTPUT_DIR/vector-$COUNT.yaml"
+echo "  - $OUTPUT_DIR/tero-vector-$COUNT.yaml"
 echo "  - $OUTPUT_DIR/tero-collector-$COUNT.yaml"
 
 # Show summary

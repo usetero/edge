@@ -19,6 +19,7 @@ Setup:
 """
 
 import glob
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -132,15 +133,16 @@ class PlotStyle:
 # =============================================================================
 
 
-def load_results(pattern: str = "results/*.results.csv") -> pd.DataFrame:
+def load_results(pattern: str = "results/*/results.csv") -> pd.DataFrame:
     """
     Load all CSV files matching pattern and combine into single DataFrame.
 
     Adds a 'run' column to identify which file each row came from.
     """
-    files = sorted(glob.glob(pattern))
+    cutoff = "2026-06-15T13-24-42"
+    files = sorted(f for f in glob.glob(pattern) if os.path.basename(os.path.dirname(f)) >= cutoff)
     if not files:
-        raise FileNotFoundError(f"No files matching pattern: {pattern}")
+        raise FileNotFoundError(f"No files matching pattern: {pattern} after {cutoff}")
 
     dfs = []
     for i, f in enumerate(files, start=1):
@@ -160,22 +162,6 @@ def load_results(pattern: str = "results/*.results.csv") -> pd.DataFrame:
             "edge-datadog": "edge",
         }
     )
-
-    # # Filter out otelcol/tero-collector DD Logs (20x slower than OTLP, skews aggregations)
-    # combined = combined[
-    #     ~(
-    #         (combined["binary"].isin(["otelcol", "tero-collector"]))
-    #         & (combined["telemetry_type"] == "DD Logs")
-    #     )
-    # ]
-
-    # # Filter out tero-collector OTLP Metrics (10x higher memory, skews aggregations)
-    # combined = combined[
-    #     ~(
-    #         (combined["binary"] == "tero-collector")
-    #         & (combined["telemetry_type"] == "OTLP Metrics")
-    #     )
-    # ]
 
     # Filter out OTLP Traces entirely
     combined = combined[combined["telemetry_type"] != "OTLP Traces"]

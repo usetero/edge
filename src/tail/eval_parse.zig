@@ -7,18 +7,21 @@ pub fn parseLine(
     input_format: types.InputFormat,
     line: []const u8,
 ) !context.TailLineContext {
-    var ctx = context.TailLineContext{ .allocator = allocator };
+    var ctx: context.TailLineContext = .{ .allocator = allocator };
     switch (input_format) {
         .raw => {
             ctx.message = line;
         },
+        // Structured formats: the parsers extract message/body when present
+        // (their `ctx.message == null` guard requires running them first);
+        // the raw line is only the fallback.
         .logfmt => {
-            ctx.message = line;
             try parseLogfmtAttrs(&ctx, line);
+            if (ctx.message == null) ctx.message = line;
         },
         .json => {
-            ctx.message = line;
             try parseJsonAttrs(&ctx, line);
+            if (ctx.message == null) ctx.message = line;
         },
     }
     return ctx;
@@ -37,7 +40,10 @@ pub fn parseLogfmtAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
         if (ctx.message == null and (std.mem.eql(u8, key, "message") or std.mem.eql(u8, key, "body"))) {
             ctx.message = owned_value;
         }
-        if (ctx.severity == null and (std.mem.eql(u8, key, "severity_text") or std.mem.eql(u8, key, "severity") or std.mem.eql(u8, key, "level"))) {
+        const is_severity_key = std.mem.eql(u8, key, "severity_text") or
+            std.mem.eql(u8, key, "severity") or
+            std.mem.eql(u8, key, "level");
+        if (ctx.severity == null and is_severity_key) {
             ctx.severity = owned_value;
         }
     }
@@ -58,7 +64,10 @@ pub fn parseJsonAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
                 if (ctx.message == null and (std.mem.eql(u8, key, "message") or std.mem.eql(u8, key, "body"))) {
                     ctx.message = owned_value;
                 }
-                if (ctx.severity == null and (std.mem.eql(u8, key, "severity_text") or std.mem.eql(u8, key, "severity") or std.mem.eql(u8, key, "level"))) {
+                const is_severity_key = std.mem.eql(u8, key, "severity_text") or
+                    std.mem.eql(u8, key, "severity") or
+                    std.mem.eql(u8, key, "level");
+                if (ctx.severity == null and is_severity_key) {
                     ctx.severity = owned_value;
                 }
             },

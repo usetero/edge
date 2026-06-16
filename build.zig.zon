@@ -25,28 +25,28 @@
     .fingerprint = 0x7506d36611375239, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .httpz = .{
-            .url = "git+https://github.com/karlseguin/http.zig?ref=master#844f8016e6616f00b05d4cc3c713307b0fe586c7",
-            .hash = "httpz-0.0.0-PNVzrBtMBwAPcQx3mNEgat3Xbsynw-eIC9SmOX5M9XtP",
-        },
         .zimdjson = .{
-            .url = "git+https://github.com/jaronoff97/zimdjson?ref=zig-0.15.1-support#f31efc9e698246f994df8eba44646134a93fa2b6",
-            .hash = "zimdjson-0.1.1-89pgxT5VBgBMxsGpAd90DI0e-DzHGKiRVlquliE5FivH",
+            .url = "git+https://github.com/jaronoff97/zimdjson?ref=main#6199cafec64280fcd9fd1df70b52809fc5a70052",
+            .hash = "zimdjson-0.1.1-89pgxQlXBgAl5hBPQrMFdumnb9Z36oftC7qkURHJwLEG",
         },
         .policy_zig = .{
-            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.3.1.tar.gz",
-            .hash = "policy_zig-0.1.7-5_dp3ps4EACY3nicmFNzL2EUIbKEM5q3fROlZirr1id8",
+            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.4.0.tar.gz",
+            .hash = "policy_zig-0.1.7-5_dp3mBWEQCMgFeFVWrd57P_E0joBbvmzQR9ivHHSNVg",
         },
         .metrics = .{
-            .url = "git+https://github.com/karlseguin/metrics.zig#28cf547974144d827b5f85c07af7f9ec72c302dc",
-            .hash = "metrics-0.0.0-W7G4ePy_AQBozb1s8-avLxHOd4thMO92zKXDW84tmAhf",
+            .url = "git+https://github.com/karlseguin/metrics.zig?ref=master#1621f82e7ecf2b3dddf5730bf52761af354a7080",
+            .hash = "metrics-0.0.0-W7G4eJOgAQDBacPAeqGCaY8gV7zuddUQyikGNq7nDPds",
+        },
+        .httpz = .{
+            .url = "https://github.com/karlseguin/http.zig/archive/5f60277d3b3beffef86321869b13c57f7acc3c5b.tar.gz",
+            .hash = "httpz-0.0.0-PNVzrJrbCACyokt2AARAG7Ul7h7xlZxL7BYAdpsAs1_-",
         },
     },
     .paths = .{

@@ -14,16 +14,11 @@
 //! - Environment-based configuration (via zonfig)
 
 const std = @import("std");
-const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const edge = @import("root.zig");
-const server_mod = edge.server;
 const runtime_metrics_mod = @import("runtime/runtime_metrics.zig");
-const proxy_module = edge.proxy_module;
-const passthrough_mod = edge.passthrough_module;
-const datadog_mod = edge.datadog_module;
-const health_mod = edge.health_module;
+const app = @import("runtime/app.zig");
 const policy = edge.policy;
 const zonfig = edge.zonfig;
 
@@ -35,13 +30,13 @@ const EventBus = o11y.EventBus;
 const StdLogAdapter = o11y.StdLogAdapter;
 const Level = o11y.Level;
 
-const ProxyServer = server_mod.ProxyServer;
-const ModuleRegistration = proxy_module.ModuleRegistration;
-const PassthroughModule = passthrough_mod.PassthroughModule;
-const DatadogModule = datadog_mod.DatadogModule;
-const DatadogConfig = datadog_mod.DatadogConfig;
-const HealthModule = health_mod.HealthModule;
 const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
+
+/// Lambda ships the datadog service set: health + datadog logs/metrics +
+/// passthrough, same composition the old module wiring built by hand.
+const lambda_service_kinds = [_]edge.distro.ServiceKind{
+    .health, .datadog_logs, .datadog_metrics, .passthrough,
+};
 
 // =============================================================================
 // Lambda Configuration
@@ -61,7 +56,6 @@ pub const LambdaConfig = struct {
 
     // Limits
     max_body_size: u32 = 5 * 1024 * 1024, // 5MB
-    max_upstream_retries: u8 = 3,
 
     // Service metadata
     service: struct {
@@ -73,7 +67,9 @@ pub const LambdaConfig = struct {
     // Policy configuration
     policy: struct {
         /// JSON array of policies to load at startup
-        /// Example: TERO_POLICY_STATIC='{"policies":[{"id":"drop-health","name":"Drop health","log":{"match":[{"log_field":"body","regex":"health"}],"keep":"none"}}]}'
+        /// Example: TERO_POLICY_STATIC='{"policies":[{"id":"drop-health",
+        ///   "name":"Drop health","log":{"match":[{"log_field":"body",
+        ///   "regex":"health"}],"keep":"none"}}]}'
         static: ?[]const u8 = null,
         /// HTTP policy provider URL for dynamic updates
         url: ?[]const u8 = null,
@@ -111,45 +107,24 @@ const StaticPoliciesError = struct { err: []const u8 };
 // Global State
 // =============================================================================
 
-var server_instance: ?*ProxyServer = null;
 var global_event_bus: ?*EventBus = null;
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-// =============================================================================
-// Server Thread
-// =============================================================================
-
-const ServerThreadContext = struct {
-    proxy: *ProxyServer,
-    bus: *EventBus,
-};
-
-fn serverThread(ctx: *ServerThreadContext) void {
-    ctx.bus.info(ProxyServerStarted{ .port = ctx.proxy.context.listen_port });
-
-    ctx.proxy.listen() catch |err| {
-        ctx.bus.err(LambdaExtensionError{ .err = @errorName(err) });
-    };
-
-    ctx.bus.info(ProxyServerStopped{});
-}
 
 // =============================================================================
 // Main Entry Point
 // =============================================================================
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     // Initialize observability
     var stdio_bus: o11y.StdioEventBus = undefined;
-    stdio_bus.init();
+    stdio_bus.init(io);
     const bus = stdio_bus.eventBus();
 
     // Parse log level from environment
-    bus.setLevel(Level.parseFromEnv("TERO_LOG_LEVEL", .info));
+    bus.setLevel(Level.parseFromEnv(init.environ_map, "TERO_LOG_LEVEL", .info));
 
     // Initialize std.log adapter
     StdLogAdapter.init(bus);
@@ -158,10 +133,17 @@ pub fn main() !void {
     global_event_bus = bus;
     defer global_event_bus = null;
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(LambdaExtensionStarting{});
 
     // Load configuration via zonfig (env vars with TERO_ prefix, no JSON file)
-    const config = zonfig.load(LambdaConfig, allocator, .{ .env_prefix = "TERO" }) catch |err| {
+    const config = zonfig.load(
+        LambdaConfig,
+        allocator,
+        io,
+        .{ .env_prefix = "TERO", .environ = init.environ_map },
+    ) catch |err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.err(LambdaExtensionError{ .err = @errorName(err) });
         return err;
     };
@@ -171,6 +153,7 @@ pub fn main() !void {
     const logs_url = config.logs_url orelse config.upstream_url;
     const metrics_url = config.metrics_url orelse config.upstream_url;
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ConfigurationLoaded{
         .logs_url = logs_url,
         .metrics_url = metrics_url,
@@ -179,14 +162,14 @@ pub fn main() !void {
     // Generate instance ID
     var instance_id_buf: [64]u8 = undefined;
     const instance_id = try std.fmt.bufPrint(&instance_id_buf, "lambda-{d}-{d}", .{
-        std.time.milliTimestamp(),
+        std.Io.Timestamp.now(io, .real).toMilliseconds(),
         std.Thread.getCurrentId(),
     });
     const instance_id_copy = try allocator.dupe(u8, instance_id);
     defer allocator.free(instance_id_copy);
 
     // Build service metadata
-    const service_metadata = policy.ServiceMetadata{
+    const service_metadata: policy.ServiceMetadata = .{
         .name = config.service.name,
         .namespace = config.service.namespace,
         .version = config.service.version,
@@ -201,15 +184,17 @@ pub fn main() !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
-    var runtime_metrics = try RuntimeMetrics.init(allocator, .lambda);
+    var runtime_metrics = try RuntimeMetrics.init(allocator, io, .lambda);
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
 
     // Load static policies from environment variable (TERO_POLICY_STATIC)
     if (config.policy.static) |static_json| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.info(StaticPoliciesLoading{});
 
         const policies = policy.parser.parsePoliciesBytes(allocator, static_json) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             bus.err(StaticPoliciesError{ .err = @errorName(err) });
             return err;
         };
@@ -221,6 +206,7 @@ pub fn main() !void {
         }
 
         try registry.updatePolicies(policies, "static", .file);
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.info(StaticPoliciesLoaded{ .count = policies.len });
     }
 
@@ -243,7 +229,7 @@ pub fn main() !void {
             headers_count = 1;
         }
 
-        const provider_config = policy.ProviderConfig{
+        const provider_config: policy.ProviderConfig = .{
             .id = "lambda-http",
             .type = .http,
             .url = policy_url,
@@ -254,97 +240,38 @@ pub fn main() !void {
         const providers = [_]policy.ProviderConfig{provider_config};
         loader = try policy.Loader.init(
             allocator,
+            io,
             bus,
             &registry,
             &providers,
             service_metadata,
         );
-        try loader.?.startAsync();
+        try loader.?.startAsync(io);
     }
 
     // Create Datadog module configuration
-    var datadog_config = DatadogConfig{
-        .registry = &registry,
-        .bus = bus,
-        .metrics = &runtime_metrics,
-    };
-
-    // Create modules
-    var health_module = HealthModule{};
-    var datadog_logs_module = DatadogModule{};
-    var datadog_metrics_module = DatadogModule{};
-    var passthrough_module = PassthroughModule{};
-
-    // Register modules (order matters - first match wins)
-    const module_registrations = [_]ModuleRegistration{
-        // Health module - reserved /_health endpoint
-        .{
-            .module = .{ .health = &health_module },
-            .routes = &health_mod.routes,
-            .upstream_url = logs_url,
-            .max_request_body = 0,
-            .max_response_body = 0,
-            .module_data = null,
-        },
-        // Datadog logs module - handles /api/v2/logs with filtering
-        .{
-            .module = .{ .datadog = &datadog_logs_module },
-            .routes = &datadog_mod.logs_routes,
-            .upstream_url = logs_url,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = @ptrCast(&datadog_config),
-        },
-        // Datadog metrics module - handles /api/v2/series with filtering
-        .{
-            .module = .{ .datadog = &datadog_metrics_module },
-            .routes = &datadog_mod.metrics_routes,
-            .upstream_url = metrics_url,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = @ptrCast(&datadog_config),
-        },
-        // Passthrough module - handles all other requests
-        .{
-            .module = .{ .passthrough = &passthrough_module },
-            .routes = &passthrough_mod.default_routes,
-            .upstream_url = logs_url,
-            .max_request_body = config.max_body_size,
-            .max_response_body = config.max_body_size,
-            .module_data = null,
-        },
-    };
-
-    // Create proxy server
-    var proxy = try ProxyServer.init(
-        allocator,
-        bus,
-        &runtime_metrics,
-        config.listen_address,
-        config.listen_port,
-        config.max_upstream_retries,
-        config.max_body_size,
-        &module_registrations,
-    );
-    defer proxy.deinit();
-
-    server_instance = &proxy;
-    defer server_instance = null;
-
-    // Start proxy server in background thread
-    var server_ctx = ServerThreadContext{
-        .proxy = &proxy,
-        .bus = bus,
-    };
-    const server_thread = try std.Thread.spawn(.{}, serverThread, .{&server_ctx});
+    const kinds: []const edge.distro.ServiceKind = &lambda_service_kinds;
+    const engine = try app.Engine.create(allocator, io, init.environ_map, bus, &registry, &runtime_metrics, kinds, .{
+        .listen_address = config.listen_address,
+        .listen_port = config.listen_port,
+        .max_body_size = config.max_body_size,
+        .upstream_url = config.upstream_url,
+        .logs_url = config.logs_url,
+        .metrics_url = config.metrics_url,
+    });
+    defer engine.destroy();
+    try engine.start();
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    bus.info(ProxyServerStarted{ .port = config.listen_port });
 
     // Initialize Lambda Extensions API client
-    var extension = try ExtensionClient.init(allocator, bus, "tero-edge");
+    var extension = try ExtensionClient.init(allocator, io, bus, init.environ_map, "tero-edge");
     defer extension.deinit();
 
     // Register with Lambda Extensions API
     try extension.register();
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(LambdaExtensionReady{ .port = config.listen_port });
 
     // Event loop - poll for Lambda events
@@ -356,6 +283,7 @@ pub fn main() !void {
         _ = arena.reset(.retain_capacity);
 
         const event = extension.nextEvent(arena.allocator()) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             bus.err(LambdaExtensionError{ .err = @errorName(err) });
             continue;
         };
@@ -375,14 +303,16 @@ pub fn main() !void {
 
                 // Stop proxy server gracefully
                 shutdown_requested.store(true, .release);
-                proxy.server.stop();
+                engine.requestShutdown();
                 break;
             },
         }
     }
 
-    // Wait for server thread to finish
-    server_thread.join();
+    // Cancel the accept loop and every connection task, then wait.
+    engine.requestShutdown();
+    engine.stop();
 
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStopped{});
 }

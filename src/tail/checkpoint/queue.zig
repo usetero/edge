@@ -3,15 +3,17 @@ const checkpoint_types = @import("types.zig");
 
 pub const UpdateQueue = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     capacity: usize,
     buf: []checkpoint_types.Update,
     head: usize = 0,
     len: usize = 0,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) !UpdateQueue {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, capacity: usize) !UpdateQueue {
         return .{
             .allocator = allocator,
+            .io = io,
             .capacity = capacity,
             .buf = try allocator.alloc(checkpoint_types.Update, capacity),
         };
@@ -19,11 +21,12 @@ pub const UpdateQueue = struct {
 
     pub fn deinit(self: *UpdateQueue) void {
         self.allocator.free(self.buf);
+        self.* = undefined;
     }
 
     pub fn push(self: *UpdateQueue, update: checkpoint_types.Update) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.len >= self.capacity) return false;
 
         const tail = (self.head + self.len) % self.capacity;
@@ -33,8 +36,8 @@ pub const UpdateQueue = struct {
     }
 
     pub fn pop(self: *UpdateQueue) ?checkpoint_types.Update {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.len == 0) return null;
 
         const update = self.buf[self.head];
@@ -44,8 +47,8 @@ pub const UpdateQueue = struct {
     }
 
     pub fn isEmpty(self: *UpdateQueue) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.len == 0;
     }
 };
@@ -54,10 +57,10 @@ const testing = std.testing;
 const tail_types = @import("../types.zig");
 
 test "checkpoint/queue: push/pop is bounded" {
-    var q = try UpdateQueue.init(testing.allocator, 1);
+    var q = try UpdateQueue.init(testing.allocator, std.Options.debug_io, 1);
     defer q.deinit();
 
-    const id = tail_types.FileIdentity{ .dev = 1, .inode = 1, .fingerprint = 1 };
+    const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 1, .fingerprint = 1 };
     try testing.expect(q.push(.{ .identity = id, .byte_offset = 1, .last_seen_size = 1, .last_seen_ns = 1 }));
     try testing.expect(!q.push(.{ .identity = id, .byte_offset = 2, .last_seen_size = 2, .last_seen_ns = 2 }));
 

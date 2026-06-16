@@ -1,5 +1,8 @@
 const std = @import("std");
+const tail_types = @import("../types.zig");
 const checkpoint_types = @import("types.zig");
+
+const log = std.log.scoped(.checkpoint_store);
 
 const Oldest = struct {
     key: u64,
@@ -8,15 +11,17 @@ const Oldest = struct {
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     max_slots: usize,
     ttl_ns: i128,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     by_identity: std.AutoHashMap(u64, checkpoint_types.Value),
     by_inode: std.AutoHashMap(u64, checkpoint_types.Value),
 
-    pub fn init(allocator: std.mem.Allocator, max_slots: usize, ttl_ns: i128) Store {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, max_slots: usize, ttl_ns: i128) Store {
         return .{
             .allocator = allocator,
+            .io = io,
             .max_slots = max_slots,
             .ttl_ns = ttl_ns,
             .by_identity = std.AutoHashMap(u64, checkpoint_types.Value).init(allocator),
@@ -27,27 +32,28 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         self.by_identity.deinit();
         self.by_inode.deinit();
+        self.* = undefined;
     }
 
     pub fn upsert(self: *Store, value: checkpoint_types.Value) !void {
         const keys = checkpoint_types.keysFor(value.identity);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (!self.by_identity.contains(keys.identity) and self.by_identity.count() >= self.max_slots) {
             self.evictOldestLocked();
         }
 
         try self.by_identity.put(keys.identity, value);
-        self.by_inode.put(keys.inode, value) catch {};
+        self.by_inode.put(keys.inode, value) catch |err| log.warn("by_inode put failed (upsert): {}", .{err});
     }
 
-    pub fn getOffset(self: *Store, identity: @import("../types.zig").FileIdentity) ?u64 {
+    pub fn getOffset(self: *Store, identity: tail_types.FileIdentity) ?u64 {
         const keys = checkpoint_types.keysFor(identity);
-        const now = std.time.nanoTimestamp();
+        const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.by_identity.get(keys.identity)) |value| {
             if (!checkpoint_types.isExpired(value, self.ttl_ns, now)) return value.offset;
@@ -59,10 +65,10 @@ pub const Store = struct {
     }
 
     pub fn evictExpired(self: *Store, now_ns: i128) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        var expired_keys: std.ArrayList(u64) = .{};
+        var expired_keys: std.ArrayList(u64) = .empty;
         defer expired_keys.deinit(self.allocator);
 
         var it = self.by_identity.iterator();
@@ -79,10 +85,10 @@ pub const Store = struct {
     }
 
     pub fn collectValues(self: *Store) !std.ArrayList(checkpoint_types.Value) {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        var out: std.ArrayList(checkpoint_types.Value) = .{};
+        var out: std.ArrayList(checkpoint_types.Value) = .empty;
         try out.ensureTotalCapacity(self.allocator, self.by_identity.count());
 
         var it = self.by_identity.iterator();
@@ -91,8 +97,8 @@ pub const Store = struct {
     }
 
     pub fn loadValues(self: *Store, values: []const checkpoint_types.Value) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         self.by_identity.clearRetainingCapacity();
         self.by_inode.clearRetainingCapacity();
@@ -103,7 +109,7 @@ pub const Store = struct {
                 self.evictOldestLocked();
             }
             try self.by_identity.put(keys.identity, value);
-            self.by_inode.put(keys.inode, value) catch {};
+            self.by_inode.put(keys.inode, value) catch |err| log.warn("by_inode put failed (loadValues): {}", .{err});
         }
     }
 
@@ -111,7 +117,7 @@ pub const Store = struct {
         var oldest: ?Oldest = null;
         var it = self.by_identity.iterator();
         while (it.next()) |entry| {
-            const candidate = Oldest{ .key = entry.key_ptr.*, .last_seen_ns = entry.value_ptr.last_seen_ns };
+            const candidate: Oldest = .{ .key = entry.key_ptr.*, .last_seen_ns = entry.value_ptr.last_seen_ns };
             if (oldest == null or candidate.last_seen_ns < oldest.?.last_seen_ns) oldest = candidate;
         }
 
