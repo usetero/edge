@@ -1,6 +1,0 @@
-Baseline: 364/365 pass.
-KNOWN FAILURE (pre-existing, caused by uncommitted local edit, NOT by the rewrite):
-  modules.otlp_metrics 'processMetrics - benchmark protobuf exposes nested arena over httpz fallback allocator'
-  Cause: working-tree edit changed arena init from page_allocator to caller allocator,
-  contradicting the test's fixed_resize_fail_count==0 assertion. See git diff src/modules/otlp_metrics.zig.
-  Gate rule: every later phase must show 364 pass / this 1 fail, or 365 pass if the user resolves the edit.
