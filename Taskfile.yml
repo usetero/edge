@@ -99,7 +99,12 @@ tasks:
     aliases: [lz]
     dir: "{{.TASKFILE_DIR}}"
     cmds:
-      - ziglint
+      - |
+        if ! command -v ziglint >/dev/null 2>&1; then
+          echo "ziglint is required before merge. Install it or add it to PATH."
+          exit 1
+        fi
+        ziglint
 
   lint:
     desc: "Run linting checks"
@@ -485,6 +490,40 @@ tasks:
           fi
         else
           echo "✅ Hyperscan already installed"
+        fi
+
+        # Check for ziglint (required by `task lint:zig`, which `do` runs).
+        if ! command -v ziglint >/dev/null 2>&1; then
+          ZIGLINT_VERSION="v0.5.2"
+          case "$(uname -s)" in
+            Darwin) zl_os="macos" ;;
+            Linux)  zl_os="linux" ;;
+            *) zl_os="" ;;
+          esac
+          case "$(uname -m)" in
+            x86_64)  zl_arch="x86_64" ;;
+            aarch64|arm64) zl_arch="aarch64" ;;
+            *) zl_arch="" ;;
+          esac
+          if [ -z "$zl_os" ] || [ -z "$zl_arch" ]; then
+            echo "Unknown platform $(uname -s)/$(uname -m). Install ziglint manually from https://github.com/rockorager/ziglint"
+          else
+            echo "Installing ziglint ${ZIGLINT_VERSION} (${zl_arch}-${zl_os})..."
+            zl_asset="ziglint-${zl_arch}-${zl_os}.tar.gz"
+            zl_url="https://github.com/rockorager/ziglint/releases/download/${ZIGLINT_VERSION}/${zl_asset}"
+            zl_tmp="$(mktemp -d)"
+            if curl -fsSL "$zl_url" -o "$zl_tmp/ziglint.tar.gz"; then
+              tar -xzf "$zl_tmp/ziglint.tar.gz" -C "$zl_tmp"
+              if [ -w /usr/local/bin ]; then zl_sudo=""; else zl_sudo="sudo"; fi
+              $zl_sudo install -m 0755 "$zl_tmp/ziglint" /usr/local/bin/ziglint
+              echo "ziglint installed: $(ziglint --version)"
+            else
+              echo "Failed to download ziglint from $zl_url"
+            fi
+            rm -rf "$zl_tmp"
+          fi
+        else
+          echo "ziglint already installed"
         fi
 
         echo "✅ CI setup complete"
