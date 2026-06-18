@@ -206,7 +206,7 @@ fn markTrackedInDirDirty(self: anytype, dir_path: []const u8) void {
 
 // inotify was removed from std.posix in Zig 0.16; wrap std.os.linux directly.
 fn inotifyInit1(flags: u32) !std.posix.fd_t {
-    const rc = std.os.linux.inotifyInit1(flags);
+    const rc = std.os.linux.inotify_init1(flags);
     return switch (std.posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         .INVAL => error.InvalidArgument,
@@ -219,7 +219,7 @@ fn inotifyInit1(flags: u32) !std.posix.fd_t {
 
 fn inotifyAddWatch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
     const path_c = try std.posix.toPosixPath(path);
-    const rc = std.os.linux.inotifyAddWatch(fd, &path_c, mask);
+    const rc = std.os.linux.inotify_add_watch(fd, &path_c, mask);
     return switch (std.posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         .ACCESS => error.AccessDenied,
@@ -232,5 +232,5 @@ fn inotifyAddWatch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
 }
 
 fn inotifyRmWatch(fd: std.posix.fd_t, wd: i32) void {
-    _ = std.os.linux.inotifyRmWatch(fd, wd);
+    _ = std.os.linux.inotify_rm_watch(fd, wd);
 }
