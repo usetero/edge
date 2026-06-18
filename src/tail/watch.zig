@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log.scoped(.tail_watch);
 const types = @import("types.zig");
 const checkpoint_mod = @import("checkpoint/mod.zig");
@@ -599,8 +600,8 @@ fn shouldTrackPath(output_path: []const u8, candidate_path: []const u8) bool {
 }
 
 /// Subset of fstat results needed for file identity and size tracking. The
-/// std.Io.File.Stat type does not expose the device id, so we fall back to a
-/// raw libc fstat on the file handle to recover dev/ino/size atomically.
+/// std.Io.File.Stat type does not expose the device id, so we call the
+/// platform stat syscall directly on the file handle to recover dev/ino/size.
 pub const FsStat = struct {
     dev: u64,
     ino: u64,
@@ -608,13 +609,34 @@ pub const FsStat = struct {
 };
 
 pub fn fstatHandle(handle: std.posix.fd_t) !FsStat {
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(handle, &st) != 0) return error.StatFailed;
-    return .{
-        .dev = @intCast(st.dev),
-        .ino = @intCast(st.ino),
-        .size = @intCast(st.size),
-    };
+    switch (comptime builtin.os.tag) {
+        .linux => {
+            // std.c.fstat is void on Linux in Zig 0.16; use statx with AT.EMPTY_PATH.
+            var stx: std.os.linux.Statx = undefined;
+            const rc = std.os.linux.statx(
+                handle,
+                "",
+                std.os.linux.AT.EMPTY_PATH,
+                std.os.linux.STATX.BASIC_STATS,
+                &stx,
+            );
+            if (rc != 0) return error.StatFailed;
+            return .{
+                .dev = (@as(u64, stx.dev_major) << 32) | stx.dev_minor,
+                .ino = stx.ino,
+                .size = stx.size,
+            };
+        },
+        else => {
+            var st: std.c.Stat = undefined;
+            if (std.c.fstat(handle, &st) != 0) return error.StatFailed;
+            return .{
+                .dev = @intCast(st.dev),
+                .ino = @intCast(st.ino),
+                .size = @intCast(st.size),
+            };
+        },
+    }
 }
 
 fn computeFingerprint(io: std.Io, file: std.Io.File) !u32 {
