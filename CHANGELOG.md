@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.20.0](https://github.com/usetero/edge/compare/v1.19.0...v1.20.0) (2026-06-18)
+
+
+### Features
+
+* set resource attrs ([#189](https://github.com/usetero/edge/issues/189)) ([c7a19b2](https://github.com/usetero/edge/commit/c7a19b2935ac8869a4066674d4a744e8507b1f1b))
+* use latest policy libs and upgrade to 0.16.0 ([#187](https://github.com/usetero/edge/issues/187)) ([040dd06](https://github.com/usetero/edge/commit/040dd0605842f4e2f6060c5c4f4b686d27fcae63))
+
+
+### Bug Fixes
+
+* install ziglint in ci ([#190](https://github.com/usetero/edge/issues/190)) ([75b97d3](https://github.com/usetero/edge/commit/75b97d3a8742ddb0b0782164c65f4a93e0d0b035))
+* uring linux zig 16 ([#191](https://github.com/usetero/edge/issues/191)) ([33ccc35](https://github.com/usetero/edge/commit/33ccc35eadfe54cd77a9032bca86904c8a0b04ac))
+
 ## [1.19.0](https://github.com/usetero/edge/compare/v1.18.3...v1.19.0) (2026-05-15)
 
 
