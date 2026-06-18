@@ -222,7 +222,7 @@ fn inotifyAddWatch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
     const rc = std.os.linux.inotify_add_watch(fd, &path_c, mask);
     return switch (std.posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
-        .ACCESS => error.AccessDenied,
+        .ACCES => error.AccessDenied,
         .NOENT => error.FileNotFound,
         .NAMETOOLONG => error.NameTooLong,
         .NOMEM => error.SystemResources,
