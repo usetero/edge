@@ -3,6 +3,15 @@
   "listen_port": 8080,
   "upstream_url": "https://agent-http-intake.logs.${TERO_DD_REGION}.datadoghq.com",
   "metrics_url": "https://api.${TERO_DD_REGION}.datadoghq.com",
+  "service": {
+    "resource_attributes": [
+      {"key": "deployment.environment", "value": "dev"},
+      {"key": "host.name", "value": "my-machine"}
+    ],
+    "labels": [
+      {"key": "team", "value": "platform"}
+    ]
+  },
   "log_level": "info",
   "max_body_size": 1048576,
   "policy_providers": [
