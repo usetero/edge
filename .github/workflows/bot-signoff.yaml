@@ -101,7 +101,21 @@ jobs:
       - run: git config user.name "tero[bot]"
       - run: git config user.email "1080325+tero[bot]@users.noreply.github.com"
 
-      - name: Setup CI environment (if task exists)
+      - name: Cache CI tools
+        id: cache-ci-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/bin/ziglint
+            /usr/include/hs
+            /usr/lib/x86_64-linux-gnu/libhyperscan*
+            /usr/lib/aarch64-linux-gnu/libhyperscan*
+            /usr/lib/x86_64-linux-gnu/pkgconfig/libhs.pc
+            /usr/lib/aarch64-linux-gnu/pkgconfig/libhs.pc
+          key: ci-tools-${{ runner.os }}-${{ runner.arch }}-ziglint-v0.5.2-hyperscan-5.4.2
+
+      - name: Setup CI environment
+        if: steps.cache-ci-tools.outputs.cache-hit != 'true'
         run: |
           if task --list | grep -q "ci:setup"; then
             task ci:setup
