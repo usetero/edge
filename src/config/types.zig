@@ -2,6 +2,7 @@ const policy = @import("policy_zig");
 
 pub const ProviderConfig = policy.ProviderConfig;
 pub const ServiceMetadata = policy.ServiceMetadata;
+pub const StringPair = policy.StringPair;
 
 pub const LogLevel = enum(u8) {
     debug,
