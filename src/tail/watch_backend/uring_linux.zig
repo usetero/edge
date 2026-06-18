@@ -23,7 +23,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io) !State {
     _ = io;
     if (builtin.os.tag != .linux) return error.UnsupportedWatcherBackend;
     const ino_flags: u32 = @bitCast(std.posix.O{ .NONBLOCK = true, .CLOEXEC = true });
-    const fd = try inotify_init1(ino_flags);
+    const fd = try inotifyInit1(ino_flags);
     errdefer _ = std.os.linux.close(fd);
     var ring = try std.os.linux.IoUring.init(64, 0);
     errdefer ring.deinit();
@@ -44,13 +44,13 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io) !State {
 pub fn deinit(s: *State) void {
     if (comptime builtin.os.tag == .linux) {
         var file_it = s.file_wd_to_idx.iterator();
-        while (file_it.next()) |kv| inotify_rm_watch(s.fd, kv.key_ptr.*);
+        while (file_it.next()) |kv| inotifyRmWatch(s.fd, kv.key_ptr.*);
     }
     s.file_wd_to_idx.deinit();
 
     if (comptime builtin.os.tag == .linux) {
         var dir_it = s.dir_wd_to_path.iterator();
-        while (dir_it.next()) |kv| inotify_rm_watch(s.fd, kv.key_ptr.*);
+        while (dir_it.next()) |kv| inotifyRmWatch(s.fd, kv.key_ptr.*);
     }
     s.dir_wd_to_path.deinit();
 
@@ -118,7 +118,7 @@ pub fn trackOpenFile(self: anytype, idx: u32, path: []const u8) !void {
     if (builtin.os.tag != .linux) return;
     const u = &self.backend_state.uring;
     try ensureDirectoryWatch(u, path);
-    const wd = inotify_add_watch(u.fd, path, INOTIFY_MASK) catch return;
+    const wd = inotifyAddWatch(u.fd, path, INOTIFY_MASK) catch return;
     try u.file_wd_to_idx.put(wd, idx);
 }
 
@@ -128,7 +128,7 @@ pub fn removeTracked(self: anytype, idx: u32) void {
     var it = u.file_wd_to_idx.iterator();
     while (it.next()) |kv| {
         if (kv.value_ptr.* == idx) {
-            inotify_rm_watch(u.fd, kv.key_ptr.*);
+            inotifyRmWatch(u.fd, kv.key_ptr.*);
             _ = u.file_wd_to_idx.remove(kv.key_ptr.*);
             break;
         }
@@ -139,7 +139,7 @@ pub fn rebuildIndexes(self: anytype) void {
     if (builtin.os.tag != .linux) return;
     const u = &self.backend_state.uring;
     var old = u.file_wd_to_idx.iterator();
-    while (old.next()) |kv| inotify_rm_watch(u.fd, kv.key_ptr.*);
+    while (old.next()) |kv| inotifyRmWatch(u.fd, kv.key_ptr.*);
     u.file_wd_to_idx.clearRetainingCapacity();
 
     var i: usize = 0;
@@ -147,7 +147,7 @@ pub fn rebuildIndexes(self: anytype) void {
         ensureDirectoryWatch(u, self.paths.items[i]) catch |err| log.warn("rebuild dir watch failed: {}", .{err});
         const file = self.files.items[i] orelse continue;
         _ = file;
-        const wd = inotify_add_watch(u.fd, self.paths.items[i], INOTIFY_MASK) catch continue;
+        const wd = inotifyAddWatch(u.fd, self.paths.items[i], INOTIFY_MASK) catch continue;
         u.file_wd_to_idx.put(wd, @intCast(i)) catch |err| log.warn("rebuild file_wd_to_idx put failed: {}", .{err});
     }
 }
@@ -171,8 +171,8 @@ fn ensureDirectoryWatch(u: *State, path: []const u8) !void {
     const owned_dir_path = try u.allocator.dupe(u8, dir_path);
     errdefer u.allocator.free(owned_dir_path);
 
-    const wd = inotify_add_watch(u.fd, owned_dir_path, INOTIFY_MASK) catch return;
-    errdefer inotify_rm_watch(u.fd, wd);
+    const wd = inotifyAddWatch(u.fd, owned_dir_path, INOTIFY_MASK) catch return;
+    errdefer inotifyRmWatch(u.fd, wd);
 
     try u.dir_path_to_wd.put(owned_dir_path, wd);
     errdefer _ = u.dir_path_to_wd.remove(owned_dir_path);
@@ -205,8 +205,8 @@ fn markTrackedInDirDirty(self: anytype, dir_path: []const u8) void {
 }
 
 // inotify was removed from std.posix in Zig 0.16; wrap std.os.linux directly.
-fn inotify_init1(flags: u32) !std.posix.fd_t {
-    const rc = std.os.linux.inotify_init1(flags);
+fn inotifyInit1(flags: u32) !std.posix.fd_t {
+    const rc = std.os.linux.inotifyInit1(flags);
     return switch (std.posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         .INVAL => error.InvalidArgument,
@@ -217,9 +217,9 @@ fn inotify_init1(flags: u32) !std.posix.fd_t {
     };
 }
 
-fn inotify_add_watch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
+fn inotifyAddWatch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
     const path_c = try std.posix.toPosixPath(path);
-    const rc = std.os.linux.inotify_add_watch(fd, &path_c, mask);
+    const rc = std.os.linux.inotifyAddWatch(fd, &path_c, mask);
     return switch (std.posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         .ACCESS => error.AccessDenied,
@@ -231,6 +231,6 @@ fn inotify_add_watch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
     };
 }
 
-fn inotify_rm_watch(fd: std.posix.fd_t, wd: i32) void {
-    _ = std.os.linux.inotify_rm_watch(fd, wd);
+fn inotifyRmWatch(fd: std.posix.fd_t, wd: i32) void {
+    _ = std.os.linux.inotifyRmWatch(fd, wd);
 }
