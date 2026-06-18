@@ -23,8 +23,8 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io) !State {
     _ = io;
     if (builtin.os.tag != .linux) return error.UnsupportedWatcherBackend;
     const ino_flags: u32 = @bitCast(std.posix.O{ .NONBLOCK = true, .CLOEXEC = true });
-    const fd = try std.posix.inotify_init1(ino_flags);
-    errdefer std.posix.close(fd);
+    const fd = try inotify_init1(ino_flags);
+    errdefer _ = std.os.linux.close(fd);
     var ring = try std.os.linux.IoUring.init(64, 0);
     errdefer ring.deinit();
 
@@ -44,13 +44,13 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io) !State {
 pub fn deinit(s: *State) void {
     if (comptime builtin.os.tag == .linux) {
         var file_it = s.file_wd_to_idx.iterator();
-        while (file_it.next()) |kv| std.posix.inotify_rm_watch(s.fd, kv.key_ptr.*);
+        while (file_it.next()) |kv| inotify_rm_watch(s.fd, kv.key_ptr.*);
     }
     s.file_wd_to_idx.deinit();
 
     if (comptime builtin.os.tag == .linux) {
         var dir_it = s.dir_wd_to_path.iterator();
-        while (dir_it.next()) |kv| std.posix.inotify_rm_watch(s.fd, kv.key_ptr.*);
+        while (dir_it.next()) |kv| inotify_rm_watch(s.fd, kv.key_ptr.*);
     }
     s.dir_wd_to_path.deinit();
 
@@ -60,7 +60,7 @@ pub fn deinit(s: *State) void {
 
     if (comptime builtin.os.tag == .linux) {
         s.ring.deinit();
-        std.posix.close(s.fd);
+        _ = std.os.linux.close(s.fd);
     }
     s.* = undefined;
 }
@@ -118,7 +118,7 @@ pub fn trackOpenFile(self: anytype, idx: u32, path: []const u8) !void {
     if (builtin.os.tag != .linux) return;
     const u = &self.backend_state.uring;
     try ensureDirectoryWatch(u, path);
-    const wd = std.posix.inotify_add_watch(u.fd, path, INOTIFY_MASK) catch return;
+    const wd = inotify_add_watch(u.fd, path, INOTIFY_MASK) catch return;
     try u.file_wd_to_idx.put(wd, idx);
 }
 
@@ -128,7 +128,7 @@ pub fn removeTracked(self: anytype, idx: u32) void {
     var it = u.file_wd_to_idx.iterator();
     while (it.next()) |kv| {
         if (kv.value_ptr.* == idx) {
-            std.posix.inotify_rm_watch(u.fd, kv.key_ptr.*);
+            inotify_rm_watch(u.fd, kv.key_ptr.*);
             _ = u.file_wd_to_idx.remove(kv.key_ptr.*);
             break;
         }
@@ -139,7 +139,7 @@ pub fn rebuildIndexes(self: anytype) void {
     if (builtin.os.tag != .linux) return;
     const u = &self.backend_state.uring;
     var old = u.file_wd_to_idx.iterator();
-    while (old.next()) |kv| std.posix.inotify_rm_watch(u.fd, kv.key_ptr.*);
+    while (old.next()) |kv| inotify_rm_watch(u.fd, kv.key_ptr.*);
     u.file_wd_to_idx.clearRetainingCapacity();
 
     var i: usize = 0;
@@ -147,7 +147,7 @@ pub fn rebuildIndexes(self: anytype) void {
         ensureDirectoryWatch(u, self.paths.items[i]) catch |err| log.warn("rebuild dir watch failed: {}", .{err});
         const file = self.files.items[i] orelse continue;
         _ = file;
-        const wd = std.posix.inotify_add_watch(u.fd, self.paths.items[i], INOTIFY_MASK) catch continue;
+        const wd = inotify_add_watch(u.fd, self.paths.items[i], INOTIFY_MASK) catch continue;
         u.file_wd_to_idx.put(wd, @intCast(i)) catch |err| log.warn("rebuild file_wd_to_idx put failed: {}", .{err});
     }
 }
@@ -171,8 +171,8 @@ fn ensureDirectoryWatch(u: *State, path: []const u8) !void {
     const owned_dir_path = try u.allocator.dupe(u8, dir_path);
     errdefer u.allocator.free(owned_dir_path);
 
-    const wd = std.posix.inotify_add_watch(u.fd, owned_dir_path, INOTIFY_MASK) catch return;
-    errdefer std.posix.inotify_rm_watch(u.fd, wd);
+    const wd = inotify_add_watch(u.fd, owned_dir_path, INOTIFY_MASK) catch return;
+    errdefer inotify_rm_watch(u.fd, wd);
 
     try u.dir_path_to_wd.put(owned_dir_path, wd);
     errdefer _ = u.dir_path_to_wd.remove(owned_dir_path);
@@ -202,4 +202,35 @@ fn markTrackedInDirDirty(self: anytype, dir_path: []const u8) void {
             self.markDirty(@intCast(i));
         }
     }
+}
+
+// inotify was removed from std.posix in Zig 0.16; wrap std.os.linux directly.
+fn inotify_init1(flags: u32) !std.posix.fd_t {
+    const rc = std.os.linux.inotify_init1(flags);
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .INVAL => error.InvalidArgument,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOMEM => error.SystemResources,
+        else => |e| std.posix.unexpectedErrno(e),
+    };
+}
+
+fn inotify_add_watch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
+    const path_c = try std.posix.toPosixPath(path);
+    const rc = std.os.linux.inotify_add_watch(fd, &path_c, mask);
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .ACCESS => error.AccessDenied,
+        .NOENT => error.FileNotFound,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOMEM => error.SystemResources,
+        .NOSPC => error.UserResourceLimitReached,
+        else => |e| std.posix.unexpectedErrno(e),
+    };
+}
+
+fn inotify_rm_watch(fd: std.posix.fd_t, wd: i32) void {
+    _ = std.os.linux.inotify_rm_watch(fd, wd);
 }
