@@ -55,9 +55,9 @@ threadlocal var tl_bufs: ?ThreadBufs = null;
 // it themselves. We can't free a thread-local from another thread, so each set
 // is also recorded here and swept once at shutdown — safe because the handler
 // pool is joined first (see HttpServer.deinit -> httpz worker thread_pool.stop).
-// ponytail: one process-wide server, so module-global bookkeeping is fine.
+// one process-wide server, so module-global bookkeeping is fine.
 var bufs_registry_mutex: std.Io.Mutex = .init;
-var bufs_registry: std.ArrayListUnmanaged(ThreadBufs) = .empty;
+var bufs_registry: std.ArrayList(ThreadBufs) = .empty;
 
 fn threadBufs(io: std.Io, gpa: std.mem.Allocator, limits: limits_mod.Limits) !ThreadBufs {
     if (tl_bufs) |bufs| return bufs;
@@ -557,7 +557,8 @@ test "collectForwardHeaders drops hop-by-hop headers" {
         .{ .key = "transfer-encoding", .value = "chunked" }, // hop-by-hop
         .{ .key = "x-keep", .value = "yes" },
     };
-    const headers = try collectForwardHeaders(arena.allocator(), FakeHeaderIter{ .pairs = &pairs });
+    const iter: FakeHeaderIter = .{ .pairs = &pairs };
+    const headers = try collectForwardHeaders(arena.allocator(), iter);
 
     try testing.expectEqual(@as(usize, 2), headers.len);
     try testing.expectEqualStrings("dd-api-key", headers[0].name);
@@ -591,5 +592,6 @@ fn buildAndReturnHeaders(arena: std.mem.Allocator) ![]std.http.Header {
     var key_buf: [6]u8 = "x-tero".*;
     var val_buf: [1]u8 = "v".*;
     const pairs = [_]HeaderPair{.{ .key = &key_buf, .value = &val_buf }};
-    return collectForwardHeaders(arena, FakeHeaderIter{ .pairs = &pairs });
+    const iter: FakeHeaderIter = .{ .pairs = &pairs };
+    return collectForwardHeaders(arena, iter);
 }
