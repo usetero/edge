@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.20.1](https://github.com/usetero/edge/compare/v1.20.0...v1.20.1) (2026-06-22)
+
+
+### Bug Fixes
+
+* hanging http request and flush ([#192](https://github.com/usetero/edge/issues/192)) ([486fb8e](https://github.com/usetero/edge/commit/486fb8ee5191e17b18c4323d737b529e5e99f44a))
+
 ## [1.20.0](https://github.com/usetero/edge/compare/v1.19.0...v1.20.0) (2026-06-18)
 
 
