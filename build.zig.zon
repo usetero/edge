@@ -45,8 +45,8 @@
             .hash = "metrics-0.0.0-W7G4eJOgAQDBacPAeqGCaY8gV7zuddUQyikGNq7nDPds",
         },
         .httpz = .{
-            .url = "https://github.com/karlseguin/http.zig/archive/5f60277d3b3beffef86321869b13c57f7acc3c5b.tar.gz",
-            .hash = "httpz-0.0.0-PNVzrJrbCACyokt2AARAG7Ul7h7xlZxL7BYAdpsAs1_-",
+            .url = "https://github.com/karlseguin/http.zig/archive/5d1b4e2e3e5a30aa489bdb33321dae83897f2426.tar.gz",
+            .hash = "httpz-0.0.0-PNVzrPjhCAAawzE3mV0uI1Hob-DYPBOZy_2Y0V_5ZbtY",
         },
     },
     .paths = .{

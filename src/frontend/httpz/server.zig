@@ -51,7 +51,15 @@ const ThreadBufs = struct {
 
 threadlocal var tl_bufs: ?ThreadBufs = null;
 
-fn threadBufs(gpa: std.mem.Allocator, limits: limits_mod.Limits) !ThreadBufs {
+// httpz handler threads cache their pipeline scratch in tl_bufs and never free
+// it themselves. We can't free a thread-local from another thread, so each set
+// is also recorded here and swept once at shutdown — safe because the handler
+// pool is joined first (see HttpServer.deinit -> httpz worker thread_pool.stop).
+// ponytail: one process-wide server, so module-global bookkeeping is fine.
+var bufs_registry_mutex: std.Io.Mutex = .init;
+var bufs_registry: std.ArrayListUnmanaged(ThreadBufs) = .empty;
+
+fn threadBufs(io: std.Io, gpa: std.mem.Allocator, limits: limits_mod.Limits) !ThreadBufs {
     if (tl_bufs) |bufs| return bufs;
     const bufs: ThreadBufs = .{
         .decode = try gpa.alloc(u8, limits.decode_buf),
@@ -60,8 +68,30 @@ fn threadBufs(gpa: std.mem.Allocator, limits: limits_mod.Limits) !ThreadBufs {
         .chunk = try gpa.alloc(u8, limits.chunk_buf),
         .upstream = try gpa.alloc(u8, limits.upstream_write_buf),
     };
+    {
+        bufs_registry_mutex.lockUncancelable(io);
+        defer bufs_registry_mutex.unlock(io);
+        try bufs_registry.append(gpa, bufs);
+    }
     tl_bufs = bufs;
     return bufs;
+}
+
+/// Frees every thread's pipeline scratch. Call exactly once, after the httpz
+/// handler pool has been joined (no handler thread may touch tl_bufs after).
+fn freeThreadBufs(io: std.Io, gpa: std.mem.Allocator) void {
+    bufs_registry_mutex.lockUncancelable(io);
+    defer bufs_registry_mutex.unlock(io);
+    for (bufs_registry.items) |bufs| {
+        gpa.free(bufs.decode);
+        gpa.free(bufs.encode);
+        gpa.free(bufs.scratch);
+        gpa.free(bufs.chunk);
+        gpa.free(bufs.upstream);
+    }
+    bufs_registry.deinit(gpa);
+    bufs_registry = .empty;
+    tl_bufs = null;
 }
 
 pub const HttpServer = struct {
@@ -100,6 +130,8 @@ pub const HttpServer = struct {
 
     pub fn deinit(self: *HttpServer) void {
         self.server.deinit();
+        // Handler pool is joined by now; reclaim each thread's pipeline scratch.
+        freeThreadBufs(self.ctx.io, self.ctx.gpa);
         self.ctx.gpa.destroy(self.handler);
         self.* = undefined;
     }
@@ -120,6 +152,34 @@ pub const HttpServer = struct {
         self.server.stop();
     }
 };
+
+/// Upper bound on forwarded request headers (datadog/prom intakes stay well
+/// under this). Excess returns error.TooManyHeaders rather than truncating.
+const max_forward_headers = 64;
+
+/// Collects forwardable (hop-by-hop-filtered) request headers into an
+/// arena-owned array, with names/values duped into the same arena.
+///
+/// The array MUST outlive this call: std.http.Client.request stores
+/// `extra_headers` by reference and only reads it later in `sendHead`. A
+/// stack array would dangle by send time and corrupt the TLS write path
+/// (segfault on a wild header.name). Hence the arena, not a local buffer.
+/// `iter` is any iterator whose `next()` yields `.{ .key, .value }`.
+fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.http.Header {
+    const out = try arena.alloc(std.http.Header, max_forward_headers);
+    var it = iter;
+    var count: usize = 0;
+    while (it.next()) |kv| {
+        if (upstream_mod.shouldSkipRequestHeader(kv.key)) continue;
+        if (count >= out.len) return error.TooManyHeaders;
+        out[count] = .{
+            .name = try arena.dupe(u8, kv.key),
+            .value = try arena.dupe(u8, kv.value),
+        };
+        count += 1;
+    }
+    return out[0..count];
+}
 
 pub const Handler = struct {
     ctx: *exec.SharedCtx,
@@ -192,19 +252,8 @@ pub const Handler = struct {
         choice: service_mod.UpstreamChoice,
     ) !std.http.Client.Request {
         const method = stdMethod(req.method) orelse return error.UnsupportedMethod;
-        var headers_buf: [64]std.http.Header = undefined;
-        var count: usize = 0;
-        var it = req.headers.iterator();
-        while (it.next()) |kv| {
-            if (upstream_mod.shouldSkipRequestHeader(kv.key)) continue;
-            if (count >= headers_buf.len) return error.TooManyHeaders;
-            headers_buf[count] = .{
-                .name = try arena.dupe(u8, kv.key),
-                .value = try arena.dupe(u8, kv.value),
-            };
-            count += 1;
-        }
-        return exec.openUpstream(self.ctx, arena, method, req.url.raw, headers_buf[0..count], choice);
+        const headers = try collectForwardHeaders(arena, req.headers.iterator());
+        return exec.openUpstream(self.ctx, arena, method, req.url.raw, headers, choice);
     }
 
     /// Relays the upstream response (status, filtered headers, body) into
@@ -235,7 +284,7 @@ pub const Handler = struct {
         fwd: service_mod.Forward,
     ) !void {
         const ctx = self.ctx;
-        const bufs = try threadBufs(ctx.gpa, ctx.limits);
+        const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         var upstream_req = self.openUpstream(req, res.arena, fwd.upstream) catch {
             res.status = 502;
             res.body = "";
@@ -263,7 +312,7 @@ pub const Handler = struct {
         if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
             return self.execForwardRaw(req, res, .{ .upstream = pipe.upstream });
         }
-        const bufs = try threadBufs(ctx.gpa, ctx.limits);
+        const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
             res.status = 502;
             res.body = "";
@@ -305,6 +354,7 @@ pub const Handler = struct {
             return;
         };
         try body_writer.end();
+        try upstream_req.connection.?.flush();
 
         if (ctx.metrics) |metrics| {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
@@ -321,7 +371,7 @@ pub const Handler = struct {
         pipe: service_mod.PipeBuffered,
     ) !void {
         const ctx = self.ctx;
-        const bufs = try threadBufs(ctx.gpa, ctx.limits);
+        const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         const raw_body = req.body() orelse "";
 
         // res.arena is httpz's per-request fallback allocator; safe for the
@@ -350,6 +400,7 @@ pub const Handler = struct {
         var fixed = std.Io.Reader.fixed(processed.body);
         _ = try pipeline_mod.streamReaderToWriter(&fixed, &body_writer.writer, processed.body.len);
         try body_writer.end();
+        try upstream_req.connection.?.flush();
 
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
         try self.relayResponse(res, &upstream_req, max_response, bufs);
@@ -362,7 +413,7 @@ pub const Handler = struct {
         fetch: service_mod.FetchFiltered,
     ) !void {
         const ctx = self.ctx;
-        const bufs = try threadBufs(ctx.gpa, ctx.limits);
+        const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         var upstream_req = self.openUpstream(req, res.arena, fetch.upstream) catch {
             res.status = 502;
             res.body = "";
@@ -418,10 +469,12 @@ fn sendBufferedBody(
         var fixed = std.Io.Reader.fixed(body);
         _ = try pipeline_mod.streamReaderToWriter(&fixed, &body_writer.writer, body.len);
         try body_writer.end();
+        try upstream_req.connection.?.flush();
     } else if (std_method.requestHasBody()) {
         upstream_req.transfer_encoding = .{ .content_length = 0 };
         var body_writer = try upstream_req.sendBodyUnflushed(bufs.upstream);
         try body_writer.end();
+        try upstream_req.connection.?.flush();
     } else {
         try upstream_req.sendBodiless();
     }
@@ -479,4 +532,64 @@ test "httpz method maps onto service and std methods" {
     try testing.expectEqual(service_mod.HttpMethod.OTHER, serviceMethod(.CONNECT));
     try testing.expectEqual(@as(?std.http.Method, .GET), stdMethod(.GET));
     try testing.expectEqual(@as(?std.http.Method, null), stdMethod(.OTHER));
+}
+
+const HeaderPair = struct { key: []const u8, value: []const u8 };
+
+const FakeHeaderIter = struct {
+    pairs: []const HeaderPair,
+    pos: usize = 0,
+    fn next(self: *FakeHeaderIter) ?HeaderPair {
+        if (self.pos == self.pairs.len) return null;
+        defer self.pos += 1;
+        return self.pairs[self.pos];
+    }
+};
+
+test "collectForwardHeaders drops hop-by-hop headers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const pairs = [_]HeaderPair{
+        .{ .key = "host", .value = "drop" }, // hop-by-hop
+        .{ .key = "dd-api-key", .value = "secret" },
+        .{ .key = "content-length", .value = "9" }, // hop-by-hop
+        .{ .key = "transfer-encoding", .value = "chunked" }, // hop-by-hop
+        .{ .key = "x-keep", .value = "yes" },
+    };
+    const headers = try collectForwardHeaders(arena.allocator(), FakeHeaderIter{ .pairs = &pairs });
+
+    try testing.expectEqual(@as(usize, 2), headers.len);
+    try testing.expectEqualStrings("dd-api-key", headers[0].name);
+    try testing.expectEqualStrings("secret", headers[0].value);
+    try testing.expectEqualStrings("x-keep", headers[1].name);
+}
+
+// Regression for the dangling-header segfault: std.http.Client.request stores
+// extra_headers by reference and reads it later in sendHead, so the returned
+// array must be arena-owned. A stack-local array (the original bug) would read
+// garbage once the building frame is reused. We build in a child frame, clobber
+// the dead stack, then assert the headers still read back intact.
+test "collectForwardHeaders headers survive the building scope" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const headers = try buildAndReturnHeaders(arena.allocator());
+
+    var scratch: [8192]u8 = undefined;
+    for (&scratch, 0..) |*b, i| b.* = @truncate(i);
+    std.mem.doNotOptimizeAway(&scratch);
+
+    try testing.expectEqual(@as(usize, 1), headers.len);
+    try testing.expectEqualStrings("x-tero", headers[0].name);
+    try testing.expectEqualStrings("v", headers[0].value);
+}
+
+fn buildAndReturnHeaders(arena: std.mem.Allocator) ![]std.http.Header {
+    // Sources live only in this frame; collectForwardHeaders must dupe them and
+    // return an arena-owned array that outlives this return.
+    var key_buf: [6]u8 = "x-tero".*;
+    var val_buf: [1]u8 = "v".*;
+    const pairs = [_]HeaderPair{.{ .key = &key_buf, .value = &val_buf }};
+    return collectForwardHeaders(arena, FakeHeaderIter{ .pairs = &pairs });
 }
