@@ -114,7 +114,6 @@ create_edge_config() {
   "listen_address": "127.0.0.1",
   "listen_port": $EDGE_OTLP_PORT,
   "upstream_url": "http://127.0.0.1:$ECHO_PORT",
-  "workspace_id": "equivalence-test",
   "log_level": "err",
   "max_body_size": 4194304,
   "policy_providers": [

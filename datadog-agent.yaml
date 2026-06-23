@@ -11,7 +11,6 @@ data:
       "listen_address": "0.0.0.0",
       "listen_port": 8080,
       "upstream_url": "https://agent-http-intake.logs.us5.datadoghq.com",
-      "workspace_id": "90A6EFC2-27B8-41BC-9343-43BFB1DF0732",
       "log_level": "info",
       "max_body_size": 1048576,
       "policy_providers": [

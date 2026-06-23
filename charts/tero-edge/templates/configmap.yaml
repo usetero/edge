@@ -15,6 +15,17 @@ data:
       "log_level": {{ .Values.config.logLevel | quote }},
       "max_body_size": {{ int .Values.config.maxBodySize }},
       "max_upstream_retries": {{ int .Values.config.maxUpstreamRetries }},
+      {{- $svc := dict }}
+      {{- with .Values.config.service }}
+      {{- if .name }}{{ $svc = set $svc "name" .name }}{{ end }}
+      {{- if .namespace }}{{ $svc = set $svc "namespace" .namespace }}{{ end }}
+      {{- if .version }}{{ $svc = set $svc "version" .version }}{{ end }}
+      {{- if .resourceAttributes }}{{ $svc = set $svc "resource_attributes" .resourceAttributes }}{{ end }}
+      {{- if .labels }}{{ $svc = set $svc "labels" .labels }}{{ end }}
+      {{- end }}
+      {{- if $svc }}
+      "service": {{ toJson $svc }},
+      {{- end }}
       "policy_providers": [
         {{- $first := true -}}
         {{- if .Values.config.fileProvider.enabled }}

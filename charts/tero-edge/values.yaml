@@ -94,6 +94,23 @@ config:
   maxBodySize: 1048576
   maxUpstreamRetries: 10
 
+  # Service identity sent to the control plane on policy sync. name, namespace,
+  # and version scope/match policies to this service; set them in production.
+  # resourceAttributes and labels are optional extra metadata. Empty fields are
+  # omitted (the binary falls back to its defaults).
+  service:
+    name: ""
+    namespace: ""
+    version: ""
+    # resourceAttributes:
+    #   - key: deployment.environment
+    #     value: production
+    resourceAttributes: []
+    # labels:
+    #   - key: team
+    #     value: platform
+    labels: []
+
   fileProvider:
     enabled: true
     id: file
