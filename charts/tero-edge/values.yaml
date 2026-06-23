@@ -92,7 +92,21 @@ config:
   metricsUrl: "https://api.datadoghq.com"
   logLevel: "info"
   maxBodySize: 1048576
-  maxUpstreamRetries: 10
+
+  # Max concurrent connections — the dominant memory/throughput cap (memory
+  # scales ~ maxConnections x maxBodySize). Also settable via the
+  # TERO_MAX_CONNECTIONS env override.
+  maxConnections: 256
+
+  # Optional. Post-decompression body ceiling; defaults to maxBodySize when
+  # null. Raise to admit payloads that decompress larger than the raw cap.
+  maxDecodedBytes: null
+
+  # Optional httpz tuning (null = built-in defaults). workerCount is event-loop
+  # workers (default 1); threadPoolCount is request-handler threads (default
+  # 32) and multiplies the per-thread pipeline-scratch memory floor.
+  workerCount: null
+  threadPoolCount: null
 
   # Service identity sent to the control plane on policy sync. name, namespace,
   # and version scope/match policies to this service; set them in production.

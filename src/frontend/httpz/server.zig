@@ -34,6 +34,10 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .max_body_size = limits.max_body_size,
             .buffer_size = limits.recv_buf,
         },
+        // null => httpz defaults (1 worker, 32 pool threads). thread_pool count
+        // multiplies the per-thread pipeline-scratch floor (see ThreadBufs).
+        .workers = .{ .count = limits.worker_count },
+        .thread_pool = .{ .count = limits.thread_pool_count },
     };
 }
 
@@ -335,7 +339,7 @@ pub const Handler = struct {
             .decode = pipe.codec,
             .format = pipe.format,
             .encode = pipe.codec,
-            .max_decoded_bytes = ctx.limits.max_body_size,
+            .max_decoded_bytes = ctx.limits.max_decoded_bytes,
             .zstd_window_len = ctx.limits.zstd_window_len,
         }, &body_reader, &body_writer.writer, .{
             .decoder = bufs.decode,
@@ -512,19 +516,26 @@ fn stdMethod(method: httpz.Method) ?std.http.Method {
 const testing = std.testing;
 
 test "httpz config derives from limits" {
-    var env_map = std.process.Environ.Map.init(testing.allocator);
-    defer env_map.deinit();
-    const limits: limits_mod.Limits = .resolve(1024 * 1024, &env_map);
+    const limits: limits_mod.Limits = .resolve(.{ .max_body_size = 1024 * 1024 });
 
     const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
     try testing.expectEqual(@as(?usize, 1024 * 1024), config.request.max_body_size);
     try testing.expectEqual(@as(?usize, limits_mod.RECV_BUF_BYTES), config.request.buffer_size);
-    // Worker/thread-pool counts ride httpz defaults — the master-proven
-    // shape. If this assert fires, someone tuned them: move the knob into
-    // limits.zig and update PLAN-FRONTEND-SWAP.md §5.
+    // Unset worker/thread-pool counts ride httpz defaults (null).
     try testing.expectEqual(@as(?u16, null), config.workers.count);
     try testing.expectEqual(@as(?u16, null), config.thread_pool.count);
     try testing.expectEqual(@as(u16, 8080), config.address.ip.ip4.port);
+}
+
+test "httpz config carries configured worker/thread-pool counts" {
+    const limits: limits_mod.Limits = .resolve(.{
+        .max_body_size = 1024 * 1024,
+        .worker_count = 2,
+        .thread_pool_count = 8,
+    });
+    const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
+    try testing.expectEqual(@as(?u16, 2), config.workers.count);
+    try testing.expectEqual(@as(?u16, 8), config.thread_pool.count);
 }
 
 test "httpz method maps onto service and std methods" {

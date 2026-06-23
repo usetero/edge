@@ -56,6 +56,12 @@ pub const Limits = struct {
     max_connections: usize,
     /// Per-request body ceiling, from the frozen `ProxyConfig.max_body_size`.
     max_body_size: u32,
+    /// Post-decompression body ceiling; defaults to `max_body_size`.
+    max_decoded_bytes: usize = 0,
+    /// httpz event-loop worker count (null = httpz default).
+    worker_count: ?u16 = null,
+    /// httpz request-handler thread-pool count (null = httpz default).
+    thread_pool_count: ?u16 = null,
     record_scratch: usize,
     recv_buf: usize,
     send_buf: usize,
@@ -69,24 +75,29 @@ pub const Limits = struct {
     zstd_window_len: usize,
     conn_arena_reserve: usize,
 
-    pub fn resolve(
+    /// Inputs to `resolve` that originate from config (`ProxyConfig`), with
+    /// the `TERO_*` env overrides already applied by zonfig. No env reads here.
+    pub const ResolveOptions = struct {
         max_body_size: u32,
-        environ_map: *const std.process.Environ.Map,
-    ) Limits {
-        const max_connections = parseEnvUsize(
-            environ_map,
-            "TERO_MAX_CONNECTIONS",
-            DEFAULT_MAX_CONNECTIONS,
-        );
-        std.debug.assert(max_connections > 0);
+        max_decoded_bytes: ?u32 = null,
+        max_connections: u32 = DEFAULT_MAX_CONNECTIONS,
+        worker_count: ?u16 = null,
+        thread_pool_count: ?u16 = null,
+    };
+
+    pub fn resolve(opts: ResolveOptions) Limits {
+        std.debug.assert(opts.max_connections > 0);
         const zstd_window_len = std.math.clamp(
-            @as(usize, max_body_size),
+            @as(usize, opts.max_body_size),
             ZSTD_WINDOW_MIN,
             ZSTD_WINDOW_MAX,
         );
         return .{
-            .max_connections = max_connections,
-            .max_body_size = max_body_size,
+            .max_connections = opts.max_connections,
+            .max_body_size = opts.max_body_size,
+            .max_decoded_bytes = opts.max_decoded_bytes orelse opts.max_body_size,
+            .worker_count = opts.worker_count,
+            .thread_pool_count = opts.thread_pool_count,
             .record_scratch = RECORD_SCRATCH_BYTES,
             .recv_buf = RECV_BUF_BYTES,
             .send_buf = SEND_BUF_BYTES,
@@ -127,22 +138,8 @@ pub const Limits = struct {
     }
 };
 
-fn parseEnvUsize(
-    environ_map: *const std.process.Environ.Map,
-    key: []const u8,
-    default: usize,
-) usize {
-    const raw = environ_map.get(key) orelse return default;
-    return std.fmt.parseUnsigned(usize, raw, 10) catch |err| {
-        log.warn("ignoring {s}={s}: {s}", .{ key, raw, @errorName(err) });
-        return default;
-    };
-}
-
 test "Limits budget formula is locked" {
-    var env_map = std.process.Environ.Map.init(std.testing.allocator);
-    defer env_map.deinit();
-    const limits: Limits = .resolve(1024 * 1024, &env_map);
+    const limits: Limits = .resolve(.{ .max_body_size = 1024 * 1024 });
 
     // Hand-computed with the default 1 MiB max_body_size:
     //   zstd window = clamp(1M, 256K, 8M)        = 1024 KiB
@@ -157,17 +154,22 @@ test "Limits budget formula is locked" {
     try std.testing.expectEqual(@as(usize, 1736 * 1024), limits.perConnBytes());
     try std.testing.expectEqual(@as(usize, 256 * 1752 * 1024), limits.steadyStateBytes());
     try std.testing.expectEqual(@as(u32, 1024 * 1024), limits.max_body_size);
+    // max_decoded_bytes defaults to max_body_size; thread knobs default off.
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.max_decoded_bytes);
+    try std.testing.expectEqual(@as(?u16, null), limits.worker_count);
+    try std.testing.expectEqual(@as(?u16, null), limits.thread_pool_count);
 }
 
-test "Limits respects TERO_MAX_CONNECTIONS override and rejects garbage" {
-    var env_map = std.process.Environ.Map.init(std.testing.allocator);
-    defer env_map.deinit();
-    try env_map.put("TERO_MAX_CONNECTIONS", "32");
-
-    const limits: Limits = .resolve(1024 * 1024, &env_map);
+test "Limits resolves config-supplied knobs" {
+    const limits: Limits = .resolve(.{
+        .max_body_size = 1024 * 1024,
+        .max_decoded_bytes = 4 * 1024 * 1024,
+        .max_connections = 32,
+        .worker_count = 2,
+        .thread_pool_count = 8,
+    });
     try std.testing.expectEqual(@as(usize, 32), limits.max_connections);
-
-    try env_map.put("TERO_MAX_CONNECTIONS", "not-a-number");
-    const fallback: Limits = .resolve(1024 * 1024, &env_map);
-    try std.testing.expectEqual(DEFAULT_MAX_CONNECTIONS, fallback.max_connections);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), limits.max_decoded_bytes);
+    try std.testing.expectEqual(@as(?u16, 2), limits.worker_count);
+    try std.testing.expectEqual(@as(?u16, 8), limits.thread_pool_count);
 }

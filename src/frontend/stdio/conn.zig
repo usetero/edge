@@ -294,7 +294,7 @@ fn execPipeStream(
         .decode = pipe.codec,
         .format = pipe.format,
         .encode = pipe.codec,
-        .max_decoded_bytes = ctx.limits.max_body_size,
+        .max_decoded_bytes = ctx.limits.max_decoded_bytes,
         .zstd_window_len = ctx.limits.zstd_window_len,
     }, body_reader, &body_writer.writer, .{
         .decoder = env.slab.decodeBuf(conn_id),
