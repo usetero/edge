@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.0](https://github.com/usetero/edge/compare/v1.20.1...v1.21.0) (2026-06-23)
+
+
+### Features
+
+* update chart to set resource attrs and labels ([#194](https://github.com/usetero/edge/issues/194)) ([fd32b67](https://github.com/usetero/edge/commit/fd32b67082638ff92b85b0205dcf01b5220f4883))
+
 ## [1.20.1](https://github.com/usetero/edge/compare/v1.20.0...v1.20.1) (2026-06-22)
 
 
