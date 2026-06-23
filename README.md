@@ -477,7 +477,6 @@ OTLP distribution.
   "listen_address": "127.0.0.1",
   "listen_port": 8080,
   "upstream_url": "https://otlp.us5.datadoghq.com",
-  "workspace_id": "your-workspace-id",
   "log_level": "info",
   "max_body_size": 1048576,
   "policy_providers": [
