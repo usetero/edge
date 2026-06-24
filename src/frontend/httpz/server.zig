@@ -246,7 +246,17 @@ pub const Handler = struct {
         // with the stdio driver's /_edge/metrics short-circuit.
         if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
             res.header("content-type", "text/plain; version=0.0.4");
+            exec.refreshPolicyGauge(ctx);
             if (ctx.metrics) |metrics| try metrics.writePrometheus(res.writer());
+            return;
+        }
+
+        // Dump the loaded policy snapshot (id/signal/enabled/name). Pairs with
+        // the gauge: shows *which* policies are active, not just how many.
+        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) {
+            const json = std.mem.eql(u8, (try req.query()).get("format") orelse "", "json");
+            res.header("content-type", if (json) "application/json" else "text/plain; charset=utf-8");
+            try exec.writePolicies(ctx.registry, res.writer(), json);
             return;
         }
 
