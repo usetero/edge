@@ -628,8 +628,10 @@ test "TapState: arm captures matching-stage records, auto-disarms after n" {
     tap.capture(.pre, "log", "json_array", "", "CCC");
 
     const out = buf.written();
-    try testing.expect(std.mem.indexOf(u8, out, "seq=1 signal=log format=json_array decision= len=3\nAAA\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "seq=2 signal=metric format=otlp_protobuf decision= len=4\nBBBB\n") != null);
+    const frame1 = "seq=1 signal=log format=json_array decision= len=3\nAAA\n";
+    const frame2 = "seq=2 signal=metric format=otlp_protobuf decision= len=4\nBBBB\n";
+    try testing.expect(std.mem.indexOf(u8, out, frame1) != null);
+    try testing.expect(std.mem.indexOf(u8, out, frame2) != null);
     try testing.expect(std.mem.indexOf(u8, out, "IGNORED") == null);
     try testing.expect(std.mem.indexOf(u8, out, "CCC") == null);
 }
