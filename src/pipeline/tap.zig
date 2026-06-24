@@ -21,6 +21,16 @@ pub const TapState = struct {
     stage: Stage = .pre,
     remaining: u32 = 0,
     seq: u32 = 0,
+    /// Payload bytes captured so far this batch; bounds total memory held
+    /// regardless of `remaining` or record size (a single record can be up to
+    /// max_decoded_bytes). The last frame is truncated to fit, then the batch
+    /// ends.
+    written: usize = 0,
+
+    /// Total payload-byte ceiling per tap batch. `n` bounds frame count;
+    /// without this, n=1000 large records could buffer gigabytes before the
+    /// endpoint's 1s deadline or disarm fires.
+    pub const max_tap_bytes: usize = 8 * 1024 * 1024;
 
     pub const Stage = enum { pre, post };
 
@@ -39,14 +49,30 @@ pub const TapState = struct {
         defer self.mutex.unlock(self.io);
         const sink = self.sink orelse return;
         if (self.stage != stage or self.remaining == 0) return;
+
+        // Total-byte ceiling: truncate the payload to the remaining budget so a
+        // burst of large records can't exhaust memory. The header reports the
+        // (possibly truncated) length, so the stream stays parseable. Hitting
+        // the ceiling ends the batch.
+        const budget = max_tap_bytes -| self.written;
+        if (budget == 0) {
+            self.remaining = 0;
+            @atomicStore(?*std.Io.Writer, &self.sink, null, .release);
+            return;
+        }
+        const payload = if (bytes.len > budget) bytes[0..budget] else bytes;
+
         self.seq += 1;
         // Best-effort: a write failure (e.g. OOM growing the sink) just ends
         // the batch early rather than faulting the data plane.
-        writeFrame(sink, self.seq, signal, format, decision, bytes) catch {
+        writeFrame(sink, self.seq, signal, format, decision, payload) catch {
             self.remaining = 0;
         };
+        self.written += payload.len;
         if (self.remaining > 0) self.remaining -= 1;
-        if (self.remaining == 0) @atomicStore(?*std.Io.Writer, &self.sink, null, .release);
+        if (self.remaining == 0 or payload.len < bytes.len) {
+            @atomicStore(?*std.Io.Writer, &self.sink, null, .release);
+        }
     }
 
     /// Endpoint side: claim the single tap slot. Returns false if one is
@@ -58,6 +84,7 @@ pub const TapState = struct {
         self.stage = stage;
         self.remaining = n;
         self.seq = 0;
+        self.written = 0;
         @atomicStore(?*std.Io.Writer, &self.sink, sink, .release);
         return true;
     }
@@ -127,4 +154,54 @@ test "TapState: arm captures matching-stage records, auto-disarms after n" {
     try testing.expect(std.mem.indexOf(u8, out, frame2) != null);
     try testing.expect(std.mem.indexOf(u8, out, "IGNORED") == null);
     try testing.expect(std.mem.indexOf(u8, out, "CCC") == null);
+}
+
+test "TapState: total-byte ceiling caps payload and ends the batch" {
+    const io = std.testing.io;
+    var tap: TapState = .{ .io = io };
+
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+
+    // High frame count so only the byte ceiling can stop it. Records sized so
+    // it takes several to reach the ceiling, with the last one overshooting.
+    try testing.expect(tap.arm(.pre, 1000, &buf.writer));
+    const chunk = TapState.max_tap_bytes / 3;
+    const rec = try testing.allocator.alloc(u8, chunk + 1024);
+    defer testing.allocator.free(rec);
+    @memset(rec, 'x');
+
+    var i: usize = 0;
+    while (i < 100 and !tap.finished()) : (i += 1) {
+        tap.capture(.pre, "log", "json_array", "", rec);
+    }
+
+    // Captured payload never exceeds the ceiling, and the batch ended.
+    try testing.expect(tap.finished());
+    try testing.expect(tap.written <= TapState.max_tap_bytes);
+    // ...but it got close: it consumed within one record of the ceiling.
+    try testing.expect(tap.written > TapState.max_tap_bytes - rec.len);
+}
+
+test "TapState: oversized record is truncated to the remaining budget" {
+    const io = std.testing.io;
+    var tap: TapState = .{ .io = io };
+
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+
+    try testing.expect(tap.arm(.pre, 1000, &buf.writer));
+
+    const over = try testing.allocator.alloc(u8, TapState.max_tap_bytes + 4096);
+    defer testing.allocator.free(over);
+    @memset(over, 'y');
+
+    // One oversized record: truncated to the ceiling, batch ends immediately.
+    tap.capture(.pre, "log", "json_array", "", over);
+    try testing.expect(tap.finished());
+    try testing.expectEqual(TapState.max_tap_bytes, tap.written);
+    // Header reports the truncated length, so the frame stays parseable.
+    var lenbuf: [32]u8 = undefined;
+    const needle = std.fmt.bufPrint(&lenbuf, "len={d}\n", .{TapState.max_tap_bytes}) catch unreachable;
+    try testing.expect(std.mem.indexOf(u8, buf.written(), needle) != null);
 }
