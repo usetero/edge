@@ -43,6 +43,21 @@ pub const ProxyConfig = struct {
 
     max_body_size: u32 = 1024 * 1024, // 1MB
 
+    /// Post-decompression body ceiling; defaults to `max_body_size` when unset.
+    /// Raise it to admit payloads that decompress larger than the raw cap.
+    max_decoded_bytes: ?u32 = null,
+
+    /// Max concurrent connections; the dominant memory/throughput knob (see
+    /// limits.zig). Also honors the `TERO_MAX_CONNECTIONS` env override.
+    max_connections: u32 = 256,
+
+    /// httpz event-loop worker count (null = httpz default of 1).
+    worker_count: ?u16 = null,
+
+    /// httpz request-handler thread-pool count (null = httpz default of 32).
+    /// Multiplies the per-thread pipeline-scratch memory floor.
+    thread_pool_count: ?u16 = null,
+
     // Policy providers - array of provider configurations
     policy_providers: []ProviderConfig = &.{},
 

@@ -14,7 +14,16 @@ data:
       "metrics_url": {{ .Values.config.metricsUrl | quote }},
       "log_level": {{ .Values.config.logLevel | quote }},
       "max_body_size": {{ int .Values.config.maxBodySize }},
-      "max_upstream_retries": {{ int .Values.config.maxUpstreamRetries }},
+      "max_connections": {{ int .Values.config.maxConnections }},
+      {{- with .Values.config.maxDecodedBytes }}
+      "max_decoded_bytes": {{ int . }},
+      {{- end }}
+      {{- with .Values.config.workerCount }}
+      "worker_count": {{ int . }},
+      {{- end }}
+      {{- with .Values.config.threadPoolCount }}
+      "thread_pool_count": {{ int . }},
+      {{- end }}
       {{- $svc := dict }}
       {{- with .Values.config.service }}
       {{- if .name }}{{ $svc = set $svc "name" .name }}{{ end }}

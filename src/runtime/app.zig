@@ -214,6 +214,10 @@ pub const EngineOptions = struct {
     listen_address: [4]u8,
     listen_port: u16,
     max_body_size: u32,
+    max_decoded_bytes: ?u32 = null,
+    max_connections: u32 = limits_mod.DEFAULT_MAX_CONNECTIONS,
+    worker_count: ?u16 = null,
+    thread_pool_count: ?u16 = null,
     upstream_url: []const u8,
     logs_url: ?[]const u8 = null,
     metrics_url: ?[]const u8 = null,
@@ -235,7 +239,6 @@ pub const Engine = struct {
     pub fn create(
         allocator: std.mem.Allocator,
         io: std.Io,
-        environ_map: *const std.process.Environ.Map,
         bus: *EventBus,
         registry: *policy.Registry,
         metrics: ?*RuntimeMetrics,
@@ -247,7 +250,13 @@ pub const Engine = struct {
 
         self.allocator = allocator;
         self.io = io;
-        self.limits = .resolve(options.max_body_size, environ_map);
+        self.limits = .resolve(.{
+            .max_body_size = options.max_body_size,
+            .max_decoded_bytes = options.max_decoded_bytes,
+            .max_connections = options.max_connections,
+            .worker_count = options.worker_count,
+            .thread_pool_count = options.thread_pool_count,
+        });
         self.limits.logStartup();
 
         self.upstreams = upstream_mod.UpstreamManager.init(io, allocator, self.limits.max_connections);
@@ -407,6 +416,14 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     };
     defer zonfig.deinit(ProxyConfig, allocator, config);
 
+    // Reset the bus level from config now that JSON + env (TERO_LOG_LEVEL) are merged.
+    bus.setLevel(switch (config.log_level) {
+        .debug => .debug,
+        .info => .info,
+        .warn => .warn,
+        .err => .err,
+    });
+
     var instance_id_buf: [64]u8 = undefined;
     const instance_id = try std.fmt.bufPrint(&instance_id_buf, "edge-{d}-{d}", .{
         std.Io.Timestamp.now(io, .real).toMilliseconds(),
@@ -438,10 +455,14 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     installSegfaultHandler();
 
     const kinds = serviceKindsFor(distribution);
-    const engine = try Engine.create(allocator, io, init.environ_map, bus, &registry, &runtime_metrics, kinds, .{
+    const engine = try Engine.create(allocator, io, bus, &registry, &runtime_metrics, kinds, .{
         .listen_address = config.listen_address,
         .listen_port = config.listen_port,
         .max_body_size = config.max_body_size,
+        .max_decoded_bytes = config.max_decoded_bytes,
+        .max_connections = config.max_connections,
+        .worker_count = config.worker_count,
+        .thread_pool_count = config.thread_pool_count,
         .upstream_url = config.upstream_url,
         .logs_url = config.logs_url,
         .metrics_url = config.metrics_url,

@@ -251,10 +251,14 @@ pub fn main(init: std.process.Init) !void {
 
     // Create Datadog module configuration
     const kinds: []const edge.distro.ServiceKind = &lambda_service_kinds;
-    const engine = try app.Engine.create(allocator, io, init.environ_map, bus, &registry, &runtime_metrics, kinds, .{
+    const engine = try app.Engine.create(allocator, io, bus, &registry, &runtime_metrics, kinds, .{
         .listen_address = config.listen_address,
         .listen_port = config.listen_port,
         .max_body_size = config.max_body_size,
+        .max_decoded_bytes = config.max_decoded_bytes,
+        .max_connections = config.max_connections,
+        .worker_count = config.worker_count,
+        .thread_pool_count = config.thread_pool_count,
         .upstream_url = config.upstream_url,
         .logs_url = config.logs_url,
         .metrics_url = config.metrics_url,
