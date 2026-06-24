@@ -416,6 +416,14 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     };
     defer zonfig.deinit(ProxyConfig, allocator, config);
 
+    // Reset the bus level from config now that JSON + env (TERO_LOG_LEVEL) are merged.
+    bus.setLevel(switch (config.log_level) {
+        .debug => .debug,
+        .info => .info,
+        .warn => .warn,
+        .err => .err,
+    });
+
     var instance_id_buf: [64]u8 = undefined;
     const instance_id = try std.fmt.bufPrint(&instance_id_buf, "edge-{d}-{d}", .{
         std.Io.Timestamp.now(io, .real).toMilliseconds(),

@@ -42,3 +42,4 @@ PLAN*.md
 sample*
 .rewrite/
 .venv/
+config.test.json
