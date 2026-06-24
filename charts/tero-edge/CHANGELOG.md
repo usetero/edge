@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/usetero/edge/compare/tero-edge-chart-v0.6.0...tero-edge-chart-v0.7.0) (2026-06-24)
+
+
+### Features
+
+* **config:** make connection and memory limits configurable ([#198](https://github.com/usetero/edge/issues/198)) ([015cb8d](https://github.com/usetero/edge/commit/015cb8dd4886a25233bcad704b9859f066602e3b))
+
+
+### Bug Fixes
+
+* add checksum to daemonset for restart ([#196](https://github.com/usetero/edge/issues/196)) ([ebbb626](https://github.com/usetero/edge/commit/ebbb626f2ab04226d99a1bbd11580f331ae29ecb))
+
 ## [0.6.0](https://github.com/usetero/edge/compare/tero-edge-chart-v0.5.1...tero-edge-chart-v0.6.0) (2026-06-23)
 
 
