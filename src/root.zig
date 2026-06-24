@@ -76,6 +76,7 @@ test {
     _ = @import("pipeline/encoding.zig");
     _ = @import("pipeline/framer.zig");
     _ = @import("pipeline/pipeline.zig");
+    _ = @import("pipeline/tap.zig");
     _ = @import("signals/datadog/logs.zig");
     _ = @import("signals/datadog/metrics.zig");
     _ = @import("signals/otlp/attributes.zig");

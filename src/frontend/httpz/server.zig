@@ -150,10 +150,29 @@ pub const HttpServer = struct {
         };
     }
 
-    /// Thread-safe: breaks `run` out of its event loop and drains httpz's
-    /// own workers (httpz.Server.stop joins in-flight requests).
+    /// Thread-safe: breaks `run` out of its event loop, closes the listener,
+    /// then waits for in-flight handlers to finish before returning. The wait
+    /// is essential: httpz's kqueue worker `stop()` only halts the event loop
+    /// and `deinit` frees the handler thread pool WITHOUT joining it, so a
+    /// handler still in `relayResponse` would otherwise race the io/upstream
+    /// teardown that follows (Engine.stop -> lifecycle.shutdown; destroy ->
+    /// upstreams.deinit) and segfault reading a freed response head. Bounded so
+    /// a wedged handler can't block shutdown forever.
     pub fn stopAccepting(self: *HttpServer) void {
         self.server.stop();
+
+        const io = self.ctx.io;
+        const deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() +
+            5 * std.time.ns_per_s;
+        while (self.handler.in_flight.load(.acquire) > 0) {
+            if (std.Io.Timestamp.now(io, .awake).toNanoseconds() >= deadline_ns) {
+                log.warn("shutdown: {d} request(s) still in flight after 5s drain", .{
+                    self.handler.in_flight.load(.acquire),
+                });
+                break;
+            }
+            io.sleep(.fromNanoseconds(2 * std.time.ns_per_ms), .awake) catch break;
+        }
     }
 };
 
@@ -187,11 +206,19 @@ fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.http.He
 
 pub const Handler = struct {
     ctx: *exec.SharedCtx,
+    /// In-flight request count. httpz's kqueue worker stops its event loop on
+    /// `stop()` but never joins its handler thread pool before `deinit` frees
+    /// it, so an in-flight handler can race shutdown's io/upstream teardown
+    /// (segfault reading a torn response head). Shutdown drains this to zero
+    /// before tearing anything down — see `HttpServer.stopAccepting`.
+    in_flight: std.atomic.Value(u32) = .init(0),
 
     /// httpz entry point (takes precedence over httpz's router). Must not
     /// return errors; failures collapse to a 502 with the buffered partial
     /// response discarded.
     pub fn handle(self: *Handler, req: *httpz.Request, res: *httpz.Response) void {
+        _ = self.in_flight.fetchAdd(1, .acquire);
+        defer _ = self.in_flight.fetchSub(1, .release);
         self.dispatch(req, res) catch |err| {
             log.debug("request handling failed: {s}", .{@errorName(err)});
             res.clearWriter();
@@ -223,6 +250,21 @@ pub const Handler = struct {
             return;
         }
 
+        // Debug tap (config-gated): block this request up to 1s while data-plane
+        // threads stream the next N records into our buffer, before or after
+        // policy evaluation. ctx.tap is null unless enabled in config.
+        if (req.method == .GET and std.mem.startsWith(u8, path, "/_edge/tap/")) {
+            const stage: exec.TapState.Stage = if (std.mem.eql(u8, path, "/_edge/tap/pre"))
+                .pre
+            else if (std.mem.eql(u8, path, "/_edge/tap/post"))
+                .post
+            else {
+                res.status = 404;
+                return;
+            };
+            return self.handleTap(req, res, stage);
+        }
+
         const outcome = exec.planRequest(
             ctx,
             method,
@@ -245,6 +287,49 @@ pub const Handler = struct {
             .pipe_buffered => |pipe| try self.execPipeBuffered(req, res, pipe),
             .fetch_filtered => |fetch| try self.execFetchFiltered(req, res, fetch),
         }
+    }
+
+    /// Serves `/_edge/tap/{pre,post}`. Arms the single tap slot, blocks up to
+    /// 1s while data-plane threads fill our buffer with the next N records,
+    /// then returns the batch. The buffer is freed on return — nothing is
+    /// retained between taps.
+    fn handleTap(self: *Handler, req: *httpz.Request, res: *httpz.Response, stage: exec.TapState.Stage) !void {
+        const ctx = self.ctx;
+        const tap = ctx.tap orelse {
+            res.status = 404;
+            res.body = "tap disabled (set tap_enabled in config)\n";
+            return;
+        };
+
+        // ?n=<count>, default 50, capped so a single tap can't buffer forever.
+        var n: u32 = 50;
+        if ((try req.query()).get("n")) |raw| {
+            n = std.fmt.parseInt(u32, raw, 10) catch 50;
+        }
+        n = std.math.clamp(n, 1, 1000);
+
+        var buf: std.Io.Writer.Allocating = .init(ctx.gpa);
+        defer buf.deinit();
+
+        if (!tap.arm(stage, n, &buf.writer)) {
+            res.status = 409;
+            res.body = "a tap is already active\n";
+            return;
+        }
+        // Always release the slot, even on error, before reading the buffer.
+        errdefer tap.disarm();
+
+        // Wait until the batch fills or 1s elapses, polling in small steps so
+        // we don't pin a handler thread for the full second when data is flowing.
+        const deadline_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() + std.time.ns_per_s;
+        while (!tap.finished()) {
+            if (std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() >= deadline_ns) break;
+            ctx.io.sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch break;
+        }
+        tap.disarm(); // stop producers before we read `buf`
+
+        res.header("content-type", "application/octet-stream");
+        try res.writer().writeAll(buf.written());
     }
 
     /// Hop-by-hop-filters and arena-dupes the inbound headers, then opens

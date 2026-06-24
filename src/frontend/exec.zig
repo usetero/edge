@@ -17,6 +17,7 @@ const upstream_mod = @import("upstream.zig");
 const pipeline_mod = @import("../pipeline/pipeline.zig");
 const encoding_mod = @import("../pipeline/encoding.zig");
 const framer_mod = @import("../pipeline/framer.zig");
+const tap_mod = @import("../pipeline/tap.zig");
 const limits_mod = @import("../core/limits.zig");
 const runtime_metrics_mod = @import("../runtime/runtime_metrics.zig");
 const dd_logs = @import("../signals/datadog/logs.zig");
@@ -48,6 +49,9 @@ pub const UpstreamIds = struct {
     }
 };
 
+/// Debug tap (`/_edge/tap/{pre,post}`), defined in the pipeline layer.
+pub const TapState = tap_mod.TapState;
+
 /// Shared, read-only state for every connection, regardless of frontend.
 /// Frontend-specific state (the stdio conn slab and arena pool) lives in the
 /// frontend's own server struct, NOT here — see PLAN-FRONTEND-SWAP.md §2.
@@ -62,6 +66,8 @@ pub const SharedCtx = struct {
     bus: *EventBus,
     metrics: ?*runtime_metrics_mod.RuntimeMetrics,
     limits: limits_mod.Limits,
+    /// Debug tap, or null when disabled by config. See `TapState`.
+    tap: ?*TapState = null,
 };
 
 /// Routes and plans a request from transport-neutral parts. Returns null
@@ -292,19 +298,35 @@ pub const RecordSink = struct {
 
     pub fn onRecord(self: *RecordSink, bytes: []const u8) !framer_mod.Decision {
         self.records += 1;
-        if (!self.active) return .keep;
+        const sig = @tagName(self.signal);
+        const fmt = @tagName(self.format);
+        if (self.ctx.tap) |tap| tap.capture(.pre, sig, fmt, "", bytes);
 
-        // Replace bytes from the PREVIOUS record die here; the framer has
-        // already written them (emit happens before the next onRecord).
-        _ = self.record_arena.reset(.retain_capacity);
-        const arena = self.record_arena.allocator();
+        const decision: framer_mod.Decision = blk: {
+            if (!self.active) break :blk .keep;
 
-        return switch (self.format) {
-            .json_array => self.evalJsonRecord(arena, bytes),
-            .otlp_protobuf => self.evalProtobufRecord(arena, bytes),
-            // raw/ndjson/prom_text never reach a policy sink today.
-            else => .keep,
+            // Replace bytes from the PREVIOUS record die here; the framer has
+            // already written them (emit happens before the next onRecord).
+            _ = self.record_arena.reset(.retain_capacity);
+            const arena = self.record_arena.allocator();
+
+            break :blk switch (self.format) {
+                .json_array => try self.evalJsonRecord(arena, bytes),
+                .otlp_protobuf => try self.evalProtobufRecord(arena, bytes),
+                // raw/ndjson/prom_text never reach a policy sink today.
+                else => .keep,
+            };
         };
+
+        if (self.ctx.tap) |tap| {
+            const after: []const u8 = switch (decision) {
+                .keep => bytes,
+                .drop => "",
+                .replace => |r| r,
+            };
+            tap.capture(.post, sig, fmt, @tagName(decision), after);
+        }
+        return decision;
     }
 
     fn evalJsonRecord(self: *RecordSink, arena: std.mem.Allocator, bytes: []const u8) !framer_mod.Decision {

@@ -222,6 +222,7 @@ pub const EngineOptions = struct {
     logs_url: ?[]const u8 = null,
     metrics_url: ?[]const u8 = null,
     service_options: distro.ServiceOptions = .{},
+    tap_enabled: bool = false,
 };
 
 pub const Engine = struct {
@@ -234,6 +235,7 @@ pub const Engine = struct {
     router: router_mod.Router,
     lifecycle: lifecycle_mod.Lifecycle,
     shared_ctx: exec_mod.SharedCtx,
+    tap: exec_mod.TapState,
     server: frontend_select.Server,
 
     pub fn create(
@@ -295,6 +297,7 @@ pub const Engine = struct {
         errdefer self.router.deinit();
 
         self.lifecycle = .init;
+        self.tap = .{ .io = io };
         self.shared_ctx = .{
             .io = io,
             .gpa = allocator,
@@ -306,6 +309,7 @@ pub const Engine = struct {
             .bus = bus,
             .metrics = metrics,
             .limits = self.limits,
+            .tap = if (options.tap_enabled) &self.tap else null,
         };
 
         self.server = try .init(
@@ -470,6 +474,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
             .prometheus_max_input_bytes = config.prometheus.max_input_bytes_per_scrape,
             .prometheus_max_output_bytes = config.prometheus.max_output_bytes_per_scrape,
         },
+        .tap_enabled = config.tap_enabled,
     });
     defer engine.destroy();
 
