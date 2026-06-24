@@ -44,10 +44,18 @@ pub const TapState = struct {
         decision: []const u8,
         bytes: []const u8,
     ) void {
-        if (@atomicLoad(?*std.Io.Writer, &self.sink, .acquire) == null) return;
+        const observed = @atomicLoad(?*std.Io.Writer, &self.sink, .acquire) orelse return;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const sink = self.sink orelse return;
+        // The session can change between the unlocked check and acquiring the
+        // lock (timeout disarms tap A, a new request arms tap B). If the armed
+        // writer is no longer the one we observed, this record predates the
+        // current session — drop it rather than leak it into B's buffer.
+        // ponytail: pointer identity; the only hole is a new request reusing
+        // the exact same writer address back-to-back, which distinct per-request
+        // buffers won't do.
+        if (sink != observed) return;
         if (self.stage != stage or self.remaining == 0) return;
 
         // Total-byte ceiling: truncate the payload to the remaining budget so a
