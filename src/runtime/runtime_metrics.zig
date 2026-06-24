@@ -97,6 +97,12 @@ const PolicyLabels = struct {
     telemetry: PolicyTelemetryLabel,
 };
 
+pub const SignalLabel = enum { log, metric, trace };
+
+const PolicySignalLabels = struct {
+    signal: SignalLabel,
+};
+
 const BuildInfoLabels = struct {
     version: []const u8,
     commit: []const u8,
@@ -112,6 +118,7 @@ const InternalMetrics = struct {
     edge_policy_records_evaluated_total: PolicyRecordsEvaluatedTotal,
     edge_policy_records_kept_total: PolicyRecordsKeptTotal,
     edge_policy_records_dropped_total: PolicyRecordsDroppedTotal,
+    edge_policies_loaded: PoliciesLoaded,
     edge_build_info: BuildInfo,
 
     const RequestsTotal = m.CounterVec(u64, RequestLabels);
@@ -126,6 +133,7 @@ const InternalMetrics = struct {
     const PolicyRecordsEvaluatedTotal = m.CounterVec(u64, PolicyLabels);
     const PolicyRecordsKeptTotal = m.CounterVec(u64, PolicyLabels);
     const PolicyRecordsDroppedTotal = m.CounterVec(u64, PolicyLabels);
+    const PoliciesLoaded = m.GaugeVec(u64, PolicySignalLabels);
     const BuildInfo = m.GaugeVec(u64, BuildInfoLabels);
 };
 
@@ -195,6 +203,13 @@ pub const RuntimeMetrics = struct {
                     .{ .help = "Total number of telemetry records dropped after policy evaluation." },
                     .{},
                 ),
+                .edge_policies_loaded = try InternalMetrics.PoliciesLoaded.init(
+                    allocator,
+                    io,
+                    "edge_policies_loaded",
+                    .{ .help = "Number of loaded policies targeting each signal in the active snapshot." },
+                    .{},
+                ),
                 .edge_build_info = try InternalMetrics.BuildInfo.init(
                     allocator,
                     io,
@@ -246,6 +261,10 @@ pub const RuntimeMetrics = struct {
             try self.internal.edge_policy_records_evaluated_total.incrBy(.{ .telemetry = telemetry }, 0);
             try self.internal.edge_policy_records_kept_total.incrBy(.{ .telemetry = telemetry }, 0);
             try self.internal.edge_policy_records_dropped_total.incrBy(.{ .telemetry = telemetry }, 0);
+        }
+
+        inline for (std.meta.tags(SignalLabel)) |signal| {
+            try self.internal.edge_policies_loaded.set(.{ .signal = signal }, 0);
         }
     }
 
@@ -333,6 +352,11 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_policy_records_dropped_total.incrBy(.{
             .telemetry = telemetry,
         }, dropped_count) catch |err| log.debug("failed to record policy dropped metric: {}", .{err});
+    }
+
+    pub fn setPoliciesLoaded(self: *RuntimeMetrics, signal: SignalLabel, count: u64) void {
+        self.internal.edge_policies_loaded.set(.{ .signal = signal }, count) catch |err|
+            log.warn("failed to set policies loaded metric: {}", .{err});
     }
 
     pub fn setBuildInfo(self: *RuntimeMetrics, version: []const u8, commit: []const u8) void {

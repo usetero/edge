@@ -197,6 +197,52 @@ pub fn policiesActiveFor(registry: *policy.Registry, signal: service_mod.Signal)
     };
 }
 
+/// Mirror the active snapshot's per-signal policy counts into the gauge. Called
+/// at scrape time so the gauge always reflects the live snapshot without hooking
+/// the loader's reload path. Counts match `policiesActiveFor` (the fast-path
+/// gate), so a 0 here is exactly when that signal is raw-forwarded untouched.
+pub fn refreshPolicyGauge(ctx: *SharedCtx) void {
+    const metrics = ctx.metrics orelse return;
+    const snapshot = ctx.registry.getSnapshot();
+    metrics.setPoliciesLoaded(.log, if (snapshot) |s| @intCast(s.getLogTargetIndices().len) else 0);
+    metrics.setPoliciesLoaded(.metric, if (snapshot) |s| @intCast(s.getMetricTargetIndices().len) else 0);
+    metrics.setPoliciesLoaded(.trace, if (snapshot) |s| @intCast(s.trace_target_indices.len) else 0);
+}
+
+/// Dump the loaded policies in the active snapshot, for the `/_edge/policies`
+/// debug endpoint. `json=true` emits the full policy tree (match rules, keep,
+/// transform — via the proto type's own jsonStringify); otherwise a one-line
+/// text summary per policy (id, signal, enabled, name).
+pub fn writePolicies(registry: *policy.Registry, w: *std.Io.Writer, json: bool) !void {
+    const snapshot = registry.getSnapshot();
+    if (json) {
+        // std.json's default struct serializer over the proto types. Repeated
+        // fields surface as {"items":[...],"capacity":N} (raw ArrayList) — fine
+        // for a debug dump; the policy data is all there.
+        try w.print("{{\"version\":{d},\"policies\":", .{if (snapshot) |s| s.version else 0});
+        try std.json.Stringify.value(if (snapshot) |s| s.policies else &.{}, .{}, w);
+        try w.writeAll("}\n");
+        return;
+    }
+    const s = snapshot orelse {
+        try w.writeAll("# no policy snapshot loaded (0 policies)\n");
+        return;
+    };
+    try w.print("# snapshot version={d} policies={d} (log={d} metric={d} trace={d})\n", .{
+        s.version,
+        s.policies.len,
+        s.getLogTargetIndices().len,
+        s.getMetricTargetIndices().len,
+        s.trace_target_indices.len,
+    });
+    for (s.policies) |*p| {
+        const signal = if (p.target) |t| @tagName(std.meta.activeTag(t)) else "none";
+        try w.print("id={s} signal={s} enabled={} name={s}\n", .{
+            p.id, signal, p.enabled, p.name,
+        });
+    }
+}
+
 pub const BufferedResult = struct {
     body: []const u8,
     all_dropped: bool,
