@@ -43,3 +43,6 @@ sample*
 .rewrite/
 .venv/
 config.test.json
+
+# local secrets-bearing test config (do not commit)
+anotherconfig.test.json
