@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.23.0](https://github.com/usetero/edge/compare/v1.22.0...v1.23.0) (2026-06-24)
+
+
+### Features
+
+* in process debug mode ([#199](https://github.com/usetero/edge/issues/199)) ([7856e7e](https://github.com/usetero/edge/commit/7856e7e269ff6e4316ca1dca7c73c957fa9b7d4a))
+
 ## [1.22.0](https://github.com/usetero/edge/compare/v1.21.0...v1.22.0) (2026-06-24)
 
 
