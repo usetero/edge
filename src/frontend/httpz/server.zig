@@ -150,10 +150,29 @@ pub const HttpServer = struct {
         };
     }
 
-    /// Thread-safe: breaks `run` out of its event loop and drains httpz's
-    /// own workers (httpz.Server.stop joins in-flight requests).
+    /// Thread-safe: breaks `run` out of its event loop, closes the listener,
+    /// then waits for in-flight handlers to finish before returning. The wait
+    /// is essential: httpz's kqueue worker `stop()` only halts the event loop
+    /// and `deinit` frees the handler thread pool WITHOUT joining it, so a
+    /// handler still in `relayResponse` would otherwise race the io/upstream
+    /// teardown that follows (Engine.stop -> lifecycle.shutdown; destroy ->
+    /// upstreams.deinit) and segfault reading a freed response head. Bounded so
+    /// a wedged handler can't block shutdown forever.
     pub fn stopAccepting(self: *HttpServer) void {
         self.server.stop();
+
+        const io = self.ctx.io;
+        const deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() +
+            5 * std.time.ns_per_s;
+        while (self.handler.in_flight.load(.acquire) > 0) {
+            if (std.Io.Timestamp.now(io, .awake).toNanoseconds() >= deadline_ns) {
+                log.warn("shutdown: {d} request(s) still in flight after 5s drain", .{
+                    self.handler.in_flight.load(.acquire),
+                });
+                break;
+            }
+            io.sleep(.fromNanoseconds(2 * std.time.ns_per_ms), .awake) catch break;
+        }
     }
 };
 
@@ -187,11 +206,19 @@ fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.http.He
 
 pub const Handler = struct {
     ctx: *exec.SharedCtx,
+    /// In-flight request count. httpz's kqueue worker stops its event loop on
+    /// `stop()` but never joins its handler thread pool before `deinit` frees
+    /// it, so an in-flight handler can race shutdown's io/upstream teardown
+    /// (segfault reading a torn response head). Shutdown drains this to zero
+    /// before tearing anything down — see `HttpServer.stopAccepting`.
+    in_flight: std.atomic.Value(u32) = .init(0),
 
     /// httpz entry point (takes precedence over httpz's router). Must not
     /// return errors; failures collapse to a 502 with the buffered partial
     /// response discarded.
     pub fn handle(self: *Handler, req: *httpz.Request, res: *httpz.Response) void {
+        _ = self.in_flight.fetchAdd(1, .acquire);
+        defer _ = self.in_flight.fetchSub(1, .release);
         self.dispatch(req, res) catch |err| {
             log.debug("request handling failed: {s}", .{@errorName(err)});
             res.clearWriter();
@@ -290,7 +317,7 @@ pub const Handler = struct {
             return;
         }
         // Always release the slot, even on error, before reading the buffer.
-        defer tap.disarm();
+        errdefer tap.disarm();
 
         // Wait until the batch fills or 1s elapses, polling in small steps so
         // we don't pin a handler thread for the full second when data is flowing.
