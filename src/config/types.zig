@@ -58,6 +58,12 @@ pub const ProxyConfig = struct {
     /// Multiplies the per-thread pipeline-scratch memory floor.
     thread_pool_count: ?u16 = null,
 
+    /// Enables the `/_edge/tap/{pre,post}` debug endpoints, which stream raw
+    /// in-flight telemetry records (before/after policy evaluation). Off by
+    /// default — this exposes customer payloads, so only enable on a trusted
+    /// listener.
+    tap_enabled: bool = false,
+
     // Policy providers - array of provider configurations
     policy_providers: []ProviderConfig = &.{},
 

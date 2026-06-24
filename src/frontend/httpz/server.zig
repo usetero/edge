@@ -223,6 +223,21 @@ pub const Handler = struct {
             return;
         }
 
+        // Debug tap (config-gated): block this request up to 1s while data-plane
+        // threads stream the next N records into our buffer, before or after
+        // policy evaluation. ctx.tap is null unless enabled in config.
+        if (req.method == .GET and std.mem.startsWith(u8, path, "/_edge/tap/")) {
+            const stage: exec.TapState.Stage = if (std.mem.eql(u8, path, "/_edge/tap/pre"))
+                .pre
+            else if (std.mem.eql(u8, path, "/_edge/tap/post"))
+                .post
+            else {
+                res.status = 404;
+                return;
+            };
+            return self.handleTap(req, res, stage);
+        }
+
         const outcome = exec.planRequest(
             ctx,
             method,
@@ -245,6 +260,49 @@ pub const Handler = struct {
             .pipe_buffered => |pipe| try self.execPipeBuffered(req, res, pipe),
             .fetch_filtered => |fetch| try self.execFetchFiltered(req, res, fetch),
         }
+    }
+
+    /// Serves `/_edge/tap/{pre,post}`. Arms the single tap slot, blocks up to
+    /// 1s while data-plane threads fill our buffer with the next N records,
+    /// then returns the batch. The buffer is freed on return — nothing is
+    /// retained between taps.
+    fn handleTap(self: *Handler, req: *httpz.Request, res: *httpz.Response, stage: exec.TapState.Stage) !void {
+        const ctx = self.ctx;
+        const tap = ctx.tap orelse {
+            res.status = 404;
+            res.body = "tap disabled (set tap_enabled in config)\n";
+            return;
+        };
+
+        // ?n=<count>, default 50, capped so a single tap can't buffer forever.
+        var n: u32 = 50;
+        if ((try req.query()).get("n")) |raw| {
+            n = std.fmt.parseInt(u32, raw, 10) catch 50;
+        }
+        n = std.math.clamp(n, 1, 1000);
+
+        var buf: std.Io.Writer.Allocating = .init(ctx.gpa);
+        defer buf.deinit();
+
+        if (!tap.arm(stage, n, &buf.writer)) {
+            res.status = 409;
+            res.body = "a tap is already active\n";
+            return;
+        }
+        // Always release the slot, even on error, before reading the buffer.
+        defer tap.disarm();
+
+        // Wait until the batch fills or 1s elapses, polling in small steps so
+        // we don't pin a handler thread for the full second when data is flowing.
+        const deadline_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() + std.time.ns_per_s;
+        while (!tap.finished()) {
+            if (std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() >= deadline_ns) break;
+            ctx.io.sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch break;
+        }
+        tap.disarm(); // stop producers before we read `buf`
+
+        res.header("content-type", "application/octet-stream");
+        try res.writer().writeAll(buf.written());
     }
 
     /// Hop-by-hop-filters and arena-dupes the inbound headers, then opens
