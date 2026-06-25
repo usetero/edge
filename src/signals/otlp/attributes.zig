@@ -84,7 +84,7 @@ pub fn typedHexBytes(allocator: std.mem.Allocator, hex_str: []const u8) ?TypedVa
     if (hex_str.len == 0 or hex_str.len % 2 != 0) return null;
     const out = allocator.alloc(u8, hex_str.len / 2) catch return null;
     _ = std.fmt.hexToBytes(out, hex_str) catch return null;
-    return TypedValue{ .bytes = out };
+    return .{ .bytes = out };
 }
 
 /// Wrap raw identifier bytes (16/8-byte trace_id/span_id from protobuf) as

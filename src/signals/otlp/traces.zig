@@ -302,7 +302,10 @@ pub fn traceTypedValue(ctx: *const anyopaque, field: TraceFieldRef) ?policy.Type
             .TRACE_FIELD_PARENT_SPAN_ID => idTyped(span_ctx, span_ctx.span.parent_span_id),
             else => otlp_attr.typedStr(traceValue(ctx, field)),
         },
-        .span_attribute => |attr_path| otlp_attr.findNestedAttributeTyped(span_ctx.span.attributes.items, attr_path.path.items),
+        .span_attribute => |attr_path| otlp_attr.findNestedAttributeTyped(
+            span_ctx.span.attributes.items,
+            attr_path.path.items,
+        ),
         .resource_attribute => |attr_path| if (span_ctx.resource_spans.resource) |res|
             otlp_attr.findNestedAttributeTyped(res.attributes.items, attr_path.path.items)
         else
