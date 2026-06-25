@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.25.0](https://github.com/usetero/edge/compare/v1.24.0...v1.25.0) (2026-06-25)
+
+
+### Features
+
+* better unwrapping for dd messages ([#203](https://github.com/usetero/edge/issues/203)) ([f40cc7e](https://github.com/usetero/edge/commit/f40cc7ea7436ee852106b1fc4867dbabbaf721a2))
+
+
+### Bug Fixes
+
+* sampling should be based on trace id hex ([#204](https://github.com/usetero/edge/issues/204)) ([43b1272](https://github.com/usetero/edge/commit/43b1272dd5d4a3c6d3a81a148ec0aa1901d9939c))
+
 ## [1.24.0](https://github.com/usetero/edge/compare/v1.23.0...v1.24.0) (2026-06-24)
 
 
