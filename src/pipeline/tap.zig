@@ -52,7 +52,7 @@ pub const TapState = struct {
         // lock (timeout disarms tap A, a new request arms tap B). If the armed
         // writer is no longer the one we observed, this record predates the
         // current session — drop it rather than leak it into B's buffer.
-        // ponytail: pointer identity; the only hole is a new request reusing
+        // note: pointer identity; the only hole is a new request reusing
         // the exact same writer address back-to-back, which distinct per-request
         // buffers won't do.
         if (sink != observed) return;

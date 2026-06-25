@@ -311,10 +311,12 @@ pub const DatadogLog = struct {
     /// Body value for matching. When the message is a JSON-wrapped log, the
     /// real body lives at `data.jsonPayload.{message|body|log}`; return that.
     /// Otherwise return the raw message verbatim.
-    /// ponytail: targets the GCP/Cloud Run `data.jsonPayload` shape only; other
+    /// note: targets the GCP/Cloud Run `data.jsonPayload` shape only; other
     /// wrappers fall through to the raw message.
     pub fn bodyForMatch(self: *DatadogLog, allocator: std.mem.Allocator) ?[]const u8 {
-        const raw = self.message orelse return null;
+        // Honor `msg`/`log` wrappers too, not just top-level `message` —
+        // otherwise body filters silently miss logs wrapped in those extras.
+        const raw = self.wrappedMessageRaw() orelse return null;
         self.ensureUnwrapped(allocator);
         if (self.message_flat.count() != 0) {
             for (inner_body_paths) |path| {
@@ -436,11 +438,28 @@ pub const DatadogLog = struct {
         }
     }
 
-    /// Drop any pending wrapper rewrite (e.g. when the whole body is replaced).
+    /// Drop every cache derived from the previous `message` (e.g. when the
+    /// whole body is replaced). Resets both the write side (rewrite/tree) and
+    /// the read side (flat/unwrapped) so the next access re-derives from the
+    /// new `message`; otherwise a later wrapped edit would serialize the stale
+    /// tree (overwriting the new body) and reads would return stale leaves.
     pub fn clearWrappedRewrite(self: *DatadogLog, allocator: std.mem.Allocator) void {
         if (self.message_rewrapped) |s| allocator.free(s);
         self.message_rewrapped = null;
         self.message_dirty = false;
+
+        if (self.message_tree) |*tree| tree.deinit();
+        self.message_tree = null;
+        self.message_tree_tried = false;
+
+        var flat_it = self.message_flat.iterator();
+        while (flat_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.message_flat.deinit(allocator);
+        self.message_flat = .empty;
+        self.message_unwrapped = false;
     }
 
     fn findNestedStringInRaw(
@@ -804,6 +823,64 @@ test "DatadogLog - parse mutate and reserialize" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"message\":\"test\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"status\":\"info\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"service\"") == null);
+}
+
+test "DatadogLog - bodyForMatch unwraps msg/log wrappers, not just message" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    // Body wrapped in `msg` with no top-level `message`. Regression: bodyForMatch
+    // used to bail on `self.message == null` and never consult the unwrapped flat.
+    const json =
+        \\{"msg": "{\"data\":{\"jsonPayload\":{\"message\":\"hello-body\"}}}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    const body = log.bodyForMatch(allocator);
+    try std.testing.expect(body != null);
+    try std.testing.expectEqualStrings("hello-body", body.?);
+}
+
+test "DatadogLog - clearWrappedRewrite drops stale message tree" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    // `message` is a JSON-wrapped object keyed `old`.
+    const json =
+        \\{"message": "{\"old\":\"alice\"}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    // Warm the wrapper tree by editing the original message.
+    try std.testing.expect(log.setWrapped(allocator, &.{"old"}, "redacted-1"));
+
+    // A later transform replaces the whole body with a differently-shaped
+    // wrapper (key `new`); the stale `old` tree must be dropped.
+    log.message = "{\"new\":\"bob\"}";
+    log.clearWrappedRewrite(allocator);
+
+    // Editing `new` must operate on the NEW message. Without the reset,
+    // ensureMessageTree returns the stale `old` tree, which has no `new` key —
+    // so the edit silently no-ops (returns false) and the redact is lost.
+    try std.testing.expect(log.setWrapped(allocator, &.{"new"}, "redacted-2"));
+    log.finalizeWrapped(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(log, .{}, &out.writer);
+    const output = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "redacted-2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bob") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "redacted-1") == null);
 }
 
 test "DatadogLog - special characters in strings" {
