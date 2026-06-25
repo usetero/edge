@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.24.0](https://github.com/usetero/edge/compare/v1.23.0...v1.24.0) (2026-06-24)
+
+
+### Features
+
+* debug endpoints ([#202](https://github.com/usetero/edge/issues/202)) ([0a7373f](https://github.com/usetero/edge/commit/0a7373f59c72accc74dd7a59995bb564af02eeee))
+
 ## [1.23.0](https://github.com/usetero/edge/compare/v1.22.0...v1.23.0) (2026-06-24)
 
 
