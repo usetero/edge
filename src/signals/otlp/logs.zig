@@ -167,6 +167,10 @@ pub const OtlpLogContext = struct {
     resource_logs: *ResourceLogs,
     scope_logs: *ScopeLogs,
     allocator: std.mem.Allocator,
+    /// True when identifier fields (trace_id/span_id) are lowercase hex strings
+    /// (OTLP/JSON path); false when raw bytes (protobuf path). Controls how
+    /// `typed_value` decodes them for the sampler's `sample_key`.
+    bytes_as_hex: bool,
 };
 
 const getAnyValueString = otlp_attr.getStringValue;
@@ -309,10 +313,43 @@ pub fn logExists(ctx: *const anyopaque, field: FieldRef) bool {
     };
 }
 
+/// Typed-value accessor for the OTLP log context. The policy engine prefers
+/// this over `logValue` for typed matchers and probabilistic sampling (the
+/// `sample_key` field). Identifier fields (trace_id/span_id) read as raw
+/// `TypedValue.bytes` so the sampler hashes the right bytes; body and
+/// attributes carry their native scalar type; everything else falls back to
+/// the string view.
+pub fn logTypedValue(ctx: *const anyopaque, field: FieldRef) ?policy.TypedValue {
+    const log_ctx: *OtlpLogContext = @ptrCast(@alignCast(@constCast(ctx)));
+    return switch (field) {
+        .log_field => |lf| switch (lf) {
+            .LOG_FIELD_BODY => otlp_attr.anyValueTyped(log_ctx.log_record.body),
+            .LOG_FIELD_TRACE_ID => idTyped(log_ctx, log_ctx.log_record.trace_id),
+            .LOG_FIELD_SPAN_ID => idTyped(log_ctx, log_ctx.log_record.span_id),
+            else => otlp_attr.typedStr(logValue(ctx, field)),
+        },
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
+            const attrs = attributeList(log_ctx, field) orelse break :blk null;
+            break :blk otlp_attr.findNestedAttributeTyped(attrs.items, attr_path.path.items);
+        },
+    };
+}
+
+/// Decode an identifier field to raw bytes for the sampler: hex-decode on the
+/// JSON path, pass raw bytes through on the protobuf path.
+fn idTyped(log_ctx: *const OtlpLogContext, id: []const u8) ?policy.TypedValue {
+    if (id.len == 0) return null;
+    return if (log_ctx.bytes_as_hex)
+        otlp_attr.typedHexBytes(log_ctx.allocator, id)
+    else
+        otlp_attr.typedBytes(id);
+}
+
 /// LogAccessor template wiring the OTLP log primitives to a registry.
 pub const log_accessor: LogAccessor = .{
     .value = logValue,
     .exists = logExists,
+    .typed_value = logTypedValue,
     .set = logSet,
     .delete = logDelete,
     .move = logMove,
@@ -335,6 +372,7 @@ fn filterLogsInPlace(
     logs_data: *LogsData,
     registry: *const PolicyRegistry,
     bus: *EventBus,
+    bytes_as_hex: bool,
 ) FilterCounts {
     const engine = PolicyEngine.init(bus, @constCast(registry));
 
@@ -360,6 +398,7 @@ fn filterLogsInPlace(
                     .resource_logs = resource_logs,
                     .scope_logs = scope_logs,
                     .allocator = allocator,
+                    .bytes_as_hex = bytes_as_hex,
                 };
 
                 const result = engine.evaluate(
@@ -436,15 +475,27 @@ fn processJsonLogs(
         };
     }
 
-    // Parse JSON into LogsData protobuf struct.
-    // NOTE: bytes-as-hex is temporarily disabled; bytes fields use base64.
+    // Parse JSON into LogsData protobuf struct. OTLP/JSON encodes bytes fields
+    // (traceId/spanId/…) as lowercase hex; protobuf 5.0.0's decoder reads this
+    // thread-local rather than a threaded option.
+    //
+    // note: this toggle is GLOBAL to all `bytes` fields, but OTLP/JSON only
+    // hex-encodes the identifier fields — a generic `AnyValue.bytesValue`
+    // attribute is base64, and the hex decoder rejects it (non-hex chars ->
+    // UnexpectedToken), failing the whole payload. Proper fix is per-field hex
+    // in the proto library (mark only trace_id/span_id hex); until then, logs
+    // carrying bytes-valued attributes won't decode here.
+    const prev_hex = proto.protobuf.json.tl_bytes_as_hex;
+    proto.protobuf.json.tl_bytes_as_hex = true;
+    defer proto.protobuf.json.tl_bytes_as_hex = prev_hex;
+
     var parsed = try LogsData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
     }, allocator);
     defer parsed.deinit();
 
-    // Filter logs in-place
-    const counts = filterLogsInPlace(allocator, &parsed.value, registry, bus);
+    // Filter logs in-place. Identifier fields are hex strings on the JSON path.
+    const counts = filterLogsInPlace(allocator, &parsed.value, registry, bus, true);
 
     // Fast path: if nothing was modified, return original data without re-encoding
     if (counts.dropped_count == 0 and !counts.was_transformed) {
@@ -461,7 +512,7 @@ fn processJsonLogs(
     // Re-serialize to JSON
     const output = try parsed.value.jsonEncode(.{}, .{
         .emit_oneof_field_name = false,
-        .bytes_as_hex = false,
+        .bytes_as_hex = true,
     }, allocator);
 
     return .{
@@ -514,8 +565,8 @@ fn processProtobufLogs(
     // Decode protobuf into LogsData struct using arena
     var logs_data = try LogsData.decode(&reader, arena_alloc);
 
-    // Filter logs in-place
-    const counts = filterLogsInPlace(arena_alloc, &logs_data, registry, bus);
+    // Filter logs in-place. Protobuf identifier fields are raw bytes.
+    const counts = filterLogsInPlace(arena_alloc, &logs_data, registry, bus, false);
 
     // Fast path: if nothing was modified, return original data without re-encoding
     if (counts.dropped_count == 0 and !counts.was_transformed) {
@@ -955,6 +1006,7 @@ test "logExists - empty body string treated as not present (spec)" {
             .resource_logs = &resource_logs,
             .scope_logs = &scope_logs,
             .allocator = allocator,
+            .bytes_as_hex = true,
         };
         const got = logExists(&ctx, .{ .log_field = .LOG_FIELD_BODY });
         try std.testing.expectEqual(@as(bool, case[1]), got);
