@@ -478,6 +478,13 @@ fn processJsonLogs(
     // Parse JSON into LogsData protobuf struct. OTLP/JSON encodes bytes fields
     // (traceId/spanId/…) as lowercase hex; protobuf 5.0.0's decoder reads this
     // thread-local rather than a threaded option.
+    //
+    // note: this toggle is GLOBAL to all `bytes` fields, but OTLP/JSON only
+    // hex-encodes the identifier fields — a generic `AnyValue.bytesValue`
+    // attribute is base64, and the hex decoder rejects it (non-hex chars ->
+    // UnexpectedToken), failing the whole payload. Proper fix is per-field hex
+    // in the proto library (mark only trace_id/span_id hex); until then, logs
+    // carrying bytes-valued attributes won't decode here.
     const prev_hex = proto.protobuf.json.tl_bytes_as_hex;
     proto.protobuf.json.tl_bytes_as_hex = true;
     defer proto.protobuf.json.tl_bytes_as_hex = prev_hex;
