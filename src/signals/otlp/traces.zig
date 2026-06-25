@@ -176,6 +176,10 @@ pub const OtlpSpanContext = struct {
     resource_spans: *ResourceSpans,
     scope_spans: *ScopeSpans,
     allocator: std.mem.Allocator,
+    /// True when identifier fields (trace_id/span_id) are stored as lowercase
+    /// hex strings (the OTLP/JSON path); false when they are raw bytes (the
+    /// protobuf path). Controls how `typed_value` decodes them for the sampler.
+    bytes_as_hex: bool,
 };
 
 const getAnyValueString = otlp_attr.getStringValue;
@@ -273,12 +277,52 @@ pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
         .link_trace_id => blk: {
             // Check if span has any links - return first linked trace_id as hex
             if (span_ctx.span.links.items.len == 0) break :blk null;
+            const link_id = span_ctx.span.links.items[0].trace_id;
+            // JSON path already holds hex; protobuf path holds raw bytes.
+            if (span_ctx.bytes_as_hex) break :blk if (link_id.len > 0) link_id else null;
             const S = struct {
                 threadlocal var buf: [32]u8 = undefined;
             };
-            break :blk traceIdToHex(span_ctx.span.links.items[0].trace_id, &S.buf);
+            break :blk traceIdToHex(link_id, &S.buf);
         },
     };
+}
+
+/// Typed-value accessor for the OTLP trace context. The policy engine prefers
+/// this over `traceValue` for typed matchers and probabilistic sampling. The
+/// only fields that must read as non-string are the identifier bytes
+/// (trace_id/span_id/parent_span_id) — everything else falls back to the
+/// string view wrapped as `TypedValue.string`.
+pub fn traceTypedValue(ctx: *const anyopaque, field: TraceFieldRef) ?policy.TypedValue {
+    const span_ctx: *const OtlpSpanContext = @ptrCast(@alignCast(ctx));
+    return switch (field) {
+        .trace_field => |tf| switch (tf) {
+            .TRACE_FIELD_TRACE_ID => idTyped(span_ctx, span_ctx.span.trace_id),
+            .TRACE_FIELD_SPAN_ID => idTyped(span_ctx, span_ctx.span.span_id),
+            .TRACE_FIELD_PARENT_SPAN_ID => idTyped(span_ctx, span_ctx.span.parent_span_id),
+            else => otlp_attr.typedStr(traceValue(ctx, field)),
+        },
+        .span_attribute => |attr_path| otlp_attr.findNestedAttributeTyped(span_ctx.span.attributes.items, attr_path.path.items),
+        .resource_attribute => |attr_path| if (span_ctx.resource_spans.resource) |res|
+            otlp_attr.findNestedAttributeTyped(res.attributes.items, attr_path.path.items)
+        else
+            null,
+        .scope_attribute => |attr_path| if (span_ctx.scope_spans.scope) |scope|
+            otlp_attr.findNestedAttributeTyped(scope.attributes.items, attr_path.path.items)
+        else
+            null,
+        else => otlp_attr.typedStr(traceValue(ctx, field)),
+    };
+}
+
+/// Decode an identifier field to raw bytes for the sampler: hex-decode on the
+/// JSON path, pass raw bytes through on the protobuf path.
+fn idTyped(span_ctx: *const OtlpSpanContext, id: []const u8) ?policy.TypedValue {
+    if (id.len == 0) return null;
+    return if (span_ctx.bytes_as_hex)
+        otlp_attr.typedHexBytes(span_ctx.allocator, id)
+    else
+        otlp_attr.typedBytes(id);
 }
 
 /// Field setter for OTLP trace format. The engine only writes
@@ -307,6 +351,7 @@ pub fn traceSet(ctx: *anyopaque, field: TraceFieldRef, value: []const u8) void {
 /// TraceAccessor template wiring the OTLP trace primitives.
 pub const trace_accessor: policy.TraceAccessor = .{
     .value = traceValue,
+    .typed_value = traceTypedValue,
     .set = traceSet,
 };
 
@@ -375,6 +420,7 @@ fn filterSpansInPlace(
     traces_data: *TracesData,
     registry: *const PolicyRegistry,
     bus: *EventBus,
+    bytes_as_hex: bool,
 ) FilterCounts {
     const engine = PolicyEngine.init(bus, @constCast(registry));
 
@@ -400,6 +446,7 @@ fn filterSpansInPlace(
                     .resource_spans = resource_spans,
                     .scope_spans = scope_spans,
                     .allocator = allocator,
+                    .bytes_as_hex = bytes_as_hex,
                 };
 
                 const result = engine.evaluate(.trace, &trace_accessor, &ctx, &policy_id_buf, .{ .io = bus.io });
@@ -458,20 +505,26 @@ fn processJsonTraces(
     bus: *EventBus,
     data: []const u8,
 ) !ProcessResult {
-    // Parse JSON into TracesData protobuf struct.
-    // NOTE: bytes-as-hex is temporarily disabled; bytes fields use base64.
+    // Parse JSON into TracesData protobuf struct. OTLP/JSON encodes bytes
+    // fields (traceId/spanId/…) as lowercase hex; protobuf 5.0.0's decoder
+    // reads this thread-local rather than a threaded option.
+    const prev_hex = proto.protobuf.json.tl_bytes_as_hex;
+    proto.protobuf.json.tl_bytes_as_hex = true;
+    defer proto.protobuf.json.tl_bytes_as_hex = prev_hex;
+
     var parsed = try TracesData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
     }, allocator);
     defer parsed.deinit();
 
-    // Filter spans in-place (allocator used for tracestate updates)
-    const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus);
+    // Filter spans in-place (allocator used for tracestate updates). Identifier
+    // fields are hex strings on the JSON path.
+    const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus, true);
 
     // Re-serialize to JSON
     const output = try parsed.value.jsonEncode(.{}, .{
         .emit_oneof_field_name = false,
-        .bytes_as_hex = false,
+        .bytes_as_hex = true,
     }, allocator);
 
     return .{
@@ -522,8 +575,9 @@ fn processProtobufTraces(
     // Decode protobuf into TracesData struct using arena
     var traces_data = try TracesData.decode(&reader, arena_alloc);
 
-    // Filter spans in-place (arena_alloc used for tracestate updates)
-    const counts = filterSpansInPlace(arena_alloc, &traces_data, registry, bus);
+    // Filter spans in-place (arena_alloc used for tracestate updates).
+    // Protobuf identifier fields are raw bytes.
+    const counts = filterSpansInPlace(arena_alloc, &traces_data, registry, bus, false);
 
     // Re-serialize to protobuf - use main allocator for output since we return it
     var output_writer = std.Io.Writer.Allocating.init(allocator);
