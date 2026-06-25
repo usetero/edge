@@ -449,6 +449,23 @@ fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
     return .{ .path = .{ .items = items, .capacity = items.len } };
 }
 
+/// Test helper: wrap `inner` JSON into a `{"message":"<escaped inner>"}` log,
+/// mirroring GCP/Cloud Run forwarders. Lets fixtures keep the inner document
+/// on short, readable lines — newlines (JSON whitespace between tokens) are
+/// dropped and quotes escaped at comptime.
+fn wrap(comptime inner: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "{\"message\":\"";
+        for (inner) |c| out = out ++ switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "",
+            else => &[_]u8{c},
+        };
+        return out ++ "\"}";
+    }
+}
+
 test "datadogFieldAccessor - extra field lookup" {
     // Unit test to verify the field accessor can retrieve extra fields
     const allocator = std.testing.allocator;
@@ -492,9 +509,13 @@ test "datadogFieldAccessor - unwraps JSON-stringified message for body and attri
     // body lives at data.jsonPayload.message, event_type at data.jsonPayload.event_type.
     // Includes a multi-element string array (`modules`) to exercise the
     // dotted-key collision path (arrays don't extend the path).
-    const json =
-        \\{"ddsource":"gcp","message":"{\"data\":{\"jsonPayload\":{\"event_type\":\"EvidenceSkipped\",\"modules\":[\"a\",\"b\"],\"message\":\"evidence skipped\"}}}"}
-    ;
+    const json = comptime wrap(
+        \\{"data":{"jsonPayload":{
+        \\"event_type":"EvidenceSkipped",
+        \\"modules":["a","b"],
+        \\"message":"evidence skipped"
+        \\}}}
+    );
 
     const doc = try parser.parseFromSlice(allocator, json);
     var log = try DatadogLog.parse(allocator, doc.asValue());
@@ -1343,12 +1364,15 @@ test "processLogs - drops wrapped GCP log via body + nested event_type exact mat
     try registry.updatePolicies(&.{drop_policy}, "test", .file);
 
     // One wrapped log that should match (drop), one that should not (kept).
-    const logs =
-        \\[
-        \\  {"ddsource":"gcp","message":"{\"data\":{\"jsonPayload\":{\"event_type\":\"EvidenceSkipped\",\"message\":\"evidence skipped\"}}}"},
-        \\  {"ddsource":"gcp","message":"{\"data\":{\"jsonPayload\":{\"event_type\":\"Started\",\"message\":\"loop started\"}}}"}
-        \\]
-    ;
+    const logs = "[" ++ comptime wrap(
+        \\{"data":{"jsonPayload":{
+        \\"event_type":"EvidenceSkipped","message":"evidence skipped"
+        \\}}}
+    ) ++ "," ++ wrap(
+        \\{"data":{"jsonPayload":{
+        \\"event_type":"Started","message":"loop started"
+        \\}}}
+    ) ++ "]";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1415,9 +1439,13 @@ test "processLogs - rewrites fields inside a JSON-wrapped message and re-seriali
 
     try registry.updatePolicies(&.{test_policy}, "test", .file);
 
-    const logs =
-        \\[{"ddsource":"gcp","message":"{\"data\":{\"jsonPayload\":{\"account_name\":\"Vivid Seats\",\"event_type\":\"EvidenceSkipped\",\"message\":\"evidence skipped\"}}}"}]
-    ;
+    const logs = "[" ++ comptime wrap(
+        \\{"data":{"jsonPayload":{
+        \\"account_name":"Vivid Seats",
+        \\"event_type":"EvidenceSkipped",
+        \\"message":"evidence skipped"
+        \\}}}
+    ) ++ "]";
 
     var in_reader = std.Io.Reader.fixed(logs);
     var out_writer: std.Io.Writer.Allocating = .init(allocator);

@@ -30,7 +30,6 @@ pub const DatadogLog = struct {
     /// subsequent lookup. Values are copied out, so the transient parser owns
     /// nothing that outlives it.
     message_flat: std.StringHashMapUnmanaged([]const u8) = .empty,
-    message_body: ?[]const u8 = null,
     message_unwrapped: bool = false,
 
     /// Mutable, re-serializable view of a JSON-wrapped `message`, built lazily
@@ -61,7 +60,6 @@ pub const DatadogLog = struct {
             allocator.free(entry.value_ptr.*);
         }
         self.message_flat.deinit(allocator);
-        if (self.message_body) |body| allocator.free(body);
         if (self.message_tree) |*tree| tree.deinit();
         if (self.message_rewrapped) |s| allocator.free(s);
         self.* = undefined;
@@ -216,10 +214,14 @@ pub const DatadogLog = struct {
         return null;
     }
 
-    /// Body/attribute lookups fall back to these keys when treating the
-    /// `message` field as a wrapped log: the inner body is conventionally
-    /// `message`, `msg`, or `log`.
-    const message_keys = [_][]const u8{ "message", "msg", "log" };
+    /// When the outer `message`/`msg`/`log` field is itself a JSON document,
+    /// the real log body lives under `data.jsonPayload` at one of these keys
+    /// (GCP/Cloud Run -> Datadog shape).
+    const inner_body_paths = [_][]const u8{
+        "data.jsonPayload.message",
+        "data.jsonPayload.body",
+        "data.jsonPayload.log",
+    };
 
     /// Return the raw (still-stringified) wrapped log, looking at `message`
     /// first, then `msg`/`log` extras.
@@ -235,10 +237,10 @@ pub const DatadogLog = struct {
     }
 
     /// Lazily unwrap the wrapped `message`/`msg`/`log` field once: parse it
-    /// with zimdjson, flatten its string leaves into `message_flat` (dotted
-    /// keys), and record the depth-first body candidate. No-op when the field
-    /// is absent or not a JSON object. Values are copied into `allocator`, so
-    /// the transient parser is freed immediately.
+    /// with zimdjson and flatten its string leaves into `message_flat` (dotted
+    /// keys), so both body and attribute lookups become map hits. No-op when
+    /// the field is absent or not a JSON object. Values are copied into
+    /// `allocator`, so the transient parser is freed immediately.
     fn ensureUnwrapped(self: *DatadogLog, allocator: std.mem.Allocator) void {
         if (self.message_unwrapped) return;
         self.message_unwrapped = true;
@@ -253,27 +255,25 @@ pub const DatadogLog = struct {
         defer parser.deinit(allocator);
         const doc = parser.parseFromSlice(allocator, raw) catch return;
 
-        var prefix: std.ArrayListUnmanaged(u8) = .empty;
+        var prefix: std.ArrayList(u8) = .empty;
         defer prefix.deinit(allocator);
-        // Best-effort: a malformed/oversized sub-tree just yields fewer leaves.
-        self.flattenValue(allocator, &prefix, doc.asValue().asAny() catch return) catch {};
+        // Best-effort: an OOM mid-flatten just yields fewer leaves (fail-open
+        // matching), consistent with the rest of this accessor.
+        self.flattenValue(allocator, &prefix, doc.asValue().asAny() catch return) catch return;
     }
 
     /// Recursively flatten a parsed value, recording every string leaf under
-    /// its dotted path and the first body-like leaf encountered (pre-order DFS).
+    /// its dotted path (pre-order; first leaf wins on a key collision).
     fn flattenValue(
         self: *DatadogLog,
         allocator: std.mem.Allocator,
-        prefix: *std.ArrayListUnmanaged(u8),
+        prefix: *std.ArrayList(u8),
         any: AnyValue,
     ) !void {
         switch (any) {
             .string => |v| {
                 const s = v.get() catch return;
                 if (prefix.items.len == 0) return;
-                if (self.message_body == null and isMessageKey(lastSegment(prefix.items))) {
-                    self.message_body = try allocator.dupe(u8, s);
-                }
                 // First leaf wins on a dotted-key collision (e.g. sibling
                 // string array elements, which don't extend the path).
                 if (self.message_flat.contains(prefix.items)) return;
@@ -308,27 +308,20 @@ pub const DatadogLog = struct {
         }
     }
 
-    fn lastSegment(path: []const u8) []const u8 {
-        if (std.mem.lastIndexOfScalar(u8, path, '.')) |i| return path[i + 1 ..];
-        return path;
-    }
-
-    fn isMessageKey(key: []const u8) bool {
-        for (message_keys) |k| {
-            if (std.mem.eql(u8, key, k)) return true;
-        }
-        return false;
-    }
-
-    /// Body value for matching. Optimistically unwraps a JSON-wrapped message
-    /// and returns the nested `message`/`msg`/`log` found via depth-first
-    /// search; otherwise returns the raw message verbatim.
-    /// ponytail: optimistic unwrap — a JSON message is assumed to carry its
-    /// body in a nested message field; raw-JSON body matches are not supported.
+    /// Body value for matching. When the message is a JSON-wrapped log, the
+    /// real body lives at `data.jsonPayload.{message|body|log}`; return that.
+    /// Otherwise return the raw message verbatim.
+    /// ponytail: targets the GCP/Cloud Run `data.jsonPayload` shape only; other
+    /// wrappers fall through to the raw message.
     pub fn bodyForMatch(self: *DatadogLog, allocator: std.mem.Allocator) ?[]const u8 {
         const raw = self.message orelse return null;
         self.ensureUnwrapped(allocator);
-        return self.message_body orelse raw;
+        if (self.message_flat.count() != 0) {
+            for (inner_body_paths) |path| {
+                if (self.message_flat.get(path)) |body| return body;
+            }
+        }
+        return raw;
     }
 
     /// Attribute fallback: look up `path` (joined with '.') inside the
