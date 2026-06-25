@@ -7,9 +7,11 @@
 const std = @import("std");
 const proto = @import("proto");
 const zimdjson = @import("zimdjson");
+const policy = @import("policy_zig");
 
 pub const AnyValue = proto.common.AnyValue;
 pub const KeyValue = proto.common.KeyValue;
+pub const TypedValue = policy.TypedValue;
 
 // =============================================================================
 // Read helpers
@@ -55,6 +57,69 @@ pub fn findNestedAttribute(attributes: []const KeyValue, path: []const []const u
                 },
                 else => return null,
             }
+        }
+    }
+    return null;
+}
+
+// =============================================================================
+// Typed read helpers (equals/gt/gte/lt/lte matchers + probabilistic sampling)
+// =============================================================================
+//
+// The policy engine prefers `accessor.typed_value` so non-string fields match
+// by type, and so the sampler gets identifier bytes (trace_id/span_id) as raw
+// `TypedValue.bytes` rather than their string form. See policy_zig's
+// probabilistic_sampler: it reads the last 7 bytes of a 16-byte trace_id, so a
+// hex-string trace_id MUST be decoded to bytes first or sampling is wrong.
+
+/// Wrap a non-empty string as a TypedValue, or null when empty/absent.
+pub fn typedStr(s: ?[]const u8) ?TypedValue {
+    const v = s orelse return null;
+    return if (v.len == 0) null else TypedValue{ .string = v };
+}
+
+/// Decode a lowercase-hex identifier (trace_id/span_id from OTLP/JSON) to raw
+/// bytes in `allocator`. Returns null for empty/odd-length/non-hex input.
+pub fn typedHexBytes(allocator: std.mem.Allocator, hex_str: []const u8) ?TypedValue {
+    if (hex_str.len == 0 or hex_str.len % 2 != 0) return null;
+    const out = allocator.alloc(u8, hex_str.len / 2) catch return null;
+    _ = std.fmt.hexToBytes(out, hex_str) catch return null;
+    return .{ .bytes = out };
+}
+
+/// Wrap raw identifier bytes (16/8-byte trace_id/span_id from protobuf) as
+/// `TypedValue.bytes`, or null when empty.
+pub fn typedBytes(b: []const u8) ?TypedValue {
+    return if (b.len == 0) null else TypedValue{ .bytes = b };
+}
+
+/// Typed view of an AnyValue: maps each scalar OTLP variant to its TypedValue.
+/// array/kvlist (and absent) read as null — a non-match, fail-open.
+pub fn anyValueTyped(value: ?AnyValue) ?TypedValue {
+    const v = value orelse return null;
+    const inner = v.value orelse return null;
+    return switch (inner) {
+        .string_value => |s| TypedValue{ .string = s },
+        .bool_value => |b| TypedValue{ .bool = b },
+        .int_value => |i| TypedValue{ .int = i },
+        .double_value => |d| TypedValue{ .double = d },
+        .bytes_value => |b| TypedValue{ .bytes = b },
+        else => null,
+    };
+}
+
+/// Typed counterpart to `findNestedAttribute`: walks `path` into nested kvlists
+/// and returns the leaf's typed value.
+pub fn findNestedAttributeTyped(attributes: []const KeyValue, path: []const []const u8) ?TypedValue {
+    if (path.len == 0) return null;
+    for (attributes) |kv| {
+        if (!std.mem.eql(u8, kv.key, path[0])) continue;
+        if (path.len == 1) return anyValueTyped(kv.value);
+        const val = kv.value orelse return null;
+        const inner = val.value orelse return null;
+        switch (inner) {
+            .kvlist_value => |kvlist| return findNestedAttributeTyped(kvlist.values.items, path[1..]),
+            else => return null,
         }
     }
     return null;
