@@ -127,7 +127,11 @@ fn lookupLogAttribute(log: *DatadogLog, allocator: std.mem.Allocator, path: []co
     }
 
     // Check extra fields (supports nested dotted-key paths)
-    return log.findExtraString(allocator, path);
+    if (log.findExtraString(allocator, path)) |found| return found;
+
+    // Fallback: the real payload may be a JSON document stringified inside the
+    // `message`/`msg`/`log` field. Lazily unwrap it and walk the path within.
+    return log.unwrappedAttribute(allocator, path);
 }
 
 /// Field accessor for Datadog JSON log format.
@@ -140,7 +144,7 @@ pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
 
     return switch (field) {
         .log_field => |lf| switch (lf) {
-            .LOG_FIELD_BODY => log.message,
+            .LOG_FIELD_BODY => log.bodyForMatch(field_ctx.allocator),
             .LOG_FIELD_SEVERITY_TEXT => log.status orelse log.level,
             // Datadog JSON format doesn't have direct equivalents for these OTLP fields
             else => null,
@@ -185,12 +189,22 @@ pub fn logSet(ctx: *anyopaque, field: FieldRef, value: []const u8) void {
     const log = field_ctx.log;
     switch (field) {
         .log_field => |lf| switch (lf) {
-            .LOG_FIELD_BODY => log.message = value,
+            .LOG_FIELD_BODY => {
+                // Replacing the whole body discards any pending wrapper rewrite.
+                log.message = value;
+                log.clearWrappedRewrite(field_ctx.allocator);
+            },
             .LOG_FIELD_SEVERITY_TEXT => log.status = value,
             else => {},
         },
         .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
-            if (writableFieldRef(log, attr_path.path.items)) |ref| ref.* = value;
+            if (writableFieldRef(log, attr_path.path.items)) |ref| {
+                ref.* = value;
+            } else {
+                // Fall back to editing an existing field inside a JSON-wrapped
+                // message (re-serialized on output).
+                _ = log.setWrapped(field_ctx.allocator, attr_path.path.items, value);
+            }
         },
     }
 }
@@ -205,6 +219,7 @@ pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
             .LOG_FIELD_BODY => blk: {
                 if (log.message == null) break :blk false;
                 log.message = null;
+                log.clearWrappedRewrite(field_ctx.allocator);
                 break :blk true;
             },
             .LOG_FIELD_SEVERITY_TEXT => blk: {
@@ -222,10 +237,13 @@ pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
             else => false,
         },
         .log_attribute, .resource_attribute, .scope_attribute => |attr_path| blk: {
-            const ref = writableFieldRef(log, attr_path.path.items) orelse break :blk false;
-            if (ref.* == null) break :blk false;
-            ref.* = null;
-            break :blk true;
+            if (writableFieldRef(log, attr_path.path.items)) |ref| {
+                if (ref.* == null) break :blk false;
+                ref.* = null;
+                break :blk true;
+            }
+            // Fall back to removing an existing field inside a JSON-wrapped message.
+            break :blk log.deleteWrapped(field_ctx.allocator, attr_path.path.items);
         },
     };
 }
@@ -261,6 +279,8 @@ fn filterLog(
         policy_id_buf,
         .{ .scratch = allocator, .io = engine.bus.io },
     );
+    // Re-serialize the wrapped message once if a transform edited inside it.
+    log.finalizeWrapped(allocator);
     return .{
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
@@ -460,6 +480,66 @@ test "datadogFieldAccessor - extra field lookup" {
     const trace_val = logValue(&field_ctx, .{ .log_attribute = testAttrPath("trace_id") });
     try std.testing.expect(trace_val != null);
     try std.testing.expectEqualStrings("abc123-def456", trace_val.?);
+}
+
+test "datadogFieldAccessor - unwraps JSON-stringified message for body and attributes" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    // `message` is itself a stringified JSON document (GCP/Cloud Run shape):
+    // body lives at data.jsonPayload.message, event_type at data.jsonPayload.event_type.
+    // Includes a multi-element string array (`modules`) to exercise the
+    // dotted-key collision path (arrays don't extend the path).
+    const json =
+        \\{"ddsource":"gcp","message":"{\"data\":{\"jsonPayload\":{\"event_type\":\"EvidenceSkipped\",\"modules\":[\"a\",\"b\"],\"message\":\"evidence skipped\"}}}"}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
+
+    // Body DFS finds the nested "message" rather than the raw wrapped JSON.
+    const body = logValue(&field_ctx, .{ .log_field = .LOG_FIELD_BODY });
+    try std.testing.expect(body != null);
+    try std.testing.expectEqualStrings("evidence skipped", body.?);
+
+    // Attribute fallback walks the path inside the unwrapped message.
+    const event_type_path: proto.policy.AttributePath = .{
+        .path = .{ .items = @constCast(&[_][]const u8{ "data", "jsonPayload", "event_type" }), .capacity = 3 },
+    };
+    const event_type = logValue(&field_ctx, .{ .log_attribute = event_type_path });
+    try std.testing.expect(event_type != null);
+    try std.testing.expectEqualStrings("EvidenceSkipped", event_type.?);
+
+    // A path absent from the unwrapped message still returns null.
+    const missing_path: proto.policy.AttributePath = .{
+        .path = .{ .items = @constCast(&[_][]const u8{ "data", "jsonPayload", "nope" }), .capacity = 3 },
+    };
+    try std.testing.expect(logValue(&field_ctx, .{ .log_attribute = missing_path }) == null);
+}
+
+test "datadogFieldAccessor - plain-text message body is returned verbatim" {
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"just a plain log line"}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
+    const body = logValue(&field_ctx, .{ .log_field = .LOG_FIELD_BODY });
+    try std.testing.expect(body != null);
+    try std.testing.expectEqualStrings("just a plain log line", body.?);
 }
 
 test "datadogFieldAccessor - resource_attribute searches log attributes" {
@@ -1229,6 +1309,145 @@ test "processLogs - filter on dynamic extra field not in schema" {
     // Logs with other trace_id or no trace_id should remain
     try std.testing.expect(std.mem.indexOf(u8, result.data, "second-log-nomatch") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.data, "third-log-notrace") != null);
+}
+
+test "processLogs - drops wrapped GCP log via body + nested event_type exact match" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // The production EvidenceSkipped policy: body exact AND nested attribute exact.
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "evidence-skipped"),
+        .name = try allocator.dupe(u8, "evidence-skipped"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .exact = try allocator.dupe(u8, "evidence skipped") },
+    });
+    var event_type_path: proto.policy.AttributePath = .{};
+    try event_type_path.path.append(allocator, try allocator.dupe(u8, "data"));
+    try event_type_path.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
+    try event_type_path.path.append(allocator, try allocator.dupe(u8, "event_type"));
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = event_type_path },
+        .match = .{ .exact = try allocator.dupe(u8, "EvidenceSkipped") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test", .file);
+
+    // One wrapped log that should match (drop), one that should not (kept).
+    const logs =
+        \\[
+        \\  {"ddsource":"gcp","message":"{\"data\":{\"jsonPayload\":{\"event_type\":\"EvidenceSkipped\",\"message\":\"evidence skipped\"}}}"},
+        \\  {"ddsource":"gcp","message":"{\"data\":{\"jsonPayload\":{\"event_type\":\"Started\",\"message\":\"loop started\"}}}"}
+        \\]
+    ;
+
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "evidence skipped") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "loop started") != null);
+}
+
+test "processLogs - rewrites fields inside a JSON-wrapped message and re-serializes" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // keep=all + transform: remove data.jsonPayload.event_type, redact
+    // data.jsonPayload.account_name. Matches on the unwrapped body.
+    var transform: proto.policy.LogTransform = .{};
+    var remove_path: proto.policy.AttributePath = .{};
+    try remove_path.path.append(allocator, try allocator.dupe(u8, "data"));
+    try remove_path.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
+    try remove_path.path.append(allocator, try allocator.dupe(u8, "event_type"));
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = remove_path } });
+
+    var redact_path: proto.policy.AttributePath = .{};
+    try redact_path.path.append(allocator, try allocator.dupe(u8, "data"));
+    try redact_path.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
+    try redact_path.path.append(allocator, try allocator.dupe(u8, "account_name"));
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = redact_path },
+        .replacement = try allocator.dupe(u8, "REDACTED"),
+    });
+
+    var test_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "rewrite-wrapped"),
+        .name = try allocator.dupe(u8, "rewrite-wrapped"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all"), .transform = transform } },
+    };
+    try test_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .exact = try allocator.dupe(u8, "evidence skipped") },
+    });
+    defer test_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{test_policy}, "test", .file);
+
+    const logs =
+        \\[{"ddsource":"gcp","message":"{\"data\":{\"jsonPayload\":{\"account_name\":\"Vivid Seats\",\"event_type\":\"EvidenceSkipped\",\"message\":\"evidence skipped\"}}}"}]
+    ;
+
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expect(result.was_transformed);
+    // event_type removed from the wrapped payload, account_name redacted.
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "EvidenceSkipped") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "event_type") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "Vivid Seats") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "REDACTED") != null);
+    // The wrapper is still a stringified JSON object and body is intact.
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "evidence skipped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "jsonPayload") != null);
 }
 
 test "processLogs - filter on nested extra field with exists" {

@@ -41,6 +41,9 @@ pub const distro = @import("runtime/distro.zig");
 // Prometheus signal codecs
 pub const prometheus = @import("signals/prometheus/root.zig");
 
+// Datadog log search/filter (exposed for benchmarking)
+pub const signals_datadog_logs = @import("signals/datadog/logs.zig");
+
 // =============================================================================
 // Distribution entry points
 // =============================================================================
