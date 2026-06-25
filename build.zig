@@ -29,6 +29,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zbench_dep = b.dependency("zbench", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const policy_dep = b.dependency("policy_zig", .{
         .target = target,
         .optimize = optimize,
@@ -192,6 +196,32 @@ pub fn build(b: *std.Build) void {
 
     const echo_step = b.step("echo-server", "Build the echo server for benchmarking");
     echo_step.dependOn(&b.addInstallArtifact(echo_server, .{}).step);
+
+    // Datadog log search/filter microbenchmark (zbench).
+    const datadog_log_bench = b.addExecutable(.{
+        .name = "datadog-log-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/datadog_log_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "edge", .module = mod },
+                .{ .name = "zbench", .module = zbench_dep.module("zbench") },
+                .{ .name = "proto", .module = proto_mod },
+                .{ .name = "o11y", .module = o11y_mod },
+            },
+        }),
+    });
+    datadog_log_bench.root_module.addAnonymousImport("datadog_wrapped_log", .{
+        .root_source_file = b.path("bench/datadog/payloads/wrapped_log.json"),
+    });
+    datadog_log_bench.root_module.link_libc = true;
+    datadog_log_bench.root_module.linkSystemLibrary("z", .{});
+    datadog_log_bench.root_module.linkSystemLibrary("zstd", .{});
+
+    const datadog_log_bench_step = b.step("datadog-log-bench", "Run the Datadog log search benchmark");
+    const run_datadog_log_bench = b.addRunArtifact(datadog_log_bench);
+    datadog_log_bench_step.dependOn(&run_datadog_log_bench.step);
 
     const run_echo_step = b.step("run-echo-server", "Run the echo server");
     const run_echo_cmd = b.addRunArtifact(echo_server);
