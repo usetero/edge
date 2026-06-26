@@ -2,8 +2,19 @@ apiVersion: v1
 entries:
   tero-edge:
   - apiVersion: v2
+    appVersion: 1.25.0
+    created: "2026-06-26T15:16:18.608066704Z"
+    description: A Helm chart for Kubernetes
+    digest: 1d2058b4f146ddaf130bac59c37a0376f7faea71daf79457c3c96e59f9cb197c
+    icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
+    name: tero-edge
+    type: application
+    urls:
+    - https://usetero.github.io/edge/tero-edge-0.10.0.tgz
+    version: 0.10.0
+  - apiVersion: v2
     appVersion: 1.24.0
-    created: "2026-06-25T15:00:47.326516669Z"
+    created: "2026-06-26T15:16:18.615637754Z"
     description: A Helm chart for Kubernetes
     digest: 7f46ffa860c107e08a58e1249ad7fc8f2b79917b14c0ffc673e74d6771b844ab
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -14,7 +25,7 @@ entries:
     version: 0.9.0
   - apiVersion: v2
     appVersion: 1.23.0
-    created: "2026-06-25T15:00:47.325913218Z"
+    created: "2026-06-26T15:16:18.615123126Z"
     description: A Helm chart for Kubernetes
     digest: c066ecbca960652f5e4902061445aca749014d84efb670659d8f65be1299d245
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -25,7 +36,7 @@ entries:
     version: 0.8.0
   - apiVersion: v2
     appVersion: 1.22.0
-    created: "2026-06-25T15:00:47.325404243Z"
+    created: "2026-06-26T15:16:18.614515545Z"
     description: A Helm chart for Kubernetes
     digest: 72edaa1cd9fb3593620dd602a00234509144fab986b7f1f73e5c5485fbb0996d
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -36,7 +47,7 @@ entries:
     version: 0.7.0
   - apiVersion: v2
     appVersion: 1.21.0
-    created: "2026-06-25T15:00:47.324817092Z"
+    created: "2026-06-26T15:16:18.613969207Z"
     description: A Helm chart for Kubernetes
     digest: 0a58509a3f62740fa206d940c2a9a1e888baa28f88ecba94497ffcb4a094b4f0
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -47,7 +58,7 @@ entries:
     version: 0.6.0
   - apiVersion: v2
     appVersion: 1.20.1
-    created: "2026-06-25T15:00:47.324327785Z"
+    created: "2026-06-26T15:16:18.613434933Z"
     description: A Helm chart for Kubernetes
     digest: bff8611a39d282c8aca727f9ec0bc62ff0870a8d83522ead97ca36f4e528124c
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -58,7 +69,7 @@ entries:
     version: 0.5.1
   - apiVersion: v2
     appVersion: 1.20.0
-    created: "2026-06-25T15:00:47.323817878Z"
+    created: "2026-06-26T15:16:18.612945742Z"
     description: A Helm chart for Kubernetes
     digest: 953c3d75592f0f459e1c50b5132e4b8f860d779651d1ba2366d1e26dde1be1d4
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -69,7 +80,7 @@ entries:
     version: 0.5.0
   - apiVersion: v2
     appVersion: 1.19.0
-    created: "2026-06-25T15:00:47.32333336Z"
+    created: "2026-06-26T15:16:18.612423139Z"
     description: A Helm chart for Kubernetes
     digest: 7a879e7cc2eee9076e7e1e3dae510ccb588992c832ee4de90d6f4a8c7717258f
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -80,7 +91,7 @@ entries:
     version: 0.4.0
   - apiVersion: v2
     appVersion: 1.18.3
-    created: "2026-06-25T15:00:47.322801432Z"
+    created: "2026-06-26T15:16:18.611923168Z"
     description: A Helm chart for Kubernetes
     digest: f0cd26d59cc3270573cd897d573405970e9a9dfa9d0e8f596eb2904abc97963d
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -91,7 +102,7 @@ entries:
     version: 0.3.3
   - apiVersion: v2
     appVersion: 1.18.2
-    created: "2026-06-25T15:00:47.321757991Z"
+    created: "2026-06-26T15:16:18.611407608Z"
     description: A Helm chart for Kubernetes
     digest: e9993e30886be8f4a4137db72693b57251fbe21ddee300ce8082f08d2ce1048a
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -102,7 +113,7 @@ entries:
     version: 0.3.2
   - apiVersion: v2
     appVersion: 1.18.1
-    created: "2026-06-25T15:00:47.320485735Z"
+    created: "2026-06-26T15:16:18.610871971Z"
     description: A Helm chart for Kubernetes
     digest: 8625e89d52d0004d87f13e09cd115f00385e61b1719ccfa8e46f6905cd8bd999
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -113,7 +124,7 @@ entries:
     version: 0.3.1
   - apiVersion: v2
     appVersion: 1.18.0
-    created: "2026-06-25T15:00:47.31993923Z"
+    created: "2026-06-26T15:16:18.609457654Z"
     description: A Helm chart for Kubernetes
     digest: 9fe058fd87ebfbb362f606dcb2b5295f895d0de1b28d1de9d70d434d361fc44b
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -124,7 +135,7 @@ entries:
     version: 0.3.0
   - apiVersion: v2
     appVersion: 1.17.0
-    created: "2026-06-25T15:00:47.319452618Z"
+    created: "2026-06-26T15:16:18.608626998Z"
     description: A Helm chart for Kubernetes
     digest: 6edc7c0a80ceeba9615feb3cf71adff6801469b15f33a6929a0ff4c996202e3e
     icon: https://docs.usetero.com/mintlify-assets/_mintlify/favicons/tero-0926be64/y5F_7SW7tjbC22aW/_generated/favicon/apple-touch-icon.png
@@ -133,4 +144,4 @@ entries:
     urls:
     - https://usetero.github.io/edge/tero-edge-0.2.0.tgz
     version: 0.2.0
-generated: "2026-06-25T15:00:47.318780598Z"
+generated: "2026-06-26T15:16:18.607335152Z"
