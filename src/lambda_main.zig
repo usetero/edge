@@ -91,11 +91,12 @@ pub const LambdaConfig = struct {
         api_key: ?[]const u8 = null,
     } = .{},
 
-    /// zonfig validation hook, run after env/JSON overrides. The limit
-    /// subsystem asserts 0 < max_connections < 65535 (core/limits.zig,
-    /// core/arena_pool.zig); clamp a bad TERO_MAX_CONNECTIONS override into
-    /// range so it degrades instead of aborting the extension at startup.
+    /// zonfig validation hook, run after env/JSON overrides. Clamps env knobs
+    /// into ranges the runtime requires so a bad override degrades instead of
+    /// aborting (or silently wedging) the extension at startup.
     pub fn validate(self: *LambdaConfig) !void {
+        // The limit subsystem asserts 0 < max_connections < 65535
+        // (core/limits.zig, core/arena_pool.zig).
         const clamped = std.math.clamp(self.max_connections, 1, 65534);
         if (clamped != self.max_connections) {
             std.log.warn(
@@ -104,6 +105,19 @@ pub const LambdaConfig = struct {
             );
             self.max_connections = clamped;
         }
+
+        // httpz starts one accept/event-loop thread per worker and one handler
+        // thread per pool slot. A 0 override binds the port but never accepts
+        // (or never handles), so every request hangs until timeout. Treat 0 as
+        // "use httpz default" (null) rather than wedging the data plane.
+        if (self.worker_count) |w| if (w == 0) {
+            std.log.warn("TERO_WORKER_COUNT=0 starts no accept threads; using httpz default", .{});
+            self.worker_count = null;
+        };
+        if (self.thread_pool_count) |t| if (t == 0) {
+            std.log.warn("TERO_THREAD_POOL_COUNT=0 starts no handler threads; using httpz default", .{});
+            self.thread_pool_count = null;
+        };
     }
 };
 
