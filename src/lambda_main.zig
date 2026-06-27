@@ -90,6 +90,21 @@ pub const LambdaConfig = struct {
         poll_interval: u64 = 60,
         api_key: ?[]const u8 = null,
     } = .{},
+
+    /// zonfig validation hook, run after env/JSON overrides. The limit
+    /// subsystem asserts 0 < max_connections < 65535 (core/limits.zig,
+    /// core/arena_pool.zig); clamp a bad TERO_MAX_CONNECTIONS override into
+    /// range so it degrades instead of aborting the extension at startup.
+    pub fn validate(self: *LambdaConfig) !void {
+        const clamped = std.math.clamp(self.max_connections, 1, 65534);
+        if (clamped != self.max_connections) {
+            std.log.warn(
+                "TERO_MAX_CONNECTIONS={d} out of range [1,65534]; clamping to {d}",
+                .{ self.max_connections, clamped },
+            );
+            self.max_connections = clamped;
+        }
+    }
 };
 
 /// Route std.log through our EventBus adapter

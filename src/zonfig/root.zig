@@ -105,6 +105,16 @@ pub fn load(comptime T: type, allocator: std.mem.Allocator, io: std.Io, options:
     // Apply environment variable substitution to all string fields
     try applyEnvSubstitution(T, allocator, config, options.environ);
 
+    // Optional final validation hook. A config struct may declare
+    // `pub fn validate(self: *T) !void` to range-check or clamp fields after
+    // env/JSON overrides land (the override values are untrusted). The hook
+    // gets a mutable pointer so it can clamp in place, or return an error to
+    // reject. Any validate error surfaces as InvalidValue; the hook itself
+    // should std.log specifics (routed through the binary's log adapter).
+    if (@hasDecl(T, "validate")) {
+        config.validate() catch return LoadError.InvalidValue;
+    }
+
     return config;
 }
 
@@ -1436,6 +1446,50 @@ test "internal: buildEnvName" {
     try testing.expectEqualStrings("PORT", buildEnvName("", "port", &buf));
     try testing.expectEqualStrings("MYAPP_PORT", buildEnvName("myapp", "port", &buf));
     try testing.expectEqualStrings("APP_SERVER_HOST", buildEnvName("APP", "server_host", &buf));
+}
+
+// -----------------------------------------------------------------------------
+// load: validate hook
+// -----------------------------------------------------------------------------
+
+test "load: validate hook clamps out-of-range value" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("CONNS", "0");
+
+    const Config = struct {
+        conns: u32 = 256,
+        pub fn validate(self: *@This()) !void {
+            self.conns = std.math.clamp(self.conns, 1, 65534);
+        }
+    };
+
+    const config = try load(Config, testing.allocator, std.Options.debug_io, .{
+        .environ = &env_map,
+        .env_prefix = "",
+    });
+    defer deinit(Config, testing.allocator, config);
+
+    try testing.expectEqual(@as(u32, 1), config.conns);
+}
+
+test "load: validate hook can reject" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+
+    const Config = struct {
+        port: u16 = 0,
+        pub fn validate(self: *@This()) !void {
+            if (self.port == 0) return error.InvalidValue;
+        }
+    };
+
+    try testing.expectError(LoadError.InvalidValue, load(
+        Config,
+        testing.allocator,
+        std.Options.debug_io,
+        .{ .environ = &env_map },
+    ));
 }
 
 // -----------------------------------------------------------------------------
