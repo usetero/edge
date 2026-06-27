@@ -1458,8 +1458,9 @@ test "load: validate hook clamps out-of-range value" {
     try env_map.put("CONNS", "0");
 
     const Config = struct {
+        const Self = @This();
         conns: u32 = 256,
-        pub fn validate(self: *@This()) !void {
+        pub fn validate(self: *Self) !void {
             self.conns = std.math.clamp(self.conns, 1, 65534);
         }
     };
@@ -1478,8 +1479,9 @@ test "load: validate hook can reject" {
     defer env_map.deinit();
 
     const Config = struct {
+        const Self = @This();
         port: u16 = 0,
-        pub fn validate(self: *@This()) !void {
+        pub fn validate(self: *Self) !void {
             if (self.port == 0) return error.InvalidValue;
         }
     };
