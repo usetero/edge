@@ -278,16 +278,18 @@ pub fn main(init: std.process.Init) !void {
         .metrics_url = config.metrics_url,
     });
     defer engine.destroy();
+
+    // Register with the Lambda Extensions API BEFORE starting the proxy thread.
+    // If registration fails (e.g. AWS_LAMBDA_RUNTIME_API unset/unreachable when
+    // run outside Lambda), there is no accept-loop thread to tear down — so we
+    // fail cleanly instead of racing httpz's stop()/destroy (segfault or hang).
+    var extension = try ExtensionClient.init(allocator, io, bus, init.environ_map, "tero-edge");
+    defer extension.deinit();
+    try extension.register();
+
     try engine.start();
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStarted{ .port = config.listen_port });
-
-    // Initialize Lambda Extensions API client
-    var extension = try ExtensionClient.init(allocator, io, bus, init.environ_map, "tero-edge");
-    defer extension.deinit();
-
-    // Register with Lambda Extensions API
-    try extension.register();
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(LambdaExtensionReady{ .port = config.listen_port });
