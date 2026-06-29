@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.25.1](https://github.com/usetero/edge/compare/v1.25.0...v1.25.1) (2026-06-29)
+
+
+### Bug Fixes
+
+* unbreak lambda extension release build ([#207](https://github.com/usetero/edge/issues/207)) ([3de66d5](https://github.com/usetero/edge/commit/3de66d58ae95deb5418e143672889525eaea8e95))
+
 ## [1.25.0](https://github.com/usetero/edge/compare/v1.24.0...v1.25.0) (2026-06-25)
 
 
