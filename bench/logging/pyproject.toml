@@ -3,7 +3,7 @@ name = "edge-tail-logging-tests"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-  "pytest>=8.0.0",
+  "pytest>=9.0.3",
   "tqdm>=4.66.0",
 ]
 
