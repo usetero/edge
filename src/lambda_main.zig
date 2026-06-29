@@ -57,6 +57,20 @@ pub const LambdaConfig = struct {
     // Limits
     max_body_size: u32 = 5 * 1024 * 1024, // 5MB
 
+    /// Post-decompression body ceiling; defaults to `max_body_size` when unset.
+    /// Raise it to admit payloads that decompress larger than the raw cap.
+    max_decoded_bytes: ?u32 = null,
+
+    /// Max concurrent connections; the dominant memory/throughput knob (see
+    /// limits.zig). Also honors the `TERO_MAX_CONNECTIONS` env override.
+    max_connections: u32 = 256,
+
+    /// httpz event-loop worker count (null = httpz default of 1).
+    worker_count: ?u16 = null,
+
+    /// httpz request-handler thread-pool count (null = httpz default of 32).
+    thread_pool_count: ?u16 = null,
+
     // Service metadata
     service: struct {
         name: []const u8 = "tero-edge-lambda",
@@ -76,6 +90,35 @@ pub const LambdaConfig = struct {
         poll_interval: u64 = 60,
         api_key: ?[]const u8 = null,
     } = .{},
+
+    /// zonfig validation hook, run after env/JSON overrides. Clamps env knobs
+    /// into ranges the runtime requires so a bad override degrades instead of
+    /// aborting (or silently wedging) the extension at startup.
+    pub fn validate(self: *LambdaConfig) !void {
+        // The limit subsystem asserts 0 < max_connections < 65535
+        // (core/limits.zig, core/arena_pool.zig).
+        const clamped = std.math.clamp(self.max_connections, 1, 65534);
+        if (clamped != self.max_connections) {
+            std.log.warn(
+                "TERO_MAX_CONNECTIONS={d} out of range [1,65534]; clamping to {d}",
+                .{ self.max_connections, clamped },
+            );
+            self.max_connections = clamped;
+        }
+
+        // httpz starts one accept/event-loop thread per worker and one handler
+        // thread per pool slot. A 0 override binds the port but never accepts
+        // (or never handles), so every request hangs until timeout. Treat 0 as
+        // "use httpz default" (null) rather than wedging the data plane.
+        if (self.worker_count) |w| if (w == 0) {
+            std.log.warn("TERO_WORKER_COUNT=0 starts no accept threads; using httpz default", .{});
+            self.worker_count = null;
+        };
+        if (self.thread_pool_count) |t| if (t == 0) {
+            std.log.warn("TERO_THREAD_POOL_COUNT=0 starts no handler threads; using httpz default", .{});
+            self.thread_pool_count = null;
+        };
+    }
 };
 
 /// Route std.log through our EventBus adapter
@@ -264,16 +307,18 @@ pub fn main(init: std.process.Init) !void {
         .metrics_url = config.metrics_url,
     });
     defer engine.destroy();
+
+    // Register with the Lambda Extensions API BEFORE starting the proxy thread.
+    // If registration fails (e.g. AWS_LAMBDA_RUNTIME_API unset/unreachable when
+    // run outside Lambda), there is no accept-loop thread to tear down — so we
+    // fail cleanly instead of racing httpz's stop()/destroy (segfault or hang).
+    var extension = try ExtensionClient.init(allocator, io, bus, init.environ_map, "tero-edge");
+    defer extension.deinit();
+    try extension.register();
+
     try engine.start();
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStarted{ .port = config.listen_port });
-
-    // Initialize Lambda Extensions API client
-    var extension = try ExtensionClient.init(allocator, io, bus, init.environ_map, "tero-edge");
-    defer extension.deinit();
-
-    // Register with Lambda Extensions API
-    try extension.register();
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(LambdaExtensionReady{ .port = config.listen_port });
