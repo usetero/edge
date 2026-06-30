@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.26.0](https://github.com/usetero/edge/compare/v1.25.1...v1.26.0) (2026-06-30)
+
+
+### Features
+
+* change log level failure and retry on closing ([#211](https://github.com/usetero/edge/issues/211)) ([081a15e](https://github.com/usetero/edge/commit/081a15ecba8179240d1dd77899746034af078dc7))
+
 ## [1.25.1](https://github.com/usetero/edge/compare/v1.25.0...v1.25.1) (2026-06-29)
 
 
