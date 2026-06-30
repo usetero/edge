@@ -224,6 +224,12 @@ tasks:
       - zig build echo-server -Doptimize=ReleaseFast
       - ./zig-out/bin/echo-server {{.PORT | default "9999"}}
 
+  harness:upstream-pool:
+    desc: "Verify upstream pool eviction+retry against the real edge binary"
+    aliases: [pool-harness]
+    cmds:
+      - zig build upstream-pool-harness -Doptimize=ReleaseSafe
+
   benchmark:setup:
     desc: "Install benchmark dependencies (oha, jq)"
     cmds:

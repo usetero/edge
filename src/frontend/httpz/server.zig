@@ -384,18 +384,51 @@ pub const Handler = struct {
     ) !void {
         const ctx = self.ctx;
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
-        var upstream_req = self.openUpstream(req, res.arena, fwd.upstream) catch {
-            res.status = 502;
-            res.body = "";
-            return;
-        };
-        defer upstream_req.deinit();
-
         const body = req.body() orelse "";
-        try sendBufferedBody(&upstream_req, req.method, body, bufs);
-
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(fwd.upstream));
-        try self.relayResponse(res, &upstream_req, max_response, bufs);
+
+        // One retry: a pooled keep-alive the upstream already idle-closed fails on
+        // reuse (send-side BrokenPipe/reset, the half std doesn't auto-evict).
+        // markUpstreamClosing destroys the dead conn so the retry dials fresh.
+        // Safe to replay: httpz buffers the inbound body (re-readable) and the
+        // response isn't flushed until we return, so clearWriter drops any
+        // partial output. note: one retry, not N — the pool holds at most one
+        // stale conn per slot; raise to a loop only if multi-stale churn shows up.
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var upstream_req = self.openUpstream(req, res.arena, fwd.upstream) catch {
+                res.status = 502;
+                res.body = "";
+                return;
+            };
+            defer upstream_req.deinit();
+
+            if (self.forwardRawOnce(&upstream_req, req.method, body, res, max_response, bufs)) {
+                return;
+            } else |err| {
+                markUpstreamClosing(&upstream_req); // evict dead conn, don't re-pool it
+                if (attempt == 0) {
+                    res.clearWriter();
+                    continue;
+                }
+                return err;
+            }
+        }
+    }
+
+    /// One open→send→relay attempt against an already-opened upstream request.
+    /// Split out so execForwardRaw can retry a fresh connection on failure.
+    fn forwardRawOnce(
+        self: *Handler,
+        upstream_req: *std.http.Client.Request,
+        method: httpz.Method,
+        body: []const u8,
+        res: *httpz.Response,
+        max_response_body: usize,
+        bufs: ThreadBufs,
+    ) !void {
+        try sendBufferedBody(upstream_req, method, body, bufs);
+        try self.relayResponse(res, upstream_req, max_response_body, bufs);
     }
 
     fn execPipeStream(
@@ -412,16 +445,57 @@ pub const Handler = struct {
             return self.execForwardRaw(req, res, .{ .upstream = pipe.upstream });
         }
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
-        var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
-            res.status = 502;
-            res.body = "";
-            return;
-        };
-        defer upstream_req.deinit();
+        // httpz already buffered the inbound body; it stays retained for the whole
+        // request, so a retry re-reads the same slice (no copy) and re-runs the
+        // pipeline through the thread-local bufs above (no extra allocation) — the
+        // retry costs CPU, not memory.
+        const raw_body = req.body() orelse "";
+        const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
 
-        // httpz already buffered the request body; the record pipeline runs
-        // over it unchanged (same framer + sink as the stdio frontend).
-        var body_reader = std.Io.Reader.fixed(req.body() orelse "");
+        // One retry on a fresh connection — see execForwardRaw for the rationale.
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
+                res.status = 502;
+                res.body = "";
+                return;
+            };
+            defer upstream_req.deinit();
+
+            if (self.pipeStreamOnce(&upstream_req, raw_body, pipe, res, max_response, bufs)) {
+                return;
+            } else |_| {
+                markUpstreamClosing(&upstream_req); // evict dead conn, don't re-pool it
+                if (attempt == 0) {
+                    res.clearWriter();
+                    continue;
+                }
+                // note: a decode error (bad payload) also lands here and wastes
+                // one re-decode before this final 502 — harmless, and not worth
+                // teasing connection errors apart from pipeline errors for.
+                res.status = 502;
+                res.body = "";
+                res.keepalive = false;
+                return;
+            }
+        }
+    }
+
+    /// One decode→evaluate→re-encode pass streamed chunked to an already-opened
+    /// upstream. Re-runnable: the sink's arena is init/deinit'd here, so each
+    /// attempt has the same footprint (never cumulative). Returns an error on any
+    /// failure so execPipeStream can retry a fresh connection.
+    fn pipeStreamOnce(
+        self: *Handler,
+        upstream_req: *std.http.Client.Request,
+        raw_body: []const u8,
+        pipe: service_mod.PipeStream,
+        res: *httpz.Response,
+        max_response_body: usize,
+        bufs: ThreadBufs,
+    ) !void {
+        const ctx = self.ctx;
+        var body_reader = std.Io.Reader.fixed(raw_body);
 
         // Filtering changes length: always chunked.
         upstream_req.transfer_encoding = .chunked;
@@ -442,15 +516,11 @@ pub const Handler = struct {
             .scratch = bufs.scratch,
             .chunk = bufs.chunk,
         }, &sink) catch |err| {
-            // PLAN §6.5.1: mid-stream decode failure aborts the exchange;
-            // bytes already sent upstream stay sent. 502 + connection close.
+            // Mid-stream failure aborts the exchange; bytes already
+            // sent to a dead conn go nowhere, so the caller can replay on a fresh one.
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             ctx.bus.err(PipelineAborted{ .err = @errorName(err) });
-            if (upstream_req.connection) |conn| conn.closing = true;
-            res.status = 502;
-            res.body = "";
-            res.keepalive = false;
-            return;
+            return err;
         };
         try body_writer.end();
         try upstream_req.connection.?.flush();
@@ -459,8 +529,7 @@ pub const Handler = struct {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
         }
 
-        const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
-        try self.relayResponse(res, &upstream_req, max_response, bufs);
+        try self.relayResponse(res, upstream_req, max_response_body, bufs);
     }
 
     fn execPipeBuffered(
@@ -488,21 +557,51 @@ pub const Handler = struct {
             return;
         }
 
-        var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
-            res.status = 502;
-            res.body = "";
-            return;
-        };
-        defer upstream_req.deinit();
-        upstream_req.transfer_encoding = .{ .content_length = processed.body.len };
+        // processed.body already lives in res.arena, so the retry below re-sends
+        // the same bytes — no recompute, no copy, zero added memory.
+        const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
+
+        // One retry on a fresh connection — see execForwardRaw for the rationale.
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
+                res.status = 502;
+                res.body = "";
+                return;
+            };
+            defer upstream_req.deinit();
+
+            if (self.pipeBufferedOnce(&upstream_req, processed.body, res, max_response, bufs)) {
+                return;
+            } else |err| {
+                markUpstreamClosing(&upstream_req); // evict dead conn, don't re-pool it
+                if (attempt == 0) {
+                    res.clearWriter();
+                    continue;
+                }
+                return err;
+            }
+        }
+    }
+
+    /// Sends an already-transformed, content-length body to an opened upstream
+    /// and relays the response. Re-runnable: streams from the arena-held body, so
+    /// a retry replays the same bytes with no extra allocation.
+    fn pipeBufferedOnce(
+        self: *Handler,
+        upstream_req: *std.http.Client.Request,
+        body: []const u8,
+        res: *httpz.Response,
+        max_response_body: usize,
+        bufs: ThreadBufs,
+    ) !void {
+        upstream_req.transfer_encoding = .{ .content_length = body.len };
         var body_writer = try upstream_req.sendBodyUnflushed(bufs.upstream);
-        var fixed = std.Io.Reader.fixed(processed.body);
-        _ = try pipeline_mod.streamReaderToWriter(&fixed, &body_writer.writer, processed.body.len);
+        var fixed = std.Io.Reader.fixed(body);
+        _ = try pipeline_mod.streamReaderToWriter(&fixed, &body_writer.writer, body.len);
         try body_writer.end();
         try upstream_req.connection.?.flush();
-
-        const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
-        try self.relayResponse(res, &upstream_req, max_response, bufs);
+        try self.relayResponse(res, upstream_req, max_response_body, bufs);
     }
 
     fn execFetchFiltered(
@@ -519,6 +618,7 @@ pub const Handler = struct {
             return;
         };
         defer upstream_req.deinit();
+        errdefer markUpstreamClosing(&upstream_req); // evict dead conn, don't re-pool it
         try upstream_req.sendBodiless();
 
         var upstream_res = try upstream_req.receiveHead(&.{});
@@ -552,6 +652,21 @@ pub const Handler = struct {
         _ = try filtering.finish();
     }
 };
+
+/// Force a failed upstream connection out of the shared client's pool.
+///
+/// std.http.Client only evicts on the *receive* side (receiveHead sets
+/// connection.closing; deinit then destroys it). A *send*-side failure —
+/// BrokenPipe/ConnectionReset writing to a keep-alive the remote idle-closed —
+/// leaves connection.closing false, so deinit returns the dead connection to
+/// the pool and every later request reuses it and fails too. That's the
+/// still-unfixed half of ziglang/zig#30165 (the 0.16 fix only covered receive).
+/// Marking it closing here makes Request.deinit destroy it instead of pooling
+/// it, so the next request dials fresh. Pair with `errdefer` so it runs on any
+/// error path before the request's own `defer ...deinit()`.
+fn markUpstreamClosing(upstream_req: *std.http.Client.Request) void {
+    if (upstream_req.connection) |conn| conn.closing = true;
+}
 
 /// Writes a fully-buffered request body upstream with an exact
 /// content-length (chunked inbound bodies were already de-chunked by httpz).

@@ -197,6 +197,21 @@ pub fn build(b: *std.Build) void {
     const echo_step = b.step("echo-server", "Build the echo server for benchmarking");
     echo_step.dependOn(&b.addInstallArtifact(echo_server, .{}).step);
 
+    // Upstream connection-pool poisoning harness: reproduces the stale-keepalive
+    // poison (ziglang/zig#30165 send-side) and verifies the eviction fix.
+    const pool_harness = b.addExecutable(.{
+        .name = "upstream-pool-harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/upstream_pool_harness.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const pool_harness_step = b.step("upstream-pool-harness", "Verify the upstream pool eviction+retry fix against the real edge binary");
+    const run_pool_harness = b.addRunArtifact(pool_harness);
+    run_pool_harness.step.dependOn(b.getInstallStep()); // harness spawns zig-out/bin/edge
+    pool_harness_step.dependOn(&run_pool_harness.step);
+
     // Datadog log search/filter microbenchmark (zbench).
     const datadog_log_bench = b.addExecutable(.{
         .name = "datadog-log-bench",
