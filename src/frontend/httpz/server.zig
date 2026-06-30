@@ -227,11 +227,20 @@ pub const Handler = struct {
     pub fn handle(self: *Handler, req: *httpz.Request, res: *httpz.Response) void {
         _ = self.in_flight.fetchAdd(1, .acquire);
         defer _ = self.in_flight.fetchSub(1, .release);
+
+        const ctx = self.ctx;
+        const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+        const method = serviceMethod(req.method);
+        const known_path = exec.classifyKnownPath(req.url.path, method);
+        if (ctx.metrics) |metrics| {
+            metrics.recordRequest(exec.methodLabel(method), known_path);
+        }
+
         self.dispatch(req, res) catch |err| {
             // A request reaching here threw past all in-handler recovery (retries,
             // fail-open) — a real failure, not a routine 4xx/5xx. Log it as such.
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            self.ctx.bus.err(RequestFailed{
+            ctx.bus.err(RequestFailed{
                 .method = @tagName(req.method),
                 .path = req.url.path,
                 .err = @errorName(err),
@@ -240,29 +249,27 @@ pub const Handler = struct {
             res.status = 502;
             res.body = "";
         };
+
+        // Lifecycle observability is emitted here, AFTER the catch applies the
+        // final status, so the duration metric and completion event reflect what
+        // the client actually got (a thrown request returns 502, not whatever
+        // partial status dispatch had set before it errored).
+        const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
+        const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+        if (ctx.metrics) |metrics| metrics.recordRequestDuration(known_path, elapsed_s);
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.debug(RequestCompleted{
+            .method = @tagName(req.method),
+            .path = req.url.path,
+            .status = res.status,
+            .duration_ms = elapsed_s * std.time.ms_per_s,
+        });
     }
 
     fn dispatch(self: *Handler, req: *httpz.Request, res: *httpz.Response) !void {
         const ctx = self.ctx;
-        const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
         const method = serviceMethod(req.method);
         const path = req.url.path;
-        const known_path = exec.classifyKnownPath(path, method);
-        if (ctx.metrics) |metrics| {
-            metrics.recordRequest(exec.methodLabel(method), known_path);
-        }
-        defer {
-            const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
-            const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-            if (ctx.metrics) |metrics| metrics.recordRequestDuration(known_path, elapsed_s);
-            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            ctx.bus.debug(RequestCompleted{
-                .method = @tagName(req.method),
-                .path = path,
-                .status = res.status,
-                .duration_ms = elapsed_s * std.time.ms_per_s,
-            });
-        }
 
         // Internal observability endpoint, checked before routing — parity
         // with the stdio driver's /_edge/metrics short-circuit.
