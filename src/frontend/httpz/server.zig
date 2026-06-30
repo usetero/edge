@@ -23,6 +23,14 @@ const log = std.log.scoped(.httpz_server);
 
 // Named event payloads: the type name is the telemetry event name.
 const PipelineAborted = struct { err: []const u8 };
+/// A request threw out of dispatch (not a handled 4xx/5xx) — answered 502.
+const RequestFailed = struct { method: []const u8, path: []const u8, err: []const u8 };
+/// A pooled upstream connection failed and was destroyed instead of re-pooled,
+/// so the next request dials fresh (breaks the stale-keepalive poison loop).
+/// We do not retry in-process — the sender retries onto the fresh connection.
+const UpstreamConnectionEvicted = struct { path: []const u8, err: []const u8 };
+/// Per-request trace, emitted at debug so it's off unless log_level=debug.
+const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 
 /// Derives the httpz tuning from limits.zig — no size constant may live
 /// here (PLAN-FRONTEND-SWAP.md §5). Worker/thread-pool counts stay on httpz
@@ -219,28 +227,49 @@ pub const Handler = struct {
     pub fn handle(self: *Handler, req: *httpz.Request, res: *httpz.Response) void {
         _ = self.in_flight.fetchAdd(1, .acquire);
         defer _ = self.in_flight.fetchSub(1, .release);
+
+        const ctx = self.ctx;
+        const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+        const method = serviceMethod(req.method);
+        const known_path = exec.classifyKnownPath(req.url.path, method);
+        if (ctx.metrics) |metrics| {
+            metrics.recordRequest(exec.methodLabel(method), known_path);
+        }
+
         self.dispatch(req, res) catch |err| {
-            log.debug("request handling failed: {s}", .{@errorName(err)});
+            // A request reaching here threw past all in-handler recovery (retries,
+            // fail-open) — a real failure, not a routine 4xx/5xx. Log it as such.
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            ctx.bus.err(RequestFailed{
+                .method = @tagName(req.method),
+                .path = req.url.path,
+                .err = @errorName(err),
+            });
             res.clearWriter();
             res.status = 502;
             res.body = "";
         };
+
+        // Lifecycle observability is emitted here, AFTER the catch applies the
+        // final status, so the duration metric and completion event reflect what
+        // the client actually got (a thrown request returns 502, not whatever
+        // partial status dispatch had set before it errored).
+        const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
+        const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+        if (ctx.metrics) |metrics| metrics.recordRequestDuration(known_path, elapsed_s);
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.debug(RequestCompleted{
+            .method = @tagName(req.method),
+            .path = req.url.path,
+            .status = res.status,
+            .duration_ms = elapsed_s * std.time.ms_per_s,
+        });
     }
 
     fn dispatch(self: *Handler, req: *httpz.Request, res: *httpz.Response) !void {
         const ctx = self.ctx;
-        const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
         const method = serviceMethod(req.method);
         const path = req.url.path;
-        const known_path = exec.classifyKnownPath(path, method);
-        if (ctx.metrics) |metrics| {
-            metrics.recordRequest(exec.methodLabel(method), known_path);
-        }
-        defer if (ctx.metrics) |metrics| {
-            const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
-            const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-            metrics.recordRequestDuration(known_path, elapsed_s);
-        };
 
         // Internal observability endpoint, checked before routing — parity
         // with the stdio driver's /_edge/metrics short-circuit.
@@ -390,12 +419,29 @@ pub const Handler = struct {
             return;
         };
         defer upstream_req.deinit();
+        // On any upstream failure, evict the connection so it isn't re-pooled — the
+        // next request dials fresh. We do NOT retry in-process: a replay could
+        // duplicate a non-idempotent request, and the sender already retries 502s.
+        errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err);
 
         const body = req.body() orelse "";
         try sendBufferedBody(&upstream_req, req.method, body, bufs);
 
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(fwd.upstream));
         try self.relayResponse(res, &upstream_req, max_response, bufs);
+    }
+
+    /// Destroy a failed pooled upstream connection and record it (warn). Keeps the
+    /// dead conn out of the pool so the next request dials fresh.
+    fn evictUpstream(
+        self: *Handler,
+        upstream_req: *std.http.Client.Request,
+        path: []const u8,
+        err: anyerror,
+    ) void {
+        markUpstreamClosing(upstream_req); // don't re-pool it
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        self.ctx.bus.warn(UpstreamConnectionEvicted{ .path = path, .err = @errorName(err) });
     }
 
     fn execPipeStream(
@@ -418,6 +464,9 @@ pub const Handler = struct {
             return;
         };
         defer upstream_req.deinit();
+        // Any failure (mid-stream send to a dead conn, or relay) evicts the conn —
+        // a partially-sent chunked body makes it unreusable anyway. No retry.
+        errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err);
 
         // httpz already buffered the request body; the record pipeline runs
         // over it unchanged (same framer + sink as the stdio frontend).
@@ -442,11 +491,13 @@ pub const Handler = struct {
             .scratch = bufs.scratch,
             .chunk = bufs.chunk,
         }, &sink) catch |err| {
-            // PLAN §6.5.1: mid-stream decode failure aborts the exchange;
-            // bytes already sent upstream stay sent. 502 + connection close.
+            // Mid-stream failure aborts the exchange: a partial chunked body is on
+            // the wire, so evict the conn and answer 502 (close the client conn —
+            // we can't complete a clean response). Handled here, so the errdefer
+            // (which covers the trailing sends/relay) does not also fire.
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             ctx.bus.err(PipelineAborted{ .err = @errorName(err) });
-            if (upstream_req.connection) |conn| conn.closing = true;
+            self.evictUpstream(&upstream_req, req.url.path, err);
             res.status = 502;
             res.body = "";
             res.keepalive = false;
@@ -494,12 +545,9 @@ pub const Handler = struct {
             return;
         };
         defer upstream_req.deinit();
-        upstream_req.transfer_encoding = .{ .content_length = processed.body.len };
-        var body_writer = try upstream_req.sendBodyUnflushed(bufs.upstream);
-        var fixed = std.Io.Reader.fixed(processed.body);
-        _ = try pipeline_mod.streamReaderToWriter(&fixed, &body_writer.writer, processed.body.len);
-        try body_writer.end();
-        try upstream_req.connection.?.flush();
+        errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err); // don't re-pool; no retry
+
+        try sendBufferedBody(&upstream_req, req.method, processed.body, bufs);
 
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
         try self.relayResponse(res, &upstream_req, max_response, bufs);
@@ -519,9 +567,18 @@ pub const Handler = struct {
             return;
         };
         defer upstream_req.deinit();
-        try upstream_req.sendBodiless();
 
-        var upstream_res = try upstream_req.receiveHead(&.{});
+        // Scope eviction to the upstream send+head phase: a reused dead keep-alive
+        // fails here, so evict it from the pool. Past receiveHead the response
+        // streams straight to the client, so failures there are client-disconnect
+        // or local filter errors — those must NOT mark a healthy upstream conn
+        // closing and churn the pool. Genuine upstream receive-side failures during
+        // the body are handled by std (it sets connection.closing on its own).
+        var upstream_res = blk: {
+            errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err);
+            try upstream_req.sendBodiless();
+            break :blk try upstream_req.receiveHead(&.{});
+        };
         var extra_headers: [64]std.http.Header = undefined;
         const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, res.arena, &extra_headers);
         res.status = @intFromEnum(upstream_res.head.status);
@@ -552,6 +609,21 @@ pub const Handler = struct {
         _ = try filtering.finish();
     }
 };
+
+/// Force a failed upstream connection out of the shared client's pool.
+///
+/// std.http.Client only evicts on the *receive* side (receiveHead sets
+/// connection.closing; deinit then destroys it). A *send*-side failure —
+/// BrokenPipe/ConnectionReset writing to a keep-alive the remote idle-closed —
+/// leaves connection.closing false, so deinit returns the dead connection to
+/// the pool and every later request reuses it and fails too. That's the
+/// still-unfixed half of ziglang/zig#30165 (the 0.16 fix only covered receive).
+/// Marking it closing here makes Request.deinit destroy it instead of pooling
+/// it, so the next request dials fresh. Pair with `errdefer` so it runs on any
+/// error path before the request's own `defer ...deinit()`.
+fn markUpstreamClosing(upstream_req: *std.http.Client.Request) void {
+    if (upstream_req.connection) |conn| conn.closing = true;
+}
 
 /// Writes a fully-buffered request body upstream with an exact
 /// content-length (chunked inbound bodies were already de-chunked by httpz).
