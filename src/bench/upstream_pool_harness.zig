@@ -194,6 +194,7 @@ fn waitFor(
             defer gpa.free(body);
             if (probe(body)) return;
         }
+        // ziglint-ignore: Z026 (best-effort poll pacing; a missed sleep is harmless)
         io.sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
     }
     return error.NotReady;
@@ -301,7 +302,9 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(body);
 
         var uri_buf: [96]u8 = undefined;
-        const uri = try std.Uri.parse(try std.fmt.bufPrint(&uri_buf, "http://127.0.0.1:{d}{s}", .{ edge_port, sc.path }));
+        const uri = try std.Uri.parse(
+            try std.fmt.bufPrint(&uri_buf, "http://127.0.0.1:{d}{s}", .{ edge_port, sc.path }),
+        );
 
         const dials_before = mock.accepted.load(.monotonic);
         var successes: u32 = 0;
@@ -309,6 +312,7 @@ pub fn main(init: std.process.Init) !void {
             if (sendRequest(&client, uri, sc.content_type, body)) successes += 1;
             // Let the mock's FIN reach edge's pooled conn before the next reuse so
             // the failure is deterministic (loopback FIN is fast; this is insurance).
+            // ziglint-ignore: Z026 (best-effort pacing; a missed sleep is harmless)
             io.sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
         }
         results[i] = .{ .sc = sc, .successes = successes, .dials = mock.accepted.load(.monotonic) - dials_before };

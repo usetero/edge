@@ -207,7 +207,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const pool_harness_step = b.step("upstream-pool-harness", "Verify the upstream pool eviction+retry fix against the real edge binary");
+    const pool_harness_step = b.step("upstream-pool-harness", "Verify upstream pool eviction+retry against real edge");
     const run_pool_harness = b.addRunArtifact(pool_harness);
     run_pool_harness.step.dependOn(b.getInstallStep()); // harness spawns zig-out/bin/edge
     pool_harness_step.dependOn(&run_pool_harness.step);

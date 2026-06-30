@@ -23,6 +23,13 @@ const log = std.log.scoped(.httpz_server);
 
 // Named event payloads: the type name is the telemetry event name.
 const PipelineAborted = struct { err: []const u8 };
+/// A request threw out of dispatch (not a handled 4xx/5xx) — answered 502.
+const RequestFailed = struct { method: []const u8, path: []const u8, err: []const u8 };
+/// A pooled upstream connection was dead on reuse and destroyed. `retrying`
+/// true => a fresh-connection retry follows (self-heal); false => giving up.
+const UpstreamConnectionEvicted = struct { path: []const u8, err: []const u8, retrying: bool };
+/// Per-request trace, emitted at debug so it's off unless log_level=debug.
+const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 
 /// Derives the httpz tuning from limits.zig — no size constant may live
 /// here (PLAN-FRONTEND-SWAP.md §5). Worker/thread-pool counts stay on httpz
@@ -220,7 +227,14 @@ pub const Handler = struct {
         _ = self.in_flight.fetchAdd(1, .acquire);
         defer _ = self.in_flight.fetchSub(1, .release);
         self.dispatch(req, res) catch |err| {
-            log.debug("request handling failed: {s}", .{@errorName(err)});
+            // A request reaching here threw past all in-handler recovery (retries,
+            // fail-open) — a real failure, not a routine 4xx/5xx. Log it as such.
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            self.ctx.bus.err(RequestFailed{
+                .method = @tagName(req.method),
+                .path = req.url.path,
+                .err = @errorName(err),
+            });
             res.clearWriter();
             res.status = 502;
             res.body = "";
@@ -236,11 +250,18 @@ pub const Handler = struct {
         if (ctx.metrics) |metrics| {
             metrics.recordRequest(exec.methodLabel(method), known_path);
         }
-        defer if (ctx.metrics) |metrics| {
+        defer {
             const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
             const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-            metrics.recordRequestDuration(known_path, elapsed_s);
-        };
+            if (ctx.metrics) |metrics| metrics.recordRequestDuration(known_path, elapsed_s);
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            ctx.bus.debug(RequestCompleted{
+                .method = @tagName(req.method),
+                .path = path,
+                .status = res.status,
+                .duration_ms = elapsed_s * std.time.ms_per_s,
+            });
+        }
 
         // Internal observability endpoint, checked before routing — parity
         // with the stdio driver's /_edge/metrics short-circuit.
@@ -406,7 +427,7 @@ pub const Handler = struct {
             if (self.forwardRawOnce(&upstream_req, req.method, body, res, max_response, bufs)) {
                 return;
             } else |err| {
-                markUpstreamClosing(&upstream_req); // evict dead conn, don't re-pool it
+                self.evictUpstream(&upstream_req, req.url.path, err, attempt == 0);
                 if (attempt == 0) {
                     res.clearWriter();
                     continue;
@@ -429,6 +450,20 @@ pub const Handler = struct {
     ) !void {
         try sendBufferedBody(upstream_req, method, body, bufs);
         try self.relayResponse(res, upstream_req, max_response_body, bufs);
+    }
+
+    /// Destroy a dead pooled upstream connection and record why. Shared by every
+    /// forward path's retry loop so the eviction/self-heal is observable (warn).
+    fn evictUpstream(
+        self: *Handler,
+        upstream_req: *std.http.Client.Request,
+        path: []const u8,
+        err: anyerror,
+        retrying: bool,
+    ) void {
+        markUpstreamClosing(upstream_req); // don't re-pool it
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        self.ctx.bus.warn(UpstreamConnectionEvicted{ .path = path, .err = @errorName(err), .retrying = retrying });
     }
 
     fn execPipeStream(
@@ -464,8 +499,8 @@ pub const Handler = struct {
 
             if (self.pipeStreamOnce(&upstream_req, raw_body, pipe, res, max_response, bufs)) {
                 return;
-            } else |_| {
-                markUpstreamClosing(&upstream_req); // evict dead conn, don't re-pool it
+            } else |err| {
+                self.evictUpstream(&upstream_req, req.url.path, err, attempt == 0);
                 if (attempt == 0) {
                     res.clearWriter();
                     continue;
@@ -574,7 +609,7 @@ pub const Handler = struct {
             if (self.pipeBufferedOnce(&upstream_req, processed.body, res, max_response, bufs)) {
                 return;
             } else |err| {
-                markUpstreamClosing(&upstream_req); // evict dead conn, don't re-pool it
+                self.evictUpstream(&upstream_req, req.url.path, err, attempt == 0);
                 if (attempt == 0) {
                     res.clearWriter();
                     continue;
@@ -618,7 +653,9 @@ pub const Handler = struct {
             return;
         };
         defer upstream_req.deinit();
-        errdefer markUpstreamClosing(&upstream_req); // evict dead conn, don't re-pool it
+        // No retry here: the response streams straight to the client, so a
+        // mid-stream failure can't be replayed. Just evict + record it.
+        errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err, false);
         try upstream_req.sendBodiless();
 
         var upstream_res = try upstream_req.receiveHead(&.{});
