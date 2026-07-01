@@ -310,16 +310,18 @@ pub fn processBuffered(
     return .{ .body = encoded.written(), .all_dropped = false };
 }
 
-/// Per-record policy evaluation: wraps each record as a minimal one-element
-/// batch and runs it through the SAME batch transform the old modules used.
-/// Semantics are therefore identical to the buffered path; memory is bounded
-/// by one record (the arena resets between records). A future pass can bind
-/// the engine directly per record to shave the wrap/parse overhead.
+/// Per-record policy evaluation for streaming framers.
+///
+/// Datadog JSON logs bind directly to the Datadog record processor; protobuf
+/// signals still use minimal one-record envelopes until they have equivalent
+/// single-record APIs. Memory is bounded by one record (the arena resets
+/// between records).
 pub const RecordSink = struct {
     ctx: *SharedCtx,
     signal: service_mod.Signal,
     format: framer_mod.WireFormat,
     record_arena: std.heap.ArenaAllocator,
+    datadog_json: ?dd_logs.JsonRecordProcessor,
     /// Snapshot emptiness for this request's signal, resolved once at init;
     /// false short-circuits onRecord to .keep without decoding.
     active: bool,
@@ -328,16 +330,22 @@ pub const RecordSink = struct {
     dropped: u64 = 0,
 
     pub fn init(ctx: *SharedCtx, signal: service_mod.Signal, format: framer_mod.WireFormat) RecordSink {
+        const active = policiesActiveFor(ctx.registry, signal);
         return .{
             .ctx = ctx,
             .signal = signal,
             .format = format,
             .record_arena = .init(ctx.gpa),
-            .active = policiesActiveFor(ctx.registry, signal),
+            .datadog_json = if (active and signal == .log and format == .json_array)
+                dd_logs.JsonRecordProcessor.init(ctx.gpa, ctx.registry, ctx.bus)
+            else
+                null,
+            .active = active,
         };
     }
 
     pub fn deinit(self: *RecordSink) void {
+        if (self.datadog_json) |*processor| processor.deinit();
         self.record_arena.deinit();
         self.* = undefined;
     }
@@ -376,33 +384,18 @@ pub const RecordSink = struct {
     }
 
     fn evalJsonRecord(self: *RecordSink, arena: std.mem.Allocator, bytes: []const u8) !framer_mod.Decision {
-        // One-element batch: "[<record>]".
-        const wrapped = try std.mem.concat(arena, u8, &.{ "[", bytes, "]" });
-        var reader = std.Io.Reader.fixed(wrapped);
-        var out: std.Io.Writer.Allocating = .init(arena);
-        const result = try dd_logs.processLogsStream(
-            arena,
-            self.ctx.registry,
-            self.ctx.bus,
-            &reader,
-            &out.writer,
-            "application/json",
-        );
-        if (result.allDropped()) {
-            self.dropped += 1;
-            return .drop;
-        }
-        const written = std.mem.trim(u8, out.written(), " \t\r\n");
-        if (written.len < 2 or written[0] != '[' or written[written.len - 1] != ']') {
-            return .keep; // unexpected shape: fail safe, forward original
-        }
-        const inner = std.mem.trim(u8, written[1 .. written.len - 1], " \t\r\n");
-        if (inner.len == 0) {
-            self.dropped += 1;
-            return .drop;
-        }
-        if (std.mem.eql(u8, inner, bytes)) return .keep;
-        return .{ .replace = inner };
+        const processor = if (self.datadog_json) |*processor| processor else return .keep;
+        return switch (try processor.process(arena, bytes)) {
+            .keep => .keep,
+            .drop => blk: {
+                self.dropped += 1;
+                break :blk .drop;
+            },
+            .replace => |replacement| if (std.mem.eql(u8, replacement, bytes))
+                .keep
+            else
+                .{ .replace = replacement },
+        };
     }
 
     fn evalProtobufRecord(self: *RecordSink, arena: std.mem.Allocator, bytes: []const u8) !framer_mod.Decision {

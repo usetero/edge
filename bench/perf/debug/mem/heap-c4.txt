@@ -1,0 +1,77 @@
+Process:         edge-datadog [19888]
+Path:            /Users/USER/*/edge-datadog
+Load Address:    0x10297c000
+Identifier:      edge-datadog
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  bash [19884]
+Target Type:     live task
+
+Date/Time:       2026-06-30 22:56:47.044 -0400
+Launch Time:     2026-06-30 22:56:24.528 -0400
+OS Version:      macOS 26.5 (25F71)
+Report Version:  7
+Analysis Tool:   /usr/bin/heap
+
+Physical footprint:         203.5M
+Physical footprint (peak):  203.5M
+Idle exit:                  untracked
+----
+
+Process 19888: 3 zones
+
+All zones: 1251 nodes malloced - Sizes: 3584KB[33] 2256KB[3] 2064KB[16] 736KB[1] 464KB[1] 272KB[76] 208KB[32] 160KB[1] 96KB[1] 48KB[68] 28KB[2] 24KB[32] 16KB[1] 10KB[2] 8KB[4] 7KB[1] 6KB[7] 5KB[33] 4KB[1] 3.5KB[3] 3KB[3] 2.5KB[16] 1.75KB[65] 1.5KB[3] 1.25KB[5] 1KB[1] 896[2] 640[10] 512[1] 448[2] 320[12] 256[9] 224[22] 192[1] 160[9] 128[13] 112[5] 96[11] 80[6] 64[131] 48[180] 32[289] 16[137] 
+
+Found:  69 ObjC classes
+Derived 32 type names for non-objects from allocation backtraces
+
+-----------------------------------------------------------------------
+All zones: 1251 nodes (196055296 bytes)
+
+   COUNT      BYTES       AVG   CLASS_NAME                                        TYPE    BINARY
+   =====      =====       ===   ==========                                        ====    ======
+     887  169280976  190846.6   malloc in heap.c_allocator_impl.alloc             C       edge-datadog
+     138       4448      32.2   Class.data (class_rw_t)                           C       libobjc.A.dylib
+      43   11976704  278528.0   calloc in dyld::ThreadLocalVariables::instantiateVariable(dyld::ThreadLocalVariables::Thunk const&)  C++     libdyld.dylib
+      33        544      16.5   malloc in frontend.httpz.server.HttpServer.run    C       edge-datadog
+      22       4048     184.0   non-object in zone DefaultMallocZone_0x103ac4000          <unknown>
+      20      10752     537.6   realloc in heap.c_allocator_impl.remap            C       edge-datadog
+      16      40960    2560.0   malloc in alloc_scratch                           C       libhs.5.4.12.dylib
+       8        768      96.0   non-object from libsystem_notify.dylib            C       libsystem_notify.dylib
+       7        896     128.0   memalign in id2data(objc_object*, SyncKind, usage)  C       libobjc.A.dylib
+       7        480      68.6   xpc_dictionary_t (Storage)                        C       libxpc.dylib
+       7        112      16.0   malloc in Thread.spawn__anon_27008                C       edge-datadog
+       6       1440     240.0   xpc_string_t (Storage)                            C       libxpc.dylib
+       6        288      48.0   xpc_string_t                                      ObjC    libxpc.dylib
+       5        224      44.8   Class.methodCache._buckets (bucket_t)             C       libobjc.A.dylib
+       4   14680064  3670016.0   malloc in ZSTD_resetCCtx_internal                 C       libzstd.1.5.7.dylib
+       4      24576    6144.0   malloc in ZSTD_createCCtx_advanced                C       libzstd.1.5.7.dylib
+       3       5056    1685.3   memalign in heap.c_allocator_impl.alloc           C       edge-datadog
+       3        960     320.0   calloc in os_set_32_ptr_init                      C       libsystem_collections.dylib
+       3        288      96.0   xpc_dictionary_t                                  ObjC    libxpc.dylib
+       2      13312    6656.0   malloc in ue2::build(ue2::NG&, unsigned int*, unsigned char)  C++     libhs.5.4.12.dylib
+       2        640     320.0   calloc in os_set_64_ptr_init                      C       libsystem_collections.dylib
+       2        640     320.0   calloc in os_set_str_ptr_init                     C       libsystem_collections.dylib
+       2         80      40.0   calloc in _fetchInitializingClassList(bool)       C       libobjc.A.dylib
+       2         80      40.0   calloc in si_module_config_modules_for_category   C       libsystem_info.dylib
+       1       5120    5120.0   calloc in __si_module_cache_byname_block_invoke   C       libsystem_info.dylib
+       1        640     640.0   calloc in os_map_64_init                          C       libsystem_collections.dylib
+       1        448     448.0   calloc in __si_module_static_search_block_invoke  C       libsystem_info.dylib
+       1        128     128.0   dispatch_queue_t (serial)                         ObjC    libdispatch.dylib
+       1         96      96.0   calloc in __si_module_static_file_block_invoke    C       libsystem_info.dylib
+       1         80      80.0   malloc in _fetchInitializingClassList(bool)       C       libobjc.A.dylib
+       1         64      64.0   malloc in runtime.app.run                         C       edge-datadog
+       1         64      64.0   xpc_array_t (Storage)                             C       libxpc.dylib
+       1         64      64.0   xpc_pipe_t                                        ObjC    libxpc.dylib
+       1         48      48.0   Class.data.extended (class_rw_ext_t)              C       libobjc.A.dylib
+       1         48      48.0   xpc_array_t                                       ObjC    libxpc.dylib
+       1         32      32.0   calloc in __si_module_static_ds_block_invoke      C       libsystem_info.dylib
+       1         32      32.0   malloc in __si_module_static_darwin_directory_block_invoke  C       libsystem_info.dylib
+       1         16      16.0   malloc in __si_module_cache_byname_block_invoke   C       libsystem_info.dylib
+       1         16      16.0   malloc in __si_module_static_ds_block_invoke      C       libsystem_info.dylib
+       1         16      16.0   malloc in __si_module_static_file_block_invoke    C       libsystem_info.dylib
+       1         16      16.0   malloc in __si_module_static_mdns_block_invoke    C       libsystem_info.dylib
+       1         16      16.0   malloc in __si_module_static_search_block_invoke  C       libsystem_info.dylib
+       1         16      16.0   malloc in registry.PolicyRegistry.subscribe       C       edge-datadog
+

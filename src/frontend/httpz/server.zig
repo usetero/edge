@@ -4,10 +4,10 @@
 //! upstream client, policy loader, and lifecycle; httpz only needs it for
 //! net types.
 //!
-//! Bodies arrive fully buffered (bounded by limits.max_body_size), so the
-//! streaming pipe outcome degrades to buffered here — identical to what the
-//! pre-rewrite httpz stack did. All routing/planning/transform logic comes
-//! from frontend/exec.zig, shared with the stdio frontend.
+//! Request bodies use httpz's lazy reader path: small bodies may already live
+//! in httpz's request buffer, while larger bodies are read from the socket by
+//! the route handler. All routing/planning/transform logic comes from
+//! frontend/exec.zig, shared with the stdio frontend.
 const std = @import("std");
 const httpz = @import("httpz");
 
@@ -41,10 +41,19 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
         .request = .{
             .max_body_size = limits.max_body_size,
             .buffer_size = limits.recv_buf,
+            .lazy_read_size = limits.chunk_buf,
         },
         // null => httpz defaults (1 worker, 32 pool threads). thread_pool count
         // multiplies the per-thread pipeline-scratch floor (see ThreadBufs).
-        .workers = .{ .count = limits.worker_count },
+        .workers = .{
+            .count = limits.worker_count,
+            // With lazy reads, large request bodies should not be parked in
+            // httpz's buffer pool. Tiny bodies fit in the request buffer; rare
+            // spillover can use the per-request arena instead of a process-wide
+            // max_body_size pool.
+            .large_buffer_count = 0,
+            .large_buffer_size = @intCast(@max(@as(usize, 1), limits.chunk_buf)),
+        },
         .thread_pool = .{ .count = limits.thread_pool_count },
     };
 }
@@ -53,8 +62,15 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
 /// retained for the thread's lifetime (httpz pool threads live as long as
 /// the process, so this is bounded by thread_pool.count and intentionally
 /// never freed). Replaces the stdio frontend's per-connection slab regions.
+///
+/// Deliberately excludes the decode window: it's the one big buffer (zstd
+/// worst case ~2 MiB) and most requests don't need it (identity=0, gzip=32K).
+/// Pinning it per thread cost thread_pool_count x 2 MiB of mostly-idle memory,
+/// so it's allocated per request, sized to that request's codec, and freed
+/// when the request ends — resident decode memory now tracks concurrent
+/// *compressed* requests, not thread count. The rest here is small (<500 KiB
+/// per thread total) and hot, so keeping it warm/threadlocal is worth it.
 const ThreadBufs = struct {
-    decode: []u8,
     encode: []u8,
     scratch: []u8,
     chunk: []u8,
@@ -74,7 +90,6 @@ var bufs_registry: std.ArrayList(ThreadBufs) = .empty;
 fn threadBufs(io: std.Io, gpa: std.mem.Allocator, limits: limits_mod.Limits) !ThreadBufs {
     if (tl_bufs) |bufs| return bufs;
     const bufs: ThreadBufs = .{
-        .decode = try gpa.alloc(u8, limits.decode_buf),
         .encode = try gpa.alloc(u8, limits.encode_buf),
         .scratch = try gpa.alloc(u8, limits.record_scratch),
         .chunk = try gpa.alloc(u8, limits.chunk_buf),
@@ -95,7 +110,6 @@ fn freeThreadBufs(io: std.Io, gpa: std.mem.Allocator) void {
     bufs_registry_mutex.lockUncancelable(io);
     defer bufs_registry_mutex.unlock(io);
     for (bufs_registry.items) |bufs| {
-        gpa.free(bufs.decode);
         gpa.free(bufs.encode);
         gpa.free(bufs.scratch);
         gpa.free(bufs.chunk);
@@ -125,11 +139,12 @@ pub const HttpServer = struct {
         const config = configFromLimits(ctx.limits, listen_address, listen_port);
         const server = try httpz.Server(*Handler).init(ctx.io, ctx.gpa, config, handler);
         log.info(
-            "httpz frontend: {d} pool threads x {d} bytes pipeline scratch (lazy per thread)",
+            "httpz frontend: {d} pool threads x {d} bytes scratch/thread; decode buffer up to {d} bytes/request",
             .{
                 config.threadPoolCount(),
-                ctx.limits.decode_buf + ctx.limits.encode_buf + ctx.limits.record_scratch +
+                ctx.limits.encode_buf + ctx.limits.record_scratch +
                     ctx.limits.chunk_buf + ctx.limits.upstream_write_buf,
+                ctx.limits.decode_buf,
             },
         );
         return .{
@@ -187,6 +202,10 @@ pub const HttpServer = struct {
 /// Upper bound on forwarded request headers (datadog/prom intakes stay well
 /// under this). Excess returns error.TooManyHeaders rather than truncating.
 const max_forward_headers = 64;
+
+/// Per-read timeout for httpz's lazy body reader. This protects handler threads
+/// from slow clients after the request head has already been accepted.
+const request_body_timeout_ms = 30 * std.time.ms_per_s;
 
 /// Collects forwardable (hop-by-hop-filtered) request headers into an
 /// arena-owned array, with names/values duped into the same arena.
@@ -270,6 +289,16 @@ pub const Handler = struct {
         const ctx = self.ctx;
         const method = serviceMethod(req.method);
         const path = req.url.path;
+
+        // httpz skips its max_body_size rejection when lazy_read_size is set.
+        // Keep the data-plane contract here and close without draining a body
+        // we already know we will not process.
+        if (req.body_len > ctx.limits.max_body_size) {
+            res.status = 413;
+            res.body = "";
+            res.keepalive = false;
+            return;
+        }
 
         // Internal observability endpoint, checked before routing — parity
         // with the stdio driver's /_edge/metrics short-circuit.
@@ -416,6 +445,7 @@ pub const Handler = struct {
         var upstream_req = self.openUpstream(req, res.arena, fwd.upstream) catch {
             res.status = 502;
             res.body = "";
+            closeIfUnread(req, res);
             return;
         };
         defer upstream_req.deinit();
@@ -424,8 +454,7 @@ pub const Handler = struct {
         // duplicate a non-idempotent request, and the sender already retries 502s.
         errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err);
 
-        const body = req.body() orelse "";
-        try sendBufferedBody(&upstream_req, req.method, body, bufs);
+        try sendRequestBody(&upstream_req, req, res, bufs);
 
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(fwd.upstream));
         try self.relayResponse(res, &upstream_req, max_response, bufs);
@@ -458,9 +487,20 @@ pub const Handler = struct {
             return self.execForwardRaw(req, res, .{ .upstream = pipe.upstream });
         }
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
+        // Decode window sized to THIS request's codec, not pinned per thread:
+        // identity => 0 (no alloc), gzip => 32 KiB, zstd => full window.
+        // page_allocator (not gpa/malloc) so free() munmaps the window straight
+        // back to the OS — resident decode memory tracks *current* concurrent
+        // compressed requests and shrinks when a burst subsides, instead of
+        // malloc caching the freed multi-MB blocks. The mmap+fault cost is
+        // negligible against the decode itself and only touched on compressed
+        // requests.
+        const decode = try std.heap.page_allocator.alloc(u8, pipe.codec.decoderBufferLen(ctx.limits.zstd_window_len));
+        defer std.heap.page_allocator.free(decode);
         var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
             res.status = 502;
             res.body = "";
+            closeIfUnread(req, res);
             return;
         };
         defer upstream_req.deinit();
@@ -468,9 +508,14 @@ pub const Handler = struct {
         // a partially-sent chunked body makes it unreusable anyway. No retry.
         errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err);
 
-        // httpz already buffered the request body; the record pipeline runs
-        // over it unchanged (same framer + sink as the stdio frontend).
-        var body_reader = std.Io.Reader.fixed(req.body() orelse "");
+        var request_body = try HttpzBodyReader.init(req);
+        defer request_body.deinit();
+        if (request_body.restore_conn) {
+            // httpz's lazy socket reader temporarily changes connection read
+            // mode/timeouts. Close socket-backed request-body connections after
+            // the response instead of reusing a connection with mutated state.
+            res.keepalive = false;
+        }
 
         // Filtering changes length: always chunked.
         upstream_req.transfer_encoding = .chunked;
@@ -485,8 +530,8 @@ pub const Handler = struct {
             .encode = pipe.codec,
             .max_decoded_bytes = ctx.limits.max_decoded_bytes,
             .zstd_window_len = ctx.limits.zstd_window_len,
-        }, &body_reader, &body_writer.writer, .{
-            .decoder = bufs.decode,
+        }, request_body.reader(), &body_writer.writer, .{
+            .decoder = decode,
             .encoder = bufs.encode,
             .scratch = bufs.scratch,
             .chunk = bufs.chunk,
@@ -522,7 +567,7 @@ pub const Handler = struct {
     ) !void {
         const ctx = self.ctx;
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
-        const raw_body = req.body() orelse "";
+        const raw_body = try readRequestBody(req, res, ctx.limits.max_body_size);
 
         // res.arena is httpz's per-request fallback allocator; safe for the
         // resize-heavy transform since 5f60277 (fallback resize fix).
@@ -542,6 +587,7 @@ pub const Handler = struct {
         var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
             res.status = 502;
             res.body = "";
+            closeIfUnread(req, res);
             return;
         };
         defer upstream_req.deinit();
@@ -564,6 +610,7 @@ pub const Handler = struct {
         var upstream_req = self.openUpstream(req, res.arena, fetch.upstream) catch {
             res.status = 502;
             res.body = "";
+            closeIfUnread(req, res);
             return;
         };
         defer upstream_req.deinit();
@@ -623,6 +670,120 @@ pub const Handler = struct {
 /// error path before the request's own `defer ...deinit()`.
 fn markUpstreamClosing(upstream_req: *std.http.Client.Request) void {
     if (upstream_req.connection) |conn| conn.closing = true;
+}
+
+fn closeIfUnread(req: *httpz.Request, res: *httpz.Response) void {
+    if (req.unread_body > 0) res.keepalive = false;
+}
+
+/// Adapts httpz's lazy body reader to std.Io EOF semantics. httpz's reader
+/// returns 0 at EOF, while std.Io APIs such as readSliceShort keep polling
+/// until the vtable reports error.EndOfStream.
+const HttpzBodyReader = struct {
+    req: *httpz.Request,
+    inner: httpz.Request.Reader,
+    remaining: usize,
+    restore_conn: bool,
+    buffer: [limits_mod.BODY_BUF_BYTES]u8 = undefined,
+    interface: std.Io.Reader = .{
+        .buffer = &.{},
+        .end = 0,
+        .seek = 0,
+        .vtable = &.{ .stream = stream },
+    },
+
+    fn init(req: *httpz.Request) !HttpzBodyReader {
+        const restore_conn = req.unread_body > 0;
+        return .{
+            .req = req,
+            .inner = try req.reader(request_body_timeout_ms),
+            .remaining = req.body_len,
+            .restore_conn = restore_conn,
+        };
+    }
+
+    fn deinit(self: *HttpzBodyReader) void {
+        defer self.* = undefined;
+        if (!self.restore_conn) return;
+
+        const timeout: std.posix.timeval = .{ .sec = 0, .usec = 0 };
+        const zero_timeout = std.mem.toBytes(timeout);
+        std.posix.setsockopt(
+            self.req.conn.stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            &zero_timeout,
+        ) catch |err| {
+            log.debug("failed to clear httpz lazy body read timeout: {s}", .{@errorName(err)});
+        };
+        self.req.conn.nonblockingMode() catch |err| {
+            log.debug("failed to restore httpz connection nonblocking mode: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn reader(self: *HttpzBodyReader) *std.Io.Reader {
+        self.interface.buffer = &self.buffer;
+        return &self.interface;
+    }
+
+    fn stream(
+        io_r: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *HttpzBodyReader = @alignCast(@fieldParentPtr("interface", io_r));
+        if (self.remaining == 0) return error.EndOfStream;
+
+        const capped_limit: std.Io.Limit = .limited(limit.minInt(self.remaining));
+        if (capped_limit == .nothing) return 0;
+
+        const n = try self.inner.interface.stream(writer, capped_limit);
+        if (n == 0) return error.EndOfStream;
+        self.remaining -= n;
+        return n;
+    }
+};
+
+/// Captures a request body for routes that are intentionally batch-buffered.
+/// Streaming routes should consume `HttpzBodyReader` directly.
+fn readRequestBody(
+    req: *httpz.Request,
+    res: *httpz.Response,
+    max_body_size: usize,
+) ![]const u8 {
+    var body_reader = try HttpzBodyReader.init(req);
+    defer body_reader.deinit();
+    if (body_reader.restore_conn) res.keepalive = false;
+    var out: std.Io.Writer.Allocating = .init(res.arena);
+    _ = try pipeline_mod.streamReaderToWriter(body_reader.reader(), &out.writer, max_body_size);
+    return out.written();
+}
+
+/// Streams the inbound request body upstream with the original content length.
+fn sendRequestBody(
+    upstream_req: *std.http.Client.Request,
+    req: *httpz.Request,
+    res: *httpz.Response,
+    bufs: ThreadBufs,
+) !void {
+    const std_method = stdMethod(req.method) orelse return error.UnsupportedMethod;
+    if (std_method.requestHasBody() and req.body_len > 0) {
+        upstream_req.transfer_encoding = .{ .content_length = req.body_len };
+        var body_writer = try upstream_req.sendBodyUnflushed(bufs.upstream);
+        var body_reader = try HttpzBodyReader.init(req);
+        defer body_reader.deinit();
+        if (body_reader.restore_conn) res.keepalive = false;
+        _ = try pipeline_mod.streamReaderToWriter(body_reader.reader(), &body_writer.writer, req.body_len);
+        try body_writer.end();
+        try upstream_req.connection.?.flush();
+    } else if (std_method.requestHasBody()) {
+        upstream_req.transfer_encoding = .{ .content_length = 0 };
+        var body_writer = try upstream_req.sendBodyUnflushed(bufs.upstream);
+        try body_writer.end();
+        try upstream_req.connection.?.flush();
+    } else {
+        try upstream_req.sendBodiless();
+    }
 }
 
 /// Writes a fully-buffered request body upstream with an exact
@@ -688,6 +849,8 @@ test "httpz config derives from limits" {
     const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
     try testing.expectEqual(@as(?usize, 1024 * 1024), config.request.max_body_size);
     try testing.expectEqual(@as(?usize, limits_mod.RECV_BUF_BYTES), config.request.buffer_size);
+    try testing.expectEqual(@as(?usize, limits_mod.CHUNK_BUF_BYTES), config.request.lazy_read_size);
+    try testing.expectEqual(@as(?u16, 0), config.workers.large_buffer_count);
     // Unset worker/thread-pool counts ride httpz defaults (null).
     try testing.expectEqual(@as(?u16, null), config.workers.count);
     try testing.expectEqual(@as(?u16, null), config.thread_pool.count);

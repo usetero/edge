@@ -5,6 +5,15 @@ pub const Parser = zimdjson.ondemand.FullParser(.default);
 pub const Value = Parser.Value;
 pub const AnyValue = Parser.AnyValue;
 
+/// Reusable parser handle for unwrapping JSON-stringified messages across many
+/// records without a per-record parser alloc+deinit. `allocator` must be the
+/// same backing allocator on every call so the parser regrows its buffers in
+/// place — never an arena, which never frees on regrow and would leak per record.
+pub const UnwrapParser = struct {
+    parser: *Parser,
+    allocator: std.mem.Allocator,
+};
+
 /// Datadog log schema for parsing and serialization
 /// Uses zimdjson ondemand parser for efficient deserialization
 pub const DatadogLog = struct {
@@ -31,6 +40,14 @@ pub const DatadogLog = struct {
     /// nothing that outlives it.
     message_flat: std.StringHashMapUnmanaged([]const u8) = .empty,
     message_unwrapped: bool = false,
+
+    /// Optional batch-lifetime parser reused across records to unwrap the
+    /// JSON-stringified message. Set by the filter loop; when null,
+    /// `ensureUnwrapped` falls back to a transient per-call parser (tests and
+    /// single-log helpers). ponytail: raw ptr into the caller's parser, only
+    /// dereferenced during matching while that parser is alive (guarded by
+    /// `message_unwrapped`).
+    unwrap: ?UnwrapParser = null,
 
     /// Mutable, re-serializable view of a JSON-wrapped `message`, built lazily
     /// only when a transform targets a field *inside* the wrapper. Edits go to
@@ -251,15 +268,23 @@ pub const DatadogLog = struct {
         const head = std.mem.trimStart(u8, raw, " \t\r\n");
         if (head.len == 0 or head[0] != '{') return;
 
-        var parser: Parser = .init;
-        defer parser.deinit(allocator);
-        const doc = parser.parseFromSlice(allocator, raw) catch return;
-
         var prefix: std.ArrayList(u8) = .empty;
         defer prefix.deinit(allocator);
-        // Best-effort: an OOM mid-flatten just yields fewer leaves (fail-open
-        // matching), consistent with the rest of this accessor.
-        self.flattenValue(allocator, &prefix, doc.asValue().asAny() catch return) catch return;
+
+        // Prefer the shared batch parser (buffers reused in place on its own
+        // backing allocator); fall back to a transient one when unset. Either
+        // way, flattened leaves are copied into `allocator` so nothing outlives
+        // the parse. Best-effort: an OOM mid-flatten just yields fewer leaves
+        // (fail-open matching), consistent with the rest of this accessor.
+        if (self.unwrap) |u| {
+            const doc = u.parser.parseFromSlice(u.allocator, raw) catch return;
+            self.flattenValue(allocator, &prefix, doc.asValue().asAny() catch return) catch return;
+        } else {
+            var parser: Parser = .init;
+            defer parser.deinit(allocator);
+            const doc = parser.parseFromSlice(allocator, raw) catch return;
+            self.flattenValue(allocator, &prefix, doc.asValue().asAny() catch return) catch return;
+        }
     }
 
     /// Recursively flatten a parsed value, recording every string leaf under

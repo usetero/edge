@@ -54,6 +54,83 @@ pub const StreamProcessResult = struct {
     }
 };
 
+pub const RecordProcessResult = union(enum) {
+    keep,
+    drop,
+    replace: []const u8,
+};
+
+/// Reusable per-record evaluator for streaming Datadog JSON arrays.
+///
+/// Parser storage is request-scoped so zimdjson buffers grow in place across
+/// records. Per-record copies and replacement JSON still go into the caller's
+/// resettable record arena.
+pub const JsonRecordProcessor = struct {
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    parser_allocator: std.mem.Allocator,
+    parser: Parser = .init,
+    unwrap_parser: Parser = .init,
+
+    pub fn init(
+        parser_allocator: std.mem.Allocator,
+        registry: *const PolicyRegistry,
+        bus: *EventBus,
+    ) JsonRecordProcessor {
+        return .{
+            .registry = registry,
+            .bus = bus,
+            .parser_allocator = parser_allocator,
+        };
+    }
+
+    pub fn deinit(self: *JsonRecordProcessor) void {
+        self.parser.deinit(self.parser_allocator);
+        self.unwrap_parser.deinit(self.parser_allocator);
+        self.* = undefined;
+    }
+
+    pub fn process(
+        self: *JsonRecordProcessor,
+        record_allocator: std.mem.Allocator,
+        bytes: []const u8,
+    ) !RecordProcessResult {
+        const document = self.parser.parseFromSlice(self.parser_allocator, bytes) catch {
+            return .keep;
+        };
+        const value = document.asValue();
+        const value_type = value.getType() catch {
+            return .keep;
+        };
+        if (value_type != .object) return .keep;
+
+        var log_obj = DatadogLog.parse(record_allocator, value) catch {
+            return .keep;
+        };
+
+        const engine = PolicyEngine.init(self.bus, @constCast(self.registry));
+        var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
+        const unwrap: datadog_log.UnwrapParser = .{
+            .parser = &self.unwrap_parser,
+            .allocator = self.parser_allocator,
+        };
+        const filter_result = filterLog(
+            &engine,
+            &log_obj,
+            record_allocator,
+            &policy_id_buf,
+            unwrap,
+        );
+
+        if (!filter_result.keep) return .drop;
+        if (!filter_result.mutated) return .keep;
+
+        var out: std.Io.Writer.Allocating = .init(record_allocator);
+        try std.json.Stringify.value(log_obj, .{}, &out.writer);
+        return .{ .replace = out.written() };
+    }
+};
+
 pub fn processLogsStream(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
@@ -270,7 +347,9 @@ fn filterLog(
     log: *DatadogLog,
     allocator: std.mem.Allocator,
     policy_id_buf: [][]const u8,
+    unwrap: datadog_log.UnwrapParser,
 ) FilterLogResult {
+    log.unwrap = unwrap;
     var field_ctx: FieldAccessorContext = .{ .log = log, .allocator = allocator };
     const result = engine.evaluate(
         .log,
@@ -381,6 +460,15 @@ fn processJsonLogsWithFilter(
         return returnUnchanged(allocator, data, 0);
     };
 
+    // Separate parser reused across records to unwrap JSON-stringified
+    // messages (`bodyForMatch`/`unwrappedAttribute`). Distinct from `parser`,
+    // which is busy holding the array we're iterating. Uses the backing
+    // allocator (not the arena) so its buffers regrow in place instead of
+    // leaking one token buffer per record.
+    var unwrap_parser: Parser = .init;
+    defer unwrap_parser.deinit(allocator);
+    const unwrap: datadog_log.UnwrapParser = .{ .parser = &unwrap_parser, .allocator = allocator };
+
     const engine = PolicyEngine.init(bus, @constCast(registry));
 
     const value_type = document.asValue().getType() catch {
@@ -405,7 +493,7 @@ fn processJsonLogsWithFilter(
                 };
 
                 state.original_count += 1;
-                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf);
+                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, unwrap);
                 if (filter_result.mutated) state.mutated = true;
                 if (filter_result.keep) {
                     try state.kept.append(arena, log_obj);
@@ -422,7 +510,7 @@ fn processJsonLogsWithFilter(
             };
 
             state.original_count = 1;
-            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf);
+            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, unwrap);
             if (filter_result.mutated) state.mutated = true;
             if (filter_result.keep) {
                 try state.kept.append(arena, log_obj);
@@ -809,6 +897,95 @@ test "processLogs - DROP policy filters logs from array" {
     try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
     try std.testing.expect(result.wasModified());
+}
+
+test "JsonRecordProcessor - DROP policy drops matching record" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-debug"),
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "none"),
+        } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .regex = try allocator.dupe(u8, "debug") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    var processor = JsonRecordProcessor.init(allocator, &registry, noop_bus.eventBus());
+    defer processor.deinit();
+    var record_arena = std.heap.ArenaAllocator.init(allocator);
+    defer record_arena.deinit();
+
+    const result = try processor.process(record_arena.allocator(),
+        \\{"status": "debug", "message": "debug msg"}
+    );
+    switch (result) {
+        .drop => {},
+        else => return error.ExpectedDrop,
+    }
+}
+
+test "JsonRecordProcessor - transform returns replacement object" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var transform: proto.policy.LogTransform = .{};
+    var remove_attr_path: proto.policy.AttributePath = .{};
+    try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_attribute = remove_attr_path },
+    });
+
+    var test_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "remove-service-policy"),
+        .name = try allocator.dupe(u8, "remove-service"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try test_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer test_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{test_policy}, "file-provider", .file);
+
+    var processor = JsonRecordProcessor.init(allocator, &registry, noop_bus.eventBus());
+    defer processor.deinit();
+    var record_arena = std.heap.ArenaAllocator.init(allocator);
+    defer record_arena.deinit();
+
+    const result = try processor.process(record_arena.allocator(),
+        \\{"message": "test log message", "service": "my-service", "status": "info"}
+    );
+    const replacement = switch (result) {
+        .replace => |payload| payload,
+        else => return error.ExpectedReplacement,
+    };
+
+    try std.testing.expect(std.mem.indexOf(u8, replacement, "test log message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replacement, "info") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replacement, "my-service") == null);
+    try std.testing.expect(std.mem.indexOf(u8, replacement, "\"service\"") == null);
 }
 
 test "processLogs - DROP policy drops single object" {

@@ -1,0 +1,569 @@
+Process:         edge-datadog [19888]
+Path:            /Users/USER/*/edge-datadog
+Load Address:    0x10297c000
+Identifier:      edge-datadog
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  bash [19884]
+Target Type:     live task
+
+Date/Time:       2026-06-30 22:56:47.753 -0400
+Launch Time:     2026-06-30 22:56:24.528 -0400
+OS Version:      macOS 26.5 (25F71)
+Report Version:  7
+Analysis Tool:   /usr/bin/vmmap
+
+Physical footprint:         203.5M
+Physical footprint (peak):  203.5M
+Idle exit:                  untracked
+----
+
+Virtual Memory Map of process 19888 (edge-datadog)
+Output report format:  2.4  -- 64-bit process
+VM page size:  16384 bytes
+Collected with PhysFootprint mode enabled
+
+==== Non-writable regions for process 19888
+REGION TYPE                    START - END         [ VSIZE  RSDNT  DIRTY   SWAP] PRT/MAX SHRMOD PURGE    REGION DETAIL
+__TEXT                      10297c000-102bed000    [ 2500K  1552K     0K     0K] r-x/r-x SM=COW          /Users/jea/Code/tero/edge/zig-out/bin/edge-datadog
+mapped file                 102bed000-102bf0000    [   12K     0K     0K     0K] r-x/r-x SM=COW          /Users/jea/Code/tero/edge/zig-out/bin/edge-datadog
+__DATA_CONST                102bf0000-102bf1000    [    4K     4K     4K     0K] r--/rw- SM=COW          /Users/jea/Code/tero/edge/zig-out/bin/edge-datadog
+mapped file                 102bf1000-102bf4000    [   12K    12K    12K     0K] r--/rw- SM=COW          /Users/jea/Code/tero/edge/zig-out/bin/edge-datadog
+__LINKEDIT                  102c44000-102c9c000    [  352K    16K     0K     0K] r--/r-- SM=COW          /Users/jea/Code/tero/edge/zig-out/bin/edge-datadog
+shared memory               102ca4000-102cac000    [   32K    32K    32K     0K] r--/r-- SM=SHM  
+Performance tool data       102cac000-102cb0000    [   16K    16K    16K     0K] r--/rwx SM=PRV          MallocStackLoggingLiteZone_Wrapper_0x102cac000 zone structure
+__TEXT                      102d3c000-102dc4000    [  544K   144K     0K     0K] r-x/rwx SM=COW          /opt/homebrew/Cellar/zstd/1.5.7_1/lib/libzstd.1.5.7.dylib
+__DATA_CONST                102dc4000-102dc8000    [   16K    16K     0K     0K] r--/rw- SM=COW          /opt/homebrew/Cellar/zstd/1.5.7_1/lib/libzstd.1.5.7.dylib
+__LINKEDIT                  102dcc000-102de0000    [   80K    16K     0K     0K] r--/rwx SM=COW          /opt/homebrew/Cellar/zstd/1.5.7_1/lib/libzstd.1.5.7.dylib
+shared memory               102f0c000-102f10000    [   16K     0K     0K     0K] r--/r-- SM=SHM  
+MALLOC guard page           1031a8000-1031ac000    [   16K     0K     0K     0K] ---/rwx SM=SHM  
+MALLOC guard page           1035ac000-1035b0000    [   16K     0K     0K     0K] ---/rwx SM=SHM  
+__TEXT                      1035c8000-103860000    [ 2656K  1456K     0K     0K] r-x/rwx SM=COW          /opt/homebrew/Cellar/vectorscan/5.4.12/lib/libhs.5.4.12.dylib
+__DATA_CONST                103860000-103868000    [   32K    32K     0K     0K] r--/rw- SM=COW          /opt/homebrew/Cellar/vectorscan/5.4.12/lib/libhs.5.4.12.dylib
+__LINKEDIT                  10386c000-1039e8000    [ 1520K    16K     0K     0K] r--/rwx SM=COW          /opt/homebrew/Cellar/vectorscan/5.4.12/lib/libhs.5.4.12.dylib
+MALLOC guard page           1039e8000-103ac4000    [  880K     0K     0K     0K] ---/--- SM=SHM  
+MALLOC metadata             103b10000-103b14000    [   16K    16K    16K     0K] r--/rwx SM=PRV  
+MALLOC guard page           103bc4000-103ed0000    [ 3120K     0K     0K     0K] ---/--- SM=SHM  
+STACK GUARD                 16c480000-16c484000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 0
+STACK GUARD                 16e490000-16e494000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 1
+STACK GUARD                 16f49c000-16f4a0000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 2
+STACK GUARD                 1704a8000-1704ac000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 3
+STACK GUARD                 1714b4000-1714b8000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 4
+STACK GUARD                 1724c0000-1724c4000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 5
+STACK GUARD                 1734cc000-1734d0000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 6
+STACK GUARD                 1744d8000-1744dc000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 7
+STACK GUARD                 1754e4000-1754e8000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 8
+STACK GUARD                 1764f0000-1764f4000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 9
+STACK GUARD                 1774fc000-177500000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 10
+STACK GUARD                 178508000-17850c000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 11
+STACK GUARD                 179514000-179518000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 12
+STACK GUARD                 17a520000-17a524000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 13
+STACK GUARD                 17b52c000-17b530000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 14
+STACK GUARD                 17c538000-17c53c000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 15
+STACK GUARD                 17d544000-17d548000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 16
+STACK GUARD                 17e550000-17e554000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 17
+__TEXT                      186a00000-186a53000    [  332K   332K     0K     0K] r-x/r-x SM=COW          /usr/lib/libobjc.A.dylib
+__TEXT                      186a53000-186a88000    [  212K   164K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libdyld.dylib
+__TEXT                      186a88000-186b2f000    [  668K   668K     0K     0K] r-x/r-x SM=COW          /usr/lib/dyld
+__TEXT                      186b2f000-186b33000    [   16K    16K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_blocks.dylib
+__TEXT                      186b33000-186b88000    [  340K   340K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libxpc.dylib
+__TEXT                      186b88000-186ba9000    [  132K   132K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_trace.dylib
+__TEXT                      186ba9000-186c58000    [  700K   700K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libcorecrypto.dylib
+__TEXT                      186c58000-186ca9000    [  324K   324K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_malloc.dylib
+__TEXT                      186ca9000-186cf1000    [  288K   288K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libdispatch.dylib
+__TEXT                      186cf1000-186cf4000    [   12K    12K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_featureflags.dylib
+__TEXT                      186cf4000-186d75000    [  516K   500K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_c.dylib
+__TEXT                      186d75000-186e06000    [  580K   468K     0K     0K] r-x/r-x SM=COW          /usr/lib/libc++.1.dylib
+__TEXT                      186e06000-186e21000    [  108K   108K     0K     0K] r-x/r-x SM=COW          /usr/lib/libc++abi.dylib
+__TEXT                      186e21000-186e5f000    [  248K   248K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_kernel.dylib
+__TEXT                      186e5f000-186e6c000    [   52K    52K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_pthread.dylib
+__TEXT                      186e6c000-186e75000    [   36K    36K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_platform.dylib
+__TEXT                      186e75000-186ea5000    [  192K   176K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_info.dylib
+__TEXT                      18ae3c000-18ae46000    [   40K    40K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_darwin.dylib
+__TEXT                      18b2a7000-18b2ba000    [   76K    76K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_notify.dylib
+__TEXT                      18d574000-18d58f000    [  108K   108K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_networkextension.dylib
+__TEXT                      18d611000-18d629000    [   96K    96K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_asl.dylib
+__TEXT                      18f1cf000-18f1d8000    [   36K    36K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_symptoms.dylib
+__TEXT                      193473000-1934ac000    [  228K   228K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_containermanager.dylib
+__TEXT                      194884000-194889000    [   20K    20K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_configuration.dylib
+__TEXT                      194889000-194890000    [   28K    28K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_sandbox.dylib
+__TEXT                      195ee3000-195ee7000    [   16K    16K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libquarantine.dylib
+__TEXT                      196682000-196689000    [   28K    28K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_coreservices.dylib
+__TEXT                      196bfe000-196c0d000    [   60K    60K     0K     0K] r-x/r-x SM=COW          /usr/lib/libz.1.dylib
+__TEXT                      196c0d000-196c4b000    [  248K   184K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_m.dylib
+__TEXT                      196c4c000-196c50000    [   16K    16K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libmacho.dylib
+__TEXT                      196c69000-196c77000    [   56K    56K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libcommonCrypto.dylib
+__TEXT                      196c77000-196c81000    [   40K    40K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libunwind.dylib
+__TEXT                      196c89000-196c94000    [   44K    44K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libcopyfile.dylib
+__TEXT                      196c94000-196c98000    [   16K    16K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libcompiler_rt.dylib
+__TEXT                      196c98000-196c9d000    [   20K    20K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_collections.dylib
+__TEXT                      196c9d000-196ca1000    [   16K    16K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_secinit.dylib
+__TEXT                      196ca1000-196ca4000    [   12K    12K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libremovefile.dylib
+__TEXT                      196ca4000-196ca5000    [    4K     4K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libkeymgr.dylib
+__TEXT                      196ca5000-196cae000    [   36K    36K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_dnssd.dylib
+__TEXT                      196cae000-196cb4000    [   24K    24K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libcache.dylib
+__TEXT                      196cb4000-196cb6000    [    8K     8K     0K     0K] r-x/r-x SM=COW          /usr/lib/libSystem.B.dylib
+__TEXT                      1b40c3000-1b40d0000    [   52K    52K     0K     0K] r-x/r-x SM=COW          /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+__DATA_CONST                1ec27f7a0-1ec280320    [  2944   2944     0K     0K] r--/rw- SM=COW          /usr/lib/libobjc.A.dylib
+__DATA_CONST                1ec280320-1ec282748    [    9K     9K     0K     0K] r--/rw- SM=COW          /usr/lib/dyld
+__DATA_CONST                1ec282748-1ec282800    [   184    184     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_blocks.dylib
+__DATA_CONST                1ec282800-1ec2840b0    [    6K     6K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libxpc.dylib
+__DATA_CONST                1ec2840b0-1ec284768    [  1720   1720     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_trace.dylib
+__DATA_CONST                1ec284768-1ec286920    [    8K     8K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcorecrypto.dylib
+__DATA_CONST                1ec286920-1ec2873f8    [  2776   2776     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_malloc.dylib
+__DATA_CONST                1ec287400-1ec288150    [  3408   3408     0K     0K] r--/rw- SM=COW          /usr/lib/system/libdispatch.dylib
+__DATA_CONST                1ec288150-1ec288190    [    64     64     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_featureflags.dylib
+__DATA_CONST                1ec288190-1ec289a00    [    6K     6K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_c.dylib
+__DATA_CONST                1ec289a00-1ec28a760    [  3424   3424     0K     0K] r--/rw- SM=COW          /usr/lib/libc++.1.dylib
+__DATA_CONST                1ec28a760-1ec28abe0    [  1152   1152     0K     0K] r--/rw- SM=COW          /usr/lib/libc++abi.dylib
+__DATA_CONST                1ec28abe0-1ec28d768    [   11K    11K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_kernel.dylib
+__DATA_CONST                1ec28d768-1ec28d7a0    [    56     56     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_pthread.dylib
+__DATA_CONST                1ec28d7a0-1ec28d7c0    [    32     32     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_platform.dylib
+__DATA_CONST                1ec28d7c0-1ec28dd48    [  1416   1416     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_info.dylib
+__DATA_CONST                1ec7016e8-1ec704090    [   10K    10K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_darwin.dylib
+__DATA_CONST                1ec71db70-1ec71dd58    [   488    488     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_notify.dylib
+__DATA_CONST                1ec7d4a68-1ec7d5180    [  1816   1816     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_networkextension.dylib
+__DATA_CONST                1ec7d6550-1ec7d6b70    [  1568   1568     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_asl.dylib
+__DATA_CONST                1ec848100-1ec8482a0    [   416    416     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_symptoms.dylib
+__DATA_CONST                1ecae2910-1ecae3630    [  3360   3360     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_containermanager.dylib
+__DATA_CONST                1ecb8ec08-1ecb8ede0    [   472    472     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_configuration.dylib
+__DATA_CONST                1ecb8ede0-1ecb8eea0    [   192    192     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_sandbox.dylib
+__DATA_CONST                1ecba74d0-1ecba7520    [    80     80     0K     0K] r--/rw- SM=COW          /usr/lib/system/libquarantine.dylib
+__DATA_CONST                1eccfad48-1eccfb650    [  2312   2312     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_coreservices.dylib
+__DATA_CONST                1ecd1ea10-1ecd1eac8    [   184    184     0K     0K] r--/rw- SM=COW          /usr/lib/libz.1.dylib
+__DATA_CONST                1ecd1ead8-1ecd1f280    [  1960   1960     0K     0K] r--/rw- SM=COW          /usr/lib/system/libmacho.dylib
+__DATA_CONST                1ecd1f2b8-1ecd1fa58    [  1952   1952     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcommonCrypto.dylib
+__DATA_CONST                1ecd1fa58-1ecd1fd78    [   800    800     0K     0K] r--/rw- SM=COW          /usr/lib/system/libunwind.dylib
+__DATA_CONST                1ecd1fdb0-1ecd20190    [   992    992     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcopyfile.dylib
+__DATA_CONST                1ecd20190-1ecd20198    [     8      8     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_collections.dylib
+__DATA_CONST                1ecd20198-1ecd20228    [   144    144     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_secinit.dylib
+__DATA_CONST                1ecd20228-1ecd20238    [    16     16     0K     0K] r--/rw- SM=COW          /usr/lib/system/libremovefile.dylib
+__DATA_CONST                1ecd20238-1ecd20248    [    16     16     0K     0K] r--/rw- SM=COW          /usr/lib/system/libkeymgr.dylib
+__DATA_CONST                1ecd20248-1ecd202c0    [   120    120     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_dnssd.dylib
+__DATA_CONST                1ecd202c0-1ecd20368    [   168    168     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcache.dylib
+__DATA_CONST                1ecd20368-1ecd20378    [    16     16     0K     0K] r--/rw- SM=COW          /usr/lib/libSystem.B.dylib
+__DATA_CONST                1ed5631c0-1ed563230    [   112    112     0K     0K] r--/rw- SM=COW          /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+unused __TEXT               1f2d30000-1f2d30030    [    48     48     48     0K] r--/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__TPRO_CONST                1f2d30030-1f2d30048    [    24     24     24     0K] r--/rw- SM=COW          /usr/lib/system/libdyld.dylib
+unused __TEXT               1f2d30048-1f2d30050    [     8      8      8     0K] r--/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__TPRO_CONST                1f2d30050-1f2d50140    [  128K    80K    48K     0K] r--/rw- SM=COW          /usr/lib/dyld
+__AUTH_CONST                1f46415b0-1f4642438    [  3720   3720     0K     0K] r--/rw- SM=COW          /usr/lib/libobjc.A.dylib
+__DATA_CONST                1f4642438-1f4642df0    [  2488   2488     0K     0K] r--/rw- SM=COW          /usr/lib/system/libdyld.dylib
+__AUTH_CONST                1f4642df0-1f46458e0    [   11K    11K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libdyld.dylib
+__AUTH_CONST                1f46458e0-1f464af48    [   22K    22K     0K     0K] r--/rw- SM=COW          /usr/lib/dyld
+__AUTH_CONST                1f464af48-1f464b3d8    [  1168   1168     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_blocks.dylib
+__AUTH_CONST                1f464b3e0-1f4650710    [   21K    21K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libxpc.dylib
+__AUTH_CONST                1f4650710-1f4651af8    [    5K     5K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_trace.dylib
+__AUTH_CONST                1f4651af8-1f4653ca8    [    8K     8K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcorecrypto.dylib
+__AUTH_CONST                1f4653ca8-1f4654788    [  2784   2784     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_malloc.dylib
+__AUTH_CONST                1f46547c0-1f4668048    [   78K    62K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libdispatch.dylib
+__AUTH_CONST                1f4668048-1f46681c8    [   384    384     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_featureflags.dylib
+__AUTH_CONST                1f46681c8-1f4668b50    [  2440   2440     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_c.dylib
+__AUTH_CONST                1f4668b50-1f466d408    [   18K    18K     0K     0K] r--/rw- SM=COW          /usr/lib/libc++.1.dylib
+__AUTH_CONST                1f466d408-1f4670ef0    [   15K    15K     0K     0K] r--/rw- SM=COW          /usr/lib/libc++abi.dylib
+__AUTH_CONST                1f4670ef0-1f4671040    [   336    336     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_kernel.dylib
+__AUTH_CONST                1f4671040-1f4671270    [   560    560     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_pthread.dylib
+__AUTH_CONST                1f4671270-1f4671498    [   552    552     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_platform.dylib
+__AUTH_CONST                1f4671498-1f4672bb8    [    6K     6K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_info.dylib
+__AUTH_CONST                1f4a03f68-1f4a043b0    [  1096   1096     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_darwin.dylib
+__AUTH_CONST                1f4a21928-1f4a21df0    [  1224   1224     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_notify.dylib
+__AUTH_CONST                1f4ce6ce8-1f4ce7960    [  3192   3192     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_networkextension.dylib
+__AUTH_CONST                1f4d57878-1f4d582c8    [  2640   2640     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_asl.dylib
+__AUTH_CONST                1f4ea6dd8-1f4ea70a0    [   712    712     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_symptoms.dylib
+__AUTH_CONST                1f51544b0-1f5155f78    [    7K     7K     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_containermanager.dylib
+__AUTH_CONST                1f5330d58-1f5331080    [   808    808     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_configuration.dylib
+__AUTH_CONST                1f5331080-1f5331318    [   664    664     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_sandbox.dylib
+__AUTH_CONST                1f53b5528-1f53b5680    [   344    344     0K     0K] r--/rw- SM=COW          /usr/lib/system/libquarantine.dylib
+__AUTH_CONST                1f54d21e8-1f54d2508    [   800    800     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_coreservices.dylib
+__AUTH_CONST                1f55595b8-1f55596e0    [   296    296     0K     0K] r--/rw- SM=COW          /usr/lib/libz.1.dylib
+__AUTH_CONST                1f55596e0-1f5559708    [    40     40     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_m.dylib
+__AUTH_CONST                1f55597b8-1f5559828    [   112    112     0K     0K] r--/rw- SM=COW          /usr/lib/system/libmacho.dylib
+__AUTH_CONST                1f5559940-1f555a7c8    [  3720   3720     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcommonCrypto.dylib
+__AUTH_CONST                1f555a7c8-1f555a8e0    [   280    280     0K     0K] r--/rw- SM=COW          /usr/lib/system/libunwind.dylib
+__AUTH_CONST                1f555ac50-1f555b0c0    [  1136   1136     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcopyfile.dylib
+__AUTH_CONST                1f555b0c0-1f555b128    [   104    104     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcompiler_rt.dylib
+__AUTH_CONST                1f555b128-1f555b278    [   336    336     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_collections.dylib
+__AUTH_CONST                1f555b278-1f555b5b8    [   832    832     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_secinit.dylib
+__AUTH_CONST                1f555b5b8-1f555b748    [   400    400     0K     0K] r--/rw- SM=COW          /usr/lib/system/libremovefile.dylib
+__AUTH_CONST                1f555b748-1f555b7c8    [   128    128     0K     0K] r--/rw- SM=COW          /usr/lib/system/libkeymgr.dylib
+__AUTH_CONST                1f555b7c8-1f555b9c0    [   504    504     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_dnssd.dylib
+__AUTH_CONST                1f555b9c0-1f555ba98    [   216    216     0K     0K] r--/rw- SM=COW          /usr/lib/system/libcache.dylib
+__AUTH_CONST                1f555ba98-1f555bd78    [   736    736     0K     0K] r--/rw- SM=COW          /usr/lib/libSystem.B.dylib
+__AUTH_CONST                1f7d45c58-1f7d46098    [  1088     0K     0K     0K] r--/rw- SM=COW          /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+__OBJC_RO                   200aa1c70-2059c8220    [ 79.1M  65.8M     0K     0K] r--/r-- SM=COW          /usr/lib/libobjc.A.dylib
+__LINKEDIT                  2059d0000-2296c4000    [573.0M  62.0M     0K     0K] r--/r-- SM=COW          dyld shared cache combined __LINKEDIT
+__TEXT                      289eeb000-289ef3000    [   32K    16K     0K     0K] r-x/r-x SM=COW          /usr/lib/libRosetta.dylib
+__TEXT                      28bb08000-28bb0c000    [   16K    16K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_darwindirectory.dylib
+__TEXT                      28bb0c000-28bb16000    [   40K    40K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_eligibility.dylib
+__TEXT                      28bb16000-28bb1e000    [   32K    32K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_sanitizers.dylib
+__TEXT                      28bb1e000-28bb1f000    [    4K     4K     0K     0K] r-x/r-x SM=COW          /usr/lib/system/libsystem_trial.dylib
+__DATA_CONST                2985c1220-2985c1258    [    56     56     0K     0K] r--/rw- SM=COW          /usr/lib/libRosetta.dylib
+__DATA_CONST                29897f028-29897f1b8    [   400    400     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_darwindirectory.dylib
+__DATA_CONST                29897f1b8-29897fd70    [  3000   3000     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_eligibility.dylib
+__DATA_CONST                29897fd70-29897fe50    [   224    224     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_sanitizers.dylib
+__AUTH_CONST                2a56e9510-2a56e9880    [   880    880     0K     0K] r--/rw- SM=COW          /usr/lib/libRosetta.dylib
+__AUTH_CONST                2a57dbd88-2a57dc0d0    [   840    840     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_darwindirectory.dylib
+__AUTH_CONST                2a57dc0d0-2a57dc288    [   440    440     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_eligibility.dylib
+__AUTH_CONST                2a57dc288-2a57dc438    [   432    432     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_sanitizers.dylib
+__AUTH_CONST                2a57dc438-2a57dc470    [    56     56     0K     0K] r--/rw- SM=COW          /usr/lib/system/libsystem_trial.dylib
+unused __TEXT               2eba84000-2eba88000    [   16K    16K    16K     0K] r--/r-- SM=COW          on dirty page  unused system shared lib __DATA
+STACK GUARD                 300000000-300004000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 18
+STACK GUARD                 30100c000-301010000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 19
+STACK GUARD                 302018000-30201c000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 20
+STACK GUARD                 303024000-303028000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 21
+STACK GUARD                 304030000-304034000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 22
+STACK GUARD                 30503c000-305040000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 23
+STACK GUARD                 306048000-30604c000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 24
+STACK GUARD                 307054000-307058000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 25
+STACK GUARD                 308060000-308064000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 26
+STACK GUARD                 30906c000-309070000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 27
+STACK GUARD                 30a078000-30a07c000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 28
+STACK GUARD                 30b084000-30b088000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 29
+STACK GUARD                 30c090000-30c094000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 30
+STACK GUARD                 30d09c000-30d0a0000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 31
+STACK GUARD                 30e0a8000-30e0ac000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 32
+STACK GUARD                 30f0b4000-30f0b8000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 33
+STACK GUARD                 3100c0000-3100c4000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 34
+STACK GUARD                 3110cc000-3110d0000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 35
+STACK GUARD                 3120d8000-3120dc000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 36
+STACK GUARD                 3130e4000-3130e8000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 37
+STACK GUARD                 3140f0000-3140f4000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 38
+STACK GUARD                 3150fc000-315100000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 39
+STACK GUARD                 316108000-31610c000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 40
+STACK GUARD                 317114000-317118000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 41
+STACK GUARD                 318120000-318124000    [   16K     0K     0K     0K] ---/rwx SM=NUL          stack guard for thread 42
+
+==== Writable regions for process 19888
+REGION TYPE                    START - END         [ VSIZE  RSDNT  DIRTY   SWAP] PRT/MAX SHRMOD PURGE    REGION DETAIL
+__DATA                      102bf4000-102c00000    [   48K    48K    48K     0K] rw-/rw- SM=COW          /Users/jea/Code/tero/edge/zig-out/bin/edge-datadog
+__DATA                      102c00000-102c41000    [  260K    20K    20K     0K] rw-/rw- SM=PRV          /Users/jea/Code/tero/edge/zig-out/bin/edge-datadog
+VM_ALLOCATE                 102c41000-102c44000    [   12K    12K    12K     0K] rw-/rw- SM=PRV  
+Kernel Alloc Once           102c9c000-102ca4000    [   32K    16K    16K     0K] rw-/rwx SM=PRV  
+Performance tool data       102cb0000-102cbc000    [   48K    48K    48K     0K] rw-/rwx SM=PRV  
+Performance tool data       102cbc000-102cd8000    [  112K   112K   112K     0K] rw-/rwx SM=PRV  
+Performance tool data       102cd8000-102ce4000    [   48K    48K    48K     0K] rw-/rwx SM=PRV  
+Performance tool data       102ce4000-102d00000    [  112K   112K   112K     0K] rw-/rwx SM=PRV  
+Performance tool data       102d00000-102d04000    [   16K    16K    16K     0K] rw-/rwx SM=PRV  
+Performance tool data       102d04000-102d1c000    [   96K    96K    96K     0K] rw-/rwx SM=PRV  
+Performance tool data       102d1c000-102d38000    [  112K   112K   112K     0K] rw-/rwx SM=PRV  
+Performance tool data       102d38000-102d3c000    [   16K    16K    16K     0K] rw-/rwx SM=PRV  
+__DATA                      102dc8000-102dcc000    [   16K     0K     0K     0K] rw-/rwx SM=NUL          /opt/homebrew/Cellar/zstd/1.5.7_1/lib/libzstd.1.5.7.dylib
+Performance tool data       102de0000-102ee0000    [ 1024K  1024K  1024K     0K] rw-/rwx SM=PRV  
+Performance tool data       102ee0000-102efc000    [  112K   112K   112K     0K] rw-/rwx SM=PRV  
+Performance tool data       102efc000-102f0c000    [   64K    64K    64K     0K] rw-/rwx SM=PRV  
+MALLOC_TINY                 1031ac000-1035ac000    [ 4096K    32K    32K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+__DATA                      103868000-10386c000    [   16K    16K    16K     0K] rw-/rwx SM=COW          /opt/homebrew/Cellar/vectorscan/5.4.12/lib/libhs.5.4.12.dylib
+MALLOC metadata             103ac4000-103b10000    [  304K   272K   272K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_NANO metadata        103b14000-103b1c000    [   32K    16K    16K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC metadata             103b1c000-103b28000    [   48K    48K    48K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC metadata             103b28000-103b30000    [   32K    32K    32K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC metadata             103b30000-103b34000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC metadata             103b34000-103b6c000    [  224K   224K   224K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC metadata             103b6c000-103b7c000    [   64K    64K    64K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC metadata             103b7c000-103b94000    [   96K    96K    96K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC metadata             103b94000-103b98000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC metadata             103b98000-103b9c000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+Memory Tag 22               103ed0000-107ed4000    [ 64.0M    16K    16K     0K] rw-/rw- SM=PRV  
+MALLOC metadata             107ed4000-107f08000    [  208K   208K   208K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000 zone structure
+MALLOC metadata             107f08000-107f34000    [  176K   176K   176K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC metadata             107f34000-107f38000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC metadata             107f38000-107f58000    [  128K   128K   128K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC metadata             107f58000-107f5c000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC metadata             107f5c000-107f6c000    [   64K    64K    64K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC metadata             107f6c000-107f70000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC metadata             107f70000-107f88000    [   96K    96K    96K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC metadata             157600000-157604000    [   16K    16K    16K     0K] rw-/rwx SM=PRV  
+Stack                       16c484000-16d484000    [ 16.0M    48K    48K     0K] rw-/rwx SM=PRV          thread 0
+Stack                       16e488000-16e490000    [   32K    16K    16K     0K] rw-/rwx SM=PRV  
+Stack                       16e494000-16f49c000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 1
+Stack                       16f4a0000-1704a8000    [ 16.0M    32K    32K     0K] rw-/rwx SM=PRV          thread 2
+Stack                       1704ac000-1714b4000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 3
+Stack                       1714b8000-1724c0000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 4
+Stack                       1724c4000-1734cc000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 5
+Stack                       1734d0000-1744d8000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 6
+Stack                       1744dc000-1754e4000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 7
+Stack                       1754e8000-1764f0000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 8
+Stack                       1764f4000-1774fc000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 9
+Stack                       177500000-178508000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 10
+Stack                       17850c000-179514000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 11
+Stack                       179518000-17a520000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 12
+Stack                       17a524000-17b52c000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 13
+Stack                       17b530000-17c538000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 14
+Stack                       17c53c000-17d544000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 15
+Stack                       17d548000-17e550000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 16
+Stack                       17e554000-17f55c000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 17
+__DATA                      1f051c000-1f051c6f8    [  1784   1784   1784     0K] rw-/rw- SM=COW          /usr/lib/libobjc.A.dylib
+__DATA                      1f051c6f8-1f051d899    [    4K     4K     4K     0K] rw-/rw- SM=COW          /usr/lib/system/libdyld.dylib
+unused __DATA               1f051d899-1f051d8c0    [    39     39     39     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA                      1f051d8c0-1f051ea10    [    4K     4K     4K     0K] rw-/rw- SM=COW          /usr/lib/dyld
+__DATA                      1f051ea10-1f051ea28    [    24     24     24     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_blocks.dylib
+__DATA                      1f051ea28-1f051f910    [  3816   3816   3816     0K] rw-/rw- SM=COW          /usr/lib/system/libxpc.dylib
+__DATA                      1f051f910-1f051fd60    [  1104   1104   1104     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_trace.dylib
+__DATA                      1f051fd60-1f0527498    [   30K    30K    14K     0K] rw-/rw- SM=COW          /usr/lib/system/libcorecrypto.dylib
+__DATA                      1f0527498-1f052987c    [    9K     9K     9K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_malloc.dylib
+unused __DATA               1f052987c-1f0529880    [     4      4      4     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA                      1f0529880-1f052ac08    [    5K     5K     5K     0K] rw-/rw- SM=COW          /usr/lib/system/libdispatch.dylib
+__DATA                      1f052ac08-1f052ac40    [    56     56     56     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_featureflags.dylib
+__DATA                      1f052ac40-1f052cd40    [    8K     8K     5K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_c.dylib
+__DATA                      1f052cd40-1f05322e0    [   21K    21K     9K     0K] rw-/rw- SM=COW          /usr/lib/libc++.1.dylib
+__DATA                      1f05322e0-1f05326a0    [   960    960    960     0K] rw-/rw- SM=COW          /usr/lib/libc++abi.dylib
+__DATA                      1f05326a0-1f0532a28    [   904    904    904     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_kernel.dylib
+unused __DATA               1f0532a28-1f0534000    [    5K     5K     5K     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA                      1f0534000-1f0541000    [   52K    52K     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_pthread.dylib
+__DATA                      1f0544000-1f054c148    [   32K    16K     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_platform.dylib
+__DATA                      1f054c148-1f054cc99    [  2897   2897     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_info.dylib
+__DATA                      1f062b2e8-1f062b2f8    [    16     16     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_darwin.dylib
+__DATA                      1f0633800-1f0633970    [   368    368     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_notify.dylib
+__DATA                      1f069ed18-1f069f350    [  1592   1592     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_networkextension.dylib
+__DATA                      1f069f650-1f069f860    [   528    528     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_asl.dylib
+__DATA                      1f06cf728-1f06cf758    [    48     48     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_symptoms.dylib
+__DATA                      1f07ba430-1f07ba930    [  1280   1280     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_containermanager.dylib
+__DATA                      1f07ebd84-1f07ebd85    [     1      1     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_configuration.dylib
+__DATA                      1f07ebd88-1f07ebda8    [    32     32     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_sandbox.dylib
+__DATA                      1f0806fe8-1f0807008    [    32     32     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_coreservices.dylib
+__DATA                      1f080f9e0-1f080f9e4    [     4      4     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_m.dylib
+__DATA                      1f080fb08-1f0810509    [  2561   2561     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libunwind.dylib
+__DATA                      1f0811678-1f08117c0    [   328    328     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_secinit.dylib
+__DATA                      1f08117c0-1f08117e8    [    40     40     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_dnssd.dylib
+__DATA                      1f08117e8-1f08117f0    [     8      8     0K     0K] rw-/rw- SM=COW          /usr/lib/libSystem.B.dylib
+unused __DATA               1f1238000-1f12384e8    [  1256   1256   1256     0K] rw-/rw- SM=COW          on dirty page  unused /usr/lib/libstdc++.6.dylib
+unused __DATA               1f12384e8-1f12397f4    [    5K     5K     5K     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/PrivateFrameworks/LoggingSupport.framework/Versions/A/LoggingSupport
+unused __DATA               1f12397f4-1f12397f8    [     4      4      4     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA                      1f12397f8-1f123c920    [   12K    12K    12K     0K] rw-/rw- SM=COW          /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+unused __DATA               1f123c920-1f123d128    [  2056   2056   2056     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/PrivateFrameworks/StorageManagement.framework/Versions/A/StorageManagement
+unused __DATA               1f123d128-1f123d130    [     8      8      8     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+unused __DATA               1f123d130-1f123e1a8    [    4K     4K     4K     0K] rw-/rw- SM=COW          on dirty page  unused /usr/lib/libmis.dylib
+unused __DATA               1f123e1a8-1f123e3f0    [   584    584    584     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/PrivateFrameworks/GPURawCounter.framework/Versions/A/GPURawCounter
+unused __DATA               1f123e3f0-1f123f5a1    [    4K     4K     4K     0K] rw-/rw- SM=COW          on dirty page  unused /usr/lib/swift/libswiftCoreAudio.dylib
+unused __DATA               1f123f5a1-1f123f5b0    [    15     15     15     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+unused __DATA               1f123f5b0-1f123f900    [   848    848    848     0K] rw-/rw- SM=COW          on dirty page  unused /usr/lib/swift/libswiftCoreFoundation.dylib
+unused __DATA               1f123f900-1f123ffa0    [  1696   1696   1696     0K] rw-/rw- SM=COW          on dirty page  unused /usr/lib/swift/libswiftIntents.dylib
+unused __DATA               1f123ffa0-1f1240000    [    96     96     96     0K] rw-/rw- SM=COW          on dirty page  unused /usr/lib/swift/libswiftXPC.dylib
+__OBJC_RW                   1f2d54000-1f2fddac0    [ 2599K  2263K    23K     0K] rw-/rw- SM=COW          /usr/lib/libobjc.A.dylib
+__DATA_DIRTY                1f2fddac0-1f2fe3fd0    [   25K    25K    25K     0K] rw-/rw- SM=COW          /usr/lib/libobjc.A.dylib
+__DATA_DIRTY                1f2fe3fd0-1f2fe4058    [   136    136    136     0K] rw-/rw- SM=COW          /usr/lib/system/libdyld.dylib
+unused __DATA               1f2fe4058-1f2fe4080    [    40     40     40     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA_DIRTY                1f2fe4080-1f2fe7774    [   14K    14K    14K     0K] rw-/rw- SM=COW          /usr/lib/dyld
+unused __DATA               1f2fe7774-1f2fe7778    [     4      4      4     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA_DIRTY                1f2fe7778-1f2fe7970    [   504    504    504     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_blocks.dylib
+__DATA_DIRTY                1f2fe7970-1f2fe8548    [  3032   3032   3032     0K] rw-/rw- SM=COW          /usr/lib/system/libxpc.dylib
+__DATA_DIRTY                1f2fe8548-1f2fe8c70    [  1832   1832   1832     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_trace.dylib
+__DATA_DIRTY                1f2fe8c70-1f2fe96b0    [  2624   2624   2624     0K] rw-/rw- SM=COW          /usr/lib/system/libcorecrypto.dylib
+__DATA_DIRTY                1f2fe96b0-1f2fe998c    [   732    732    732     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_malloc.dylib
+unused __DATA               1f2fe998c-1f2fe99c0    [    52     52     52     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA_DIRTY                1f2fe99c0-1f2fed468    [   15K    15K    15K     0K] rw-/rw- SM=COW          /usr/lib/system/libdispatch.dylib
+__DATA_DIRTY                1f2fed468-1f2fed488    [    32     32     32     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_featureflags.dylib
+__DATA_DIRTY                1f2fed488-1f2ff0224    [   11K    11K    11K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_c.dylib
+unused __DATA               1f2ff0224-1f2ff0228    [     4      4      4     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA_DIRTY                1f2ff0228-1f2ff1d78    [    7K     7K     7K     0K] rw-/rw- SM=COW          /usr/lib/libc++.1.dylib
+__DATA_DIRTY                1f2ff1d78-1f2ff1e50    [   216    216    216     0K] rw-/rw- SM=COW          /usr/lib/libc++abi.dylib
+__DATA_DIRTY                1f2ff1e50-1f2ff2528    [  1752   1752   1752     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_kernel.dylib
+unused __DATA               1f2ff2528-1f2ff4000    [    7K     7K     7K     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA_DIRTY                1f2ff4000-1f3004018    [   64K    64K    48K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_pthread.dylib
+__DATA_DIRTY                1f3004018-1f3004068    [    80     80     80     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_platform.dylib
+__DATA_DIRTY                1f3004068-1f3004510    [  1192   1192   1192     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_info.dylib
+unused __DATA_DIRTY         1f3004510-1f3007d10    [   14K    14K    14K     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+unused __DATA_DIRTY         1f3007d10-1f3008000    [   752    752    752     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/LaunchServices
+unused __DATA_DIRTY         1f3028000-1f3028b80    [  2944   2944   2944     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
+unused __DATA_DIRTY         1f3028b80-1f30293f0    [  2160   2160   2160     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/Frameworks/Security.framework/Versions/A/Security
+unused __DATA_DIRTY         1f30293f0-1f302ace0    [    6K     6K     6K     0K] rw-/rw- SM=COW          on dirty page  unused /usr/lib/libicucore.A.dylib
+__DATA_DIRTY                1f302ace0-1f302ad20    [    64     64     64     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_darwin.dylib
+unused __DATA_DIRTY         1f302ad20-1f302b60c    [  2284   2284   2284     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/CarbonCore
+unused __DATA               1f302b60c-1f302b610    [     4      4      4     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+unused __DATA_DIRTY         1f302b610-1f302c000    [  2544   2544   2544     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/PrivateFrameworks/CoreServicesInternal.framework/Versions/A/CoreServicesInternal
+unused __DATA_DIRTY         1f302c000-1f302da30    [    7K     7K     7K     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/PrivateFrameworks/CoreServicesInternal.framework/Versions/A/CoreServicesInternal
+unused __DATA_DIRTY         1f302da30-1f302dae8    [   184    184    184     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/PrivateFrameworks/CoreServicesStore.framework/Versions/A/CoreServicesStore
+unused __DATA_DIRTY         1f302dae8-1f302de7c    [   916    916    916     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+unused __DATA               1f302de7c-1f302de80    [     4      4      4     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+__DATA_DIRTY                1f302de80-1f302deb0    [    48     48     48     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_notify.dylib
+unused __DATA_DIRTY         1f302deb0-1f302dee8    [    56     56     56     0K] rw-/rw- SM=COW          on dirty page  unused /usr/lib/libsandbox.1.dylib
+unused __DATA               1f302dee8-1f302def0    [     8      8      8     0K] rw-/rw- SM=COW          on dirty page  unused system shared lib __DATA
+unused __DATA_DIRTY         1f302def0-1f3030000    [    8K     8K     8K     0K] rw-/rw- SM=COW          on dirty page  unused /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
+__DATA_DIRTY                1f3057428-1f305752a    [   258    258     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_networkextension.dylib
+__DATA_DIRTY                1f30593a0-1f3059508    [   360    360     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_asl.dylib
+__DATA_DIRTY                1f306e1c8-1f306e1e8    [    32     32     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_symptoms.dylib
+__DATA_DIRTY                1f30a1260-1f30a1408    [   424    424     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_containermanager.dylib
+__DATA_DIRTY                1f30ba3b8-1f30ba478    [   192    192     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_configuration.dylib
+__DATA_DIRTY                1f30ba478-1f30ba4a0    [    40     40     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_sandbox.dylib
+__DATA_DIRTY                1f30c2d38-1f30c2d48    [    16     16     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libquarantine.dylib
+__DATA_DIRTY                1f30d4b50-1f30d4bf8    [   168    168     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_coreservices.dylib
+__DATA_DIRTY                1f30e28b8-1f30e28d8    [    32     32     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libcommonCrypto.dylib
+__DATA_DIRTY                1f30e28e8-1f30e28f8    [    16     16     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libcopyfile.dylib
+__DATA_DIRTY                1f30e28f8-1f30e38f8    [    4K     4K     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libcompiler_rt.dylib
+__DATA_DIRTY                1f30e38f8-1f30e3900    [     8      8     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_dnssd.dylib
+__DATA_DIRTY                1f30e3900-1f30e3908    [     8      8     0K     0K] rw-/rw- SM=COW          /usr/lib/libSystem.B.dylib
+__AUTH                      1f3ca3500-1f3ca3598    [   152    152     0K     0K] rw-/rw- SM=COW          /usr/lib/libobjc.A.dylib
+__AUTH                      1f3ca3598-1f3ca35e8    [    80     80     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libxpc.dylib
+__AUTH                      1f3ca35e8-1f3ca3890    [   680    680     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_trace.dylib
+__AUTH                      1f3ca3890-1f3ca39a8    [   280    280     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libcorecrypto.dylib
+__AUTH                      1f3ca4000-1f3cac000    [   32K    32K     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_malloc.dylib
+__AUTH                      1f3cac000-1f3cac070    [   112    112     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libdispatch.dylib
+__AUTH                      1f3cac070-1f3cac120    [   176    176     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_c.dylib
+__AUTH                      1f3cac120-1f3cac150    [    48     48     0K     0K] rw-/rw- SM=COW          /usr/lib/libc++.1.dylib
+__AUTH                      1f3cac150-1f3cac180    [    48     48     0K     0K] rw-/rw- SM=COW          /usr/lib/libc++abi.dylib
+__AUTH                      1f3cac180-1f3cac350    [   464    464     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_info.dylib
+__AUTH                      1f3d56950-1f3d56d88    [  1080   1080     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_containermanager.dylib
+__AUTH                      1f3f64d38-1f3f64dc0    [   136    136     0K     0K] rw-/rw- SM=COW          /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+__DATA                      29e9580e0-29e959248    [    4K     4K     0K     0K] rw-/rw- SM=COW          /usr/lib/libRosetta.dylib
+__DATA                      29eb079b0-29eb07f18    [  1384     0K     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_sanitizers.dylib
+__DATA_DIRTY                29fe31d98-29fe31da8    [    16     16     0K     0K] rw-/rw- SM=COW          /usr/lib/libRosetta.dylib
+__DATA_DIRTY                29fe3ed60-29fe3eda0    [    64     64     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_darwindirectory.dylib
+__DATA_DIRTY                29fe3eda0-29fe3edb0    [    16     16     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_eligibility.dylib
+__AUTH                      2a0953e18-2a0953e48    [    48     48     0K     0K] rw-/rw- SM=COW          /usr/lib/system/libsystem_sanitizers.dylib
+Stack                       300004000-30100c000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 18
+Stack                       301010000-302018000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 19
+Stack                       30201c000-303024000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 20
+Stack                       303028000-304030000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 21
+Stack                       304034000-30503c000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 22
+Stack                       305040000-306048000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 23
+Stack                       30604c000-307054000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 24
+Stack                       307058000-308060000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 25
+Stack                       308064000-30906c000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 26
+Stack                       309070000-30a078000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 27
+Stack                       30a07c000-30b084000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 28
+Stack                       30b088000-30c090000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 29
+Stack                       30c094000-30d09c000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 30
+Stack                       30d0a0000-30e0a8000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 31
+Stack                       30e0ac000-30f0b4000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 32
+Stack                       30f0b8000-3100c0000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 33
+Stack                       3100c4000-3110cc000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 34
+Stack                       3110d0000-3120d8000    [ 16.0M   752K   752K     0K] rw-/rwx SM=PRV          thread 35
+Stack                       3120dc000-3130e4000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 36
+Stack                       3130e8000-3140f0000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 37
+Stack                       3140f4000-3150fc000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 38
+Stack                       315100000-316108000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 39
+Stack                       31610c000-317114000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 40
+Stack                       317118000-318120000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 41
+Stack                       318124000-31912c000    [ 16.0M    16K    16K     0K] rw-/rwx SM=PRV          thread 42
+MALLOC_LARGE                4e6000000-4e6204000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e6400000-4e6604000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL                4e6800000-4e680c000    [   48K    48K    48K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        4e680c000-4e6c00000    [ 4048K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_LARGE                4e6c00000-4e6e04000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e7000000-4e7204000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e7400000-4e7604000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e7800000-4e7a04000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e7c00000-4e7e04000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e8000000-4e8204000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e8400000-4e8604000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e8800000-4e8a04000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e8c00000-4e8e04000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e9000000-4e9204000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e9400000-4e9604000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e9800000-4e9a04000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4e9c00000-4e9e04000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ea000000-4ea204000    [ 2064K  2064K  2064K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ea400000-4ea634000    [ 2256K  2256K  2256K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ea800000-4eaa34000    [ 2256K  2256K  2256K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4eac00000-4eae34000    [ 2256K  2256K  2256K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4eb000000-4eb380000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4eb400000-4eb780000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4eb800000-4ebb80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ebc00000-4ebf80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ec000000-4ec380000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ec400000-4ec780000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ec800000-4ecb80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ecc00000-4ecf80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ed000000-4ed380000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ed400000-4ed780000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ed800000-4edb80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4edc00000-4edf80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ee000000-4ee380000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ee400000-4ee780000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ee800000-4eeb80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4eec00000-4eef80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ef000000-4ef380000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ef400000-4ef780000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4ef800000-4efb80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4efc00000-4eff80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f0000000-4f0380000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f0400000-4f0780000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f0800000-4f0b80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f0c00000-4f0f80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f1000000-4f1380000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f1400000-4f1780000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f1800000-4f1b80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f1c00000-4f1f80000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f2000000-4f2380000    [ 3584K  3584K  3584K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f2400000-4f2780000    [ 3584K  2784K  2784K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f2800000-4f2b80000    [ 3584K  2784K  2784K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f2c00000-4f2f80000    [ 3584K  2784K  2784K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_LARGE                4f3000000-4f3380000    [ 3584K  2784K  2784K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL                810c00000-810f8c000    [ 3632K  3632K  3632K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        810f8c000-811000000    [  464K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                811000000-8113f4000    [ 4048K  4048K  4048K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        8113f4000-811400000    [   48K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                811400000-8117dc000    [ 3952K  3952K  3952K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        8117dc000-811800000    [  144K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                811800000-811bfc000    [ 4080K  2160K  2160K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        811bfc000-811c00000    [   16K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                811c00000-811ffc000    [ 4080K   480K   480K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        811ffc000-812000000    [   16K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                812000000-812400000    [ 4096K  2176K  2176K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL                812400000-812800000    [ 4096K  1936K  1936K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL                812800000-812bf8000    [ 4064K  3088K  3088K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        812bf8000-812c00000    [   32K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                812c00000-812c04000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                812c04000-812e14000    [ 2112K  1232K  1232K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        812e14000-813000000    [ 1968K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                813000000-813004000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                813004000-813280000    [ 2544K  1840K  1840K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        813280000-813400000    [ 1536K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+MALLOC_SMALL                813400000-813404000    [   16K    16K    16K     0K] rw-/rwx SM=PRV          MallocStackLoggingLiteZone_0x107ed4000
+MALLOC_SMALL (empty)        813404000-813800000    [ 4080K     0K     0K     0K] rw-/rwx SM=PRV          DefaultMallocZone_0x103ac4000
+page table in kernel           kernel-kernel       [  721K   721K   721K     0K] rw-/rw- SM=PRV          charged to process physical footprint
+
+==== Legend
+SM=sharing mode:  
+	COW=copy_on_write PRV=private NUL=empty ALI=aliased 
+	SHM=shared ZER=zero_filled S/A=shared_alias
+PURGE=purgeable mode:  
+	V=volatile N=nonvolatile E=empty   otherwise is unpurgeable
+
+==== Summary for process 19888
+ReadOnly portion of Libraries: Total=586.5M resident=71.0M(12%) swapped_out_or_unallocated=515.5M(88%)
+Writable regions: Total=964.0M written=203.0M(21%) resident=203.0M(21%) swapped_out=0K(0%) unallocated=761.0M(79%)
+
+                                VIRTUAL RESIDENT    DIRTY  SWAPPED VOLATILE   NONVOL    EMPTY   REGION 
+REGION TYPE                        SIZE     SIZE     SIZE     SIZE     SIZE     SIZE     SIZE    COUNT (non-coalesced) 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+Kernel Alloc Once                   32K      16K      16K       0K       0K       0K       0K        1 
+MALLOC guard page                 4032K       0K       0K       0K       0K       0K       0K        4 
+MALLOC metadata                   1568K    1536K    1536K       0K       0K       0K       0K       19 
+MALLOC_LARGE                     154.4M   151.2M   151.2M       0K       0K       0K       0K       52         see MALLOC ZONE table below
+MALLOC_NANO metadata                32K      16K      16K       0K       0K       0K       0K        1         see MALLOC ZONE table below
+MALLOC_SMALL                      35.9M    24.1M    24.1M       0K       0K       0K       0K       14         see MALLOC ZONE table below
+MALLOC_SMALL (empty)              12.1M       0K       0K       0K       0K       0K       0K       10         see MALLOC ZONE table below
+MALLOC_TINY                       4096K      32K      32K       0K       0K       0K       0K        1         see MALLOC ZONE table below
+Memory Tag 22                     64.0M      16K      16K       0K       0K       0K       0K        1 
+Performance tool data             1776K    1776K    1776K       0K       0K       0K       0K       12         not counted in TOTAL below
+STACK GUARD                        688K       0K       0K       0K       0K       0K       0K       43 
+Stack                            689.3M    23.7M    23.7M       0K       0K       0K       0K       44 
+VM_ALLOCATE                         12K      12K      12K       0K       0K       0K       0K        1 
+__AUTH                              35K      35K       0K       0K       0K       0K       0K       13 
+__AUTH_CONST                       225K     208K       0K       0K       0K       0K       0K       47 
+__DATA                             542K     269K     155K       0K       0K       0K       0K       38 
+__DATA_CONST                       143K     143K       4K       0K       0K       0K       0K       47 
+__DATA_DIRTY                       153K     153K     132K       0K       0K       0K       0K       35 
+__LINKEDIT                       574.9M    62.1M       0K       0K       0K       0K       0K        4 
+__OBJC_RO                         79.1M    65.8M       0K       0K       0K       0K       0K        1 
+__OBJC_RW                         2599K    2263K      23K       0K       0K       0K       0K        1 
+__TEXT                            11.6M    9088K       0K       0K       0K       0K       0K       50 
+__TPRO_CONST                       128K      80K      48K       0K       0K       0K       0K        2 
+mapped file                         24K      12K      12K       0K       0K       0K       0K        2 
+page table in kernel               721K     721K     721K       0K       0K       0K       0K        1 
+shared memory                       48K      32K      32K       0K       0K       0K       0K        2 
+unused but dirty shlib __DATA       95K      95K      95K       0K       0K       0K       0K       38 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+TOTAL                              1.6G   341.3M   201.8M       0K       0K       0K       0K      472 
+
+                                                  VIRTUAL   RESIDENT      DIRTY    SWAPPED ALLOCATION      BYTES DIRTY+SWAP          REGION
+MALLOC ZONE                                          SIZE       SIZE       SIZE       SIZE      COUNT  ALLOCATED  FRAG SIZE  % FRAG   COUNT
+===========                                       =======  =========  =========  =========  =========  =========  =========  ======  ======
+MallocStackLoggingLiteZone_0x107ed4000             191.1M     176.1M     176.1M         0K       1065     187.0M         0K      0%      72
+DefaultMallocZone_0x103ac4000                       16.6M       544K       544K         0K        186        11K       533K     98%      22
+MallocStackLoggingLiteZone_Wrapper_0x102cac000         0K         0K         0K         0K          0         0K         0K      0%       0
+===========                                       =======  =========  =========  =========  =========  =========  =========  ======  ======
+TOTAL                                              207.7M     176.6M     176.6M         0K       1251     187.0M         0K      0%      94
+

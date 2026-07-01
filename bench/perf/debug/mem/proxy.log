@@ -1,0 +1,5 @@
+thread 47869743 panic: reached unreachable code
+d err="ReadFailed"
+2026-07-01T02:56:54.943Z [ERROR] pipeline.aborted err="ReadFailed"
+2026-07-01T02:56:54.949Z [ERROR] pipeline.aborted err="ReadFailed"
+2026-07-01T02:56:54.949Z [ERROR] pipeline.aborted err="ReadFailed"
