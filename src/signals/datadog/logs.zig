@@ -14,7 +14,7 @@ const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 const DatadogLog = datadog_log.DatadogLog;
 
-const Parser = datadog_log.Parser;
+pub const Parser = datadog_log.Parser;
 const Value = datadog_log.Value;
 const ArrayList = std.ArrayListUnmanaged;
 
@@ -74,8 +74,30 @@ pub fn processLogsStream(
     const data = try readAll(allocator, in_reader);
     defer allocator.free(data);
 
-    const result = try processJsonLogsWithFilter(allocator, registry, bus, data);
-    defer allocator.free(result.data);
+    // Single-shot callers (tests, non-streaming paths) get a throwaway parser;
+    // the per-record streaming path reuses one via processLogsSlice instead.
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+    return processLogsSlice(allocator, &parser, allocator, registry, bus, data, out_writer);
+}
+
+/// Filters a JSON log body already sitting in a slice, reusing a caller-owned
+/// parser. The per-record streaming path calls this so zimdjson's structural
+/// buffers survive across records (they're keyed to `parser_gpa`, a stable
+/// allocator — NOT `scratch`, which is a per-record arena that gets reset).
+/// `scratch` backs the DatadogLog structs and the result buffer; the processed
+/// body is written to `out_writer`.
+pub fn processLogsSlice(
+    scratch: std.mem.Allocator,
+    parser: *Parser,
+    parser_gpa: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    data: []const u8,
+    out_writer: *std.Io.Writer,
+) !StreamProcessResult {
+    const result = try processJsonLogsWithFilter(scratch, parser, parser_gpa, registry, bus, data);
+    defer scratch.free(result.data);
     try out_writer.writeAll(result.data);
 
     return .{
@@ -370,14 +392,13 @@ fn returnUnchanged(allocator: std.mem.Allocator, data: []const u8, original_coun
 /// Detects if input is an array or single object, applies filter to each log
 fn processJsonLogsWithFilter(
     allocator: std.mem.Allocator,
+    parser: *Parser,
+    parser_gpa: std.mem.Allocator,
     registry: *const PolicyRegistry,
     bus: *EventBus,
     data: []const u8,
 ) !ProcessResult {
-    var parser: Parser = .init;
-    defer parser.deinit(allocator);
-
-    const document = parser.parseFromSlice(allocator, data) catch {
+    const document = parser.parseFromSlice(parser_gpa, data) catch {
         return returnUnchanged(allocator, data, 0);
     };
 

@@ -2,9 +2,21 @@ const std = @import("std");
 
 pub const Frontend = enum { stdio, httpz };
 
+fn keepProfilingSymbols(m: *std.Build.Module) void {
+    m.omit_frame_pointer = false;
+    m.strip = false;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Keep frame pointers + symbols so sampling profilers (Instruments) can
+    // unwind and name frames instead of dumping self-time onto
+    // <deduplicated_symbol>. Pair with -Doptimize=ReleaseFast for a realistic
+    // profile. Must be applied to every module in the hot path (deps included),
+    // since it's a per-module setting.
+    const profiling = b.option(bool, "profiling",
+        "Keep frame pointers and symbols for profilers") orelse false;
     const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
     const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
     // httpz is the default until std.Io has an evented implementation that
@@ -69,6 +81,18 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", build_options);
 
+    if (profiling) {
+        for ([_]*std.Build.Module{
+            mod,
+            proto_mod,
+            o11y_mod,
+            policy_dep.module("policy_zig"),
+            zimdjson.module("zimdjson"),
+            metrics_dep.module("metrics"),
+            httpz_mod,
+        }) |m| keepProfilingSymbols(m);
+    }
+
     // ==========================================================================
     // Main Executable
     // ==========================================================================
@@ -94,6 +118,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("z", .{});
     exe.root_module.linkSystemLibrary("zstd", .{});
+
+    if (profiling) keepProfilingSymbols(exe.root_module);
 
     b.installArtifact(exe);
 
@@ -133,6 +159,8 @@ pub fn build(b: *std.Build) void {
         dist_exe.root_module.link_libc = true;
         dist_exe.root_module.linkSystemLibrary("z", .{});
         dist_exe.root_module.linkSystemLibrary("zstd", .{});
+
+        if (profiling) keepProfilingSymbols(dist_exe.root_module);
 
         const dist_step = b.step(name, "Build the " ++ name ++ " distribution (" ++ desc ++ ")");
         dist_step.dependOn(&b.addInstallArtifact(dist_exe, .{}).step);

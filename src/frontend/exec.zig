@@ -320,6 +320,10 @@ pub const RecordSink = struct {
     signal: service_mod.Signal,
     format: framer_mod.WireFormat,
     record_arena: std.heap.ArenaAllocator,
+    /// Reused across records so zimdjson's structural buffers aren't
+    /// reallocated per log line. Backed by ctx.gpa (stable), NOT record_arena
+    /// (which resets each record). Only the json_array/log path touches it.
+    log_parser: dd_logs.Parser = .init,
     /// Snapshot emptiness for this request's signal, resolved once at init;
     /// false short-circuits onRecord to .keep without decoding.
     active: bool,
@@ -333,11 +337,13 @@ pub const RecordSink = struct {
             .signal = signal,
             .format = format,
             .record_arena = .init(ctx.gpa),
+            .log_parser = .init,
             .active = policiesActiveFor(ctx.registry, signal),
         };
     }
 
     pub fn deinit(self: *RecordSink) void {
+        self.log_parser.deinit(self.ctx.gpa);
         self.record_arena.deinit();
         self.* = undefined;
     }
@@ -378,15 +384,15 @@ pub const RecordSink = struct {
     fn evalJsonRecord(self: *RecordSink, arena: std.mem.Allocator, bytes: []const u8) !framer_mod.Decision {
         // One-element batch: "[<record>]".
         const wrapped = try std.mem.concat(arena, u8, &.{ "[", bytes, "]" });
-        var reader = std.Io.Reader.fixed(wrapped);
         var out: std.Io.Writer.Allocating = .init(arena);
-        const result = try dd_logs.processLogsStream(
+        const result = try dd_logs.processLogsSlice(
             arena,
+            &self.log_parser,
+            self.ctx.gpa,
             self.ctx.registry,
             self.ctx.bus,
-            &reader,
+            wrapped,
             &out.writer,
-            "application/json",
         );
         if (result.allDropped()) {
             self.dropped += 1;
