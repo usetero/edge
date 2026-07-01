@@ -164,6 +164,12 @@ tasks:
     cmds:
       - ./bench/run.sh --skip-build
 
+  benchmark:framer:
+    desc: "Run the JSON-array framer microbenchmark (zbench)"
+    aliases: [bench-framer, bmf]
+    cmds:
+      - zig build json-framer-bench
+
   benchmark:logging:
     desc: "Run edge-tail logging integration tests"
     aliases: [bench-logging, bml]

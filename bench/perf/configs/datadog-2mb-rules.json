@@ -11,5 +11,6 @@
       "type": "file",
       "path": "bench/perf/configs/policies.json"
     }
-  ]
+  ],
+  "thread_pool_count": 8
 }

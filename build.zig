@@ -266,6 +266,27 @@ pub fn build(b: *std.Build) void {
     const run_datadog_log_bench = b.addRunArtifact(datadog_log_bench);
     datadog_log_bench_step.dependOn(&run_datadog_log_bench.step);
 
+    // JSON-array framer microbenchmark (zbench).
+    const json_framer_bench = b.addExecutable(.{
+        .name = "json-framer-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/json_framer_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "edge", .module = mod },
+                .{ .name = "zbench", .module = zbench_dep.module("zbench") },
+            },
+        }),
+    });
+    json_framer_bench.root_module.link_libc = true;
+    json_framer_bench.root_module.linkSystemLibrary("z", .{});
+    json_framer_bench.root_module.linkSystemLibrary("zstd", .{});
+
+    const json_framer_bench_step = b.step("json-framer-bench", "Run the JSON-array framer benchmark");
+    const run_json_framer_bench = b.addRunArtifact(json_framer_bench);
+    json_framer_bench_step.dependOn(&run_json_framer_bench.step);
+
     const run_echo_step = b.step("run-echo-server", "Run the echo server");
     const run_echo_cmd = b.addRunArtifact(echo_server);
     run_echo_step.dependOn(&run_echo_cmd.step);
