@@ -360,10 +360,10 @@ fn processJsonMetrics(
     // Filter metrics in-place
     const counts = filterMetricsInPlace(&parsed.value, registry, bus);
 
-    // Re-serialize to JSON
+    // Re-serialize to JSON. Metrics carry no identifier fields, so all bytes
+    // fields stay base64 (no hex_bytes_fields).
     const output = try parsed.value.jsonEncode(.{}, .{
         .emit_oneof_field_name = false,
-        .bytes_as_hex = false,
     }, allocator);
 
     return .{

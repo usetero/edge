@@ -176,14 +176,32 @@ pub const OtlpSpanContext = struct {
     resource_spans: *ResourceSpans,
     scope_spans: *ScopeSpans,
     allocator: std.mem.Allocator,
-    /// True when identifier fields (trace_id/span_id) are stored as lowercase
-    /// hex strings (the OTLP/JSON path); false when they are raw bytes (the
-    /// protobuf path). Controls how `typed_value` decodes them for the sampler.
+    /// Whether identifier fields (trace_id/span_id/parent_span_id) are held as
+    /// lowercase-hex strings in memory. Now false on both production paths — JSON
+    /// decode hex-decodes ids to raw bytes (see processJsonTraces), matching the
+    /// protobuf path — so the accessors' hex branch only serves callers that build
+    /// a context from hex ids directly. Governs how `value`/`typed_value`
+    /// normalize ids to raw bytes before matching/sampling.
     bytes_as_hex: bool,
 };
 
 const getAnyValueString = otlp_attr.getStringValue;
 const findNestedAttribute = otlp_attr.findNestedAttribute;
+
+/// Yields identifier fields (trace_id/span_id/parent_span_id) as RAW bytes for
+/// the string-matcher primitive. Policy authors write these as lowercase hex,
+/// but the engine renders raw bytes to hex itself before matching, so `value`
+/// must return raw bytes: pass through on the protobuf path, hex-decode on the
+/// JSON path. Returns null on empty or malformed hex (hides the id from
+/// exact/contains/regex matchers — fail-safe). Mirrors `idTyped`.
+fn idBytes(span_ctx: *const OtlpSpanContext, id: []const u8) ?[]const u8 {
+    if (id.len == 0) return null;
+    if (!span_ctx.bytes_as_hex) return id;
+    if (id.len % 2 != 0) return null;
+    const out = span_ctx.allocator.alloc(u8, id.len / 2) catch return null;
+    _ = std.fmt.hexToBytes(out, id) catch return null;
+    return out;
+}
 
 /// Convert trace ID bytes to hex string (16 bytes -> 32 chars)
 fn traceIdToHex(trace_id: []const u8, buf: *[32]u8) ?[]const u8 {
@@ -204,12 +222,12 @@ pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
     return switch (field) {
         .trace_field => |tf| switch (tf) {
             .TRACE_FIELD_NAME => if (span_ctx.span.name.len > 0) span_ctx.span.name else null,
-            .TRACE_FIELD_TRACE_ID => if (span_ctx.span.trace_id.len > 0) span_ctx.span.trace_id else null,
-            .TRACE_FIELD_SPAN_ID => if (span_ctx.span.span_id.len > 0) span_ctx.span.span_id else null,
-            .TRACE_FIELD_PARENT_SPAN_ID => if (span_ctx.span.parent_span_id.len > 0)
-                span_ctx.span.parent_span_id
-            else
-                null,
+            // Identifier bytes are stored raw (protobuf) or hex (JSON); the
+            // engine hex-renders raw bytes before string matching, so return
+            // raw bytes on both paths. See `idBytes`.
+            .TRACE_FIELD_TRACE_ID => idBytes(span_ctx, span_ctx.span.trace_id),
+            .TRACE_FIELD_SPAN_ID => idBytes(span_ctx, span_ctx.span.span_id),
+            .TRACE_FIELD_PARENT_SPAN_ID => idBytes(span_ctx, span_ctx.span.parent_span_id),
             .TRACE_FIELD_TRACE_STATE => if (span_ctx.span.trace_state.len > 0)
                 span_ctx.span.trace_state
             else
@@ -508,33 +526,24 @@ fn processJsonTraces(
     bus: *EventBus,
     data: []const u8,
 ) !ProcessResult {
-    // Parse JSON into TracesData protobuf struct. OTLP/JSON encodes bytes
-    // fields (traceId/spanId/…) as lowercase hex; protobuf 5.0.0's decoder
-    // reads this thread-local rather than a threaded option.
-    //
-    // note: this toggle is GLOBAL to all `bytes` fields, but OTLP/JSON only
-    // hex-encodes the identifier fields — a generic `AnyValue.bytesValue`
-    // attribute is base64, and the hex decoder rejects it (non-hex chars ->
-    // UnexpectedToken), failing the whole payload. Proper fix is per-field hex
-    // in the proto library (mark only trace_id/span_id/parent_span_id hex);
-    // until then, spans carrying bytes-valued attributes won't decode here.
-    const prev_hex = proto.protobuf.json.tl_bytes_as_hex;
-    proto.protobuf.json.tl_bytes_as_hex = true;
-    defer proto.protobuf.json.tl_bytes_as_hex = prev_hex;
-
-    var parsed = try TracesData.jsonDecode(data, .{
+    // OTLP/JSON hex-encodes the identifier bytes fields (trace_id/span_id/
+    // parent_span_id); other bytes fields (e.g. AnyValue.bytes_value) stay
+    // base64. jsonDecodeOpts marks only the id fields hex — per-field, so spans
+    // carrying base64 bytes attributes still decode. In memory the ids become
+    // raw bytes, identical to the protobuf wire path.
+    var parsed = try TracesData.jsonDecodeOpts(data, .{
         .ignore_unknown_fields = true,
-    }, allocator);
+    }, .{ .hex_bytes_fields = otlp_attr.hex_id_fields }, allocator);
     defer parsed.deinit();
 
     // Filter spans in-place (allocator used for tracestate updates). Identifier
-    // fields are hex strings on the JSON path.
-    const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus, true);
+    // fields are raw bytes in memory now (decoded above), same as protobuf.
+    const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus, false);
 
-    // Re-serialize to JSON
+    // Re-serialize to JSON, hex-encoding the same identifier fields back out.
     const output = try parsed.value.jsonEncode(.{}, .{
         .emit_oneof_field_name = false,
-        .bytes_as_hex = true,
+        .hex_bytes_fields = otlp_attr.hex_id_fields,
     }, allocator);
 
     return .{
@@ -844,6 +853,43 @@ test "processTraces - parses and re-serializes JSON" {
     try std.testing.expect(std.mem.indexOf(u8, result.data, "test-span") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.data, "resourceSpans") != null);
     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+}
+
+test "traceValue: trace_id reads as raw bytes so the engine can hex-render for matching" {
+    // The policy engine now renders raw id bytes to lowercase hex before string
+    // matching (policy-zig #73), so `value` MUST return raw bytes on both paths.
+    const allocator = std.testing.allocator;
+    const raw_id = [16]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    const hex_id = "aabbccdd000102030405060708090a0b";
+
+    var rs: ResourceSpans = .{};
+    var ss: ScopeSpans = .{};
+
+    // Protobuf path: ids already raw in memory -> returned as-is.
+    var span_raw: Span = .{ .trace_id = &raw_id };
+    var ctx_raw: OtlpSpanContext = .{
+        .span = &span_raw,
+        .resource_spans = &rs,
+        .scope_spans = &ss,
+        .allocator = allocator,
+        .bytes_as_hex = false,
+    };
+    const raw_got = traceValue(&ctx_raw, .{ .trace_field = .TRACE_FIELD_TRACE_ID }).?;
+    try std.testing.expectEqualSlices(u8, &raw_id, raw_got);
+
+    // Hex-in-memory path: value() must hex-decode to the SAME raw bytes, so the
+    // engine's hex rendering reproduces the policy literal either way.
+    var span_hex: Span = .{ .trace_id = hex_id };
+    var ctx_hex: OtlpSpanContext = .{
+        .span = &span_hex,
+        .resource_spans = &rs,
+        .scope_spans = &ss,
+        .allocator = allocator,
+        .bytes_as_hex = true,
+    };
+    const hex_got = traceValue(&ctx_hex, .{ .trace_field = .TRACE_FIELD_TRACE_ID }).?;
+    defer allocator.free(hex_got); // idBytes allocates on the hex path
+    try std.testing.expectEqualSlices(u8, &raw_id, hex_got);
 }
 
 test "processTraces - malformed JSON returns unchanged (fail-open)" {
