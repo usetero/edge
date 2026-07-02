@@ -2,9 +2,20 @@ const std = @import("std");
 
 pub const Frontend = enum { stdio, httpz };
 
+fn keepProfilingSymbols(m: *std.Build.Module) void {
+    m.omit_frame_pointer = false;
+    m.strip = false;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Keep frame pointers + symbols so sampling profilers (Instruments) can
+    // unwind and name frames instead of dumping self-time onto
+    // <deduplicated_symbol>. Pair with -Doptimize=ReleaseFast for a realistic
+    // profile. Must be applied to every module in the hot path (deps included),
+    // since it's a per-module setting.
+    const profiling = b.option(bool, "profiling", "Keep frame pointers and symbols for profilers") orelse false;
     const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
     const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
     // httpz is the default until std.Io has an evented implementation that
@@ -69,6 +80,18 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", build_options);
 
+    if (profiling) {
+        for ([_]*std.Build.Module{
+            mod,
+            proto_mod,
+            o11y_mod,
+            policy_dep.module("policy_zig"),
+            zimdjson.module("zimdjson"),
+            metrics_dep.module("metrics"),
+            httpz_mod,
+        }) |m| keepProfilingSymbols(m);
+    }
+
     // ==========================================================================
     // Main Executable
     // ==========================================================================
@@ -94,6 +117,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("z", .{});
     exe.root_module.linkSystemLibrary("zstd", .{});
+
+    if (profiling) keepProfilingSymbols(exe.root_module);
 
     b.installArtifact(exe);
 
@@ -133,6 +158,8 @@ pub fn build(b: *std.Build) void {
         dist_exe.root_module.link_libc = true;
         dist_exe.root_module.linkSystemLibrary("z", .{});
         dist_exe.root_module.linkSystemLibrary("zstd", .{});
+
+        if (profiling) keepProfilingSymbols(dist_exe.root_module);
 
         const dist_step = b.step(name, "Build the " ++ name ++ " distribution (" ++ desc ++ ")");
         dist_step.dependOn(&b.addInstallArtifact(dist_exe, .{}).step);
@@ -237,6 +264,27 @@ pub fn build(b: *std.Build) void {
     const datadog_log_bench_step = b.step("datadog-log-bench", "Run the Datadog log search benchmark");
     const run_datadog_log_bench = b.addRunArtifact(datadog_log_bench);
     datadog_log_bench_step.dependOn(&run_datadog_log_bench.step);
+
+    // JSON-array framer microbenchmark (zbench).
+    const json_framer_bench = b.addExecutable(.{
+        .name = "json-framer-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/json_framer_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "edge", .module = mod },
+                .{ .name = "zbench", .module = zbench_dep.module("zbench") },
+            },
+        }),
+    });
+    json_framer_bench.root_module.link_libc = true;
+    json_framer_bench.root_module.linkSystemLibrary("z", .{});
+    json_framer_bench.root_module.linkSystemLibrary("zstd", .{});
+
+    const json_framer_bench_step = b.step("json-framer-bench", "Run the JSON-array framer benchmark");
+    const run_json_framer_bench = b.addRunArtifact(json_framer_bench);
+    json_framer_bench_step.dependOn(&run_json_framer_bench.step);
 
     const run_echo_step = b.step("run-echo-server", "Run the echo server");
     const run_echo_cmd = b.addRunArtifact(echo_server);

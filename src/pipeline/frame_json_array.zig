@@ -24,6 +24,11 @@ pub const JsonArrayFramer = struct {
     escaped: bool = false,
     /// Current element outgrew scratch and is streaming verbatim.
     overflowed: bool = false,
+    /// Start (within the current ingest chunk) of element bytes not yet copied
+    /// to scratch or emitted. Enables zero-copy framing: an element contained
+    /// in a single chunk is handed to the sink as a direct chunk slice, and
+    /// cross-chunk elements are bulk-copied one run per boundary, never per byte.
+    run_start: usize = 0,
     /// '[' has been written to the output.
     wrote_open: bool = false,
     /// At least one element was written (controls comma placement).
@@ -43,6 +48,8 @@ pub const JsonArrayFramer = struct {
     }
 
     pub fn ingest(self: *JsonArrayFramer, chunk: []const u8, out: *std.Io.Writer, sink: anytype) !void {
+        // A continued element (carried from a previous chunk) resumes at byte 0.
+        self.run_start = 0;
         var i: usize = 0;
         while (i < chunk.len) {
             switch (self.state) {
@@ -72,64 +79,67 @@ pub const JsonArrayFramer = struct {
                         try self.enterDesync(out, chunk[i - 1 ..]);
                         return;
                     }
-                    // First element byte: rewind and let the in_element state
-                    // process it, so '{'/'['/'"' structure is tracked.
+                    // First element byte: rewind, mark the element start, and let
+                    // the in_element state track '{'/'['/'"' structure.
                     self.state = .in_element;
                     self.depth = 0;
                     self.in_string = false;
                     self.escaped = false;
+                    self.overflowed = false;
                     i -= 1;
+                    self.run_start = i;
                     continue;
                 },
                 .in_element => {
-                    const byte = chunk[i];
-                    i += 1;
-                    if (self.in_string) {
-                        if (self.escaped) {
-                            self.escaped = false;
-                        } else if (byte == '\\') {
-                            self.escaped = true;
-                        } else if (byte == '"') {
-                            self.in_string = false;
+                    // Pure register state machine: scan for the depth-0 element
+                    // terminator without touching memory per byte. Bytes are
+                    // materialized (bulk-copied or emitted) only at run
+                    // boundaries — a terminator or the end of the chunk.
+                    while (i < chunk.len) {
+                        const byte = chunk[i];
+                        i += 1;
+                        if (self.in_string) {
+                            if (self.escaped) {
+                                self.escaped = false;
+                            } else if (byte == '\\') {
+                                self.escaped = true;
+                            } else if (byte == '"') {
+                                self.in_string = false;
+                            }
+                            continue;
                         }
-                        try self.elementByte(byte, out);
-                        continue;
-                    }
-                    switch (byte) {
-                        '"' => {
-                            self.in_string = true;
-                            try self.elementByte(byte, out);
-                        },
-                        '{', '[' => {
-                            self.depth += 1;
-                            try self.elementByte(byte, out);
-                        },
-                        '}' => {
-                            if (self.depth == 0) {
-                                try self.enterDesync(out, chunk[i - 1 ..]);
-                                return;
-                            }
-                            self.depth -= 1;
-                            try self.elementByte(byte, out);
-                        },
-                        ']' => {
-                            if (self.depth == 0) {
-                                try self.endElement(out, sink);
-                                self.state = .done;
-                            } else {
+                        switch (byte) {
+                            '"' => self.in_string = true,
+                            '{', '[' => self.depth += 1,
+                            '}' => {
+                                if (self.depth == 0) {
+                                    try self.enterDesyncInElement(out, chunk);
+                                    return;
+                                }
                                 self.depth -= 1;
-                                try self.elementByte(byte, out);
-                            }
-                        },
-                        ',' => {
-                            if (self.depth == 0) {
-                                try self.endElement(out, sink);
-                                self.state = .expect_element_or_end;
-                            } else {
-                                try self.elementByte(byte, out);
-                            }
-                        },
-                        else => try self.elementByte(byte, out),
+                            },
+                            ']' => {
+                                if (self.depth == 0) {
+                                    try self.emitElement(chunk, i - 1, out, sink);
+                                    self.state = .done;
+                                    break;
+                                }
+                                self.depth -= 1;
+                            },
+                            ',' => {
+                                if (self.depth == 0) {
+                                    try self.emitElement(chunk, i - 1, out, sink);
+                                    self.state = .expect_element_or_end;
+                                    break;
+                                }
+                            },
+                            else => {},
+                        }
+                    } else {
+                        // Chunk ended mid-element: preserve this run (and any
+                        // spilled prefix) in scratch for the next chunk.
+                        try self.bufferElement(chunk[self.run_start..], out);
+                        return;
                     }
                     continue;
                 },
@@ -180,31 +190,72 @@ pub const JsonArrayFramer = struct {
         _ = sink;
     }
 
-    fn elementByte(self: *JsonArrayFramer, byte: u8, out: *std.Io.Writer) !void {
+    /// Appends an element run to scratch. When the element outgrows scratch it
+    /// fails open (PLAN §6.5): the buffered prefix and this run are emitted
+    /// verbatim and the rest of the element streams unevaluated.
+    fn bufferElement(self: *JsonArrayFramer, run: []const u8, out: *std.Io.Writer) !void {
         if (self.overflowed) {
-            try out.writeByte(byte);
+            try out.writeAll(run);
             return;
         }
-        if (self.scratch_len == self.scratch.len) {
-            // Fail open: emit what we buffered plus the rest verbatim.
-            try self.writeSeparator(out);
-            try out.writeAll(self.scratch[0..self.scratch_len]);
-            try out.writeByte(byte);
-            self.scratch_len = 0;
-            self.overflowed = true;
+        if (self.scratch_len + run.len <= self.scratch.len) {
+            @memcpy(self.scratch[self.scratch_len..][0..run.len], run);
+            self.scratch_len += run.len;
             return;
         }
-        self.scratch[self.scratch_len] = byte;
-        self.scratch_len += 1;
+        try self.writeSeparator(out);
+        try out.writeAll(self.scratch[0..self.scratch_len]);
+        try out.writeAll(run);
+        self.scratch_len = 0;
+        self.overflowed = true;
     }
 
-    fn endElement(self: *JsonArrayFramer, out: *std.Io.Writer, sink: anytype) !void {
+    /// Finalizes the element ending at `end` (exclusive) in `chunk`: evaluates
+    /// it through the sink and emits the verdict. Zero-copy when the whole
+    /// element lives in this chunk; falls back to scratch across chunk
+    /// boundaries; forwards verbatim (unevaluated) when it exceeds the scratch
+    /// bound, matching the byte-at-a-time fail-open behavior it replaces.
+    fn emitElement(
+        self: *JsonArrayFramer,
+        chunk: []const u8,
+        end: usize,
+        out: *std.Io.Writer,
+        sink: anytype,
+    ) !void {
         if (self.overflowed) {
+            // Prefix already on the wire; flush the verbatim tail, fail open.
+            try out.writeAll(chunk[self.run_start..end]);
             self.overflowed = false;
+            self.scratch_len = 0;
             self.stats.failed_open += 1;
             return;
         }
-        const record = std.mem.trimEnd(u8, self.scratch[0..self.scratch_len], " \t\r\n");
+
+        var record: []const u8 = undefined;
+        if (self.scratch_len == 0) {
+            const elem = chunk[self.run_start..end];
+            if (elem.len > self.scratch.len) {
+                // Too large to evaluate within the record-scratch bound: the
+                // sink never sees it — forward verbatim.
+                try self.writeSeparator(out);
+                try out.writeAll(elem);
+                self.stats.failed_open += 1;
+                return;
+            }
+            record = elem; // zero-copy: element contained in this chunk
+        } else {
+            // Spanned chunks: append this chunk's tail, evaluate from scratch.
+            try self.bufferElement(chunk[self.run_start..end], out);
+            if (self.overflowed) {
+                self.overflowed = false;
+                self.scratch_len = 0;
+                self.stats.failed_open += 1;
+                return;
+            }
+            record = self.scratch[0..self.scratch_len];
+        }
+
+        record = std.mem.trimEnd(u8, record, " \t\r\n");
         self.scratch_len = 0;
         self.stats.records += 1;
         switch (try sink.onRecord(record)) {
@@ -250,6 +301,20 @@ pub const JsonArrayFramer = struct {
             self.scratch_len = 0;
         }
         try out.writeAll(rest);
+        self.state = .desync;
+        self.stats.desynced = true;
+    }
+
+    /// Desync triggered mid-element: flush the element bytes seen so far (any
+    /// spilled prefix plus this chunk's run) and the rest of the chunk
+    /// verbatim, then copy all future input through untouched.
+    fn enterDesyncInElement(self: *JsonArrayFramer, out: *std.Io.Writer, chunk: []const u8) !void {
+        if (!self.overflowed and self.scratch_len > 0) {
+            try out.writeAll(self.scratch[0..self.scratch_len]);
+        }
+        self.scratch_len = 0;
+        self.overflowed = false;
+        try out.writeAll(chunk[self.run_start..]);
         self.state = .desync;
         self.stats.desynced = true;
     }

@@ -93,6 +93,13 @@ pub fn typedBytes(b: []const u8) ?TypedValue {
     return if (b.len == 0) null else TypedValue{ .bytes = b };
 }
 
+/// OTLP/JSON hex-encodes only the identifier `bytes` fields; every other bytes
+/// field (e.g. `AnyValue.bytes_value`) stays base64. Pass this to the protobuf
+/// json codec's `hex_bytes_fields` for both decode and encode so ids round-trip
+/// as hex while other bytes fields are left untouched. In memory the decoded
+/// ids are always raw bytes (identical to the binary wire path).
+pub const hex_id_fields: []const []const u8 = &.{ "trace_id", "span_id", "parent_span_id" };
+
 /// Typed view of an AnyValue: maps each scalar OTLP variant to its TypedValue.
 /// array/kvlist (and absent) read as null — a non-match, fail-open.
 pub fn anyValueTyped(value: ?AnyValue) ?TypedValue {
