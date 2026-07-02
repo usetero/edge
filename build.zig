@@ -15,8 +15,7 @@ pub fn build(b: *std.Build) void {
     // <deduplicated_symbol>. Pair with -Doptimize=ReleaseFast for a realistic
     // profile. Must be applied to every module in the hot path (deps included),
     // since it's a per-module setting.
-    const profiling = b.option(bool, "profiling",
-        "Keep frame pointers and symbols for profilers") orelse false;
+    const profiling = b.option(bool, "profiling", "Keep frame pointers and symbols for profilers") orelse false;
     const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
     const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
     // httpz is the default until std.Io has an evented implementation that

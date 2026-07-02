@@ -12,7 +12,7 @@ const zbench = @import("zbench");
 const edge = @import("edge");
 
 const JsonArrayFramer = edge.pipeline_framer.frame_json_array.JsonArrayFramer;
-const Decision = edge.pipeline_framer.Decision;
+pub const Decision = edge.pipeline_framer.Decision;
 const CHUNK_BUF_BYTES = edge.core_limits.CHUNK_BUF_BYTES;
 const RECORD_SCRATCH_BYTES = edge.core_limits.RECORD_SCRATCH_BYTES;
 
