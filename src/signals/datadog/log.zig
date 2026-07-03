@@ -249,10 +249,11 @@ pub const DatadogLog = struct {
     }
 
     /// Guards extra spans against structurally-plausible garbage the walker
-    /// would otherwise wave through (e.g. `tru`, `1x2`). Strings and
+    /// would otherwise wave through (e.g. `tru`, `1e+`). Strings and
     /// containers were already structurally validated by the walker; scalar
-    /// tokens must look like JSON literals so a record the full parser would
-    /// reject can't be filtered (it fails open verbatim instead, as today).
+    /// tokens must be well-formed JSON literals so a record the full parser
+    /// would reject can't be filtered (it fails open verbatim instead, as
+    /// today).
     fn validScalarOrStructureSpan(span: []const u8) bool {
         if (span.len == 0) return false;
         return switch (span[0]) {
@@ -260,15 +261,35 @@ pub const DatadogLog = struct {
             't' => std.mem.eql(u8, span, "true"),
             'f' => std.mem.eql(u8, span, "false"),
             'n' => std.mem.eql(u8, span, "null"),
-            '-', '0'...'9' => blk: {
-                for (span[1..]) |byte| switch (byte) {
-                    '0'...'9', 'e', 'E', '+', '-', '.' => {},
-                    else => break :blk false,
-                };
-                break :blk true;
-            },
+            '-', '0'...'9' => validNumberSpan(span),
             else => false,
         };
+    }
+
+    /// RFC 8259 number grammar: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+    fn validNumberSpan(span: []const u8) bool {
+        var i: usize = 0;
+        if (span[i] == '-') i += 1;
+        if (i >= span.len) return false;
+        if (span[i] == '0') {
+            i += 1;
+        } else if (span[i] >= '1' and span[i] <= '9') {
+            while (i < span.len and std.ascii.isDigit(span[i])) i += 1;
+        } else {
+            return false;
+        }
+        if (i < span.len and span[i] == '.') {
+            i += 1;
+            if (i >= span.len or !std.ascii.isDigit(span[i])) return false;
+            while (i < span.len and std.ascii.isDigit(span[i])) i += 1;
+        }
+        if (i < span.len and (span[i] == 'e' or span[i] == 'E')) {
+            i += 1;
+            if (i < span.len and (span[i] == '+' or span[i] == '-')) i += 1;
+            if (i >= span.len or !std.ascii.isDigit(span[i])) return false;
+            while (i < span.len and std.ascii.isDigit(span[i])) i += 1;
+        }
+        return i == span.len;
     }
 
     /// Unescaped view of a raw span holding a JSON string, or null for
@@ -670,7 +691,9 @@ pub const DatadogLog = struct {
             };
         }
         return switch (current) {
-            .string => |s| s,
+            // std.json.Value strings live in the parsed arena, which the
+            // deinit above frees — copy out or the caller reads freed memory.
+            .string => |s| allocator.dupe(u8, s) catch null,
             else => null,
         };
     }
@@ -979,6 +1002,306 @@ test "FieldWalker - spans across whitespace, escapes, and nesting" {
     try std.testing.expectEqualStrings("null", d.value);
 
     try std.testing.expectEqual(@as(?FieldWalker.RawField, null), try walker.nextField());
+}
+
+test "DatadogLog - findExtraString escaped nested string survives the transient parser" {
+    // Regression (macroscope PR 214): findNestedStringInRaw returned a slice
+    // into the std.json parsed arena for ESCAPED nested strings, then freed
+    // it via parsed.deinit(). testing.allocator poisons freed memory, so this
+    // fails loudly on the old code. The returned copy is caller-owned here
+    // (the escaped-nested case dupes; production passes the record arena).
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{"message":"m","nested":{"k":"a\tb"}}
+    ;
+    var log = try DatadogLog.parseRaw(allocator, json);
+    defer log.deinit(allocator);
+
+    const value = log.findExtraString(allocator, &.{ "nested", "k" }).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("a\tb", value);
+}
+
+test "DatadogLog - parseRaw rejects malformed scalar tokens" {
+    // Regression (macroscope PR 214): the loose charset check let malformed
+    // numbers through, so records the full parser rejects could be filtered
+    // instead of failing open. Each must now error out of parseRaw.
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "1e+", "--1", "01", "1..2", "1.", ".5", "1e", "-" }) |bad| {
+        var buf: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf, "{{\"message\":\"ok\",\"bad\":{s}}}", .{bad});
+        try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator, json));
+    }
+    // Well-formed numbers still pass.
+    for ([_][]const u8{ "0", "-0.5", "1e5", "1E+10", "42", "123.456e-7" }) |good| {
+        var buf: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf, "{{\"message\":\"ok\",\"n\":{s}}}", .{good});
+        var log = try DatadogLog.parseRaw(allocator, json);
+        defer log.deinit(allocator);
+        try std.testing.expectEqualStrings(good, log.extra_spans.get("n").?);
+    }
+}
+
+test "DatadogLog - parseRaw output is byte-identical to materializing parse" {
+    // Equivalence: for records both paths accept, serialization must match
+    // byte-for-byte. Fixtures avoid escapes/floats/whitespace-in-containers,
+    // where the old path canonicalizes and spans stay verbatim (an intended
+    // difference covered elsewhere).
+    const allocator = std.testing.allocator;
+
+    const fixtures = [_][]const u8{
+        // ziglint-ignore: Z024 (one record = one fixture line)
+        \\{"message":"hello","status":"info","level":"warn","service":"svc","hostname":"h1","ddsource":"src","ddtags":"a:b","timestamp":1733946000000,"environment":"prod","custom_field":"cf"}
+        ,
+        \\{"message":"m","trace_id":"abc","count":42,"neg":-7,"ok":true,"missing":null,"usr.id":"u1"}
+        ,
+        \\{"message":"m","http":{"method":"GET","code":200},"tags":["a","b"],"empty":{}}
+        ,
+        \\{}
+        ,
+    };
+
+    for (fixtures) |json| {
+        var parser: Parser = .init;
+        defer parser.deinit(allocator);
+        const doc = try parser.parseFromSlice(allocator, json);
+        var old_log = try DatadogLog.parse(allocator, doc.asValue());
+        defer old_log.deinit(allocator);
+        var new_log = try DatadogLog.parseRaw(allocator, json);
+        defer new_log.deinit(allocator);
+
+        var old_out: std.Io.Writer.Allocating = .init(allocator);
+        defer old_out.deinit();
+        try std.json.Stringify.value(old_log, .{}, &old_out.writer);
+        var new_out: std.Io.Writer.Allocating = .init(allocator);
+        defer new_out.deinit();
+        try std.json.Stringify.value(new_log, .{}, &new_out.writer);
+
+        try std.testing.expectEqualStrings(old_out.written(), new_out.written());
+    }
+}
+
+test "DatadogLog - parseRaw decodes every escape sequence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"message":"q\" b\\ s\/ bs\b ff\f nl\n cr\r tab\t"}
+    ;
+    var log = try DatadogLog.parseRaw(allocator, json);
+    defer log.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "q\" b\\ s/ bs\x08 ff\x0c nl\n cr\r tab\t",
+        log.message.?,
+    );
+}
+
+test "DatadogLog - parseRaw decodes unicode escapes and surrogate pairs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // \u escapes in the input (BMP char + surrogate pair) must decode to
+    // the UTF-8 forms.
+    const json =
+        \\{"message":"caf\u00e9 \ud83d\ude00 end"}
+    ;
+    var log = try DatadogLog.parseRaw(allocator, json);
+    defer log.deinit(allocator);
+    try std.testing.expectEqualStrings("café 😀 end", log.message.?);
+}
+
+test "DatadogLog - parseRaw rejects invalid escape sequences" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const bad_records = [_][]const u8{
+        // Unknown escape letter.
+        \\{"message":"a\qb"}
+        ,
+        // Lone high surrogate.
+        \\{"message":"a\uD83Db"}
+        ,
+        // Lone low surrogate.
+        \\{"message":"a\uDE00b"}
+        ,
+        // Truncated \u sequence.
+        \\{"message":"a\u12"}
+        ,
+        // Non-hex in \u sequence.
+        \\{"message":"a\uZZZZb"}
+        ,
+    };
+    for (bad_records) |json| {
+        // stringValue folds unescape failures into Desync: the record routes
+        // to the validating fallback rather than being trusted.
+        try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator, json));
+    }
+}
+
+test "DatadogLog - parseRaw rejects non-string known fields (parse parity)" {
+    const allocator = std.testing.allocator;
+
+    // The materializing parse errors on all of these (asString/asSigned), so
+    // parseRaw must too — the record fails open verbatim either way.
+    const bad_records = [_][]const u8{
+        \\{"message":42}
+        ,
+        \\{"service":null}
+        ,
+        \\{"status":true}
+        ,
+        \\{"message":{"nested":"object"}}
+        ,
+        \\{"timestamp":1.5}
+        ,
+        \\{"timestamp":"1733946000000"}
+        ,
+    };
+    for (bad_records) |json| {
+        try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator, json));
+    }
+}
+
+test "DatadogLog - parseRaw rejects escaped keys and trailing garbage" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator,
+        \\{"a\tb":1}
+    ));
+    try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator,
+        \\{"message":"m"} trailing
+    ));
+    try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator,
+        \\{"message":"m"}}
+    ));
+}
+
+test "DatadogLog - parseRaw duplicate keys: last wins (parse parity)" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{"status":"first","x":1,"status":"last","x":2}
+    ;
+    var log = try DatadogLog.parseRaw(allocator, json);
+    defer log.deinit(allocator);
+    try std.testing.expectEqualStrings("last", log.status.?);
+    try std.testing.expectEqualStrings("2", log.extra_spans.get("x").?);
+}
+
+test "DatadogLog - parseRaw empty object and empty string values" {
+    const allocator = std.testing.allocator;
+
+    var empty = try DatadogLog.parseRaw(allocator, "{}");
+    defer empty.deinit(allocator);
+    try std.testing.expect(empty.message == null);
+    try std.testing.expectEqual(@as(usize, 0), empty.extra_spans.count());
+
+    var log = try DatadogLog.parseRaw(allocator,
+        \\{"message":"","service":"","x":""}
+    );
+    defer log.deinit(allocator);
+    try std.testing.expectEqualStrings("", log.message.?);
+    try std.testing.expectEqualStrings("", log.service.?);
+    try std.testing.expectEqualStrings("\"\"", log.extra_spans.get("x").?);
+}
+
+test "DatadogLog - parseRaw long strings exercise the bulk-scan paths" {
+    // Strings longer than the 32-byte linear windows force the memchr
+    // branches in stringEnd and unescape.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const pad = "x" ** 100;
+    // Escape-free long string: single-memchr stringEnd + borrowed slice.
+    {
+        const json = "{\"message\":\"" ++ pad ++ "\"}";
+        var log = try DatadogLog.parseRaw(allocator, json);
+        defer log.deinit(allocator);
+        try std.testing.expectEqualStrings(pad, log.message.?);
+    }
+    // Escape past the window: memchr run, then decode, then another run.
+    {
+        const json = "{\"message\":\"" ++ pad ++ "\\t" ++ pad ++ "\"}";
+        var log = try DatadogLog.parseRaw(allocator, json);
+        defer log.deinit(allocator);
+        try std.testing.expectEqualStrings(pad ++ "\t" ++ pad, log.message.?);
+    }
+}
+
+test "FieldWalker - backslash parity decides the closing quote" {
+    // Value ends in an even backslash run: the final quote is real.
+    {
+        var walker = try FieldWalker.init(
+            \\{"a":"x\\"}
+        );
+        const field = (try walker.nextField()).?;
+        try std.testing.expectEqualStrings("\"x\\\\\"", field.value);
+    }
+    // Escape-dense string: the first candidate quote is escaped, flipping
+    // stringEnd into its linear mode for the rest of the string.
+    {
+        var walker = try FieldWalker.init(
+            \\{"a":"\"\"\" plain tail that runs past the escapes"}
+        );
+        const field = (try walker.nextField()).?;
+        try std.testing.expect(std.mem.endsWith(u8, field.value, "escapes\""));
+    }
+}
+
+test "DatadogLog - bodyForMatch prefers message over msg/log span extras" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var log = try DatadogLog.parseRaw(allocator,
+        \\{"message":"outer body","msg":"shadowed","log":"also shadowed"}
+    );
+    defer log.deinit(allocator);
+    try std.testing.expectEqualStrings("outer body", log.bodyForMatch(allocator).?);
+}
+
+test "DatadogLog - findExtraString span misses: arrays, deep paths, non-strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var log = try DatadogLog.parseRaw(allocator,
+        \\{"message":"m","tags":["a","b"],"n":7,"http":{"code":200}}
+    );
+    defer log.deinit(allocator);
+
+    // Array and number spans are not string-matchable.
+    try std.testing.expect(log.findExtraString(allocator, &.{"tags"}) == null);
+    try std.testing.expect(log.findExtraString(allocator, &.{"n"}) == null);
+    // Descent into an array or past a leaf yields null, not garbage.
+    try std.testing.expect(log.findExtraString(allocator, &.{ "tags", "0" }) == null);
+    try std.testing.expect(log.findExtraString(allocator, &.{ "http", "code" }) == null);
+    try std.testing.expect(log.findExtraString(allocator, &.{ "http", "missing", "deep" }) == null);
+}
+
+test "DatadogLog - parseRaw escaped known field re-escapes on serialization" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{"message":"a\tb \"quoted\"","status":"info"}
+    ;
+    var log = try DatadogLog.parseRaw(allocator, json);
+    defer log.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(log, .{}, &out.writer);
+
+    // Round-trip through std.json: the decoded body must survive intact.
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, out.written(), .{});
+    try std.testing.expectEqualStrings("a\tb \"quoted\"", parsed.object.get("message").?.string);
 }
 
 test "FieldWalker - malformed input errors instead of desyncing silently" {

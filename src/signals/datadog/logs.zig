@@ -730,7 +730,11 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
 }
 
 test "datadogFieldAccessor - nested object fallback via path segments" {
-    const allocator = std.testing.allocator;
+    // Arena-scratch like the production record arena: nested lookups may
+    // copy decoded strings out of the transient std.json parse.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     var parser: Parser = .init;
     defer parser.deinit(allocator);
