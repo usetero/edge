@@ -130,11 +130,17 @@ pub fn evalLogRecord(
     bus: *EventBus,
     record: []const u8,
 ) !RecordVerdict {
-    const document = parser.parseFromSlice(parser_gpa, record) catch return .keep;
-    const value_type = document.asValue().getType() catch return .keep;
-    if (value_type != .object) return .keep;
-
-    var log_obj = DatadogLog.parse(scratch, document.asValue()) catch return .keep;
+    // Single-pass zero-copy parse; zimdjson never runs on the hot path.
+    // Anything the walker doesn't like — non-object records, escaped keys,
+    // structural surprises — re-parses through the fully validating
+    // materializing path, so semantics never depend on the fast path. Only
+    // when both fail does the record fail open to keep.
+    var log_obj = DatadogLog.parseRaw(scratch, record) catch blk: {
+        const document = parser.parseFromSlice(parser_gpa, record) catch return .keep;
+        const value_type = document.asValue().getType() catch return .keep;
+        if (value_type != .object) return .keep;
+        break :blk DatadogLog.parse(scratch, document.asValue()) catch return .keep;
+    };
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;

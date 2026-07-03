@@ -257,13 +257,20 @@ pub fn build(b: *std.Build) void {
     datadog_log_bench.root_module.addAnonymousImport("datadog_wrapped_log", .{
         .root_source_file = b.path("bench/datadog/payloads/wrapped_log.json"),
     });
+    // The bench has a --profile mode for attaching Instruments; always keep
+    // frame pointers + symbols so ReleaseFast stacks symbolicate.
+    keepProfilingSymbols(datadog_log_bench.root_module);
     datadog_log_bench.root_module.link_libc = true;
     datadog_log_bench.root_module.linkSystemLibrary("z", .{});
     datadog_log_bench.root_module.linkSystemLibrary("zstd", .{});
 
-    const datadog_log_bench_step = b.step("datadog-log-bench", "Run the Datadog log search benchmark");
+    const datadog_log_bench_step = b.step("datadog-log-bench", "Run the Datadog log eval matrix benchmark");
     const run_datadog_log_bench = b.addRunArtifact(datadog_log_bench);
+    // Forward CLI args (e.g. `zig build datadog-log-bench -- --profile plain/none 30`)
+    // and install the binary so a profiler can be attached to it directly.
+    if (b.args) |args| run_datadog_log_bench.addArgs(args);
     datadog_log_bench_step.dependOn(&run_datadog_log_bench.step);
+    datadog_log_bench_step.dependOn(&b.addInstallArtifact(datadog_log_bench, .{}).step);
 
     // JSON-array framer microbenchmark (zbench).
     const json_framer_bench = b.addExecutable(.{
