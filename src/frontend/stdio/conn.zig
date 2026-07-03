@@ -287,7 +287,11 @@ fn execPipeStream(
     upstream_req.transfer_encoding = .chunked;
     var body_writer = try upstream_req.sendBodyUnflushed(env.slab.upstreamBuf(conn_id));
 
-    var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format);
+    // ponytail: per-request scratch; hoist to the conn slab if stdio ever
+    // becomes a hot path (httpz reuses it per thread).
+    var record_scratch = exec.RecordScratch.init(ctx.gpa);
+    defer record_scratch.deinit();
+    var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &record_scratch);
     defer sink.deinit();
 
     const stats = pipeline_mod.run(.{
