@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.27.1](https://github.com/usetero/edge/compare/v1.27.0...v1.27.1) (2026-07-06)
+
+
+### Bug Fixes
+
+* release please chart sync ([#217](https://github.com/usetero/edge/issues/217)) ([e2f9f64](https://github.com/usetero/edge/commit/e2f9f647370ec6d996ce88ccd4acd03648598d9a))
+
 ## [1.27.0](https://github.com/usetero/edge/compare/v1.26.0...v1.27.0) (2026-07-06)
 
 
