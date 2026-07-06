@@ -25,8 +25,8 @@ pub const DatadogLog = struct {
 
     /// Unknown fields captured by `parseRaw` as verbatim spans of the input
     /// record — key and value both borrow the record bytes, so nothing here
-    /// is owned. String
-    /// values keep their quotes/escapes; `findExtraString` unescapes lazily
+    /// is owned. String values keep their quotes/escapes; `findExtraString`
+    /// unescapes lazily
     /// only when a policy actually reads the field. Mutually exclusive with
     /// `extra`/`extra_raw_json` (which the materializing `parse` fills).
     extra_spans: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -63,7 +63,9 @@ pub const DatadogLog = struct {
             allocator.free(raw.*);
         }
         self.extra_raw_json.deinit(allocator);
-        self.extra_spans.deinit(allocator); // contents are borrowed
+        // parseRaw contents (spans, unescaped strings) are arena-scoped by
+        // contract and never individually freed; only map storage goes here.
+        self.extra_spans.deinit(allocator);
         var flat_it = self.message_flat.iterator();
         while (flat_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
@@ -130,10 +132,16 @@ pub const DatadogLog = struct {
     /// fields are captured verbatim into `extra_spans` — never materialized,
     /// never duped; string extras are unescaped lazily on first policy read.
     ///
-    /// `raw` must outlive the returned log. Anything the walker doesn't like
-    /// (structural surprises, escaped keys, malformed scalar tokens, trailing
-    /// bytes) errors out; callers retry with the zimdjson-validated
-    /// materializing `parse`, so semantics never depend on this path.
+    /// `raw` must outlive the returned log, and `allocator` must be an
+    /// arena scoped to the record: string fields are borrowed from `raw` or
+    /// unescaped into `allocator` with no ownership distinction, so nothing
+    /// is ever individually freed — `deinit` releases map storage only and
+    /// the arena reset reclaims the rest.
+    ///
+    /// Anything the walker doesn't like (structural surprises, escaped keys,
+    /// malformed scalar tokens, trailing bytes) errors out; callers retry
+    /// with the zimdjson-validated materializing `parse`, so semantics never
+    /// depend on this path.
     pub fn parseRaw(allocator: std.mem.Allocator, raw: []const u8) !DatadogLog {
         var log: DatadogLog = .{};
         errdefer log.deinit(allocator);

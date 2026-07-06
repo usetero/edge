@@ -10,6 +10,20 @@
 //! errors with `Malformed` (or `InvalidEscape` inside strings) instead of
 //! being waved through. Callers keep a validating parser as their fallback
 //! path, so these scanners never have to be lenient.
+//!
+//! Known deviation, on purpose: raw control bytes (unescaped < 0x20) inside
+//! string content or container interiors are not rejected (except as the
+//! character following a backslash, where the check rides an existing
+//! branch). Guarding the escape-free fast path costs 10-15% on every
+//! record (measured; whether swept record-wide or checked per string), to
+//! reject invalid-JSON records that are forwarded byte-identically either
+//! way — the only effect of accepting them is that policies evaluate a
+//! record the validating parser would have passed through verbatim.
+//!
+//! Memory contract: functions taking an allocator return strings that are
+//! either borrowed from the input or owned by the allocator, with no way
+//! for the caller to distinguish. Pass a per-record arena so borrowed spans
+//! and decoded strings share one lifetime and are freed together at reset.
 const std = @import("std");
 
 /// Scanner over a JSON object's `"key": value` pairs, yielding each field's
@@ -93,8 +107,9 @@ pub const FieldWalker = struct {
     /// With `start` at an opening quote, returns the index just past the
     /// closing quote, honoring escapes. Escape-free strings (the common
     /// case) cost exactly one memchr + a parity check; the first escaped
-    /// quote proves the string dense and the rest scans linearly — memchr
-    /// hop overhead on `\"`-riddled wrapped messages costs more than bytes.
+    /// quote proves the string dense and the rest scans linearly, where
+    /// raw control bytes are rejected for free (see the module doc's known
+    /// deviation: the fast path deliberately does not scan for them).
     fn stringEnd(self: *const FieldWalker, start: usize) ?usize {
         const quote = std.mem.findScalarPos(u8, self.raw, start + 1, '"') orelse return null;
         var first_backslash = quote;
@@ -106,7 +121,12 @@ pub const FieldWalker = struct {
         var i = quote + 1;
         while (i < self.raw.len) : (i += 1) {
             switch (self.raw[i]) {
-                '\\' => i += 1, // skip the escaped byte
+                '\\' => {
+                    if (i + 1 >= self.raw.len) return null;
+                    i += 1;
+                    // A raw control byte is not a legal escape character.
+                    if (self.raw[i] < 0x20) return null;
+                },
                 '"' => return i + 1,
                 else => {},
             }
@@ -120,15 +140,26 @@ pub const FieldWalker = struct {
         switch (self.raw[start]) {
             '"' => return self.stringEnd(start) orelse error.Malformed,
             '{', '[' => {
-                var depth: u32 = 0;
+                // Opener kinds as a bit-stack (0 = object, 1 = array):
+                // depth counts alone accept mismatched closers like `[{]}`.
+                // Nesting beyond 64 levels falls to the validating parser.
+                var stack: u64 = 0;
+                var depth: u8 = 0;
                 var i = start;
                 while (i < self.raw.len) : (i += 1) {
-                    switch (self.raw[i]) {
+                    const byte = self.raw[i];
+                    switch (byte) {
                         // Bulk of container bytes are string keys/values:
                         // vault over them with the vectorized scan.
                         '"' => i = (self.stringEnd(i) orelse return error.Malformed) - 1,
-                        '{', '[' => depth += 1,
+                        '{', '[' => {
+                            if (depth == 64) return error.Malformed;
+                            stack = (stack << 1) | @intFromBool(byte == '[');
+                            depth += 1;
+                        },
                         '}', ']' => {
+                            if ((stack & 1) != @intFromBool(byte == ']')) return error.Malformed;
+                            stack >>= 1;
                             depth -= 1;
                             if (depth == 0) return i + 1;
                         },
@@ -153,9 +184,15 @@ pub const FieldWalker = struct {
     }
 };
 
+const vec_len = std.simd.suggestVectorLength(u8) orelse 16;
+
 /// The unescaped string inside a raw `"..."` span: borrowed zero-copy when
 /// escape-free, unescaped into `allocator` otherwise. Errors on non-string
 /// spans.
+///
+/// Ownership: the returned slice is either borrowed from `span` or owned by
+/// `allocator`, and callers cannot tell which — pass an arena scoped to the
+/// record so both die together at reset; never free the result individually.
 pub fn stringSpan(allocator: std.mem.Allocator, span: []const u8) ![]const u8 {
     if (span.len < 2 or span[0] != '"') return error.Malformed;
     const inner = span[1 .. span.len - 1];
@@ -344,6 +381,68 @@ test "FieldWalker - comma separator violations error" {
         }) |_| {}
         try testing.expect(failed);
     }
+}
+
+test "FieldWalker - mismatched container closers error" {
+    // Regression (macroscope PR 214): one depth counter treated '}' and ']'
+    // interchangeably, so `{"x":[}}` yielded the span `[}`.
+    const bad_inputs = [_][]const u8{
+        \\{"x":[}}
+        ,
+        \\{"x":{]}
+        ,
+        \\{"x":[{]}}
+        ,
+        \\{"x":[1,2}}
+        ,
+    };
+    for (bad_inputs) |json| {
+        var walker = try FieldWalker.init(json);
+        try testing.expectError(error.Malformed, walker.nextField());
+    }
+
+    // Properly matched mixed nesting still parses.
+    var ok = try FieldWalker.init(
+        \\{"x":[{"a":[1]},[]]}
+    );
+    const field = (try ok.nextField()).?;
+    try testing.expectEqualStrings("[{\"a\":[1]},[]]", field.value);
+}
+
+test "FieldWalker - nesting beyond 64 levels falls to the validating parser" {
+    const deep_bad = "{\"x\":" ++ "[" ** 65 ++ "]" ** 65 ++ "}";
+    var walker = try FieldWalker.init(deep_bad);
+    try testing.expectError(error.Malformed, walker.nextField());
+
+    const deep_ok = "{\"x\":" ++ "[" ** 64 ++ "]" ** 64 ++ "}";
+    var ok = try FieldWalker.init(deep_ok);
+    _ = (try ok.nextField()).?;
+    try testing.expectEqual(@as(?FieldWalker.RawField, null), try ok.nextField());
+}
+
+test "FieldWalker - control bytes: escaped-char check rejects, content deviation is pinned" {
+    // A raw control byte as the character FOLLOWING a backslash is rejected
+    // in the dense branch (the check rides the existing escape handling).
+    var rejected = try FieldWalker.init("{\"a\":\"q\\\" x\\\n\"}");
+    try testing.expectError(error.Malformed, rejected.nextField());
+
+    // DOCUMENTED DEVIATION (see module doc): raw control bytes in string
+    // content are otherwise accepted — guarding them costs 10-15% per record
+    // (measured, both swept record-wide and checked per string). Such
+    // records are invalid JSON but are forwarded byte-identically either
+    // way; pin the acceptance so changing it is a conscious decision.
+    var deviant = try FieldWalker.init("{\"a\":\"line1\nline2\"}");
+    const field = (try deviant.nextField()).?;
+    try testing.expectEqualStrings("\"line1\nline2\"", field.value);
+    var deviant2 = try FieldWalker.init("{\"a\":\"q\\\" then\nraw\"}");
+    _ = (try deviant2.nextField()).?;
+
+    // Legal whitespace between container tokens is fine, and DEL (0x7f)
+    // needs no escaping per RFC 8259.
+    var ok = try FieldWalker.init("{\"a\":[1,\n\t 2],\"d\":\"\x7f\"}");
+    _ = (try ok.nextField()).?;
+    const d = (try ok.nextField()).?;
+    try testing.expectEqualStrings("\"\x7f\"", d.value);
 }
 
 test "unescape - decodes every escape and rejects invalid sequences" {
