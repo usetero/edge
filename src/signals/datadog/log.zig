@@ -1,5 +1,6 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
+const jscan = @import("../json_scan.zig");
 
 pub const Parser = zimdjson.ondemand.FullParser(.default);
 pub const Value = Parser.Value;
@@ -137,35 +138,35 @@ pub const DatadogLog = struct {
         var log: DatadogLog = .{};
         errdefer log.deinit(allocator);
 
-        var walker = try FieldWalker.init(raw);
+        var walker = try jscan.FieldWalker.init(raw);
         while (try walker.nextField()) |field| {
             // Escaped keys are ~nonexistent in log records; the fallback
             // parse handles them rather than paying an unescape here.
-            if (std.mem.findScalar(u8, field.key, '\\') != null) return error.Desync;
+            if (std.mem.findScalar(u8, field.key, '\\') != null) return error.Malformed;
             const key = field.key;
 
             if (std.mem.eql(u8, key, "message")) {
-                log.message = try stringValue(allocator, field.value);
+                log.message = try jscan.stringSpan(allocator, field.value);
             } else if (std.mem.eql(u8, key, "status")) {
-                log.status = try stringValue(allocator, field.value);
+                log.status = try jscan.stringSpan(allocator, field.value);
             } else if (std.mem.eql(u8, key, "level")) {
-                log.level = try stringValue(allocator, field.value);
+                log.level = try jscan.stringSpan(allocator, field.value);
             } else if (std.mem.eql(u8, key, "service")) {
-                log.service = try stringValue(allocator, field.value);
+                log.service = try jscan.stringSpan(allocator, field.value);
             } else if (std.mem.eql(u8, key, "hostname")) {
-                log.hostname = try stringValue(allocator, field.value);
+                log.hostname = try jscan.stringSpan(allocator, field.value);
             } else if (std.mem.eql(u8, key, "ddsource")) {
-                log.ddsource = try stringValue(allocator, field.value);
+                log.ddsource = try jscan.stringSpan(allocator, field.value);
             } else if (std.mem.eql(u8, key, "ddtags")) {
-                log.ddtags = try stringValue(allocator, field.value);
+                log.ddtags = try jscan.stringSpan(allocator, field.value);
             } else if (std.mem.eql(u8, key, "timestamp")) {
-                log.timestamp = std.fmt.parseInt(i64, field.value, 10) catch return error.Desync;
+                log.timestamp = std.fmt.parseInt(i64, field.value, 10) catch return error.Malformed;
             } else if (std.mem.eql(u8, key, "environment")) {
-                log.environment = try stringValue(allocator, field.value);
+                log.environment = try jscan.stringSpan(allocator, field.value);
             } else if (std.mem.eql(u8, key, "custom_field")) {
-                log.custom_field = try stringValue(allocator, field.value);
+                log.custom_field = try jscan.stringSpan(allocator, field.value);
             } else {
-                if (!validScalarOrStructureSpan(field.value)) return error.Desync;
+                if (!jscan.validValueSpan(field.value)) return error.Malformed;
                 try log.extra_spans.put(allocator, key, field.value);
             }
         }
@@ -174,132 +175,11 @@ pub const DatadogLog = struct {
         return log;
     }
 
-    /// The unescaped string inside a raw `"..."` span: borrowed zero-copy
-    /// when escape-free, unescaped into `allocator` otherwise. Errors on
-    /// non-string values, matching `parse`'s asString behavior (the record
-    /// falls open to the materializing path, which rejects it identically).
-    fn stringValue(allocator: std.mem.Allocator, span: []const u8) ![]const u8 {
-        if (span.len < 2 or span[0] != '"') return error.Desync;
-        const inner = span[1 .. span.len - 1];
-        if (std.mem.findScalar(u8, inner, '\\') == null) return inner;
-        return unescape(allocator, inner) catch return error.Desync;
-    }
-
-    /// JSON string unescape over the bytes between the quotes, including
-    /// \uXXXX surrogate pairs. Escape scanning is adaptive: a short linear
-    /// window resolves escape-dense text (wrapped JSON messages are ~all
-    /// `\"` every few bytes) without memchr call overhead, while sparse text
-    /// bulk-skips with one memchr per long run. Output is at most inner.len
-    /// bytes (every escape shrinks), so capacity is reserved once up front.
-    fn unescape(allocator: std.mem.Allocator, inner: []const u8) ![]const u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(allocator);
-        try out.ensureTotalCapacity(allocator, inner.len);
-
-        var i: usize = 0;
-        while (i < inner.len) {
-            const window_end = @min(inner.len, i + 32);
-            var backslash = i;
-            while (backslash < window_end and inner[backslash] != '\\') backslash += 1;
-            if (backslash == window_end) {
-                backslash = std.mem.findScalarPos(u8, inner, window_end, '\\') orelse inner.len;
-            }
-            out.appendSliceAssumeCapacity(inner[i..backslash]);
-            if (backslash == inner.len) break;
-            if (backslash + 1 >= inner.len) return error.InvalidEscape;
-            i = backslash + 2;
-            switch (inner[backslash + 1]) {
-                '"', '\\', '/' => |c| out.appendAssumeCapacity(c),
-                'b' => out.appendAssumeCapacity(0x08),
-                'f' => out.appendAssumeCapacity(0x0c),
-                'n' => out.appendAssumeCapacity('\n'),
-                'r' => out.appendAssumeCapacity('\r'),
-                't' => out.appendAssumeCapacity('\t'),
-                'u' => {
-                    const first = try hex4(inner, i);
-                    i += 4;
-                    var codepoint: u21 = first;
-                    if (first >= 0xD800 and first <= 0xDBFF) {
-                        // High surrogate: a \uXXXX low surrogate must follow.
-                        if (i + 6 > inner.len or inner[i] != '\\' or inner[i + 1] != 'u') {
-                            return error.InvalidEscape;
-                        }
-                        const low = try hex4(inner, i + 2);
-                        i += 6;
-                        if (low < 0xDC00 or low > 0xDFFF) return error.InvalidEscape;
-                        codepoint = 0x10000 +
-                            ((@as(u21, first - 0xD800) << 10) | (low - 0xDC00));
-                    } else if (first >= 0xDC00 and first <= 0xDFFF) {
-                        return error.InvalidEscape; // lone low surrogate
-                    }
-                    var buf: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(codepoint, &buf) catch
-                        return error.InvalidEscape;
-                    out.appendSliceAssumeCapacity(buf[0..n]);
-                },
-                else => return error.InvalidEscape,
-            }
-        }
-        return out.toOwnedSlice(allocator);
-    }
-
-    fn hex4(inner: []const u8, at: usize) error{InvalidEscape}!u16 {
-        if (at + 4 > inner.len) return error.InvalidEscape;
-        return std.fmt.parseInt(u16, inner[at .. at + 4], 16) catch error.InvalidEscape;
-    }
-
-    /// Guards extra spans against structurally-plausible garbage the walker
-    /// would otherwise wave through (e.g. `tru`, `1e+`). Strings and
-    /// containers were already structurally validated by the walker; scalar
-    /// tokens must be well-formed JSON literals so a record the full parser
-    /// would reject can't be filtered (it fails open verbatim instead, as
-    /// today).
-    fn validScalarOrStructureSpan(span: []const u8) bool {
-        if (span.len == 0) return false;
-        return switch (span[0]) {
-            '"', '{', '[' => true,
-            't' => std.mem.eql(u8, span, "true"),
-            'f' => std.mem.eql(u8, span, "false"),
-            'n' => std.mem.eql(u8, span, "null"),
-            '-', '0'...'9' => validNumberSpan(span),
-            else => false,
-        };
-    }
-
-    /// RFC 8259 number grammar: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
-    fn validNumberSpan(span: []const u8) bool {
-        var i: usize = 0;
-        if (span[i] == '-') i += 1;
-        if (i >= span.len) return false;
-        if (span[i] == '0') {
-            i += 1;
-        } else if (span[i] >= '1' and span[i] <= '9') {
-            while (i < span.len and std.ascii.isDigit(span[i])) i += 1;
-        } else {
-            return false;
-        }
-        if (i < span.len and span[i] == '.') {
-            i += 1;
-            if (i >= span.len or !std.ascii.isDigit(span[i])) return false;
-            while (i < span.len and std.ascii.isDigit(span[i])) i += 1;
-        }
-        if (i < span.len and (span[i] == 'e' or span[i] == 'E')) {
-            i += 1;
-            if (i < span.len and (span[i] == '+' or span[i] == '-')) i += 1;
-            if (i >= span.len or !std.ascii.isDigit(span[i])) return false;
-            while (i < span.len and std.ascii.isDigit(span[i])) i += 1;
-        }
-        return i == span.len;
-    }
-
     /// Unescaped view of a raw span holding a JSON string, or null for
     /// non-strings. Escape-free strings are borrowed; escaped ones are
     /// unescaped into `allocator` (lazy — only fields a policy reads pay it).
     fn spanString(allocator: std.mem.Allocator, span: []const u8) ?[]const u8 {
-        if (span.len < 2 or span[0] != '"') return null;
-        const inner = span[1 .. span.len - 1];
-        if (std.mem.findScalar(u8, inner, '\\') == null) return inner;
-        return unescape(allocator, inner) catch null;
+        return jscan.stringSpan(allocator, span) catch null;
     }
 
     /// Custom JSON serialization for known fields only.
@@ -741,139 +621,6 @@ pub const DatadogLog = struct {
     }
 };
 
-/// Tracks raw byte offsets of `"key": value` pairs while zimdjson iterates
-/// the same object, so parseFast can capture field values as verbatim spans
-/// of the input record. Structure only — zimdjson stays authoritative for
-/// types and validation; parseFast cross-checks every key against zimdjson's
-/// and bails with error.Desync on any divergence (callers fall back to the
-/// materializing parse).
-const FieldWalker = struct {
-    raw: []const u8,
-    pos: usize = 0,
-
-    const RawField = struct {
-        /// Key bytes between the quotes, escapes intact.
-        key: []const u8,
-        /// Value bytes, verbatim JSON (quotes/braces included).
-        value: []const u8,
-    };
-
-    fn init(raw: []const u8) error{Desync}!FieldWalker {
-        var walker: FieldWalker = .{ .raw = raw };
-        walker.skipWhitespace();
-        if (walker.pos >= raw.len or raw[walker.pos] != '{') return error.Desync;
-        walker.pos += 1;
-        return walker;
-    }
-
-    fn nextField(self: *FieldWalker) error{Desync}!?RawField {
-        self.skipWhitespace();
-        if (self.pos < self.raw.len and self.raw[self.pos] == ',') {
-            self.pos += 1;
-            self.skipWhitespace();
-        }
-        if (self.pos >= self.raw.len) return error.Desync;
-        if (self.raw[self.pos] == '}') return null;
-        if (self.raw[self.pos] != '"') return error.Desync;
-
-        const key_start = self.pos + 1;
-        const key_close = self.stringEnd(self.pos) orelse return error.Desync;
-        const key = self.raw[key_start .. key_close - 1];
-        self.pos = key_close;
-
-        self.skipWhitespace();
-        if (self.pos >= self.raw.len or self.raw[self.pos] != ':') return error.Desync;
-        self.pos += 1;
-        self.skipWhitespace();
-
-        const value_start = self.pos;
-        const value_end = try self.valueEnd(value_start);
-        self.pos = value_end;
-        return .{ .key = key, .value = self.raw[value_start..value_end] };
-    }
-
-    fn skipWhitespace(self: *FieldWalker) void {
-        while (self.pos < self.raw.len) : (self.pos += 1) {
-            switch (self.raw[self.pos]) {
-                ' ', '\t', '\r', '\n' => {},
-                else => return,
-            }
-        }
-    }
-
-    /// Asserts nothing but whitespace follows the object's closing brace, so
-    /// a record with trailing bytes can't be treated as parsed (the full
-    /// parser would reject it; error here routes it to that path).
-    fn finish(self: *FieldWalker) error{Desync}!void {
-        // nextField returned null at the '}'.
-        self.pos += 1;
-        self.skipWhitespace();
-        if (self.pos != self.raw.len) return error.Desync;
-    }
-
-    /// With `start` at an opening quote, returns the index just past the
-    /// closing quote, honoring escapes. Escape-free strings (the common
-    /// case) cost exactly one memchr + a parity check; the first escaped
-    /// quote proves the string dense and the rest scans linearly — memchr
-    /// hop overhead on `\"`-riddled wrapped messages costs more than bytes.
-    fn stringEnd(self: *const FieldWalker, start: usize) ?usize {
-        const quote = std.mem.findScalarPos(u8, self.raw, start + 1, '"') orelse return null;
-        var first_backslash = quote;
-        while (first_backslash > start + 1 and self.raw[first_backslash - 1] == '\\') {
-            first_backslash -= 1;
-        }
-        if ((quote - first_backslash) % 2 == 0) return quote + 1;
-
-        var i = quote + 1;
-        while (i < self.raw.len) : (i += 1) {
-            switch (self.raw[i]) {
-                '\\' => i += 1, // skip the escaped byte
-                '"' => return i + 1,
-                else => {},
-            }
-        }
-        return null;
-    }
-
-    /// Returns the index just past the JSON value starting at `start`.
-    fn valueEnd(self: *const FieldWalker, start: usize) error{Desync}!usize {
-        if (start >= self.raw.len) return error.Desync;
-        switch (self.raw[start]) {
-            '"' => return self.stringEnd(start) orelse error.Desync,
-            '{', '[' => {
-                var depth: u32 = 0;
-                var i = start;
-                while (i < self.raw.len) : (i += 1) {
-                    switch (self.raw[i]) {
-                        // Bulk of container bytes are string keys/values:
-                        // vault over them with the vectorized scan.
-                        '"' => i = (self.stringEnd(i) orelse return error.Desync) - 1,
-                        '{', '[' => depth += 1,
-                        '}', ']' => {
-                            depth -= 1;
-                            if (depth == 0) return i + 1;
-                        },
-                        else => {},
-                    }
-                }
-                return error.Desync;
-            },
-            else => {
-                // Scalar: runs to the next structural byte or whitespace.
-                var i = start;
-                while (i < self.raw.len) : (i += 1) {
-                    switch (self.raw[i]) {
-                        ',', '}', ']', ' ', '\t', '\r', '\n' => return i,
-                        else => {},
-                    }
-                }
-                // A top-level scalar can't legally end the enclosing object.
-                return error.Desync;
-            },
-        }
-    }
-};
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -983,27 +730,6 @@ test "DatadogLog - parseRaw unwraps msg/log span extras for bodyForMatch" {
     try std.testing.expectEqualStrings("inner body", body.?);
 }
 
-test "FieldWalker - spans across whitespace, escapes, and nesting" {
-    const json =
-        \\ { "a" : "x\"y" , "b": [1, {"c": "}"}] , "d" :null }
-    ;
-    var walker = try FieldWalker.init(json);
-
-    const a = (try walker.nextField()).?;
-    try std.testing.expectEqualStrings("a", a.key);
-    try std.testing.expectEqualStrings("\"x\\\"y\"", a.value);
-
-    const b = (try walker.nextField()).?;
-    try std.testing.expectEqualStrings("b", b.key);
-    try std.testing.expectEqualStrings("[1, {\"c\": \"}\"}]", b.value);
-
-    const d = (try walker.nextField()).?;
-    try std.testing.expectEqualStrings("d", d.key);
-    try std.testing.expectEqualStrings("null", d.value);
-
-    try std.testing.expectEqual(@as(?FieldWalker.RawField, null), try walker.nextField());
-}
-
 test "DatadogLog - findExtraString escaped nested string survives the transient parser" {
     // Regression (macroscope PR 214): findNestedStringInRaw returned a slice
     // into the std.json parsed arena for ESCAPED nested strings, then freed
@@ -1031,7 +757,7 @@ test "DatadogLog - parseRaw rejects malformed scalar tokens" {
     for ([_][]const u8{ "1e+", "--1", "01", "1..2", "1.", ".5", "1e", "-" }) |bad| {
         var buf: [64]u8 = undefined;
         const json = try std.fmt.bufPrint(&buf, "{{\"message\":\"ok\",\"bad\":{s}}}", .{bad});
-        try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator, json));
+        try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator, json));
     }
     // Well-formed numbers still pass.
     for ([_][]const u8{ "0", "-0.5", "1e5", "1E+10", "42", "123.456e-7" }) |good| {
@@ -1136,9 +862,9 @@ test "DatadogLog - parseRaw rejects invalid escape sequences" {
         ,
     };
     for (bad_records) |json| {
-        // stringValue folds unescape failures into Desync: the record routes
-        // to the validating fallback rather than being trusted.
-        try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator, json));
+        // Unescape failures propagate: the record routes to the validating
+        // fallback rather than being trusted.
+        try std.testing.expectError(error.InvalidEscape, DatadogLog.parseRaw(allocator, json));
     }
 }
 
@@ -1162,20 +888,20 @@ test "DatadogLog - parseRaw rejects non-string known fields (parse parity)" {
         ,
     };
     for (bad_records) |json| {
-        try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator, json));
+        try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator, json));
     }
 }
 
 test "DatadogLog - parseRaw rejects escaped keys and trailing garbage" {
     const allocator = std.testing.allocator;
 
-    try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator,
+    try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator,
         \\{"a\tb":1}
     ));
-    try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator,
+    try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator,
         \\{"message":"m"} trailing
     ));
-    try std.testing.expectError(error.Desync, DatadogLog.parseRaw(allocator,
+    try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator,
         \\{"message":"m"}}
     ));
 }
@@ -1233,26 +959,6 @@ test "DatadogLog - parseRaw long strings exercise the bulk-scan paths" {
     }
 }
 
-test "FieldWalker - backslash parity decides the closing quote" {
-    // Value ends in an even backslash run: the final quote is real.
-    {
-        var walker = try FieldWalker.init(
-            \\{"a":"x\\"}
-        );
-        const field = (try walker.nextField()).?;
-        try std.testing.expectEqualStrings("\"x\\\\\"", field.value);
-    }
-    // Escape-dense string: the first candidate quote is escaped, flipping
-    // stringEnd into its linear mode for the rest of the string.
-    {
-        var walker = try FieldWalker.init(
-            \\{"a":"\"\"\" plain tail that runs past the escapes"}
-        );
-        const field = (try walker.nextField()).?;
-        try std.testing.expect(std.mem.endsWith(u8, field.value, "escapes\""));
-    }
-}
-
 test "DatadogLog - bodyForMatch prefers message over msg/log span extras" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1304,14 +1010,36 @@ test "DatadogLog - parseRaw escaped known field re-escapes on serialization" {
     try std.testing.expectEqualStrings("a\tb \"quoted\"", parsed.object.get("message").?.string);
 }
 
-test "FieldWalker - malformed input errors instead of desyncing silently" {
-    try std.testing.expectError(error.Desync, FieldWalker.init("[1,2]"));
+test "DatadogLog - parseRaw rejects comma separator violations (parse parity)" {
+    // Regression (macroscope PR 214): the walker used to accept a trailing
+    // comma; leading and missing commas were the same hole. All three are
+    // invalid JSON the full parser rejects, so they must fail open.
+    const allocator = std.testing.allocator;
 
-    var truncated = try FieldWalker.init("{\"a\": \"unterminated");
-    try std.testing.expectError(error.Desync, truncated.nextField());
+    const bad_records = [_][]const u8{
+        // Trailing comma before '}'.
+        \\{"message":"m",}
+        ,
+        // Comma before the first field.
+        \\{,"message":"m"}
+        ,
+        // Missing comma between fields.
+        \\{"message":"m" "status":"info"}
+        ,
+        // Double comma.
+        \\{"message":"m",,"status":"info"}
+        ,
+    };
+    for (bad_records) |json| {
+        try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator, json));
+    }
 
-    var bad_sep = try FieldWalker.init("{\"a\" \"b\"}");
-    try std.testing.expectError(error.Desync, bad_sep.nextField());
+    // Whitespace around a single legitimate comma still parses.
+    var log = try DatadogLog.parseRaw(allocator,
+        \\{"message":"m" , "status":"info"}
+    );
+    defer log.deinit(allocator);
+    try std.testing.expectEqualStrings("info", log.status.?);
 }
 
 test "DatadogLog - parse basic fields" {
