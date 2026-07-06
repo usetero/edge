@@ -194,7 +194,9 @@ const vec_len = std.simd.suggestVectorLength(u8) orelse 16;
 /// `allocator`, and callers cannot tell which — pass an arena scoped to the
 /// record so both die together at reset; never free the result individually.
 pub fn stringSpan(allocator: std.mem.Allocator, span: []const u8) ![]const u8 {
-    if (span.len < 2 or span[0] != '"') return error.Malformed;
+    // An escaped final quote (`"abc\"`) passes this check but fails in
+    // unescape below on its dangling backslash.
+    if (span.len < 2 or span[0] != '"' or span[span.len - 1] != '"') return error.Malformed;
     const inner = span[1 .. span.len - 1];
     if (std.mem.findScalar(u8, inner, '\\') == null) return inner;
     return unescape(allocator, inner);
@@ -483,6 +485,11 @@ test "stringSpan - borrows escape-free strings, errors on non-strings" {
 
     try testing.expectError(error.Malformed, stringSpan(testing.failing_allocator, "42"));
     try testing.expectError(error.Malformed, stringSpan(testing.failing_allocator, "\""));
+    // Unterminated span must error, not silently truncate (macroscope PR 214).
+    try testing.expectError(error.Malformed, stringSpan(testing.failing_allocator, "\"abc"));
+    // Final quote that is itself escaped fails on the dangling backslash
+    // (in unescape, which allocates first — errdefer keeps it leak-free).
+    try testing.expectError(error.InvalidEscape, stringSpan(testing.allocator, "\"abc\\\""));
 }
 
 test "validValueSpan / validNumberSpan - strict JSON literals" {
