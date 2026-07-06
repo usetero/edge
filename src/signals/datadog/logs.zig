@@ -82,11 +82,11 @@ pub fn processLogsStream(
 }
 
 /// Filters a JSON log body already sitting in a slice, reusing a caller-owned
-/// parser. The per-record streaming path calls this so zimdjson's structural
-/// buffers survive across records (they're keyed to `parser_gpa`, a stable
+/// parser (zimdjson's structural buffers are keyed to `parser_gpa`, a stable
 /// allocator — NOT `scratch`, which is a per-record arena that gets reset).
 /// `scratch` backs the DatadogLog structs and the result buffer; the processed
-/// body is written to `out_writer`.
+/// body is written to `out_writer`. Batch callers only — the per-record
+/// streaming path uses `evalLogRecord`, which skips output materialization.
 pub fn processLogsSlice(
     scratch: std.mem.Allocator,
     parser: *Parser,
@@ -105,6 +105,52 @@ pub fn processLogsSlice(
         .dropped_count = result.dropped_count,
         .original_count = result.original_count,
     };
+}
+
+/// Verdict for one evaluated record. `replace` bytes are owned by the scratch
+/// allocator passed to `evalLogRecord` and die on its next reset.
+pub const RecordVerdict = union(enum) {
+    keep,
+    drop,
+    replace: []const u8,
+};
+
+/// Evaluate ONE JSON log record (one intake-array element) in place.
+///
+/// The common case — no policy drops or mutates the record — returns `.keep`
+/// without allocating or copying anything: the caller forwards the original
+/// bytes. Output is serialized only when a transform actually changed the
+/// record. Fail-open: input that doesn't parse as a JSON object is kept
+/// verbatim, matching the batch path's returnUnchanged semantics.
+pub fn evalLogRecord(
+    scratch: std.mem.Allocator,
+    parser: *Parser,
+    parser_gpa: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    record: []const u8,
+) !RecordVerdict {
+    // Single-pass zero-copy parse; zimdjson never runs on the hot path.
+    // Anything the walker doesn't like — non-object records, escaped keys,
+    // structural surprises — re-parses through the fully validating
+    // materializing path, so semantics never depend on the fast path. Only
+    // when both fail does the record fail open to keep.
+    var log_obj = DatadogLog.parseRaw(scratch, record) catch blk: {
+        const document = parser.parseFromSlice(parser_gpa, record) catch return .keep;
+        const value_type = document.asValue().getType() catch return .keep;
+        if (value_type != .object) return .keep;
+        break :blk DatadogLog.parse(scratch, document.asValue()) catch return .keep;
+    };
+
+    const engine = PolicyEngine.init(bus, @constCast(registry));
+    var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
+    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf);
+    if (!result.keep) return .drop;
+    if (!result.mutated) return .keep;
+
+    var out: std.Io.Writer.Allocating = .init(scratch);
+    try std.json.Stringify.value(log_obj, .{}, &out.writer);
+    return .{ .replace = out.written() };
 }
 
 fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
@@ -684,7 +730,11 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
 }
 
 test "datadogFieldAccessor - nested object fallback via path segments" {
-    const allocator = std.testing.allocator;
+    // Arena-scratch like the production record arena: nested lookups may
+    // copy decoded strings out of the transient std.json parse.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     var parser: Parser = .init;
     defer parser.deinit(allocator);
@@ -736,6 +786,152 @@ test "datadogFieldAccessor - multi-segment path with no matching dotted key retu
     };
     const val = logValue(&field_ctx, .{ .log_attribute = bad_path });
     try std.testing.expect(val == null);
+}
+
+test "evalLogRecord - no policies keeps record without output" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const verdict = try evalLogRecord(
+        arena.allocator(),
+        &parser,
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        \\{"status": "info", "message": "test1"}
+        ,
+    );
+    try std.testing.expectEqual(RecordVerdict.keep, verdict);
+}
+
+test "evalLogRecord - drop policy drops, non-matching keeps" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-debug"),
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+    };
+    try drop_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        .match = .{ .regex = try allocator.dupe(u8, "debug") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const dropped = try evalLogRecord(
+        arena.allocator(),
+        &parser,
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        \\{"status": "debug", "message": "debug msg"}
+        ,
+    );
+    try std.testing.expectEqual(RecordVerdict.drop, dropped);
+
+    _ = arena.reset(.retain_capacity);
+    const kept = try evalLogRecord(
+        arena.allocator(),
+        &parser,
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        \\{"status": "error", "message": "error msg"}
+        ,
+    );
+    try std.testing.expectEqual(RecordVerdict.keep, kept);
+}
+
+test "evalLogRecord - transform yields replace with serialized record" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var transform: proto.policy.LogTransform = .{};
+    var remove_attr_path: proto.policy.AttributePath = .{};
+    try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
+    try transform.remove.append(allocator, .{
+        .field = .{ .log_attribute = remove_attr_path },
+    });
+    var test_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "remove-service"),
+        .name = try allocator.dupe(u8, "remove-service"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    try test_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .regex = try allocator.dupe(u8, "test") },
+    });
+    defer test_policy.deinit(allocator);
+    try registry.updatePolicies(&.{test_policy}, "test", .file);
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const verdict = try evalLogRecord(
+        arena.allocator(),
+        &parser,
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        \\{"message": "test log message", "service": "my-service", "status": "info"}
+        ,
+    );
+    try std.testing.expect(verdict == .replace);
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "test log message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "my-service") == null);
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "\"service\"") == null);
+}
+
+test "evalLogRecord - malformed and non-object records fail open to keep" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const bus = noop_bus.eventBus();
+    const malformed = try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, "{ not json }");
+    try std.testing.expectEqual(RecordVerdict.keep, malformed);
+
+    const scalar = try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, "42");
+    try std.testing.expectEqual(RecordVerdict.keep, scalar);
 }
 
 test "processLogs - no policies keeps all logs in array" {

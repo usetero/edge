@@ -41,6 +41,9 @@ pub const distro = @import("runtime/distro.zig");
 // Prometheus signal codecs
 pub const prometheus = @import("signals/prometheus/root.zig");
 
+// Shared single-pass JSON span scanning for signal parsers
+pub const signals_json_scan = @import("signals/json_scan.zig");
+
 // Datadog log search/filter (exposed for benchmarking)
 pub const signals_datadog_logs = @import("signals/datadog/logs.zig");
 
@@ -80,6 +83,7 @@ test {
     _ = @import("pipeline/framer.zig");
     _ = @import("pipeline/pipeline.zig");
     _ = @import("pipeline/tap.zig");
+    _ = @import("signals/json_scan.zig");
     _ = @import("signals/datadog/logs.zig");
     _ = @import("signals/datadog/metrics.zig");
     _ = @import("signals/otlp/attributes.zig");

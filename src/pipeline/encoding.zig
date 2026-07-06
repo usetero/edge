@@ -162,20 +162,60 @@ pub const Encoder = union(ContentEncoding) {
     }
 };
 
+/// Process-wide cache of libzstd compression contexts. A ZSTD_CCtx carries a
+/// ~3.5 MiB level-3 workspace; creating and freeing one per request was the
+/// single largest under-load allocation. Encoders acquire on init and release
+/// on deinit; a released context keeps its workspace, so steady-state reuse
+/// allocates nothing. Retention is capped — overflow contexts (more than
+/// `cap` concurrent zstd encoders) are freed on release, so idle memory is
+/// bounded at cap x workspace regardless of load spikes.
+const CctxCache = struct {
+    /// Fixed atomic slots instead of a mutex: each acquire/release is one
+    /// swap/cmpxchg per slot scanned, safe from any thread, no Io needed.
+    slots: [cap]std.atomic.Value(?*c.ZSTD_CCtx) = @splat(.init(null)),
+
+    /// Matches the bench/production handler concurrency (thread_pool_count).
+    /// ponytail: fixed cap; wire to limits if encoder concurrency diversifies.
+    const cap = 8;
+
+    fn acquire(self: *CctxCache) ?*c.ZSTD_CCtx {
+        for (&self.slots) |*slot| {
+            if (slot.swap(null, .acquire)) |cctx| return cctx;
+        }
+        return null;
+    }
+
+    fn release(self: *CctxCache, cctx: *c.ZSTD_CCtx) void {
+        for (&self.slots) |*slot| {
+            if (slot.cmpxchgStrong(null, cctx, .release, .monotonic) == null) return;
+        }
+        _ = c.ZSTD_freeCCtx(cctx); // cache full: overflow context is freed
+    }
+};
+
+var cctx_cache: CctxCache = .{};
+
 /// std.Io.Writer adapter over libzstd streaming compression. Bytes written to
 /// `writer` are compressed and drained to `output`; `finish` emits the frame
-/// epilogue. The compression context lives in libzstd-owned memory (bounded
-/// by level-3 defaults, ~1-2 MiB) — counted as a shared pool in the budget
-/// notes, not the per-connection slab.
+/// epilogue. The compression context comes from `cctx_cache` (shared-pool
+/// memory, bounded by CctxCache.cap x ~3.5 MiB — not the per-connection slab).
 pub const ZstdCompressor = struct {
     writer: std.Io.Writer,
     output: *std.Io.Writer,
     cctx: *c.ZSTD_CCtx,
 
     pub fn init(output: *std.Io.Writer, buffer: []u8) error{CompressionInitFailed}!ZstdCompressor {
-        const cctx = c.ZSTD_createCCtx() orelse return error.CompressionInitFailed;
+        const cctx = cctx_cache.acquire() orelse
+            (c.ZSTD_createCCtx() orelse return error.CompressionInitFailed);
+        errdefer _ = c.ZSTD_freeCCtx(cctx);
+        // A cached context may hold state from an aborted stream; reset
+        // everything and re-apply parameters so reuse is indistinguishable
+        // from a fresh context. The workspace survives the reset — that's
+        // the allocation being saved.
+        if (c.ZSTD_isError(c.ZSTD_CCtx_reset(cctx, c.ZSTD_reset_session_and_parameters)) != 0) {
+            return error.CompressionInitFailed;
+        }
         if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, c.ZSTD_CLEVEL_DEFAULT)) != 0) {
-            _ = c.ZSTD_freeCCtx(cctx);
             return error.CompressionInitFailed;
         }
         return .{
@@ -186,7 +226,7 @@ pub const ZstdCompressor = struct {
     }
 
     pub fn deinit(self: *ZstdCompressor) void {
-        _ = c.ZSTD_freeCCtx(self.cctx);
+        cctx_cache.release(self.cctx);
         self.* = undefined;
     }
 
@@ -366,6 +406,32 @@ test "streaming zstd encode is decodable by buffered oracle" {
             try testing.expectEqualStrings(fixture, decoded);
         }
     }
+}
+
+test "zstd compression contexts are cached and reused across encoders" {
+    var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 4096);
+    defer out.deinit();
+    var buf: [zstd.block_size_max]u8 = undefined;
+
+    var first: Encoder = try .init(.zstd, &out.writer, &buf);
+    const first_cctx = first.zstd.cctx;
+    try first.writer().writeAll("hello");
+    try first.finish();
+    first.deinit();
+
+    // The freed slot is refilled and re-acquired first, so the next encoder
+    // gets the context just released; its stream must still decode (reset
+    // cleared prior state).
+    var second: Encoder = try .init(.zstd, &out.writer, &buf);
+    defer second.deinit();
+    try testing.expectEqual(first_cctx, second.zstd.cctx);
+    out.clearRetainingCapacity();
+    try second.writer().writeAll("world");
+    try second.finish();
+
+    const decoded = try buffered.decompressZstd(testing.allocator, out.written(), 0);
+    defer testing.allocator.free(decoded);
+    try testing.expectEqualStrings("world", decoded);
 }
 
 test "identity passes bytes through untouched" {

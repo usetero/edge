@@ -44,7 +44,15 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
         },
         // null => httpz defaults (1 worker, 32 pool threads). thread_pool count
         // multiplies the per-thread pipeline-scratch floor (see ThreadBufs).
-        .workers = .{ .count = limits.worker_count },
+        // The large-buffer pool is eagerly allocated (count x size at startup)
+        // and httpz's defaults are 16 x max_body_size; we bound it from limits.
+        // Misses fall back to exact-size per-request arena allocs, so this is
+        // a memory cap, not a body-size cap.
+        .workers = .{
+            .count = limits.worker_count,
+            .large_buffer_count = limits.large_body_buffer_count,
+            .large_buffer_size = limits.large_body_buffer_size,
+        },
         .thread_pool = .{ .count = limits.thread_pool_count },
     };
 }
@@ -59,6 +67,9 @@ const ThreadBufs = struct {
     scratch: []u8,
     chunk: []u8,
     upstream: []u8,
+    /// Per-record eval state (zimdjson parser + record arena), reused across
+    /// every request this thread handles.
+    record: *exec.RecordScratch,
 };
 
 threadlocal var tl_bufs: ?ThreadBufs = null;
@@ -73,12 +84,15 @@ var bufs_registry: std.ArrayList(ThreadBufs) = .empty;
 
 fn threadBufs(io: std.Io, gpa: std.mem.Allocator, limits: limits_mod.Limits) !ThreadBufs {
     if (tl_bufs) |bufs| return bufs;
+    const record = try gpa.create(exec.RecordScratch);
+    record.* = .init(gpa);
     const bufs: ThreadBufs = .{
         .decode = try gpa.alloc(u8, limits.decode_buf),
         .encode = try gpa.alloc(u8, limits.encode_buf),
         .scratch = try gpa.alloc(u8, limits.record_scratch),
         .chunk = try gpa.alloc(u8, limits.chunk_buf),
         .upstream = try gpa.alloc(u8, limits.upstream_write_buf),
+        .record = record,
     };
     {
         bufs_registry_mutex.lockUncancelable(io);
@@ -100,6 +114,8 @@ fn freeThreadBufs(io: std.Io, gpa: std.mem.Allocator) void {
         gpa.free(bufs.scratch);
         gpa.free(bufs.chunk);
         gpa.free(bufs.upstream);
+        bufs.record.deinit();
+        gpa.destroy(bufs.record);
     }
     bufs_registry.deinit(gpa);
     bufs_registry = .empty;
@@ -476,7 +492,7 @@ pub const Handler = struct {
         upstream_req.transfer_encoding = .chunked;
         var body_writer = try upstream_req.sendBodyUnflushed(bufs.upstream);
 
-        var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format);
+        var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, bufs.record);
         defer sink.deinit();
 
         const stats = pipeline_mod.run(.{
@@ -691,6 +707,9 @@ test "httpz config derives from limits" {
     // Unset worker/thread-pool counts ride httpz defaults (null).
     try testing.expectEqual(@as(?u16, null), config.workers.count);
     try testing.expectEqual(@as(?u16, null), config.thread_pool.count);
+    // The large-body pool must NOT ride httpz defaults (16 x max_body_size).
+    try testing.expectEqual(@as(?u16, 8), config.workers.large_buffer_count);
+    try testing.expectEqual(@as(?u32, 1024 * 1024), config.workers.large_buffer_size);
     try testing.expectEqual(@as(u16, 8080), config.address.ip.ip4.port);
 }
 

@@ -310,20 +310,39 @@ pub fn processBuffered(
     return .{ .body = encoded.written(), .all_dropped = false };
 }
 
-/// Per-record policy evaluation: wraps each record as a minimal one-element
-/// batch and runs it through the SAME batch transform the old modules used.
-/// Semantics are therefore identical to the buffered path; memory is bounded
-/// by one record (the arena resets between records). A future pass can bind
-/// the engine directly per record to shave the wrap/parse overhead.
+/// Long-lived scratch for the per-record path: zimdjson's structural buffers
+/// and the record arena. Owned by the frontend and reused across requests
+/// (thread-local in the httpz frontend), so steady-state request handling
+/// pays zero setup allocations. The arena's retained capacity is bounded by
+/// the largest single record evaluated (records themselves are bounded by
+/// limits.record_scratch).
+pub const RecordScratch = struct {
+    gpa: std.mem.Allocator,
+    parser: dd_logs.Parser,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn init(gpa: std.mem.Allocator) RecordScratch {
+        return .{ .gpa = gpa, .parser = .init, .arena = .init(gpa) };
+    }
+
+    pub fn deinit(self: *RecordScratch) void {
+        self.parser.deinit(self.gpa);
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Per-record policy evaluation. JSON log records are parsed and evaluated in
+/// place (dd_logs.evalLogRecord): the keep path forwards the original bytes
+/// with no copy. Protobuf records still round-trip through the batch
+/// transform. Memory is bounded by one record (the arena resets between
+/// records).
 pub const RecordSink = struct {
     ctx: *SharedCtx,
     signal: service_mod.Signal,
     format: framer_mod.WireFormat,
-    record_arena: std.heap.ArenaAllocator,
-    /// Reused across records so zimdjson's structural buffers aren't
-    /// reallocated per log line. Backed by ctx.gpa (stable), NOT record_arena
-    /// (which resets each record). Only the json_array/log path touches it.
-    log_parser: dd_logs.Parser = .init,
+    /// Parser + arena reused across records AND requests; see RecordScratch.
+    scratch: *RecordScratch,
     /// Snapshot emptiness for this request's signal, resolved once at init;
     /// false short-circuits onRecord to .keep without decoding.
     active: bool,
@@ -331,20 +350,23 @@ pub const RecordSink = struct {
     records: u64 = 0,
     dropped: u64 = 0,
 
-    pub fn init(ctx: *SharedCtx, signal: service_mod.Signal, format: framer_mod.WireFormat) RecordSink {
+    pub fn init(
+        ctx: *SharedCtx,
+        signal: service_mod.Signal,
+        format: framer_mod.WireFormat,
+        scratch: *RecordScratch,
+    ) RecordSink {
         return .{
             .ctx = ctx,
             .signal = signal,
             .format = format,
-            .record_arena = .init(ctx.gpa),
-            .log_parser = .init,
+            .scratch = scratch,
             .active = policiesActiveFor(ctx.registry, signal),
         };
     }
 
     pub fn deinit(self: *RecordSink) void {
-        self.log_parser.deinit(self.ctx.gpa);
-        self.record_arena.deinit();
+        // The scratch outlives the sink (frontend-owned); nothing to free.
         self.* = undefined;
     }
 
@@ -359,8 +381,8 @@ pub const RecordSink = struct {
 
             // Replace bytes from the PREVIOUS record die here; the framer has
             // already written them (emit happens before the next onRecord).
-            _ = self.record_arena.reset(.retain_capacity);
-            const arena = self.record_arena.allocator();
+            _ = self.scratch.arena.reset(.retain_capacity);
+            const arena = self.scratch.arena.allocator();
 
             break :blk switch (self.format) {
                 .json_array => try self.evalJsonRecord(arena, bytes),
@@ -382,33 +404,22 @@ pub const RecordSink = struct {
     }
 
     fn evalJsonRecord(self: *RecordSink, arena: std.mem.Allocator, bytes: []const u8) !framer_mod.Decision {
-        // One-element batch: "[<record>]".
-        const wrapped = try std.mem.concat(arena, u8, &.{ "[", bytes, "]" });
-        var out: std.Io.Writer.Allocating = .init(arena);
-        const result = try dd_logs.processLogsSlice(
+        const verdict = try dd_logs.evalLogRecord(
             arena,
-            &self.log_parser,
+            &self.scratch.parser,
             self.ctx.gpa,
             self.ctx.registry,
             self.ctx.bus,
-            wrapped,
-            &out.writer,
+            bytes,
         );
-        if (result.allDropped()) {
-            self.dropped += 1;
-            return .drop;
+        switch (verdict) {
+            .keep => return .keep,
+            .drop => {
+                self.dropped += 1;
+                return .drop;
+            },
+            .replace => |replacement| return .{ .replace = replacement },
         }
-        const written = std.mem.trim(u8, out.written(), " \t\r\n");
-        if (written.len < 2 or written[0] != '[' or written[written.len - 1] != ']') {
-            return .keep; // unexpected shape: fail safe, forward original
-        }
-        const inner = std.mem.trim(u8, written[1 .. written.len - 1], " \t\r\n");
-        if (inner.len == 0) {
-            self.dropped += 1;
-            return .drop;
-        }
-        if (std.mem.eql(u8, inner, bytes)) return .keep;
-        return .{ .replace = inner };
     }
 
     fn evalProtobufRecord(self: *RecordSink, arena: std.mem.Allocator, bytes: []const u8) !framer_mod.Decision {
