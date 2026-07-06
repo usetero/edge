@@ -4,7 +4,7 @@ fullnameOverride: ""
 image:
   repository: ghcr.io/usetero/edge
   pullPolicy: IfNotPresent
-  tag: ""
+  tag: "@sha256:c8e2fe40b23845012c6a6c9ca4b0865f0ea8da8599f8b9bdd15b60c48cab6f24"
 imagePullSecrets: []
 
 serviceAccount:
