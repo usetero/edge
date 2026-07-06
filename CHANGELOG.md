@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.27.0](https://github.com/usetero/edge/compare/v1.26.0...v1.27.0) (2026-07-06)
+
+
+### Features
+
+* more perf improvements ([#214](https://github.com/usetero/edge/issues/214)) ([361614e](https://github.com/usetero/edge/commit/361614e16d3cccc216e59f13072393dd207ff35c))
+
+
+### Bug Fixes
+
+* implement better json parsing and quick wins ([#212](https://github.com/usetero/edge/issues/212)) ([d87c0a0](https://github.com/usetero/edge/commit/d87c0a063f87e43fdd2c13dfde65e8a2003bf0b8))
+
 ## [1.26.0](https://github.com/usetero/edge/compare/v1.25.1...v1.26.0) (2026-06-30)
 
 
