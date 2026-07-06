@@ -131,6 +131,11 @@ jobs:
             app_version_old="$(git show "origin/master:${manifest_file}" | jq -r '.["."] // empty' || true)"
           fi
 
+          if [ "${app_version_new}" = "${app_version_old}" ]; then
+            echo "Root app version is unchanged; skipping chart bump."
+            exit 0
+          fi
+
           bump_kind="patch"
           if [[ "${app_version_new}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "${app_version_old}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             IFS='.' read -r app_old_major app_old_minor app_old_patch <<< "${app_version_old}"
