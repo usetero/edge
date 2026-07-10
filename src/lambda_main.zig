@@ -126,7 +126,9 @@ pub const LambdaConfig = struct {
             self.thread_pool_count = null;
         };
 
-        try self.s3_dump.validate();
+        // Lambda flush is event-driven (per-invoke + shutdown), so
+        // `flush_interval_ms` is unused here — validate only the batch caps.
+        try self.s3_dump.validateBatching();
     }
 };
 

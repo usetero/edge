@@ -56,18 +56,26 @@ pub const S3DumpConfig = struct {
     max_attempts: usize = 1,
     targets: []const S3TargetConfig = &.{},
 
-    /// Reject knobs that would silently break the runtime: a zero flush
-    /// interval spins the (server-distro) flush task in a tight loop, and a
-    /// zero batch/backlog cap makes the handler drop every record. Only checked
-    /// when enabled. Shared by every distribution's config validator.
-    pub fn validate(self: S3DumpConfig) !void {
+    /// Batch/backlog caps that must be nonzero no matter how flush is driven —
+    /// a zero cap makes the handler treat every record as oversized and drop it.
+    /// Used by every distribution (the Lambda flush is event-driven, so it only
+    /// needs this, not the flush-interval check below).
+    pub fn validateBatching(self: S3DumpConfig) !void {
         if (!self.enabled) return;
-        if (self.flush_interval_ms == 0) {
-            log.warn("s3_dump.flush_interval_ms must be > 0", .{});
-            return error.InvalidS3DumpConfig;
-        }
         if (self.max_batch_bytes == 0 or self.max_sealed_bytes == 0 or self.max_batch_records == 0) {
             log.warn("s3_dump batch caps (max_batch_bytes/max_sealed_bytes/max_batch_records) must be > 0", .{});
+            return error.InvalidS3DumpConfig;
+        }
+    }
+
+    /// Full validation for distributions that run the wall-clock flush task
+    /// (the server distro): the batch caps plus a nonzero flush interval, since
+    /// a zero interval spins the flush loop tight. Lambda calls
+    /// `validateBatching` directly instead — `flush_interval_ms` is unused there.
+    pub fn validate(self: S3DumpConfig) !void {
+        try self.validateBatching();
+        if (self.enabled and self.flush_interval_ms == 0) {
+            log.warn("s3_dump.flush_interval_ms must be > 0", .{});
             return error.InvalidS3DumpConfig;
         }
     }
@@ -144,4 +152,16 @@ test "ProxyConfig.validate rejects zero s3_dump knobs when enabled" {
     // Enabled with sane defaults → accepted.
     var ok: ProxyConfig = .{ .s3_dump = .{ .enabled = true } };
     try ok.validate();
+}
+
+test "S3DumpConfig.validateBatching (Lambda path) ignores flush_interval_ms" {
+    // Lambda flush is event-driven, so a zero interval is fine there...
+    const zero_interval: S3DumpConfig = .{ .enabled = true, .flush_interval_ms = 0 };
+    try zero_interval.validateBatching();
+    // ...but the full validate (server distro) still rejects it.
+    try std.testing.expectError(error.InvalidS3DumpConfig, zero_interval.validate());
+
+    // Zero batch caps are rejected on both paths.
+    const zero_cap: S3DumpConfig = .{ .enabled = true, .max_batch_bytes = 0 };
+    try std.testing.expectError(error.InvalidS3DumpConfig, zero_cap.validateBatching());
 }
