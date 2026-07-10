@@ -19,6 +19,8 @@ const build_options = @import("build_options");
 const edge = @import("root.zig");
 const runtime_metrics_mod = @import("runtime/runtime_metrics.zig");
 const app = @import("runtime/app.zig");
+const ext_rt = @import("runtime/extensions.zig");
+const config_types = @import("config/types.zig");
 const policy = edge.policy;
 const zonfig = edge.zonfig;
 
@@ -91,6 +93,11 @@ pub const LambdaConfig = struct {
         api_key: ?[]const u8 = null,
     } = .{},
 
+    /// com.usetero/s3-dump extension (Datadog logs → S3). Disabled by default.
+    /// In Lambda the flush is event-driven (per-invoke + shutdown), so
+    /// `flush_interval_ms` is unused here — see the event loop in `main`.
+    s3_dump: config_types.S3DumpConfig = .{},
+
     /// zonfig validation hook, run after env/JSON overrides. Clamps env knobs
     /// into ranges the runtime requires so a bad override degrades instead of
     /// aborting (or silently wedging) the extension at startup.
@@ -118,6 +125,8 @@ pub const LambdaConfig = struct {
             std.log.warn("TERO_THREAD_POOL_COUNT=0 starts no handler threads; using httpz default", .{});
             self.thread_pool_count = null;
         };
+
+        try self.s3_dump.validate();
     }
 };
 
@@ -227,6 +236,18 @@ pub fn main(init: std.process.Init) !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
+    // s3-dump extension: wired before policies compile so extension bindings
+    // resolve at snapshot build. Inert unless enabled with targets.
+    var exts = ext_rt.Extensions.init(allocator, .{ .log = ext_rt.datadogLogEncode });
+    defer exts.deinit();
+    const s3_dump_active = config.s3_dump.enabled and config.s3_dump.targets.len > 0;
+    var extension_sink: ?policy.ExtensionSink = null;
+    if (s3_dump_active) {
+        try ext_rt.configure(&exts, allocator, io, config.s3_dump, init.environ_map);
+        exts.register(&registry);
+        extension_sink = exts.sink();
+    }
+
     var runtime_metrics = try RuntimeMetrics.init(allocator, io, .lambda);
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
@@ -305,6 +326,7 @@ pub fn main(init: std.process.Init) !void {
         .upstream_url = config.upstream_url,
         .logs_url = config.logs_url,
         .metrics_url = config.metrics_url,
+        .extension_sink = extension_sink,
     });
     defer engine.destroy();
 
@@ -342,13 +364,21 @@ pub fn main(init: std.process.Init) !void {
                 bus.debug(LambdaInvokeReceived{
                     .request_id = invoke_event.request_id,
                 });
-                // Proxy server handles requests in background
-                // Nothing to do here - just continue polling
+                // Lambda freezes the environment between invocations, so the
+                // server distro's wall-clock flush timer is unreliable here.
+                // Flush at each invoke boundary instead: receiving this event
+                // means the PRIOR invocation's function has completed, so its
+                // telemetry is fully batched. The final invocation's tail is
+                // drained by the SHUTDOWN force-flush below.
+                if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{}));
             },
             .shutdown => |shutdown_event| {
                 bus.info(LambdaExtensionShutdown{
                     .reason = @tagName(shutdown_event.reason),
                 });
+
+                // Final drain within Lambda's shutdown deadline (io still live).
+                if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
 
                 // Stop proxy server gracefully
                 shutdown_requested.store(true, .release);

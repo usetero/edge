@@ -43,9 +43,19 @@ pub fn datadogLogEncode(record: *const anyopaque, writer: *std.Io.Writer) anyerr
 /// Read S3 credentials from the environment. Returns null when either half is
 /// absent — the extension then counts-and-drops deliveries for its targets
 /// (fail-open), so a missing credential never stalls telemetry.
+///
+/// The `TERO_S3_*` names are checked first, then the standard `AWS_*` names.
+/// This matters in Lambda: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are
+/// *reserved* — the runtime overwrites them with the execution role's TEMPORARY
+/// creds (which z3 can't sign, since it emits no `x-amz-security-token`). So to
+/// use static IAM-user keys there, set them under the non-reserved `TERO_S3_*`
+/// names, which the runtime never touches. Outside Lambda the `AWS_*` fallback
+/// works as usual.
 pub fn credentialsFromEnv(env: *const std.process.Environ.Map) ?ext.S3Dump.Credentials {
-    const access = env.get("AWS_ACCESS_KEY_ID") orelse return null;
-    const secret = env.get("AWS_SECRET_ACCESS_KEY") orelse return null;
+    const access = env.get("TERO_S3_ACCESS_KEY_ID") orelse
+        env.get("AWS_ACCESS_KEY_ID") orelse return null;
+    const secret = env.get("TERO_S3_SECRET_ACCESS_KEY") orelse
+        env.get("AWS_SECRET_ACCESS_KEY") orelse return null;
     if (access.len == 0 or secret.len == 0) return null;
     return .{ .access_key_id = access, .secret_access_key = secret };
 }
@@ -105,6 +115,26 @@ pub fn flushLoop(
         const result = exts.flush(io, .{});
         if (metrics) |mx| mx.recordS3DumpFlush(result);
     }
+}
+
+test "credentialsFromEnv prefers TERO_S3_* over the reserved AWS_* names" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    // Neither set → null (fail-open: deliveries drop, nothing stalls).
+    try std.testing.expect(credentialsFromEnv(&env) == null);
+
+    // Only AWS_* (in Lambda these are the reserved role creds) → fallback.
+    try env.put("AWS_ACCESS_KEY_ID", "AKIA-fallback");
+    try env.put("AWS_SECRET_ACCESS_KEY", "fallback-secret");
+    try std.testing.expectEqualStrings("AKIA-fallback", credentialsFromEnv(&env).?.access_key_id);
+
+    // TERO_S3_* present → wins (the Lambda static-key path the runtime can't clobber).
+    try env.put("TERO_S3_ACCESS_KEY_ID", "AKIA-user");
+    try env.put("TERO_S3_SECRET_ACCESS_KEY", "user-secret");
+    const creds = credentialsFromEnv(&env).?;
+    try std.testing.expectEqualStrings("AKIA-user", creds.access_key_id);
+    try std.testing.expectEqualStrings("user-secret", creds.secret_access_key);
 }
 
 test "datadogLogEncode renders the delivered log context as JSON" {

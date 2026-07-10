@@ -55,6 +55,22 @@ pub const S3DumpConfig = struct {
     max_sealed_bytes: usize = 32 << 20,
     max_attempts: usize = 1,
     targets: []const S3TargetConfig = &.{},
+
+    /// Reject knobs that would silently break the runtime: a zero flush
+    /// interval spins the (server-distro) flush task in a tight loop, and a
+    /// zero batch/backlog cap makes the handler drop every record. Only checked
+    /// when enabled. Shared by every distribution's config validator.
+    pub fn validate(self: S3DumpConfig) !void {
+        if (!self.enabled) return;
+        if (self.flush_interval_ms == 0) {
+            log.warn("s3_dump.flush_interval_ms must be > 0", .{});
+            return error.InvalidS3DumpConfig;
+        }
+        if (self.max_batch_bytes == 0 or self.max_sealed_bytes == 0 or self.max_batch_records == 0) {
+            log.warn("s3_dump batch caps (max_batch_bytes/max_sealed_bytes/max_batch_records) must be > 0", .{});
+            return error.InvalidS3DumpConfig;
+        }
+    }
 };
 
 /// Main proxy configuration - loadable via zonfig
@@ -106,21 +122,9 @@ pub const ProxyConfig = struct {
     /// com.usetero/s3-dump extension (Datadog logs → S3). Disabled by default.
     s3_dump: S3DumpConfig = .{},
 
-    /// Post-load validation hook (called by zonfig). Rejects s3-dump knobs that
-    /// would silently break the runtime: a zero flush interval spins the flush
-    /// task in a tight loop, and a zero batch/backlog cap makes the handler drop
-    /// every record. Only checked when the extension is enabled.
+    /// Post-load validation hook (called by zonfig).
     pub fn validate(self: *ProxyConfig) !void {
-        const s = self.s3_dump;
-        if (!s.enabled) return;
-        if (s.flush_interval_ms == 0) {
-            log.warn("s3_dump.flush_interval_ms must be > 0", .{});
-            return error.InvalidS3DumpConfig;
-        }
-        if (s.max_batch_bytes == 0 or s.max_sealed_bytes == 0 or s.max_batch_records == 0) {
-            log.warn("s3_dump batch caps (max_batch_bytes/max_sealed_bytes/max_batch_records) must be > 0", .{});
-            return error.InvalidS3DumpConfig;
-        }
+        try self.s3_dump.validate();
     }
 };
 
