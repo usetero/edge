@@ -817,7 +817,7 @@ test "evalLogRecord - no policies keeps record without output" {
         &registry,
         noop_bus.eventBus(),
         \\{"status": "info", "message": "test1"}
-        ,
+    ,
         null,
     );
     try std.testing.expectEqual(RecordVerdict.keep, verdict);
@@ -856,7 +856,7 @@ test "evalLogRecord - drop policy drops, non-matching keeps" {
         &registry,
         noop_bus.eventBus(),
         \\{"status": "debug", "message": "debug msg"}
-        ,
+    ,
         null,
     );
     try std.testing.expectEqual(RecordVerdict.drop, dropped);
@@ -869,7 +869,7 @@ test "evalLogRecord - drop policy drops, non-matching keeps" {
         &registry,
         noop_bus.eventBus(),
         \\{"status": "error", "message": "error msg"}
-        ,
+    ,
         null,
     );
     try std.testing.expectEqual(RecordVerdict.keep, kept);
@@ -917,7 +917,7 @@ test "evalLogRecord - transform yields replace with serialized record" {
         &registry,
         noop_bus.eventBus(),
         \\{"message": "test log message", "service": "my-service", "status": "info"}
-        ,
+    ,
         null,
     );
     try std.testing.expect(verdict == .replace);
