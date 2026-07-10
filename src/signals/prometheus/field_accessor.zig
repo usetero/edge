@@ -18,10 +18,35 @@ pub const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = proto.policy.MetricField;
 const AttributePath = proto.policy.AttributePath;
 
+/// Typed read primitive (required since v0.5.0). Prometheus labels and metadata
+/// are strings, but the synthetic `value` and `timestamp` datapoint attributes
+/// are numeric — return them as `.double`/`.int` so the typed matchers
+/// (`equals`/`gt`/`gte`/`lt`/`lte`) work (e.g. `datapoint_attribute("value") > 0.5`).
+pub fn metricTypedValue(ctx: *const anyopaque, field: MetricFieldRef) ?policy.TypedValue {
+    switch (field) {
+        .datapoint_attribute => |attr_path| {
+            const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return null;
+            const prom_ctx: *const PrometheusFieldContext = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, key, "value")) {
+                const s = prom_ctx.getValue() orelse return null;
+                // NaN/±Inf parse via parseFloat; anything else falls back to string.
+                return if (std.fmt.parseFloat(f64, s)) |f| .{ .double = f } else |_| .{ .string = s };
+            }
+            if (std.mem.eql(u8, key, "timestamp")) {
+                const s = prom_ctx.getTimestamp() orelse return null;
+                return if (std.fmt.parseInt(i64, s, 10)) |n| .{ .int = n } else |_| .{ .string = s };
+            }
+            // Labels and the "labels" pseudo-field are strings.
+            return .{ .string = metricValue(ctx, field) orelse return null };
+        },
+        else => return .{ .string = metricValue(ctx, field) orelse return null },
+    }
+}
+
 /// MetricAccessor template for Prometheus. Exposition format is immutable
-/// (lines are forwarded verbatim or dropped), so only `value` is wired.
+/// (lines are forwarded verbatim or dropped), so only the read primitive is wired.
 pub const metric_accessor: policy.MetricAccessor = .{
-    .value = metricValue,
+    .typed_value = metricTypedValue,
 };
 
 /// Context for Prometheus field access.
@@ -237,6 +262,27 @@ test "prometheusFieldAccessor - value access" {
     const value = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("value") });
     try std.testing.expect(value != null);
     try std.testing.expectEqualStrings("0.75", value.?);
+}
+
+test "prometheusFieldAccessor - typed value/timestamp are numeric, labels are string" {
+    const line = "cpu_usage{host=\"a\"} 0.75 1234567890";
+    const parsed = line_parser.parseLine(line);
+    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+
+    // The sample value must be a double so numeric matchers (gt/lt/equals) fire.
+    const value = metricTypedValue(&ctx, .{ .datapoint_attribute = testAttrPath("value") });
+    try std.testing.expect(value.? == .double);
+    try std.testing.expectEqual(@as(f64, 0.75), value.?.double);
+
+    // Timestamp is an integer.
+    const ts = metricTypedValue(&ctx, .{ .datapoint_attribute = testAttrPath("timestamp") });
+    try std.testing.expect(ts.? == .int);
+    try std.testing.expectEqual(@as(i64, 1234567890), ts.?.int);
+
+    // Labels stay string.
+    const host = metricTypedValue(&ctx, .{ .datapoint_attribute = testAttrPath("host") });
+    try std.testing.expect(host.? == .string);
+    try std.testing.expectEqualStrings("a", host.?.string);
 }
 
 test "prometheusFieldAccessor - timestamp access" {

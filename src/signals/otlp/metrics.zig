@@ -256,10 +256,34 @@ fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
     };
 }
 
+/// Typed read primitive (required since v0.5.0). Attribute fields carry their
+/// native OTLP type (bool/int/double/bytes/string) so the typed matchers
+/// (`equals`/`gt`/`gte`/`lt`/`lte`) fire on non-string values; the scalar
+/// metric fields (name/unit/schema urls, and the enum tag-name pseudo-fields)
+/// are genuinely strings.
+pub fn metricTypedValue(ctx: *const anyopaque, field: MetricFieldRef) ?policy.TypedValue {
+    const metric_ctx: *const OtlpMetricContext = @ptrCast(@alignCast(ctx));
+    return switch (field) {
+        .datapoint_attribute => |attr_path| otlp_attr.findNestedAttributeTyped(
+            metric_ctx.datapoint_attributes,
+            attr_path.path.items,
+        ),
+        .resource_attribute => |attr_path| if (metric_ctx.resource_metrics.resource) |res|
+            otlp_attr.findNestedAttributeTyped(res.attributes.items, attr_path.path.items)
+        else
+            null,
+        .scope_attribute => |attr_path| if (metric_ctx.scope_metrics.scope) |scope|
+            otlp_attr.findNestedAttributeTyped(scope.attributes.items, attr_path.path.items)
+        else
+            null,
+        else => otlp_attr.typedStr(metricValue(ctx, field)),
+    };
+}
+
 /// MetricAccessor template wiring the OTLP metric value primitive.
 /// Metric mutations aren't part of the policy-zig MetricAccessor interface.
 pub const metric_accessor: policy.MetricAccessor = .{
-    .value = metricValue,
+    .typed_value = metricTypedValue,
 };
 
 /// Result of filtering metrics in-place

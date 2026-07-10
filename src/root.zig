@@ -100,6 +100,7 @@ test {
     _ = @import("frontend/stdio/server.zig");
     _ = @import("frontend/httpz/server.zig");
     _ = @import("runtime/distro.zig");
+    _ = @import("runtime/extensions.zig");
     _ = @import("signals/prometheus/root.zig");
     _ = @import("lambda/root.zig");
     _ = @import("zonfig/root.zig");

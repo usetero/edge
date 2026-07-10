@@ -298,12 +298,52 @@ tasks:
       - task: test
       - echo "✅ All checks passed"
 
+  test:s3-e2e:
+    desc: "s3-dump MinIO smoke test: dump a Datadog log to a real S3 server (requires docker)"
+    cmds:
+      - |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "docker is required for task test:s3-e2e"
+          exit 1
+        fi
+        CONTAINER=edge-minio-e2e
+        NETWORK=edge-minio-e2e-net
+        BUCKET=edge-e2e
+        cleanup() {
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          docker network rm "$NETWORK" >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+        cleanup
+        docker network create "$NETWORK" >/dev/null
+        docker run -d --rm --name "$CONTAINER" --network "$NETWORK" \
+          -p 9000:9000 \
+          -e MINIO_ROOT_USER=minioadmin \
+          -e MINIO_ROOT_PASSWORD=minioadmin \
+          minio/minio server /data >/dev/null
+        # Wait for the server to report healthy on the published port.
+        for i in $(seq 1 30); do
+          if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then break; fi
+          if [ "$i" = "30" ]; then echo "MinIO did not become healthy"; docker logs "$CONTAINER" || true; exit 1; fi
+          sleep 1
+        done
+        # Edge has no S3 admin client, so create the bucket with mc on the same
+        # docker network (reaches the server by container name).
+        docker run --rm --network "$NETWORK" --entrypoint /bin/sh minio/mc -c \
+          "mc alias set local http://$CONTAINER:9000 minioadmin minioadmin >/dev/null && mc mb -p local/$BUCKET >/dev/null"
+        AWS_ACCESS_KEY_ID=minioadmin \
+        AWS_SECRET_ACCESS_KEY=minioadmin \
+        S3_ENDPOINT=http://127.0.0.1:9000 \
+        S3_BUCKET="$BUCKET" \
+          zig build test-s3-e2e --summary all
+
   signoff:
     desc: "Sign off the codebase"
     aliases: ["sign", "s"]
     cmds:
       - task: do
       - task: build:safe
+      - task: test:s3-e2e
       - gh signoff
 
   install:

@@ -267,6 +267,7 @@ fn evalOne(registry: *PolicyRegistry, record: []const u8) std.meta.Tag(logs.Reco
         registry,
         g_bus,
         record,
+        null,
     ) catch |err| std.debug.panic("evalLogRecord failed: {t}", .{err});
     return std.meta.activeTag(verdict);
 }

@@ -49,8 +49,8 @@
             .hash = "zbench-0.13.0-YTdc7xVBAQCCMC-IdLLuotBeiNNNm8k9Pi2V4VYqrwfI",
         },
         .policy_zig = .{
-            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.4.4.tar.gz",
-            .hash = "policy_zig-0.1.7-5_dp3q0-EgDyYRR7_LInB9k-CjcBiI8nGewWKOXAVbvO",
+            .url = "https://github.com/usetero/policy-zig/archive/refs/tags/v0.5.0.tar.gz",
+            .hash = "policy_zig-0.1.7-5_dp3j7lFAAWNWhq8DkCv990ujiTWKWjYxzsIKNpeXIT",
         },
     },
     .paths = .{
