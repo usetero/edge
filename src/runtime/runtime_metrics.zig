@@ -1,5 +1,6 @@
 const std = @import("std");
 const m = @import("metrics_zig");
+const ext = @import("extensions");
 
 const log = std.log.scoped(.runtime_metrics);
 
@@ -121,6 +122,16 @@ const InternalMetrics = struct {
     edge_policies_loaded: PoliciesLoaded,
     edge_build_info: BuildInfo,
 
+    // s3-dump extension flush stats (aggregate across targets; the FlushResult
+    // the handler returns is already summed, so these carry no labels).
+    edge_s3_dump_flushes_total: S3DumpFlushes,
+    edge_s3_dump_objects_uploaded_total: S3DumpCounter,
+    edge_s3_dump_objects_failed_total: S3DumpCounter,
+    edge_s3_dump_records_uploaded_total: S3DumpCounter,
+    edge_s3_dump_records_dropped_total: S3DumpCounter,
+    edge_s3_dump_bytes_uploaded_total: S3DumpCounter,
+    edge_s3_dump_backlog_bytes: S3DumpBacklog,
+
     const RequestsTotal = m.CounterVec(u64, RequestLabels);
     const RequestDurationSeconds = m.HistogramVec(
         f64,
@@ -135,6 +146,11 @@ const InternalMetrics = struct {
     const PolicyRecordsDroppedTotal = m.CounterVec(u64, PolicyLabels);
     const PoliciesLoaded = m.GaugeVec(u64, PolicySignalLabels);
     const BuildInfo = m.GaugeVec(u64, BuildInfoLabels);
+
+    // Label-less: one series each, so plain Counter/Gauge (no allocation).
+    const S3DumpFlushes = m.Counter(u64);
+    const S3DumpCounter = m.Counter(u64);
+    const S3DumpBacklog = m.Gauge(u64);
 };
 
 pub const RuntimeMetrics = struct {
@@ -217,6 +233,41 @@ pub const RuntimeMetrics = struct {
                     .{ .help = "Build metadata for this edge process." },
                     .{},
                 ),
+                .edge_s3_dump_flushes_total = InternalMetrics.S3DumpFlushes.init(
+                    "edge_s3_dump_flushes_total",
+                    .{ .help = "Total number of s3-dump flush cycles executed." },
+                    .{},
+                ),
+                .edge_s3_dump_objects_uploaded_total = InternalMetrics.S3DumpCounter.init(
+                    "edge_s3_dump_objects_uploaded_total",
+                    .{ .help = "Total s3-dump objects successfully uploaded." },
+                    .{},
+                ),
+                .edge_s3_dump_objects_failed_total = InternalMetrics.S3DumpCounter.init(
+                    "edge_s3_dump_objects_failed_total",
+                    .{ .help = "Total s3-dump object uploads that failed." },
+                    .{},
+                ),
+                .edge_s3_dump_records_uploaded_total = InternalMetrics.S3DumpCounter.init(
+                    "edge_s3_dump_records_uploaded_total",
+                    .{ .help = "Total telemetry records uploaded via s3-dump." },
+                    .{},
+                ),
+                .edge_s3_dump_records_dropped_total = InternalMetrics.S3DumpCounter.init(
+                    "edge_s3_dump_records_dropped_total",
+                    .{ .help = "Total records dropped by s3-dump (backlog full, encode failure, or no credentials)." },
+                    .{},
+                ),
+                .edge_s3_dump_bytes_uploaded_total = InternalMetrics.S3DumpCounter.init(
+                    "edge_s3_dump_bytes_uploaded_total",
+                    .{ .help = "Total object body bytes uploaded via s3-dump." },
+                    .{},
+                ),
+                .edge_s3_dump_backlog_bytes = InternalMetrics.S3DumpBacklog.init(
+                    "edge_s3_dump_backlog_bytes",
+                    .{ .help = "Sealed-but-not-yet-uploaded s3-dump bytes after the last flush." },
+                    .{},
+                ),
             },
         };
         try metrics.initializeStaticSeries();
@@ -273,13 +324,27 @@ pub const RuntimeMetrics = struct {
         // callers deinit RuntimeMetrics only after the server has stopped
         // (listen thread joined), so no worker threads touch the metrics here.
         inline for (std.meta.fields(InternalMetrics)) |field| {
-            @field(self.internal, field.name).deinit();
+            // Vec metrics allocate per-series and expose deinit; the label-less
+            // plain Counter/Gauge don't allocate and have none.
+            if (@hasDecl(field.type, "deinit")) @field(self.internal, field.name).deinit();
         }
         self.* = undefined;
     }
 
     pub fn writePrometheus(self: *RuntimeMetrics, writer: *std.Io.Writer) !void {
         try m.write(&self.internal, writer);
+    }
+
+    /// Fold one s3-dump flush result into the extension metrics. Called after
+    /// every flush (the background loop and the shutdown drain).
+    pub fn recordS3DumpFlush(self: *RuntimeMetrics, result: ext.S3Dump.FlushResult) void {
+        self.internal.edge_s3_dump_flushes_total.incr();
+        self.internal.edge_s3_dump_objects_uploaded_total.incrBy(result.objects_uploaded);
+        self.internal.edge_s3_dump_objects_failed_total.incrBy(result.objects_failed);
+        self.internal.edge_s3_dump_records_uploaded_total.incrBy(result.records_uploaded);
+        self.internal.edge_s3_dump_records_dropped_total.incrBy(result.records_dropped);
+        self.internal.edge_s3_dump_bytes_uploaded_total.incrBy(result.bytes_uploaded);
+        self.internal.edge_s3_dump_backlog_bytes.set(@intCast(result.backlog_bytes));
     }
 
     pub fn recordRequest(

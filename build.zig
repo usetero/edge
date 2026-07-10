@@ -61,6 +61,9 @@ pub fn build(b: *std.Build) void {
     // Shared modules from policy-zig ensure type identity across boundaries.
     const proto_mod = policy_dep.module("proto");
     const o11y_mod = policy_dep.module("observability");
+    // Optional extensions module (pulls in the z3 S3 client). Only edge code
+    // that wires s3-dump imports it.
+    const ext_mod = policy_dep.module("extensions");
 
     // ==========================================================================
     // Edge Library Module
@@ -74,6 +77,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zimdjson", .module = zimdjson.module("zimdjson") },
             .{ .name = "policy_zig", .module = policy_dep.module("policy_zig") },
             .{ .name = "o11y", .module = o11y_mod },
+            .{ .name = "extensions", .module = ext_mod },
             .{ .name = "metrics_zig", .module = metrics_dep.module("metrics") },
             .{ .name = "httpz", .module = httpz_mod },
         },
@@ -111,6 +115,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
     exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
     exe.root_module.addImport("o11y", o11y_mod);
+    exe.root_module.addImport("extensions", ext_mod);
     exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
     exe.root_module.addImport("httpz", httpz_mod);
     exe.root_module.addOptions("build_options", build_options);
@@ -152,6 +157,7 @@ pub fn build(b: *std.Build) void {
         dist_exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
         dist_exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
         dist_exe.root_module.addImport("o11y", o11y_mod);
+        dist_exe.root_module.addImport("extensions", ext_mod);
         dist_exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
         dist_exe.root_module.addImport("httpz", httpz_mod);
         dist_exe.root_module.addOptions("build_options", build_options);
@@ -207,6 +213,26 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    // Real-storage smoke test for the s3-dump extension, filtered to the MinIO
+    // e2e test. Excluded from `test` (it needs a live backend); driven by
+    // `task test:s3-e2e`, which starts MinIO, creates the bucket, and sets the
+    // S3 env vars this test reads.
+    const s3_e2e_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{"e2e minio"},
+    });
+    s3_e2e_tests.root_module.link_libc = true;
+    s3_e2e_tests.root_module.linkSystemLibrary("z", .{});
+    s3_e2e_tests.root_module.linkSystemLibrary("zstd", .{});
+    s3_e2e_tests.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
+    s3_e2e_tests.root_module.addOptions("build_options", build_options);
+    s3_e2e_tests.root_module.addAnonymousImport("otlp_metrics_benchmark_pb", .{
+        .root_source_file = b.path("bench/scaling/payloads/otlp-metrics.pb"),
+    });
+    const run_s3_e2e_tests = b.addRunArtifact(s3_e2e_tests);
+    const s3_e2e_step = b.step("test-s3-e2e", "Run the s3-dump MinIO smoke test (needs S3 env vars)");
+    s3_e2e_step.dependOn(&run_s3_e2e_tests.step);
 
     // ==========================================================================
     // Benchmark Tools

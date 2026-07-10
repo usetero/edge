@@ -518,7 +518,7 @@ pub const PolicyStreamingFilter = struct {
             &field_accessor.metric_accessor,
             @ptrCast(&ctx),
             &self.policy_id_buf,
-            .{},
+            .{ .io = self.bus.io },
         );
 
         // Continue means keep, drop means filter out

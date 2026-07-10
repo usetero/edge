@@ -68,6 +68,9 @@ pub const SharedCtx = struct {
     limits: limits_mod.Limits,
     /// Debug tap, or null when disabled by config. See `TapState`.
     tap: ?*TapState = null,
+    /// Extension dispatch sink (s3-dump), or null when extensions are off.
+    /// Threaded into per-record policy evaluation on the Datadog log path.
+    extension_sink: ?policy.ExtensionSink = null,
 };
 
 /// Routes and plans a request from transport-neutral parts. Returns null
@@ -411,6 +414,7 @@ pub const RecordSink = struct {
             self.ctx.registry,
             self.ctx.bus,
             bytes,
+            self.ctx.extension_sink,
         );
         switch (verdict) {
             .keep => return .keep,

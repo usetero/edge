@@ -18,10 +18,16 @@ pub const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = proto.policy.MetricField;
 const AttributePath = proto.policy.AttributePath;
 
+/// Prometheus fields are string-valued; wrap the byte primitive as `.string`
+/// (v0.5.0 removed the `value` accessor field, `typed_value` is now required).
+pub fn metricTypedValue(ctx: *const anyopaque, field: MetricFieldRef) ?policy.TypedValue {
+    return .{ .string = metricValue(ctx, field) orelse return null };
+}
+
 /// MetricAccessor template for Prometheus. Exposition format is immutable
-/// (lines are forwarded verbatim or dropped), so only `value` is wired.
+/// (lines are forwarded verbatim or dropped), so only the read primitive is wired.
 pub const metric_accessor: policy.MetricAccessor = .{
-    .value = metricValue,
+    .typed_value = metricTypedValue,
 };
 
 /// Context for Prometheus field access.

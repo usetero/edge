@@ -256,10 +256,18 @@ fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
     };
 }
 
+/// Metric fields are all string-valued, so the typed read wraps the byte
+/// primitive as `.string` — byte-identical to what the engine consumed before
+/// v0.5.0 removed the `value` accessor field.
+// ponytail: string-only; add typed numeric reads if metric `equals`/`gt` on numbers is ever needed.
+pub fn metricTypedValue(ctx: *const anyopaque, field: MetricFieldRef) ?policy.TypedValue {
+    return .{ .string = metricValue(ctx, field) orelse return null };
+}
+
 /// MetricAccessor template wiring the OTLP metric value primitive.
 /// Metric mutations aren't part of the policy-zig MetricAccessor interface.
 pub const metric_accessor: policy.MetricAccessor = .{
-    .value = metricValue,
+    .typed_value = metricTypedValue,
 };
 
 /// Result of filtering metrics in-place

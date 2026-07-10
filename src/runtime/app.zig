@@ -22,6 +22,7 @@ const router_mod = @import("../service/router.zig");
 const upstream_mod = @import("../frontend/upstream.zig");
 const exec_mod = @import("../frontend/exec.zig");
 const frontend_select = @import("../frontend/select.zig");
+const ext_rt = @import("extensions.zig");
 
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
@@ -223,6 +224,7 @@ pub const EngineOptions = struct {
     metrics_url: ?[]const u8 = null,
     service_options: distro.ServiceOptions = .{},
     tap_enabled: bool = false,
+    extension_sink: ?policy.ExtensionSink = null,
 };
 
 pub const Engine = struct {
@@ -310,6 +312,7 @@ pub const Engine = struct {
             .metrics = metrics,
             .limits = self.limits,
             .tap = if (options.tap_enabled) &self.tap else null,
+            .extension_sink = options.extension_sink,
         };
 
         self.server = try .init(
@@ -449,6 +452,18 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
 
+    // s3-dump extension: wired before the loader subscribes providers so the
+    // sync hooks reach every provider. Stays inert unless enabled with targets.
+    var exts = ext_rt.Extensions.init(allocator, .{ .log = ext_rt.datadogLogEncode });
+    defer exts.deinit();
+    const s3_dump_active = config.s3_dump.enabled and config.s3_dump.targets.len > 0;
+    var extension_sink: ?policy.ExtensionSink = null;
+    if (s3_dump_active) {
+        try ext_rt.configure(&exts, allocator, io, config.s3_dump, init.environ_map);
+        exts.register(&registry);
+        extension_sink = exts.sink();
+    }
+
     var runtime_metrics = try RuntimeMetrics.init(allocator, io, distributionLabel(distribution));
     defer runtime_metrics.deinit();
     runtime_metrics.setBuildInfo(build_options.version, build_options.commit);
@@ -475,6 +490,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
             .prometheus_max_output_bytes = config.prometheus.max_output_bytes_per_scrape,
         },
         .tap_enabled = config.tap_enabled,
+        .extension_sink = extension_sink,
     });
     defer engine.destroy();
 
@@ -489,6 +505,17 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     }
 
     try engine.start();
+
+    // Single background flush task, torn down with the rest of the group on
+    // shutdown; the final force-flush runs on the main path below.
+    if (s3_dump_active) {
+        try engine.lifecycle.spawn(io, ext_rt.flushLoop, .{
+            &exts,
+            io,
+            config.s3_dump.flush_interval_ms,
+            &runtime_metrics,
+        });
+    }
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(DataPlaneBudget{
@@ -505,6 +532,11 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
 
     engine.awaitShutdown();
     engine.stop();
+
+    // Drain any buffered dump batches before we tear down (io is still live).
+    if (s3_dump_active) {
+        runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
+    }
 
     if (signal_waiter) |waiter| {
         shutdown_waiter.store(true, .release);

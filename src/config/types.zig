@@ -24,6 +24,36 @@ pub const PrometheusModuleConfig = struct {
     max_output_bytes_per_scrape: usize = 10 * 1024 * 1024,
 };
 
+/// A single S3-compatible destination the s3-dump extension can write to.
+/// Fields (except `name`) mirror the z3 target config the extension expects;
+/// `name` is what policies reference via `ExtensionTargetRef`.
+pub const S3TargetConfig = struct {
+    name: []const u8,
+    /// S3-compatible endpoint URL. Null uses the AWS default for `region`.
+    endpoint: ?[]const u8 = null,
+    region: []const u8 = "us-east-1",
+    bucket: []const u8,
+    prefix: []const u8 = "",
+    /// Path-style (MinIO/R2) vs virtual-host-style URLs.
+    force_path_style: bool = true,
+};
+
+/// `com.usetero/s3-dump` extension configuration. Off unless `enabled` and at
+/// least one target is set. Credentials are NOT here — they come from the
+/// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY environment variables.
+pub const S3DumpConfig = struct {
+    enabled: bool = false,
+    /// Interval between background flush cycles (single flush task).
+    flush_interval_ms: u64 = 30_000,
+    // Batching knobs — map 1:1 onto the extension's S3Dump.Options.
+    max_batch_bytes: usize = 4 << 20,
+    max_batch_records: u32 = 10_000,
+    max_batch_age_ms: u64 = 30_000,
+    max_sealed_bytes: usize = 32 << 20,
+    max_attempts: usize = 1,
+    targets: []const S3TargetConfig = &.{},
+};
+
 /// Main proxy configuration - loadable via zonfig
 pub const ProxyConfig = struct {
     // Network config
@@ -69,4 +99,7 @@ pub const ProxyConfig = struct {
 
     // Module-specific configuration
     prometheus: PrometheusModuleConfig = .{},
+
+    /// com.usetero/s3-dump extension (Datadog logs → S3). Disabled by default.
+    s3_dump: S3DumpConfig = .{},
 };

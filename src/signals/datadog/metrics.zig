@@ -201,8 +201,14 @@ fn getDatadogMetricTypeString(series: *MetricSeries) ?[]const u8 {
 /// MetricAccessor template wiring the Datadog metric value primitive.
 /// Metric mutations aren't part of the policy-zig MetricAccessor interface;
 /// the engine only runs filter decisions on metrics.
+/// Datadog metric fields are string-valued; wrap the byte primitive as
+/// `.string` (v0.5.0 removed the `value` accessor field).
+pub fn metricTypedValue(ctx: *const anyopaque, field: policy.MetricFieldRef) ?policy.TypedValue {
+    return .{ .string = metricValue(ctx, field) orelse return null };
+}
+
 pub const metric_accessor: policy.MetricAccessor = .{
-    .value = metricValue,
+    .typed_value = metricTypedValue,
 };
 
 /// Result of evaluating a single metric series

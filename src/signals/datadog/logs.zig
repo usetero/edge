@@ -129,6 +129,7 @@ pub fn evalLogRecord(
     registry: *const PolicyRegistry,
     bus: *EventBus,
     record: []const u8,
+    sink: ?policy.ExtensionSink,
 ) !RecordVerdict {
     // Single-pass zero-copy parse; zimdjson never runs on the hot path.
     // Anything the walker doesn't like — non-object records, escaped keys,
@@ -144,7 +145,7 @@ pub fn evalLogRecord(
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
-    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf);
+    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf, sink);
     if (!result.keep) return .drop;
     if (!result.mutated) return .keep;
 
@@ -206,6 +207,13 @@ fn lookupLogAttribute(log: *DatadogLog, allocator: std.mem.Allocator, path: []co
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
 /// All attribute types (log, resource, scope) search the same flat namespace since
 /// Datadog has no OTLP-style resource/scope hierarchy.
+/// Typed read primitive (required since v0.5.0). Datadog log fields are all
+/// string-valued in the JSON, so wrap the byte primitive as `.string` —
+/// byte-identical to the pre-v0.5.0 `value` path.
+pub fn logTypedValue(ctx: *const anyopaque, field: FieldRef) ?policy.TypedValue {
+    return .{ .string = logValue(ctx, field) orelse return null };
+}
+
 pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     const field_ctx: *const FieldAccessorContext = @ptrCast(@alignCast(ctx));
     const log = field_ctx.log;
@@ -320,7 +328,7 @@ pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
 /// support rename, so `move` is left null (policies that require rename are
 /// rejected at snapshot-compile time).
 pub const log_accessor: policy.LogAccessor = .{
-    .value = logValue,
+    .typed_value = logTypedValue,
     .set = logSet,
     .delete = logDelete,
 };
@@ -338,6 +346,7 @@ fn filterLog(
     log: *DatadogLog,
     allocator: std.mem.Allocator,
     policy_id_buf: [][]const u8,
+    sink: ?policy.ExtensionSink,
 ) FilterLogResult {
     var field_ctx: FieldAccessorContext = .{ .log = log, .allocator = allocator };
     const result = engine.evaluate(
@@ -345,7 +354,7 @@ fn filterLog(
         &log_accessor,
         &field_ctx,
         policy_id_buf,
-        .{ .scratch = allocator, .io = engine.bus.io },
+        .{ .scratch = allocator, .io = engine.bus.io, .extension_sink = sink },
     );
     // Re-serialize the wrapped message once if a transform edited inside it.
     log.finalizeWrapped(allocator);
@@ -472,7 +481,7 @@ fn processJsonLogsWithFilter(
                 };
 
                 state.original_count += 1;
-                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf);
+                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, null);
                 if (filter_result.mutated) state.mutated = true;
                 if (filter_result.keep) {
                     try state.kept.append(arena, log_obj);
@@ -489,7 +498,7 @@ fn processJsonLogsWithFilter(
             };
 
             state.original_count = 1;
-            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf);
+            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, null);
             if (filter_result.mutated) state.mutated = true;
             if (filter_result.keep) {
                 try state.kept.append(arena, log_obj);
@@ -809,6 +818,7 @@ test "evalLogRecord - no policies keeps record without output" {
         noop_bus.eventBus(),
         \\{"status": "info", "message": "test1"}
         ,
+        null,
     );
     try std.testing.expectEqual(RecordVerdict.keep, verdict);
 }
@@ -847,6 +857,7 @@ test "evalLogRecord - drop policy drops, non-matching keeps" {
         noop_bus.eventBus(),
         \\{"status": "debug", "message": "debug msg"}
         ,
+        null,
     );
     try std.testing.expectEqual(RecordVerdict.drop, dropped);
 
@@ -859,6 +870,7 @@ test "evalLogRecord - drop policy drops, non-matching keeps" {
         noop_bus.eventBus(),
         \\{"status": "error", "message": "error msg"}
         ,
+        null,
     );
     try std.testing.expectEqual(RecordVerdict.keep, kept);
 }
@@ -906,6 +918,7 @@ test "evalLogRecord - transform yields replace with serialized record" {
         noop_bus.eventBus(),
         \\{"message": "test log message", "service": "my-service", "status": "info"}
         ,
+        null,
     );
     try std.testing.expect(verdict == .replace);
     try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "test log message") != null);
@@ -927,10 +940,10 @@ test "evalLogRecord - malformed and non-object records fail open to keep" {
     defer arena.deinit();
 
     const bus = noop_bus.eventBus();
-    const malformed = try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, "{ not json }");
+    const malformed = try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, "{ not json }", null);
     try std.testing.expectEqual(RecordVerdict.keep, malformed);
 
-    const scalar = try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, "42");
+    const scalar = try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, "42", null);
     try std.testing.expectEqual(RecordVerdict.keep, scalar);
 }
 

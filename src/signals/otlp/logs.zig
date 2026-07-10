@@ -371,7 +371,6 @@ fn idTyped(log_ctx: *const OtlpLogContext, id: []const u8) ?policy.TypedValue {
 
 /// LogAccessor template wiring the OTLP log primitives to a registry.
 pub const log_accessor: LogAccessor = .{
-    .value = logValue,
     .exists = logExists,
     .typed_value = logTypedValue,
     .set = logSet,

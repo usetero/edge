@@ -371,7 +371,6 @@ pub fn traceSet(ctx: *anyopaque, field: TraceFieldRef, value: []const u8) void {
 
 /// TraceAccessor template wiring the OTLP trace primitives.
 pub const trace_accessor: policy.TraceAccessor = .{
-    .value = traceValue,
     .typed_value = traceTypedValue,
     .set = traceSet,
 };

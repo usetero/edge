@@ -15,6 +15,12 @@ pub const TailLineContext = struct {
     severity: ?[]const u8 = null,
     attrs: std.ArrayListUnmanaged(TailAttr) = .empty,
 
+    /// Typed read primitive (required since v0.5.0). Tail fields are all
+    /// string-valued, so wrap the byte primitive as `.string`.
+    pub fn logTypedValue(ctx_ptr: *const anyopaque, field: FieldRef) ?policy.TypedValue {
+        return .{ .string = logValue(ctx_ptr, field) orelse return null };
+    }
+
     pub fn logValue(ctx_ptr: *const anyopaque, field: FieldRef) ?[]const u8 {
         const self: *const TailLineContext = @ptrCast(@alignCast(ctx_ptr));
         return switch (field) {
@@ -113,7 +119,7 @@ pub const TailLineContext = struct {
 
 /// LogAccessor template wiring the tail-evaluator primitives.
 pub const log_accessor: LogAccessor = .{
-    .value = TailLineContext.logValue,
+    .typed_value = TailLineContext.logTypedValue,
     .set = TailLineContext.logSet,
     .delete = TailLineContext.logDelete,
     .move = TailLineContext.logMove,
