@@ -28,6 +28,13 @@ const log = std.log.scoped(.s3_dump);
 /// accessor context (`*FieldAccessorContext`) borrowed for the duration of
 /// this call; we render its log as one JSON object (the handler appends the
 /// newline that makes the batch ndjson).
+///
+/// The engine dispatches this after keep and before transforms, so the record
+/// is the PRE-transform snapshot by design — for a wrapped-message mutation the
+/// dump carries the original message, not the transformed one the pipeline
+/// forwards downstream. That's the spec's intent (dumps are the record as it
+/// arrived; `mode: dropped` records aren't forwarded at all). See `filterLog`
+/// in signals/datadog/logs.zig.
 pub fn datadogLogEncode(record: *const anyopaque, writer: *std.Io.Writer) anyerror!void {
     const field_ctx: *const dd_logs.FieldAccessorContext = @ptrCast(@alignCast(record));
     try std.json.Stringify.value(field_ctx.log.*, .{}, writer);

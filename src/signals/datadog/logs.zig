@@ -370,7 +370,13 @@ fn filterLog(
         policy_id_buf,
         .{ .scratch = allocator, .io = engine.bus.io, .extension_sink = sink },
     );
-    // Re-serialize the wrapped message once if a transform edited inside it.
+    // The extension sink (s3-dump) fires INSIDE evaluate — after keep, before
+    // transforms — so it snapshots the pre-transform record by design (policy
+    // spec v1.6.0; the flagship `mode: dropped` dumps records discarded
+    // downstream anyway). `finalizeWrapped` below rewrites a transform-mutated
+    // wrapped `message` only for the forwarded output; the dump intentionally
+    // keeps the original message. The dispatch point is owned by the engine,
+    // not us, so pre-transform is the only possible (and correct) ordering.
     log.finalizeWrapped(allocator);
     return .{
         .keep = result.decision.shouldContinue(),
