@@ -1,6 +1,7 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
 const jscan = @import("../json_scan.zig");
+const policy = @import("policy_zig");
 
 pub const Parser = zimdjson.ondemand.FullParser(.default);
 pub const Value = Parser.Value;
@@ -188,6 +189,59 @@ pub const DatadogLog = struct {
     /// unescaped into `allocator` (lazy — only fields a policy reads pay it).
     fn spanString(allocator: std.mem.Allocator, span: []const u8) ?[]const u8 {
         return jscan.stringSpan(allocator, span) catch null;
+    }
+
+    /// Native typed view of a single-segment extra attribute, so the typed
+    /// matchers fire on numeric/boolean values. Handles both storage forms:
+    /// the materializing `parse` path fills `extra` (typed `AnyValue`), while
+    /// the fast `parseRaw` path fills `extra_spans` (raw JSON value text, which
+    /// we classify by first byte). Nested/dotted paths and objects/arrays fall
+    /// back to the string primitive at the call site.
+    pub fn findExtraTyped(self: *const DatadogLog, allocator: std.mem.Allocator, key: []const u8) ?policy.TypedValue {
+        // The two maps are mutually exclusive per parse path (parseRaw fills
+        // `extra_spans`, parse fills `extra`), so probe only the populated one.
+        if (self.extra.count() != 0) {
+            if (self.extra.get(key)) |v| return anyValueTyped(v);
+        } else if (self.extra_spans.get(key)) |span| {
+            return spanTyped(allocator, span);
+        }
+        return null;
+    }
+
+    fn anyValueTyped(v: AnyValue) ?policy.TypedValue {
+        return switch (v) {
+            .bool => |b| .{ .bool = b },
+            .number => |n| switch (n) {
+                .signed => |i| .{ .int = i },
+                // u64 that overflows i64 can't be an .int; widen to double.
+                .unsigned => |u| if (u <= std.math.maxInt(i64))
+                    .{ .int = @intCast(u) }
+                else
+                    .{ .double = @floatFromInt(u) },
+                .double => |d| .{ .double = d },
+            },
+            .string => |s| .{ .string = s.get() catch return null },
+            .null, .object, .array => null,
+        };
+    }
+
+    /// Classify a raw JSON value span (`parseRaw` storage) by its first byte.
+    fn spanTyped(allocator: std.mem.Allocator, span: []const u8) ?policy.TypedValue {
+        if (span.len == 0) return null;
+        switch (span[0]) {
+            '"' => return .{ .string = spanString(allocator, span) orelse return null },
+            't' => return .{ .bool = true },
+            'f' => return .{ .bool = false },
+            'n' => return null, // JSON null: not scalar-matchable
+            else => {
+                // A JSON number: integer if it has no fraction/exponent, else double.
+                if (std.mem.indexOfAny(u8, span, ".eE") == null) {
+                    if (std.fmt.parseInt(i64, span, 10)) |i| return .{ .int = i } else |_| {}
+                }
+                if (std.fmt.parseFloat(f64, span)) |d| return .{ .double = d } else |_| {}
+                return null;
+            },
+        }
     }
 
     /// Custom JSON serialization for known fields only.

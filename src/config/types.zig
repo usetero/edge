@@ -1,4 +1,7 @@
+const std = @import("std");
 const policy = @import("policy_zig");
+
+const log = std.log.scoped(.config);
 
 pub const ProviderConfig = policy.ProviderConfig;
 pub const ServiceMetadata = policy.ServiceMetadata;
@@ -102,4 +105,39 @@ pub const ProxyConfig = struct {
 
     /// com.usetero/s3-dump extension (Datadog logs → S3). Disabled by default.
     s3_dump: S3DumpConfig = .{},
+
+    /// Post-load validation hook (called by zonfig). Rejects s3-dump knobs that
+    /// would silently break the runtime: a zero flush interval spins the flush
+    /// task in a tight loop, and a zero batch/backlog cap makes the handler drop
+    /// every record. Only checked when the extension is enabled.
+    pub fn validate(self: *ProxyConfig) !void {
+        const s = self.s3_dump;
+        if (!s.enabled) return;
+        if (s.flush_interval_ms == 0) {
+            log.warn("s3_dump.flush_interval_ms must be > 0", .{});
+            return error.InvalidS3DumpConfig;
+        }
+        if (s.max_batch_bytes == 0 or s.max_sealed_bytes == 0 or s.max_batch_records == 0) {
+            log.warn("s3_dump batch caps (max_batch_bytes/max_sealed_bytes/max_batch_records) must be > 0", .{});
+            return error.InvalidS3DumpConfig;
+        }
+    }
 };
+
+test "ProxyConfig.validate rejects zero s3_dump knobs when enabled" {
+    // Disabled: knobs are ignored even if degenerate.
+    var disabled: ProxyConfig = .{ .s3_dump = .{ .enabled = false, .flush_interval_ms = 0 } };
+    try disabled.validate();
+
+    // Enabled with a zero flush interval → tight-spin guard.
+    var zero_interval: ProxyConfig = .{ .s3_dump = .{ .enabled = true, .flush_interval_ms = 0 } };
+    try std.testing.expectError(error.InvalidS3DumpConfig, zero_interval.validate());
+
+    // Enabled with a zero batch cap → every record would drop.
+    var zero_bytes: ProxyConfig = .{ .s3_dump = .{ .enabled = true, .max_batch_bytes = 0 } };
+    try std.testing.expectError(error.InvalidS3DumpConfig, zero_bytes.validate());
+
+    // Enabled with sane defaults → accepted.
+    var ok: ProxyConfig = .{ .s3_dump = .{ .enabled = true } };
+    try ok.validate();
+}

@@ -256,12 +256,28 @@ fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
     };
 }
 
-/// Metric fields are all string-valued, so the typed read wraps the byte
-/// primitive as `.string` — byte-identical to what the engine consumed before
-/// v0.5.0 removed the `value` accessor field.
-// ponytail: string-only; add typed numeric reads if metric `equals`/`gt` on numbers is ever needed.
+/// Typed read primitive (required since v0.5.0). Attribute fields carry their
+/// native OTLP type (bool/int/double/bytes/string) so the typed matchers
+/// (`equals`/`gt`/`gte`/`lt`/`lte`) fire on non-string values; the scalar
+/// metric fields (name/unit/schema urls, and the enum tag-name pseudo-fields)
+/// are genuinely strings.
 pub fn metricTypedValue(ctx: *const anyopaque, field: MetricFieldRef) ?policy.TypedValue {
-    return .{ .string = metricValue(ctx, field) orelse return null };
+    const metric_ctx: *const OtlpMetricContext = @ptrCast(@alignCast(ctx));
+    return switch (field) {
+        .datapoint_attribute => |attr_path| otlp_attr.findNestedAttributeTyped(
+            metric_ctx.datapoint_attributes,
+            attr_path.path.items,
+        ),
+        .resource_attribute => |attr_path| if (metric_ctx.resource_metrics.resource) |res|
+            otlp_attr.findNestedAttributeTyped(res.attributes.items, attr_path.path.items)
+        else
+            null,
+        .scope_attribute => |attr_path| if (metric_ctx.scope_metrics.scope) |scope|
+            otlp_attr.findNestedAttributeTyped(scope.attributes.items, attr_path.path.items)
+        else
+            null,
+        else => otlp_attr.typedStr(metricValue(ctx, field)),
+    };
 }
 
 /// MetricAccessor template wiring the OTLP metric value primitive.

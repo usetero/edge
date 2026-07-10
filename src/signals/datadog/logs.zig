@@ -61,6 +61,7 @@ pub fn processLogsStream(
     in_reader: *std.Io.Reader,
     out_writer: *std.Io.Writer,
     content_type: []const u8,
+    sink: ?policy.ExtensionSink,
 ) !StreamProcessResult {
     if (std.mem.indexOf(u8, content_type, "application/json") == null) {
         try streamAll(in_reader, out_writer);
@@ -78,7 +79,7 @@ pub fn processLogsStream(
     // the per-record streaming path reuses one via processLogsSlice instead.
     var parser: Parser = .init;
     defer parser.deinit(allocator);
-    return processLogsSlice(allocator, &parser, allocator, registry, bus, data, out_writer);
+    return processLogsSlice(allocator, &parser, allocator, registry, bus, data, out_writer, sink);
 }
 
 /// Filters a JSON log body already sitting in a slice, reusing a caller-owned
@@ -95,8 +96,9 @@ pub fn processLogsSlice(
     bus: *EventBus,
     data: []const u8,
     out_writer: *std.Io.Writer,
+    sink: ?policy.ExtensionSink,
 ) !StreamProcessResult {
-    const result = try processJsonLogsWithFilter(scratch, parser, parser_gpa, registry, bus, data);
+    const result = try processJsonLogsWithFilter(scratch, parser, parser_gpa, registry, bus, data, sink);
     defer scratch.free(result.data);
     try out_writer.writeAll(result.data);
 
@@ -207,11 +209,23 @@ fn lookupLogAttribute(log: *DatadogLog, allocator: std.mem.Allocator, path: []co
 /// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
 /// All attribute types (log, resource, scope) search the same flat namespace since
 /// Datadog has no OTLP-style resource/scope hierarchy.
-/// Typed read primitive (required since v0.5.0). Datadog log fields are all
-/// string-valued in the JSON, so wrap the byte primitive as `.string` —
-/// byte-identical to the pre-v0.5.0 `value` path.
+/// Typed read primitive (required since v0.5.0). Known top-level fields are
+/// strings, but single-segment attributes carry their native JSON type, so the
+/// typed matchers fire on numeric/bool attributes; everything else (nested
+/// attributes, known fields) falls back to the string primitive.
 pub fn logTypedValue(ctx: *const anyopaque, field: FieldRef) ?policy.TypedValue {
-    return .{ .string = logValue(ctx, field) orelse return null };
+    switch (field) {
+        .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
+            if (attr_path.path.items.len == 1) {
+                const field_ctx: *const FieldAccessorContext = @ptrCast(@alignCast(ctx));
+                if (field_ctx.log.findExtraTyped(field_ctx.allocator, attr_path.path.items[0])) |typed| {
+                    return typed;
+                }
+            }
+            return .{ .string = logValue(ctx, field) orelse return null };
+        },
+        else => return .{ .string = logValue(ctx, field) orelse return null },
+    }
 }
 
 pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
@@ -452,6 +466,7 @@ fn processJsonLogsWithFilter(
     registry: *const PolicyRegistry,
     bus: *EventBus,
     data: []const u8,
+    sink: ?policy.ExtensionSink,
 ) !ProcessResult {
     const document = parser.parseFromSlice(parser_gpa, data) catch {
         return returnUnchanged(allocator, data, 0);
@@ -481,7 +496,7 @@ fn processJsonLogsWithFilter(
                 };
 
                 state.original_count += 1;
-                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, null);
+                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, sink);
                 if (filter_result.mutated) state.mutated = true;
                 if (filter_result.keep) {
                     try state.kept.append(arena, log_obj);
@@ -498,7 +513,7 @@ fn processJsonLogsWithFilter(
             };
 
             state.original_count = 1;
-            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, null);
+            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, sink);
             if (filter_result.mutated) state.mutated = true;
             if (filter_result.keep) {
                 try state.kept.append(arena, log_obj);
@@ -573,6 +588,45 @@ test "datadogFieldAccessor - extra field lookup" {
     const trace_val = logValue(&field_ctx, .{ .log_attribute = testAttrPath("trace_id") });
     try std.testing.expect(trace_val != null);
     try std.testing.expectEqualStrings("abc123-def456", trace_val.?);
+}
+
+test "datadogFieldAccessor - typed attributes are numeric/bool, not string" {
+    const allocator = std.testing.allocator;
+    // No escapes in string values, so the string read borrows (no leak).
+    const json =
+        \\{"message":"x","duration":1234,"ratio":0.5,"ok":true,"name":"svc"}
+    ;
+
+    // Both parse paths must type identically: the materializing `parse` fills
+    // the typed `extra` map; the fast `parseRaw` fills `extra_spans` (raw text).
+    inline for (.{ "parse", "parseRaw" }) |which| {
+        var parser: Parser = .init;
+        defer parser.deinit(allocator);
+
+        var log = if (comptime std.mem.eql(u8, which, "parse")) blk: {
+            const doc = try parser.parseFromSlice(allocator, json);
+            break :blk try DatadogLog.parse(allocator, doc.asValue());
+        } else try DatadogLog.parseRaw(allocator, json);
+        defer log.deinit(allocator);
+
+        var ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
+
+        const duration = logTypedValue(&ctx, .{ .log_attribute = testAttrPath("duration") });
+        try std.testing.expectEqual(@as(i64, 1234), duration.?.int);
+
+        const ratio = logTypedValue(&ctx, .{ .log_attribute = testAttrPath("ratio") });
+        try std.testing.expectEqual(@as(f64, 0.5), ratio.?.double);
+
+        const ok = logTypedValue(&ctx, .{ .log_attribute = testAttrPath("ok") });
+        try std.testing.expectEqual(true, ok.?.bool);
+
+        const name = logTypedValue(&ctx, .{ .log_attribute = testAttrPath("name") });
+        try std.testing.expectEqualStrings("svc", name.?.string);
+
+        // Known top-level fields stay string.
+        const body = logTypedValue(&ctx, .{ .log_field = .LOG_FIELD_BODY });
+        try std.testing.expect(body.? == .string);
+    }
 }
 
 test "datadogFieldAccessor - unwraps JSON-stringified message for body and attributes" {
@@ -969,6 +1023,7 @@ test "processLogs - no policies keeps all logs in array" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1024,6 +1079,7 @@ test "processLogs - DROP policy filters logs from array" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1079,6 +1135,7 @@ test "processLogs - DROP policy drops single object" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1113,6 +1170,7 @@ test "processLogs - malformed JSON returns unchanged (fail-open)" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1146,6 +1204,7 @@ test "processLogs - non-JSON content type returns unchanged" {
         &in_reader,
         &out_writer.writer,
         "text/plain",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1182,6 +1241,7 @@ test "processLogs - Datadog format with ddtags and service" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1239,6 +1299,7 @@ test "processLogs - filter on arbitrary custom field" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1281,6 +1342,7 @@ test "processLogs - extra fields are preserved when no logs dropped" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1342,6 +1404,7 @@ test "processLogs - nested extra fields are preserved when reserializing after d
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1409,6 +1472,7 @@ test "processLogs - nested extra transform is ignored and payload is unchanged" 
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1474,6 +1538,7 @@ test "processLogs - mutation triggers reserialization and removes field" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1542,6 +1607,7 @@ test "processLogs - filter on dynamic extra field not in schema" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1614,6 +1680,7 @@ test "processLogs - drops wrapped GCP log via body + nested event_type exact mat
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1687,6 +1754,7 @@ test "processLogs - rewrites fields inside a JSON-wrapped message and re-seriali
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),
@@ -1751,6 +1819,7 @@ test "processLogs - filter on nested extra field with exists" {
         &in_reader,
         &out_writer.writer,
         "application/json",
+        null,
     );
     const result: ProcessResult = .{
         .data = try out_writer.toOwnedSlice(),

@@ -329,6 +329,37 @@ test "getStringValue - empty string" {
     try std.testing.expectEqualStrings("", getStringValue(v).?);
 }
 
+// ── anyValueTyped / findNestedAttributeTyped ──────────
+// These back the typed read primitive for all three OTLP signals (logs,
+// traces, metrics), so the typed matchers (equals/gt/gte/lt/lte) fire on
+// non-string attribute values instead of silently missing them.
+
+test "anyValueTyped - each variant maps to its native type" {
+    try std.testing.expectEqual(@as(i64, 42), anyValueTyped(.{ .value = .{ .int_value = 42 } }).?.int);
+    try std.testing.expectEqual(@as(f64, 0.5), anyValueTyped(.{ .value = .{ .double_value = 0.5 } }).?.double);
+    try std.testing.expectEqual(true, anyValueTyped(.{ .value = .{ .bool_value = true } }).?.bool);
+    try std.testing.expectEqualStrings("hi", anyValueTyped(.{ .value = .{ .string_value = "hi" } }).?.string);
+    try std.testing.expectEqualStrings("\x01\x02", anyValueTyped(.{ .value = .{ .bytes_value = "\x01\x02" } }).?.bytes);
+    try std.testing.expectEqual(@as(?TypedValue, null), anyValueTyped(null));
+    try std.testing.expectEqual(@as(?TypedValue, null), anyValueTyped(.{ .value = null }));
+}
+
+test "findNestedAttributeTyped - typed leaf and nested walk" {
+    const attrs = [_]KeyValue{
+        .{ .key = "code", .value = .{ .value = .{ .int_value = 200 } } },
+        .{ .key = "ok", .value = .{ .value = .{ .bool_value = true } } },
+    };
+    try std.testing.expectEqual(@as(i64, 200), findNestedAttributeTyped(&attrs, &.{"code"}).?.int);
+    try std.testing.expectEqual(true, findNestedAttributeTyped(&attrs, &.{"ok"}).?.bool);
+    try std.testing.expectEqual(@as(?TypedValue, null), findNestedAttributeTyped(&attrs, &.{"missing"}));
+
+    const inner = @constCast(&[_]KeyValue{.{ .key = "status", .value = .{ .value = .{ .int_value = 404 } } }});
+    const nested = [_]KeyValue{.{ .key = "http", .value = .{ .value = .{ .kvlist_value = .{
+        .values = .{ .items = inner, .capacity = inner.len },
+    } } } }};
+    try std.testing.expectEqual(@as(i64, 404), findNestedAttributeTyped(&nested, &.{ "http", "status" }).?.int);
+}
+
 // ── findAttribute ──────────
 
 test "findAttribute - found" {
