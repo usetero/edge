@@ -43,9 +43,33 @@ pub fn datadogLogEncode(record: *const anyopaque, writer: *std.Io.Writer) anyerr
 /// Read S3 credentials from the environment. Returns null when either half is
 /// absent — the extension then counts-and-drops deliveries for its targets
 /// (fail-open), so a missing credential never stalls telemetry.
+///
+/// The `TERO_S3_*` pair is tried first, then the standard `AWS_*` pair — each
+/// resolved as a UNIT (both halves from the same set), never mixed. A partial
+/// `TERO_S3_*` (id without secret) means the override is intentionally absent,
+/// so we fall through to `AWS_*` rather than pairing keys across credential
+/// sets (which would sign every request with an invalid keypair).
+///
+/// This matters in Lambda: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are
+/// *reserved* — the runtime overwrites them with the execution role's TEMPORARY
+/// creds (which z3 can't sign, since it emits no `x-amz-security-token`). So to
+/// use static IAM-user keys there, set them under the non-reserved `TERO_S3_*`
+/// names, which the runtime never touches. Outside Lambda the `AWS_*` fallback
+/// works as usual.
 pub fn credentialsFromEnv(env: *const std.process.Environ.Map) ?ext.S3Dump.Credentials {
-    const access = env.get("AWS_ACCESS_KEY_ID") orelse return null;
-    const secret = env.get("AWS_SECRET_ACCESS_KEY") orelse return null;
+    return pairFromEnv(env, "TERO_S3_ACCESS_KEY_ID", "TERO_S3_SECRET_ACCESS_KEY") orelse
+        pairFromEnv(env, "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY");
+}
+
+/// Resolve a same-set access-key/secret pair, or null if either half is
+/// missing or empty (so the caller can cleanly fall back to the next set).
+fn pairFromEnv(
+    env: *const std.process.Environ.Map,
+    access_name: []const u8,
+    secret_name: []const u8,
+) ?ext.S3Dump.Credentials {
+    const access = env.get(access_name) orelse return null;
+    const secret = env.get(secret_name) orelse return null;
     if (access.len == 0 or secret.len == 0) return null;
     return .{ .access_key_id = access, .secret_access_key = secret };
 }
@@ -105,6 +129,30 @@ pub fn flushLoop(
         const result = exts.flush(io, .{});
         if (metrics) |mx| mx.recordS3DumpFlush(result);
     }
+}
+
+test "credentialsFromEnv prefers TERO_S3_* over the reserved AWS_* names" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    // Neither set → null (fail-open: deliveries drop, nothing stalls).
+    try std.testing.expect(credentialsFromEnv(&env) == null);
+
+    // Only AWS_* (in Lambda these are the reserved role creds) → fallback.
+    try env.put("AWS_ACCESS_KEY_ID", "AKIA-fallback");
+    try env.put("AWS_SECRET_ACCESS_KEY", "fallback-secret");
+    try std.testing.expectEqualStrings("AKIA-fallback", credentialsFromEnv(&env).?.access_key_id);
+
+    // A PARTIAL TERO_S3_* (id only) must NOT pair with AWS_*'s secret — that
+    // would sign with a mixed keypair. Fall back to the whole AWS_* pair.
+    try env.put("TERO_S3_ACCESS_KEY_ID", "AKIA-user");
+    try std.testing.expectEqualStrings("AKIA-fallback", credentialsFromEnv(&env).?.access_key_id);
+
+    // Complete TERO_S3_* pair → wins (the Lambda static-key path).
+    try env.put("TERO_S3_SECRET_ACCESS_KEY", "user-secret");
+    const creds = credentialsFromEnv(&env).?;
+    try std.testing.expectEqualStrings("AKIA-user", creds.access_key_id);
+    try std.testing.expectEqualStrings("user-secret", creds.secret_access_key);
 }
 
 test "datadogLogEncode renders the delivered log context as JSON" {
