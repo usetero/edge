@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.28.0](https://github.com/usetero/edge/compare/v1.27.1...v1.28.0) (2026-07-14)
+
+
+### Features
+
+* enable lambda s3 dumps ([#220](https://github.com/usetero/edge/issues/220)) ([07e5428](https://github.com/usetero/edge/commit/07e5428b4cd052fdde7098ed1ff045586d640367))
+* implement s3 dump extension ([#218](https://github.com/usetero/edge/issues/218)) ([5fa6b03](https://github.com/usetero/edge/commit/5fa6b0366040188ada177f2982c071d2638dfd08))
+
 ## [1.27.1](https://github.com/usetero/edge/compare/v1.27.0...v1.27.1) (2026-07-06)
 
 
