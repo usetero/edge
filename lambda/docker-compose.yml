@@ -11,7 +11,7 @@ services:
 
   # Lambda extension test using AWS Lambda RIE
   lambda-test:
-    image: public.ecr.aws/lambda/python:3.12-arm64@sha256:0638987602841b05aa5b242617333525458a2d073d3289525816bb0026e4bdfd
+    image: public.ecr.aws/lambda/python:3.12-arm64@sha256:9341f307b37563d5321bbae1da363485136e6b121aacd34e54bbf6d2d20bd7e4
     platform: linux/arm64
     ports:
       - "9000:8080"
