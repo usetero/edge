@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.0](https://github.com/usetero/edge/compare/v1.28.0...v1.29.0) (2026-07-15)
+
+
+### Features
+
+* support targets ([#224](https://github.com/usetero/edge/issues/224)) ([8a9b5b8](https://github.com/usetero/edge/commit/8a9b5b86d896f9d83c7313cf92ad1f1c1cf60451))
+
 ## [1.28.0](https://github.com/usetero/edge/compare/v1.27.1...v1.28.0) (2026-07-14)
 
 
