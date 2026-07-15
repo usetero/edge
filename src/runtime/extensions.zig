@@ -50,28 +50,39 @@ pub fn datadogLogEncode(record: *const anyopaque, writer: *std.Io.Writer) anyerr
 /// so we fall through to `AWS_*` rather than pairing keys across credential
 /// sets (which would sign every request with an invalid keypair).
 ///
+/// Each set also carries its own optional session token, resolved as part of the
+/// same unit — `TERO_S3_SESSION_TOKEN` for the override set, `AWS_SESSION_TOKEN`
+/// for the standard set. A session token is only meaningful with the keypair it
+/// was issued alongside, so it's never pulled from the other set.
+///
 /// This matters in Lambda: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are
 /// *reserved* — the runtime overwrites them with the execution role's TEMPORARY
-/// creds (which z3 can't sign, since it emits no `x-amz-security-token`). So to
-/// use static IAM-user keys there, set them under the non-reserved `TERO_S3_*`
-/// names, which the runtime never touches. Outside Lambda the `AWS_*` fallback
-/// works as usual.
+/// creds, which come with `AWS_SESSION_TOKEN`. Since z3 now signs an
+/// `x-amz-security-token`, those role creds work directly: no static IAM-user
+/// keypair required. `TERO_S3_*` still wins when set (cross-account/static keys,
+/// or pinning a keypair the runtime won't clobber).
 pub fn credentialsFromEnv(env: *const std.process.Environ.Map) ?ext.S3Dump.Credentials {
-    return pairFromEnv(env, "TERO_S3_ACCESS_KEY_ID", "TERO_S3_SECRET_ACCESS_KEY") orelse
-        pairFromEnv(env, "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY");
+    return pairFromEnv(env, "TERO_S3_ACCESS_KEY_ID", "TERO_S3_SECRET_ACCESS_KEY", "TERO_S3_SESSION_TOKEN") orelse
+        pairFromEnv(env, "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN");
 }
 
-/// Resolve a same-set access-key/secret pair, or null if either half is
-/// missing or empty (so the caller can cleanly fall back to the next set).
+/// Resolve a same-set access-key/secret pair (plus its optional session token),
+/// or null if either required half is missing or empty (so the caller can
+/// cleanly fall back to the next set). An absent/empty session token is null.
 fn pairFromEnv(
     env: *const std.process.Environ.Map,
     access_name: []const u8,
     secret_name: []const u8,
+    session_name: []const u8,
 ) ?ext.S3Dump.Credentials {
     const access = env.get(access_name) orelse return null;
     const secret = env.get(secret_name) orelse return null;
     if (access.len == 0 or secret.len == 0) return null;
-    return .{ .access_key_id = access, .secret_access_key = secret };
+    const session: ?[]const u8 = if (env.get(session_name)) |s|
+        (if (s.len == 0) null else s)
+    else
+        null;
+    return .{ .access_key_id = access, .secret_access_key = secret, .session_token = session };
 }
 
 /// Enable the s3-dump handler on `exts` from config, wiring credentials and
@@ -142,17 +153,30 @@ test "credentialsFromEnv prefers TERO_S3_* over the reserved AWS_* names" {
     try env.put("AWS_ACCESS_KEY_ID", "AKIA-fallback");
     try env.put("AWS_SECRET_ACCESS_KEY", "fallback-secret");
     try std.testing.expectEqualStrings("AKIA-fallback", credentialsFromEnv(&env).?.access_key_id);
+    // No session token in this set yet → null (not an empty string).
+    try std.testing.expect(credentialsFromEnv(&env).?.session_token == null);
+
+    // The AWS_* session token (the Lambda role's temporary creds) flows through
+    // as part of that set — z3 signs it as x-amz-security-token.
+    try env.put("AWS_SESSION_TOKEN", "role-token");
+    try std.testing.expectEqualStrings("role-token", credentialsFromEnv(&env).?.session_token.?);
 
     // A PARTIAL TERO_S3_* (id only) must NOT pair with AWS_*'s secret — that
     // would sign with a mixed keypair. Fall back to the whole AWS_* pair.
     try env.put("TERO_S3_ACCESS_KEY_ID", "AKIA-user");
     try std.testing.expectEqualStrings("AKIA-fallback", credentialsFromEnv(&env).?.access_key_id);
 
-    // Complete TERO_S3_* pair → wins (the Lambda static-key path).
+    // Complete TERO_S3_* pair → wins (static IAM-user keys, no session token).
+    // The AWS_* session token must NOT leak across sets: TERO_S3_* has none.
     try env.put("TERO_S3_SECRET_ACCESS_KEY", "user-secret");
     const creds = credentialsFromEnv(&env).?;
     try std.testing.expectEqualStrings("AKIA-user", creds.access_key_id);
     try std.testing.expectEqualStrings("user-secret", creds.secret_access_key);
+    try std.testing.expect(creds.session_token == null);
+
+    // A session token set under the winning TERO_S3_* set is carried.
+    try env.put("TERO_S3_SESSION_TOKEN", "user-token");
+    try std.testing.expectEqualStrings("user-token", credentialsFromEnv(&env).?.session_token.?);
 }
 
 test "datadogLogEncode renders the delivered log context as JSON" {

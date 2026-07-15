@@ -32,6 +32,19 @@ services:
       TERO_METRICS_URL: https://api.datadoghq.com
       TERO_POLICY_STATIC: '{"policies":[{"id":"drop-health","name":"Drop health checks","log":{"match":[{"log_field":"body","regex":"^Test log from Lambda.*"}],"keep":"none"}}]}'
       TERO_LOG_LEVEL: debug
+      # --- s3-dump extension (Datadog logs -> S3), disabled above by default ---
+      # On Lambda config is env-only, so targets come as a JSON array (zonfig
+      # can't express a slice-of-struct from a plain env var).
+      # A policy with `extension: {kind: "s3", name: "main"}` routes records here.
+      # TERO_S3_DUMP_ENABLED: "true"
+      # TERO_S3_DUMP_TARGETS_JSON: '[{"name":"main","bucket":"my-logs","region":"us-east-1","prefix":"datadog/","endpoint":"https://s3.us-east-1.amazonaws.com","force_path_style":false}]'
+      # Credentials: on Lambda the execution role's own creds (the reserved
+      # AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN) now work
+      # directly — the signer sends x-amz-security-token. Set the TERO_S3_* names
+      # below only for a static IAM-user keypair the runtime won't clobber:
+      # TERO_S3_ACCESS_KEY_ID: "AKIA..."
+      # TERO_S3_SECRET_ACCESS_KEY: "..."
+      # TERO_S3_SESSION_TOKEN: "..."   # optional; only for temporary TERO_S3_* creds
     command: ["handler.handler"]
 
   # Optional: Mock upstream for testing without real Datadog

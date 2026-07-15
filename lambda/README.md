@@ -115,6 +115,32 @@ docker compose --profile mock up
 | `TERO_POLICY_URL`    | -       | HTTP policy provider URL                       |
 | `TERO_POLICY_STATIC` | -       | Static policy JSON string                      |
 
+### s3-dump extension (Datadog logs → S3)
+
+| Variable                    | Default | Description                                          |
+| --------------------------- | ------- | ---------------------------------------------------- |
+| `TERO_S3_DUMP_ENABLED`      | false   | Turn the s3-dump extension on                        |
+| `TERO_S3_DUMP_TARGETS_JSON` | -       | JSON array of targets (see below)                    |
+| `TERO_S3_ACCESS_KEY_ID`     | -       | S3 access key override (static IAM-user keypair)     |
+| `TERO_S3_SECRET_ACCESS_KEY` | -       | S3 secret key override                               |
+| `TERO_S3_SESSION_TOKEN`     | -       | Optional session token for the `TERO_S3_*` set       |
+
+The extension is inert unless `TERO_S3_DUMP_ENABLED=true` **and** at least one
+target is set. On Lambda config is env-only, so targets are a JSON array in
+`TERO_S3_DUMP_TARGETS_JSON` (zonfig can't express a slice-of-struct via a plain
+env var). Each target: `{"name","bucket","region","prefix","endpoint","force_path_style"}`
+— only `name` and `bucket` are required. Policies route records to a target by
+its `name` via `extension: {kind: "s3", name: "..."}`.
+
+> **Credentials on Lambda:** the execution role's own credentials work
+> directly — the reserved `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+> `AWS_SESSION_TOKEN` are signed with an `x-amz-security-token`, so no static
+> keypair is needed. Set `TERO_S3_ACCESS_KEY_ID` / `TERO_S3_SECRET_ACCESS_KEY`
+> (which the runtime never clobbers) only when you want a static IAM-user
+> keypair — e.g. cross-account writes; add `TERO_S3_SESSION_TOKEN` if that
+> keypair is itself temporary. Each set (access/secret/token) is resolved as a
+> unit; a token is never mixed across sets.
+
 ## Troubleshooting
 
 ### Extension not starting
