@@ -404,10 +404,10 @@ pub fn main(init: std.process.Init) !void {
                     .reason = @tagName(shutdown_event.reason),
                 });
 
-                // Final drain within Lambda's shutdown deadline (io still live).
-                if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
-
-                // Stop proxy server gracefully
+                // Stop proxy server gracefully. The final S3 force-flush is
+                // deferred until AFTER the connection tasks join below —
+                // flushing here would race an in-flight telemetry request that
+                // appends records post-flush, silently dropping that tail.
                 shutdown_requested.store(true, .release);
                 engine.requestShutdown();
                 break;
@@ -418,6 +418,11 @@ pub fn main(init: std.process.Init) !void {
     // Cancel the accept loop and every connection task, then wait.
     engine.requestShutdown();
     engine.stop();
+
+    // Final drain now that every connection task has joined (no more records
+    // can be appended) and while `io` is still live — within Lambda's shutdown
+    // deadline. This is the last flush; the invocation tail lands here.
+    if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStopped{});
