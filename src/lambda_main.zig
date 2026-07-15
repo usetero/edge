@@ -203,6 +203,33 @@ pub fn main(init: std.process.Init) !void {
     };
     defer zonfig.deinit(LambdaConfig, allocator, config);
 
+    // zonfig can't populate a slice-of-struct from an env var, so the env-only
+    // Lambda takes its s3-dump targets as a JSON array in
+    // TERO_S3_DUMP_TARGETS_JSON (see config_types.S3DumpConfig.targets_json).
+    // Kept in its own Parsed arena — NOT spliced into `config.s3_dump.targets`,
+    // since zonfig.deinit would then try to free arena-owned memory. We pass a
+    // struct copy with `.targets` overridden to `configure` below instead.
+    // Gated on `enabled`: a disabled extension is inert, so a malformed or
+    // stale TERO_S3_DUMP_TARGETS_JSON must be a no-op, not a startup abort.
+    var s3_targets: []const config_types.S3TargetConfig = config.s3_dump.targets;
+    var targets_parsed: ?std.json.Parsed([]const config_types.S3TargetConfig) = null;
+    defer if (targets_parsed) |p| p.deinit();
+    if (config.s3_dump.enabled) {
+        if (config.s3_dump.targets_json) |targets_json| {
+            targets_parsed = std.json.parseFromSlice(
+                []const config_types.S3TargetConfig,
+                allocator,
+                targets_json,
+                .{},
+            ) catch |err| {
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                bus.err(LambdaExtensionError{ .err = @errorName(err) });
+                return err;
+            };
+            s3_targets = targets_parsed.?.value;
+        }
+    }
+
     // Determine effective URLs
     const logs_url = config.logs_url orelse config.upstream_url;
     const metrics_url = config.metrics_url orelse config.upstream_url;
@@ -242,10 +269,12 @@ pub fn main(init: std.process.Init) !void {
     // resolve at snapshot build. Inert unless enabled with targets.
     var exts = ext_rt.Extensions.init(allocator, .{ .log = ext_rt.datadogLogEncode });
     defer exts.deinit();
-    const s3_dump_active = config.s3_dump.enabled and config.s3_dump.targets.len > 0;
+    const s3_dump_active = config.s3_dump.enabled and s3_targets.len > 0;
     var extension_sink: ?policy.ExtensionSink = null;
     if (s3_dump_active) {
-        try ext_rt.configure(&exts, allocator, io, config.s3_dump, init.environ_map);
+        var s3_cfg = config.s3_dump;
+        s3_cfg.targets = s3_targets; // env-JSON targets (see targets_json above)
+        try ext_rt.configure(&exts, allocator, io, s3_cfg, init.environ_map);
         exts.register(&registry);
         extension_sink = exts.sink();
     }
@@ -379,10 +408,7 @@ pub fn main(init: std.process.Init) !void {
                     .reason = @tagName(shutdown_event.reason),
                 });
 
-                // Final drain within Lambda's shutdown deadline (io still live).
-                if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
-
-                // Stop proxy server gracefully
+                // The two-phase S3 drain runs after the loop (see below).
                 shutdown_requested.store(true, .release);
                 engine.requestShutdown();
                 break;
@@ -390,9 +416,24 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Two-phase S3 drain across shutdown, `io` live throughout. `engine.stop()`
+    // joins in-flight connection tasks with no timeout and can block up to ~5s,
+    // while Lambda enforces `shutdown_event.deadline_ms` and may kill us mid-join
+    // — so a single flush is wrong on either side of stop():
+    //   1. BEFORE stop(): persist everything batched by the time SHUTDOWN
+    //      arrived. If a slow task join blows the deadline, the bulk of the
+    //      tail is already durable rather than lost.
+    //   2. AFTER stop(): every connection task has joined, so this captures
+    //      records a still-in-flight handler appended during the join window
+    //      (which a before-only flush would silently drop).
+    // The second flush is a cheap no-op when nothing new was appended.
+    if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
+
     // Cancel the accept loop and every connection task, then wait.
     engine.requestShutdown();
     engine.stop();
+
+    if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStopped{});

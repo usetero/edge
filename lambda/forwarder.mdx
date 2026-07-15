@@ -200,6 +200,31 @@ string:
 | `TERO_POLICY_STATIC`   | JSON string with static policies               |
 | `TERO_SERVICE_VERSION` | Version identifier for tracking                |
 
+### s3-dump extension (Datadog logs → S3)
+
+| Variable                    | Description                                         |
+| --------------------------- | --------------------------------------------------- |
+| `TERO_S3_DUMP_ENABLED`      | Set `true` to enable the s3-dump extension          |
+| `TERO_S3_DUMP_TARGETS_JSON` | JSON array of S3 targets (env-only targets config)  |
+| `TERO_S3_ACCESS_KEY_ID`     | S3 access key override (static IAM-user keypair)    |
+| `TERO_S3_SECRET_ACCESS_KEY` | S3 secret key override                              |
+| `TERO_S3_SESSION_TOKEN`     | Optional session token for the `TERO_S3_*` set      |
+
+The extension stays inert unless enabled with at least one target. Targets are
+a JSON array (Lambda config is env-only and zonfig can't express a
+slice-of-struct via a plain env var), e.g.
+`[{"name":"main","bucket":"my-logs","region":"us-east-1","prefix":"datadog/"}]`;
+only `name` and `bucket` are required. A policy routes records to a target by
+`name` via `extension: {kind: "s3", name: "..."}`.
+
+> **Credentials:** on Lambda the execution role's own credentials work directly
+> — the reserved `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+> `AWS_SESSION_TOKEN` are signed with an `x-amz-security-token`, so no static
+> keypair is required. Use `TERO_S3_ACCESS_KEY_ID` / `TERO_S3_SECRET_ACCESS_KEY`
+> (never clobbered by the runtime) only for a static IAM-user keypair, adding
+> `TERO_S3_SESSION_TOKEN` if that keypair is itself temporary. Each credential
+> set is resolved as a unit — a token is never mixed across sets.
+
 ## Troubleshooting
 
 **Extension not starting**

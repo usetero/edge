@@ -56,6 +56,15 @@ pub const S3DumpConfig = struct {
     max_attempts: usize = 1,
     targets: []const S3TargetConfig = &.{},
 
+    /// Env-only escape hatch for `targets`: a JSON array of `S3TargetConfig`,
+    /// e.g. `TERO_S3_DUMP_TARGETS_JSON='[{"name":"main","bucket":"b",...}]'`.
+    /// zonfig can't express a slice-of-struct through an env var (only scalars
+    /// and string slices), so the Lambda distro — which loads config env-only,
+    /// no JSON file — parses this into `targets` after load. Mirrors the
+    /// `TERO_POLICY_STATIC` pattern. Unused by the server distro (it reads
+    /// `targets` straight from its JSON config file). Parsed in lambda_main.
+    targets_json: ?[]const u8 = null,
+
     /// Batch/backlog caps that must be nonzero no matter how flush is driven —
     /// a zero cap makes the handler treat every record as oversized and drop it.
     /// Used by every distribution (the Lambda flush is event-driven, so it only
@@ -152,6 +161,31 @@ test "ProxyConfig.validate rejects zero s3_dump knobs when enabled" {
     // Enabled with sane defaults → accepted.
     var ok: ProxyConfig = .{ .s3_dump = .{ .enabled = true } };
     try ok.validate();
+}
+
+test "s3_dump targets_json parses into S3TargetConfig (Lambda env-only path)" {
+    // The exact parse lambda_main runs on TERO_S3_DUMP_TARGETS_JSON. Only
+    // `name` and `bucket` are required; the rest fall back to field defaults.
+    const json =
+        \\[{"name":"main","bucket":"logs","endpoint":"http://minio:9000","force_path_style":true},
+        \\ {"name":"backup","bucket":"logs-eu","region":"eu-west-1"}]
+    ;
+    const parsed = try std.json.parseFromSlice(
+        []const S3TargetConfig,
+        std.testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.len);
+    try std.testing.expectEqualStrings("main", parsed.value[0].name);
+    try std.testing.expectEqualStrings("http://minio:9000", parsed.value[0].endpoint.?);
+    try std.testing.expectEqualStrings("us-east-1", parsed.value[0].region); // default
+    // Second target defaults endpoint to null and overrides region.
+    try std.testing.expect(parsed.value[1].endpoint == null);
+    try std.testing.expectEqualStrings("eu-west-1", parsed.value[1].region);
+    try std.testing.expect(parsed.value[1].force_path_style); // default true
 }
 
 test "S3DumpConfig.validateBatching (Lambda path) ignores flush_interval_ms" {
