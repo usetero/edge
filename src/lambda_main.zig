@@ -408,10 +408,7 @@ pub fn main(init: std.process.Init) !void {
                     .reason = @tagName(shutdown_event.reason),
                 });
 
-                // Stop proxy server gracefully. The final S3 force-flush is
-                // deferred until AFTER the connection tasks join below —
-                // flushing here would race an in-flight telemetry request that
-                // appends records post-flush, silently dropping that tail.
+                // The two-phase S3 drain runs after the loop (see below).
                 shutdown_requested.store(true, .release);
                 engine.requestShutdown();
                 break;
@@ -419,13 +416,23 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Two-phase S3 drain across shutdown, `io` live throughout. `engine.stop()`
+    // joins in-flight connection tasks with no timeout and can block up to ~5s,
+    // while Lambda enforces `shutdown_event.deadline_ms` and may kill us mid-join
+    // — so a single flush is wrong on either side of stop():
+    //   1. BEFORE stop(): persist everything batched by the time SHUTDOWN
+    //      arrived. If a slow task join blows the deadline, the bulk of the
+    //      tail is already durable rather than lost.
+    //   2. AFTER stop(): every connection task has joined, so this captures
+    //      records a still-in-flight handler appended during the join window
+    //      (which a before-only flush would silently drop).
+    // The second flush is a cheap no-op when nothing new was appended.
+    if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
+
     // Cancel the accept loop and every connection task, then wait.
     engine.requestShutdown();
     engine.stop();
 
-    // Final drain now that every connection task has joined (no more records
-    // can be appended) and while `io` is still live — within Lambda's shutdown
-    // deadline. This is the last flush; the invocation tail lands here.
     if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
