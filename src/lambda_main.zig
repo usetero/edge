@@ -209,21 +209,25 @@ pub fn main(init: std.process.Init) !void {
     // Kept in its own Parsed arena — NOT spliced into `config.s3_dump.targets`,
     // since zonfig.deinit would then try to free arena-owned memory. We pass a
     // struct copy with `.targets` overridden to `configure` below instead.
+    // Gated on `enabled`: a disabled extension is inert, so a malformed or
+    // stale TERO_S3_DUMP_TARGETS_JSON must be a no-op, not a startup abort.
     var s3_targets: []const config_types.S3TargetConfig = config.s3_dump.targets;
     var targets_parsed: ?std.json.Parsed([]const config_types.S3TargetConfig) = null;
     defer if (targets_parsed) |p| p.deinit();
-    if (config.s3_dump.targets_json) |targets_json| {
-        targets_parsed = std.json.parseFromSlice(
-            []const config_types.S3TargetConfig,
-            allocator,
-            targets_json,
-            .{},
-        ) catch |err| {
-            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            bus.err(LambdaExtensionError{ .err = @errorName(err) });
-            return err;
-        };
-        s3_targets = targets_parsed.?.value;
+    if (config.s3_dump.enabled) {
+        if (config.s3_dump.targets_json) |targets_json| {
+            targets_parsed = std.json.parseFromSlice(
+                []const config_types.S3TargetConfig,
+                allocator,
+                targets_json,
+                .{},
+            ) catch |err| {
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                bus.err(LambdaExtensionError{ .err = @errorName(err) });
+                return err;
+            };
+            s3_targets = targets_parsed.?.value;
+        }
     }
 
     // Determine effective URLs
