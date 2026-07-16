@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.2](https://github.com/usetero/edge/compare/v1.29.1...v1.29.2) (2026-07-16)
+
+
+### Bug Fixes
+
+* flush at close ([#229](https://github.com/usetero/edge/issues/229)) ([9301b56](https://github.com/usetero/edge/commit/9301b56da632fca31b46cd5bd1ba11007b361668))
+
 ## [1.29.1](https://github.com/usetero/edge/compare/v1.29.0...v1.29.1) (2026-07-16)
 
 
