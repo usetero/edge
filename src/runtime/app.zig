@@ -538,6 +538,13 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
     }
 
+    // Flush final policy stats to the control plane before teardown (io still
+    // live). The sync provider only reports on its poll interval, so a clean
+    // shutdown/redeploy otherwise drops everything accrued since the last tick —
+    // which Cloud Run's frequent scale-to-zero and rollouts make routine. The
+    // deferred `loader.deinit` won't re-sync. Best-effort: never block shutdown.
+    loader.close() catch |err| log.warn("final policy stats sync failed: {}", .{err});
+
     if (signal_waiter) |waiter| {
         shutdown_waiter.store(true, .release);
         std.posix.kill(std.c.getpid(), std.posix.SIG.USR1) catch |err|
