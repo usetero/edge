@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.1](https://github.com/usetero/edge/compare/v1.29.0...v1.29.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* support static extensions ([#225](https://github.com/usetero/edge/issues/225)) ([8a44eef](https://github.com/usetero/edge/commit/8a44eef38e01d8bff8edf6f7a6fbab60da24db12))
+
 ## [1.29.0](https://github.com/usetero/edge/compare/v1.28.0...v1.29.0) (2026-07-15)
 
 
