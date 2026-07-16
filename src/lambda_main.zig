@@ -435,6 +435,17 @@ pub fn main(init: std.process.Init) !void {
 
     if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
 
+    // Flush final policy stats to the control plane before the layer closes.
+    // The sync provider reports per-policy stats (hits/misses/errors) only on
+    // its poll interval, which Lambda's freeze-between-invokes makes unreliable,
+    // and it never reports on teardown — so without this the control plane sees
+    // no stats for short-lived/idle functions. close() does one final
+    // synchronous sync while `io` is still live; the deferred `deinit` won't
+    // re-sync. Best-effort: a failed report must not crash shutdown.
+    if (loader) |l| l.close() catch |err|
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        bus.err(LambdaExtensionError{ .err = @errorName(err) });
+
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStopped{});
 }
