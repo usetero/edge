@@ -91,6 +91,17 @@ WORKDIR /app
 ARG DISTRIBUTION=datadog
 COPY --from=builder /build/zig-out/bin/edge-${DISTRIBUTION} /app/edge
 
+# Bake the distribution's default config to /app/config.json (the CMD arg).
+# Every value is overridable at runtime: TERO_-prefixed env vars replace whole
+# fields, and ${VAR} references inside the file (e.g. the policy-sync API key)
+# are substituted from the environment at load. Distributions without a bundled
+# default fall back to env-only config (missing file -> defaults + env).
+COPY docker/defaults/ /tmp/defaults/
+RUN if [ -f "/tmp/defaults/${DISTRIBUTION}.json" ]; then \
+        cp "/tmp/defaults/${DISTRIBUTION}.json" /app/config.json; \
+    fi; \
+    rm -rf /tmp/defaults
+
 USER tero
 EXPOSE 8080
 

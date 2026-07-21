@@ -11,53 +11,45 @@ containers in task ──► datadog-agent ──► tero-edge (127.0.0.1:8080) 
 In `awsvpc`/Fargate networking all containers in a task share `localhost`, so no
 `hostIP`/`hostPort` plumbing is needed (unlike the Kubernetes DaemonSet setup).
 
-## Files
+## No config file needed
 
-- `config.json` — Edge config. Policies sync from Tero over HTTPS (recommended).
-- `policies.json` — only needed if you use the **file provider** instead (see below).
+The `ghcr.io/usetero/edge-datadog` image ships a default config baked in. You
+only set environment variables:
 
-Set `upstream_url` / `metrics_url` for your Datadog region:
+- `TERO_API_KEY` — **required** for policy sync from Tero (from Secrets Manager / SSM).
+- `TERO_UPSTREAM_URL` / `TERO_METRICS_URL` — override only if you're **not** on US1.
 
-| Region | `upstream_url` | `metrics_url` |
-|--------|----------------|---------------|
-| US1 | `https://agent-http-intake.logs.datadoghq.com` | `https://api.datadoghq.com` |
+The default targets US1 (`agent-http-intake.logs.datadoghq.com` /
+`api.datadoghq.com`), listens on `0.0.0.0:8080`, and syncs policies from
+`https://sync.usetero.com`. For other regions set:
+
+| Region | `TERO_UPSTREAM_URL` | `TERO_METRICS_URL` |
+|--------|---------------------|--------------------|
 | US3 | `https://agent-http-intake.logs.us3.datadoghq.com` | `https://api.us3.datadoghq.com` |
 | US5 | `https://agent-http-intake.logs.us5.datadoghq.com` | `https://api.us5.datadoghq.com` |
 | EU  | `https://agent-http-intake.logs.datadoghq.eu` | `https://api.datadoghq.eu` |
 | AP1 | `https://agent-http-intake.logs.ap1.datadoghq.com` | `https://api.ap1.datadoghq.com` |
 
-## Getting the config into the container
-
-Fargate has no ConfigMap. Bake `config.json` into a thin image — reproducible and
-no extra infra:
-
-```dockerfile
-# Dockerfile
-FROM ghcr.io/usetero/edge-datadog:latest
-COPY config.json /etc/tero/config.json
-# For the file provider, also: COPY policies.json /etc/tero/policies.json
-```
-
-`${TERO_API_KEY}` in `config.json` is substituted at startup from the env var, so
-the secret never lives in the image.
-
-> Alternative: mount an EFS volume at `/etc/tero` and drop the files there instead
-> of baking an image.
+Any config field is overridable via a `TERO_`-prefixed env var (e.g.
+`TERO_LISTEN_PORT`, `TERO_LOG_LEVEL`). See
+https://docs.usetero.com/edge/edge-reference/config.
 
 ## Terraform: add the Edge sidecar
 
 ```hcl
 edge_container = {
   name       = "tero-edge"
-  image      = "<your-account>.dkr.ecr.<region>.amazonaws.com/tero-edge:latest" # image above
+  image      = "ghcr.io/usetero/edge-datadog:latest"
   cpu        = 0
   essential  = true
-  command    = ["/etc/tero/config.json"]
   portMappings = [
     { "containerPort" : 8080, "protocol" : "tcp" }
   ]
   environment = [
     { "name" : "TERO_LOG_LEVEL", "value" : "info" }
+    # Non-US1 only:
+    # { "name" : "TERO_UPSTREAM_URL", "value" : "https://agent-http-intake.logs.datadoghq.eu" },
+    # { "name" : "TERO_METRICS_URL", "value" : "https://api.datadoghq.eu" }
   ]
   secrets = [
     # API key for policy sync — from SSM Parameter Store or Secrets Manager
@@ -98,22 +90,14 @@ Add these to the **existing Datadog Agent container** `environment` block:
 ```
 
 `DD_LOGS_CONFIG_LOGS_DD_URL` takes `host:port` (no scheme). The Agent POSTs logs
-over plain HTTP to Edge; Edge re-forwards to `upstream_url` over HTTPS.
+over plain HTTP to Edge; Edge re-forwards to the upstream over HTTPS.
 
-## Using the file provider instead of Tero sync
+## Managing policies locally instead of Tero sync
 
-To manage policies locally instead of syncing from Tero, bake `policies.json`
-into the image and swap the `policy_providers` block in `config.json` to:
-
-```json
-"policy_providers": [
-  { "id": "file", "type": "file", "path": "/etc/tero/policies.json" }
-]
-```
-
-`policies.json` in this directory drops `DEBUG` logs, drops `nginx`-sourced logs,
-and force-keeps errors — adjust to taste. See
-https://docs.usetero.com/edge/policy-reference/log-filter for all options.
+The default syncs policies from Tero. To manage them locally instead, supply your
+own `config.json` with a file provider and mount it over `/app/config.json` (EFS
+volume, or bake a thin image `FROM ghcr.io/usetero/edge-datadog`). See
+https://docs.usetero.com/edge/policy-reference/log-filter for policy options.
 
 ## Verify
 

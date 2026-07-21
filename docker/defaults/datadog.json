@@ -6,11 +6,7 @@
   "log_level": "info",
   "service": {
     "name": "edge",
-    "namespace": "production",
-    "resource_attributes": [
-      { "key": "deployment.environment", "value": "production" }
-    ],
-    "labels": [{ "key": "team", "value": "platform" }]
+    "namespace": "production"
   },
   "max_body_size": 1048576,
   "policy_providers": [
