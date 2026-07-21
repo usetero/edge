@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.29.3](https://github.com/usetero/edge/compare/v1.29.2...v1.29.3) (2026-07-21)
+
+
+### Bug Fixes
+
+* datadog sidecar example ([#236](https://github.com/usetero/edge/issues/236)) ([d3c0778](https://github.com/usetero/edge/commit/d3c0778bc1a6a670ca87ed13e945da8e59d970ab))
+* move flush ([#235](https://github.com/usetero/edge/issues/235)) ([c8bafa7](https://github.com/usetero/edge/commit/c8bafa75d8c215ca7d458227168fb41284439ddc))
+
 ## [1.29.2](https://github.com/usetero/edge/compare/v1.29.1...v1.29.2) (2026-07-16)
 
 
