@@ -357,15 +357,18 @@ fn applyEnvOverrides(
     prefix: []const u8,
     environ: *const std.process.Environ.Map,
 ) LoadError!void {
-    // Build env var names at runtime using the prefix
+    // Build env var names at runtime using the prefix. Defaults are threaded
+    // through so a string field that JSON already allocated can be freed before
+    // the override replaces it (see freeReplacedString).
     var env_name_buf: [256]u8 = undefined;
-    try applyEnvOverridesRecursive(T, allocator, config, prefix, "", &env_name_buf, environ);
+    try applyEnvOverridesRecursive(T, allocator, config, defaultValue(T), prefix, "", &env_name_buf, environ);
 }
 
 fn applyEnvOverridesRecursive(
     comptime T: type,
     allocator: std.mem.Allocator,
     config: *T,
+    defaults: T,
     prefix: []const u8,
     comptime path: []const u8,
     env_name_buf: *[256]u8,
@@ -382,6 +385,7 @@ fn applyEnvOverridesRecursive(
                     path ++ "_" ++ field.name;
 
                 const field_ptr = &@field(config, field.name);
+                const field_default = @field(defaults, field.name);
 
                 if (@typeInfo(field.type) == .@"struct") {
                     // Recurse into nested struct
@@ -389,6 +393,7 @@ fn applyEnvOverridesRecursive(
                         field.type,
                         allocator,
                         field_ptr,
+                        field_default,
                         prefix,
                         field_path,
                         env_name_buf,
@@ -399,7 +404,38 @@ fn applyEnvOverridesRecursive(
                     // field_path is comptime known, so we pass it directly
                     const env_name = buildEnvName(prefix, field_path, env_name_buf);
                     if (environ.get(env_name)) |env_value| {
+                        // Free any JSON-allocated string before overwriting it,
+                        // else applyEnvValue's dupe orphans it (deinit only frees
+                        // the final pointer).
+                        freeReplacedString(field.type, allocator, field_ptr, field_default);
                         try applyEnvValue(field.type, allocator, field_ptr, env_value);
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+/// Free a string field's current value if an env override is about to replace
+/// it AND that value was heap-allocated (i.e. it differs from the comptime
+/// default, so it came from JSON parsing). Mirrors the free logic in the
+/// substitution pass. No-op for non-string fields and for values still pointing
+/// at their comptime default.
+fn freeReplacedString(comptime T: type, allocator: std.mem.Allocator, ptr: *T, default: T) void {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size == .slice and p.child == u8) {
+                if (ptr.*.ptr != default.ptr and ptr.*.len > 0) allocator.free(ptr.*);
+            }
+        },
+        .optional => |o| {
+            if (@typeInfo(o.child) == .pointer) {
+                const p = @typeInfo(o.child).pointer;
+                if (p.size == .slice and p.child == u8) {
+                    if (ptr.*) |cur| {
+                        const is_default = default != null and default.?.ptr == cur.ptr;
+                        if (!is_default and cur.len > 0) allocator.free(cur);
                     }
                 }
             }
@@ -742,6 +778,79 @@ fn createTempConfigFile(io: std.Io, dir: std.Io.Dir, content: []const u8) !void 
     const file = try dir.createFile(io, "config.json", .{});
     defer file.close(io);
     try file.writeStreamingAll(io, content);
+}
+
+// -----------------------------------------------------------------------------
+// load: baked-config override (mirrors docker/defaults/datadog.json)
+// -----------------------------------------------------------------------------
+
+test "load: TERO env override replaces a baked JSON upstream_url" {
+    // Mirrors the shipped datadog image: a baked config.json whose upstream_url
+    // points at US1, overridden at runtime for another region via
+    // TERO_UPSTREAM_URL. The env override must win, and the trailing
+    // substitution pass must leave the (variable-free) override value intact.
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("TERO_UPSTREAM_URL", "https://agent-http-intake.logs.datadoghq.eu");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try createTempConfigFile(std.Options.debug_io, tmp_dir.dir,
+        \\{"upstream_url": "https://agent-http-intake.logs.datadoghq.com"}
+    );
+
+    const Config = struct {
+        upstream_url: []const u8 = "http://127.0.0.1:80",
+    };
+
+    const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
+    defer testing.allocator.free(path);
+
+    const config = try load(Config, testing.allocator, std.Options.debug_io, .{
+        .environ = &env_map,
+        .env_prefix = "TERO",
+        .json_path = path,
+    });
+    defer deinit(Config, testing.allocator, config);
+
+    // Override wins over the baked JSON value (which itself won over the default).
+    try testing.expectEqualStrings("https://agent-http-intake.logs.datadoghq.eu", config.upstream_url);
+}
+
+test "load: baked ${VAR} substitution and TERO override coexist" {
+    // The datadog default carries a ${TERO_API_KEY} reference in its policy
+    // header and a literal upstream. Prove the two runtime passes don't collide:
+    // the env-field override lands on upstream_url, and ${...} substitution fills
+    // the api-key field from the environment.
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("TERO_UPSTREAM_URL", "https://agent-http-intake.logs.us5.datadoghq.com");
+    try env_map.put("TERO_API_KEY", "secret-abc");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try createTempConfigFile(std.Options.debug_io, tmp_dir.dir,
+        \\{"upstream_url": "https://agent-http-intake.logs.datadoghq.com",
+        \\ "auth": "Bearer ${TERO_API_KEY}"}
+    );
+
+    const Config = struct {
+        upstream_url: []const u8 = "http://127.0.0.1:80",
+        auth: []const u8 = "",
+    };
+
+    const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
+    defer testing.allocator.free(path);
+
+    const config = try load(Config, testing.allocator, std.Options.debug_io, .{
+        .environ = &env_map,
+        .env_prefix = "TERO",
+        .json_path = path,
+    });
+    defer deinit(Config, testing.allocator, config);
+
+    try testing.expectEqualStrings("https://agent-http-intake.logs.us5.datadoghq.com", config.upstream_url);
+    try testing.expectEqualStrings("Bearer secret-abc", config.auth);
 }
 
 // -----------------------------------------------------------------------------
