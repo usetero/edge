@@ -1,0 +1,30 @@
+# Overlay to verify final policy-stats flush to the control plane on shutdown.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.stats-test.yml up -d lambda-test
+#   ./stats-test.sh
+#
+# Points the extension at a stub control plane (records every sync POST), loads
+# a policy that matches all logs so hits accumulate, and runs at debug so the
+# `http.sync.*` events are visible. The real test is what the stub prints on
+# SHUTDOWN — a SYNC carrying policyStatuses with non-zero matchHits.
+services:
+  control-plane:
+    image: python:3.12-slim
+    volumes:
+      - ./control_plane_stub.py:/stub.py:ro
+    command: ["python3", "/stub.py"]
+
+  lambda-test:
+    depends_on:
+      - control-plane
+    environment:
+      AWS_LAMBDA_FUNCTION_HANDLER: handler.handler
+      TERO_LISTEN_PORT: "3000"
+      TERO_LOG_LEVEL: debug
+      # Stub control plane (records syncs). Poll interval kept long so the ONLY
+      # stats-bearing sync is the final one close() fires at shutdown.
+      TERO_POLICY_URL: http://control-plane:8888/v1/policy/sync
+      TERO_POLICY_POLL_INTERVAL: "3600"
+      # A drop policy matching every log (keep:none = a real effect, so it's
+      # retained + evaluated). Each handler log is a match → hits accumulate.
+      TERO_POLICY_STATIC: '{"policies":[{"id":"count-all","name":"Count all logs","enabled":true,"log":{"keep":"none","match":[{"log_field":"body","exists":true}]}}]}'

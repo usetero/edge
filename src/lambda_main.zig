@@ -429,22 +429,24 @@ pub fn main(init: std.process.Init) !void {
     // The second flush is a cheap no-op when nothing new was appended.
     if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
 
+    // Flush final policy stats to the control plane BEFORE engine.stop(). The
+    // sync provider reports per-policy stats (hits/misses/errors) only on its
+    // poll interval, which Lambda's freeze-between-invokes makes unreliable, so
+    // this final sync is the only one that carries real stats — and it must run
+    // with deadline budget to spare. engine.stop() can block up to ~5s joining
+    // connections and blow the Lambda shutdown deadline, so anything after it
+    // may never run. Stats are already accumulated (they don't need the drain),
+    // so sync here. Best-effort: a failed report must not crash shutdown; the
+    // deferred `deinit` won't re-sync.
+    if (loader) |l| l.close() catch |err|
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        bus.err(LambdaExtensionError{ .err = @errorName(err) });
+
     // Cancel the accept loop and every connection task, then wait.
     engine.requestShutdown();
     engine.stop();
 
     if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
-
-    // Flush final policy stats to the control plane before the layer closes.
-    // The sync provider reports per-policy stats (hits/misses/errors) only on
-    // its poll interval, which Lambda's freeze-between-invokes makes unreliable,
-    // and it never reports on teardown — so without this the control plane sees
-    // no stats for short-lived/idle functions. close() does one final
-    // synchronous sync while `io` is still live; the deferred `deinit` won't
-    // re-sync. Best-effort: a failed report must not crash shutdown.
-    if (loader) |l| l.close() catch |err|
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        bus.err(LambdaExtensionError{ .err = @errorName(err) });
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ProxyServerStopped{});
