@@ -1,0 +1,26 @@
+{
+  "listen_address": "0.0.0.0",
+  "listen_port": 8080,
+  "upstream_url": "https://agent-http-intake.logs.datadoghq.com",
+  "metrics_url": "https://api.datadoghq.com",
+  "log_level": "info",
+  "service": {
+    "name": "edge",
+    "namespace": "production",
+    "resource_attributes": [
+      { "key": "deployment.environment", "value": "production" }
+    ],
+    "labels": [{ "key": "team", "value": "platform" }]
+  },
+  "max_body_size": 1048576,
+  "policy_providers": [
+    {
+      "id": "tero",
+      "type": "http",
+      "url": "https://sync.usetero.com/v1/policy/sync",
+      "headers": [
+        { "name": "Authorization", "value": "Bearer ${TERO_API_KEY}" }
+      ]
+    }
+  ]
+}
