@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.5](https://github.com/usetero/edge/compare/v1.29.4...v1.29.5) (2026-07-28)
+
+
+### Bug Fixes
+
+* **charts:** sync appVersion to 1.29.4 ([#245](https://github.com/usetero/edge/issues/245)) ([b313822](https://github.com/usetero/edge/commit/b31382223c144149505000a4d8f69ac7cbdd273d))
+
 ## [1.29.4](https://github.com/usetero/edge/compare/v1.29.3...v1.29.4) (2026-07-28)
 
 
