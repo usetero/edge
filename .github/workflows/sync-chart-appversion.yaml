@@ -1,0 +1,126 @@
+---
+# Sync Chart appVersion after an app release
+#
+# Why this exists:
+# The chart should ship the app version that was just released, but the chart
+# must still be versioned and released by release-please so it gets a tag, a
+# GitHub release and a changelog entry.
+#
+# release-please only tags what it lists in the release PR body it generates,
+# so the chart version cannot be hand-bumped: a version written in out-of-band
+# gets published but never tagged. Instead this workflow opens an ordinary PR
+# carrying a real conventional commit that touches charts/tero-edge. Merging it
+# gives release-please a `fix` for the chart package, which then releases the
+# chart through its normal path.
+#
+# Flow:
+# 1. App release v1.30.0 is published
+# 2. This workflow opens "fix(charts): sync appVersion to 1.30.0"
+# 3. Merging it makes release-please open a chart release PR
+# 4. Merging that tags tero-edge-chart-v0.16.2 and publishes the chart
+#
+# Note: appVersion is deliberately NOT in release-please-config.json
+# extra-files. If release-please wrote it during the app release PR, the commit
+# below would be an empty diff and the chart would never be released.
+name: Sync chart appVersion
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "App version to sync (without leading v)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    # Only app releases. Chart releases are tagged tero-edge-chart-v* and must
+    # not retrigger this.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.TERO_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TERO_BOT_PRIVATE_SIGNING_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: master
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Open appVersion sync PR
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          RAW_VERSION: >-
+            ${{ inputs.version || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          chart_file="charts/tero-edge/Chart.yaml"
+          version="${RAW_VERSION#v}"
+
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported app version format: ${version}" >&2
+            exit 1
+          fi
+
+          current="$(awk '/^appVersion:[[:space:]]*/ {print $2; exit}' "${chart_file}")"
+          if [ "${current}" = "${version}" ]; then
+            echo "Chart appVersion is already ${version}; nothing to sync."
+            exit 0
+          fi
+
+          awk -v v="${version}" '
+            /^appVersion:[[:space:]]*/ && !done { print "appVersion: " v; done=1; next }
+            { print }
+          ' "${chart_file}" > "${chart_file}.tmp"
+          mv "${chart_file}.tmp" "${chart_file}"
+
+          if git diff --quiet -- "${chart_file}"; then
+            echo "No change to ${chart_file}; nothing to sync." >&2
+            exit 1
+          fi
+
+          branch="chore/sync-chart-appversion-${version}"
+          title="fix(charts): sync appVersion to ${version}"
+
+          open_prs="$(gh pr list --head "${branch}" --state open --json number --jq 'length')"
+          if [ "${open_prs}" != "0" ]; then
+            echo "PR for ${branch} is already open; nothing to do."
+            exit 0
+          fi
+
+          git config user.name "tero-bot[bot]"
+          git config user.email "tero-bot[bot]@users.noreply.github.com"
+          git checkout -b "${branch}"
+          git add "${chart_file}"
+          git commit -m "${title}"
+          git push --force-with-lease origin "${branch}"
+
+          body="$(cat <<EOF
+          Syncs the chart appVersion to the app release \`v${version}\`.
+
+          Merging this gives release-please a \`fix\` touching \`charts/tero-edge\`, so
+          the chart is versioned, tagged, released and published through its normal
+          path.
+
+          Opened automatically by \`.github/workflows/sync-chart-appversion.yaml\`.
+          EOF
+          )"
+
+          gh pr create \
+            --base master \
+            --head "${branch}" \
+            --title "${title}" \
+            --body "${body}"

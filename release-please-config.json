@@ -3,14 +3,7 @@
   "include-v-in-tag": true,
   "packages": {
     ".": {
-      "release-type": "simple",
-      "extra-files": [
-        {
-          "type": "yaml",
-          "path": "charts/tero-edge/Chart.yaml",
-          "jsonpath": "$.appVersion"
-        }
-      ]
+      "release-type": "simple"
     },
     "charts/tero-edge": {
       "release-type": "helm",

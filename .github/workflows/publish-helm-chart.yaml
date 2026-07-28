@@ -3,7 +3,10 @@ name: Publish Helm Chart
 on:
   push:
     tags:
-      - "v*"
+      # Chart tags only. Publishing on app (v*) tags too would repackage the
+      # current, unchanged chart version with a new appVersion and overwrite an
+      # already-published .tgz. appVersion changes ship with the next chart
+      # release instead.
       - "tero-edge-chart-v*"
   workflow_dispatch:
 
