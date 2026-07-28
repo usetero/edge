@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.29.4](https://github.com/usetero/edge/compare/v1.29.3...v1.29.4) (2026-07-28)
+
+
+### Bug Fixes
+
+* bump policy-zig to 0.6.2 ([#243](https://github.com/usetero/edge/issues/243)) ([3a08dd1](https://github.com/usetero/edge/commit/3a08dd1a09c4649c5368cc57e75ab235e1070418))
+* **ci:** release the chart through release-please so it gets tagged ([#244](https://github.com/usetero/edge/issues/244)) ([1c82caa](https://github.com/usetero/edge/commit/1c82caaa263f02d9d0bfec0dc7658a78340024af))
+* update all deps ([#242](https://github.com/usetero/edge/issues/242)) ([aa2d8e2](https://github.com/usetero/edge/commit/aa2d8e27074a38c3fe6d65337e1e180a0cf7bf84))
+
 ## [1.29.3](https://github.com/usetero/edge/compare/v1.29.2...v1.29.3) (2026-07-21)
 
 
