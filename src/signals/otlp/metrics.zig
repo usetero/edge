@@ -57,9 +57,9 @@ const MetricsProcessingFailed = struct { err: []const u8, contentType: []const u
 pub const ProcessResult = struct {
     /// Whether any transformations were applied (not yet supported for metrics)
     was_transformed: bool = false,
-    /// Number of metrics that were dropped by filter policies
+    /// Number of data points that were dropped by filter policies
     dropped_count: usize,
-    /// Original number of metrics before filtering
+    /// Original number of data points before filtering
     original_count: usize,
     /// The processed data (caller owns this slice)
     data: []u8,
@@ -241,18 +241,11 @@ pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
     };
 }
 
-/// Get attributes from the first datapoint of a metric
-fn getDatapointAttrs(metric: *const Metric) []const KeyValue {
-    const data = metric.data orelse return &.{};
+/// Number of data points carried by a metric, across every data variant.
+fn dataPointCount(metric: *const Metric) usize {
+    const data = metric.data orelse return 0;
     return switch (data) {
-        .gauge => |g| if (g.data_points.items.len > 0) g.data_points.items[0].attributes.items else &.{},
-        .sum => |s| if (s.data_points.items.len > 0) s.data_points.items[0].attributes.items else &.{},
-        .histogram => |h| if (h.data_points.items.len > 0) h.data_points.items[0].attributes.items else &.{},
-        .exponential_histogram => |eh| if (eh.data_points.items.len > 0)
-            eh.data_points.items[0].attributes.items
-        else
-            &.{},
-        .summary => |s| if (s.data_points.items.len > 0) s.data_points.items[0].attributes.items else &.{},
+        inline else => |variant| variant.data_points.items.len,
     };
 }
 
@@ -286,7 +279,7 @@ pub const metric_accessor: policy.MetricAccessor = .{
     .typed_value = metricTypedValue,
 };
 
-/// Result of filtering metrics in-place
+/// Result of filtering metrics in-place, counted in data points
 const FilterCounts = struct {
     original_count: usize,
     dropped_count: usize,
@@ -311,30 +304,44 @@ fn filterMetricsInPlace(
     // Structure: MetricsData -> ResourceMetrics[] -> ScopeMetrics[] -> Metric[]
     for (metrics_data.resource_metrics.items) |*resource_metrics| {
         for (resource_metrics.scope_metrics.items) |*scope_metrics| {
-            // Count original metrics
-            original_count += scope_metrics.metrics.items.len;
-
             // Filter metrics in place by shrinking the list
             var write_idx: usize = 0;
             for (scope_metrics.metrics.items) |*metric| {
-                var ctx: OtlpMetricContext = .{
-                    .metric = metric,
-                    .resource_metrics = resource_metrics,
-                    .scope_metrics = scope_metrics,
-                    .datapoint_attributes = getDatapointAttrs(metric),
+                // The data point is the record unit for metrics (policy spec
+                // v1.7.1): each one is evaluated against its own attributes and
+                // dropped individually, and the metric itself goes only once
+                // every data point is gone.
+                if (metric.data) |*metric_data| switch (metric_data.*) {
+                    inline else => |*variant| {
+                        var d: usize = 0;
+                        while (d < variant.data_points.items.len) {
+                            original_count += 1;
+                            var ctx: OtlpMetricContext = .{
+                                .metric = metric,
+                                .resource_metrics = resource_metrics,
+                                .scope_metrics = scope_metrics,
+                                .datapoint_attributes = variant.data_points.items[d].attributes.items,
+                            };
+
+                            const result = engine.evaluate(.metric, &metric_accessor, &ctx, &policy_id_buf, .{
+                                .io = bus.io,
+                            });
+
+                            if (result.decision.shouldContinue()) {
+                                d += 1;
+                            } else {
+                                _ = variant.data_points.orderedRemove(d);
+                                dropped_count += 1;
+                            }
+                        }
+                    },
                 };
 
-                const result = engine.evaluate(.metric, &metric_accessor, &ctx, &policy_id_buf, .{ .io = bus.io });
-
-                if (result.decision.shouldContinue()) {
-                    // Keep this metric - move to write position if needed
-                    if (write_idx != scope_metrics.metrics.items.len - 1) {
-                        scope_metrics.metrics.items[write_idx] = metric.*;
-                    }
-                    write_idx += 1;
-                } else {
-                    dropped_count += 1;
-                }
+                // A metric with no data at all is left alone; one whose data
+                // points were all dropped is pruned.
+                if (metric.data != null and dataPointCount(metric) == 0) continue;
+                scope_metrics.metrics.items[write_idx] = metric.*;
+                write_idx += 1;
             }
 
             // Shrink the list to only kept items (zero allocation)
@@ -612,7 +619,9 @@ test "processMetrics - no policies keeps all metrics" {
     const metrics =
         \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
     ++
-        \\"metrics":[{"name":"metric1"},{"name":"metric2"}]}]}]}
+        \\"metrics":[{"name":"metric1","sum":{"dataPoints":[{"asInt":"1"}]}},
+    ++
+        \\{"name":"metric2","sum":{"dataPoints":[{"asInt":"2"}]}}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -669,7 +678,9 @@ test "processMetrics - DROP policy filters metrics by name" {
     const metrics =
         \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
     ++
-        \\"metrics":[{"name":"http.requests"},{"name":"debug.internal"}]}]}]}
+        \\"metrics":[{"name":"http.requests","sum":{"dataPoints":[{"asInt":"1"}]}},
+    ++
+        \\{"name":"debug.internal","sum":{"dataPoints":[{"asInt":"2"}]}}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -731,11 +742,15 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
     ++
         \\"value":{"stringValue":"test-service"}}]},"scopeMetrics":
     ++
-        \\[{"scope":{},"metrics":[{"name":"from.test"}]}]},{"resource":
+        \\[{"scope":{},"metrics":[{"name":"from.test","sum":{"dataPoints":[{"asInt":"1"}]}}]}]},
+    ++
+        \\{"resource":
     ++
         \\{"attributes":[{"key":"service.name","value":{"stringValue":"prod-service"}}]},
     ++
-        \\"scopeMetrics":[{"scope":{},"metrics":[{"name":"from.prod"}]}]}]}
+        \\"scopeMetrics":[{"scope":{},"metrics":[{"name":"from.prod",
+    ++
+        \\"sum":{"dataPoints":[{"asInt":"2"}]}}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -792,7 +807,9 @@ test "processMetrics - all metrics dropped returns empty structure" {
     const metrics =
         \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
     ++
-        \\"metrics":[{"name":"metric1"},{"name":"metric2"}]}]}]}
+        \\"metrics":[{"name":"metric1","sum":{"dataPoints":[{"asInt":"1"}]}},
+    ++
+        \\{"name":"metric2","sum":{"dataPoints":[{"asInt":"2"}]}}]}]}]}
     ;
 
     var in_reader = std.Io.Reader.fixed(metrics);
@@ -817,6 +834,68 @@ test "processMetrics - all metrics dropped returns empty structure" {
     try std.testing.expectEqual(@as(usize, 2), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 2), result.original_count);
     try std.testing.expect(result.allDropped());
+}
+
+test "processMetrics - DROP policy filters individual data points" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-canary-datapoints"),
+        .name = try allocator.dupe(u8, "drop-canary-datapoints"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    var attr_path: proto.policy.AttributePath = .{};
+    try attr_path.path.append(allocator, try allocator.dupe(u8, "env"));
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .datapoint_attribute = attr_path },
+        .match = .{ .regex = try allocator.dupe(u8, "canary") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // One metric, three data points: only the canary one matches, so the metric
+    // survives with the other two intact.
+    const metrics =
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[
+    ++
+        \\{"name":"http.requests","sum":{"dataPoints":[
+    ++
+        \\{"asInt":"1","attributes":[{"key":"env","value":{"stringValue":"prod"}}]},
+    ++
+        \\{"asInt":"2","attributes":[{"key":"env","value":{"stringValue":"canary"}}]},
+    ++
+        \\{"asInt":"3","attributes":[{"key":"env","value":{"stringValue":"staging"}}]}
+    ++
+        \\]}}]}]}]}
+    ;
+
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+
+    const data = out_writer.written();
+    try std.testing.expect(std.mem.indexOf(u8, data, "http.requests") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "prod") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "staging") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "canary") == null);
+    try std.testing.expectEqual(@as(usize, 3), result.original_count);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expect(!result.allDropped());
 }
 
 test "ContentFormat.fromContentType" {
