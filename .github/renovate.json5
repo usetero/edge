@@ -4,5 +4,14 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "github>usetero/renovate-config"
+  ],
+  "packageRules": [
+    {
+      // The chart image tag comes from Chart.yaml appVersion, which the
+      // sync-chart-appversion workflow keeps current. Renovate digest pins in
+      // values.yaml fight that workflow and go stale.
+      "matchManagers": ["helm-values"],
+      "enabled": false
+    }
   ]
 }
