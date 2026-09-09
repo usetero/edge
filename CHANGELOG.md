@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.30.0](https://github.com/usetero/edge/compare/v1.29.4...v1.30.0) (2026-09-09)
+
+
+### Features
+
+* update to policy-zig 0.7.0 ([#250](https://github.com/usetero/edge/issues/250)) ([c97dca2](https://github.com/usetero/edge/commit/c97dca2eb5c3db795b59ff894d796b21cf2e7138))
+
+
+### Bug Fixes
+
+* image tags were incorrectly rendering ([#254](https://github.com/usetero/edge/issues/254)) ([da0d058](https://github.com/usetero/edge/commit/da0d0584255067598a4eaf1ba706b17d0443d454))
+
 ## [1.29.4](https://github.com/usetero/edge/compare/v1.29.3...v1.29.4) (2026-07-28)
 
 
