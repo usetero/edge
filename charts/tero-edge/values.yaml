@@ -4,7 +4,8 @@ fullnameOverride: ""
 image:
   repository: ghcr.io/usetero/edge
   pullPolicy: IfNotPresent
-  tag: "@sha256:4601525582254eb3c8666aebbc8cf608e7973203360a2f55b911614848210110"
+  # Defaults to the chart appVersion. Set a tag ("1.29.4") or a digest ("@sha256:...").
+  tag: ""
 imagePullSecrets: []
 
 serviceAccount:
