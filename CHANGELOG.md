@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.30.1](https://github.com/usetero/edge/compare/v1.30.0...v1.30.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* update to policy-zig 0.7.1 ([#259](https://github.com/usetero/edge/issues/259)) ([836fc3c](https://github.com/usetero/edge/commit/836fc3c8758b8a19afe7d1a45fb297a898569a8f))
+
 ## [1.30.0](https://github.com/usetero/edge/compare/v1.29.4...v1.30.0) (2026-09-09)
 
 
