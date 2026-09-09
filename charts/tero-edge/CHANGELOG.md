@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.2](https://github.com/usetero/edge/compare/tero-edge-chart-v0.17.1...tero-edge-chart-v0.17.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* image tags were incorrectly rendering ([#254](https://github.com/usetero/edge/issues/254)) ([da0d058](https://github.com/usetero/edge/commit/da0d0584255067598a4eaf1ba706b17d0443d454))
+
 ## [0.17.1](https://github.com/usetero/edge/compare/tero-edge-chart-v0.17.0...tero-edge-chart-v0.17.1) (2026-07-28)
 
 
