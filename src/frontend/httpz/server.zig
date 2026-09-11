@@ -23,6 +23,11 @@ const prom = @import("../../signals/prometheus/root.zig");
 
 const log = std.log.scoped(.httpz_server);
 
+// Bound a stalled upstream without adding another deployment tuning knob.
+// The watchdog is process-wide; requests only update their handler-local slot.
+const upstream_attempt_timeout_ns: i128 = 30 * std.time.ns_per_s;
+const upstream_watchdog_interval_ms: u64 = 100;
+
 // Named event payloads: the type name is the telemetry event name.
 const UpstreamRetried = struct { path: []const u8, err: []const u8 };
 /// A request threw out of dispatch and was mapped to a bounded error response.
@@ -75,6 +80,10 @@ const ThreadBufs = struct {
     chunk: []u8 = &.{},
     upstream: []u8,
     record: exec.RecordScratch,
+    deadline_lock: std.Io.Mutex = .init,
+    connection: ?*std.http.Client.Connection = null,
+    deadline_ns: i128 = 0,
+    timed_out: std.atomic.Value(bool) = .init(false),
 
     fn prepare(
         self: *ThreadBufs,
@@ -110,6 +119,40 @@ fn threadBufs(io: std.Io, allocator: std.mem.Allocator, limits: limits_mod.Limit
     try bufs_registry.append(allocator, bufs);
     tl_bufs = bufs;
     return bufs;
+}
+
+fn trackUpstream(io: std.Io, bufs: *ThreadBufs, connection: ?*std.http.Client.Connection) void {
+    bufs.deadline_lock.lockUncancelable(io);
+    defer bufs.deadline_lock.unlock(io);
+    bufs.connection = connection;
+    if (connection) |_| {
+        bufs.deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() + upstream_attempt_timeout_ns;
+        bufs.timed_out.store(false, .release);
+    }
+}
+
+fn expireTrackedUpstreams(ctx: *exec.SharedCtx, force: bool) void {
+    const now = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+    bufs_registry_mutex.lockUncancelable(ctx.io);
+    defer bufs_registry_mutex.unlock(ctx.io);
+    for (bufs_registry.items) |bufs| {
+        bufs.deadline_lock.lockUncancelable(ctx.io);
+        defer bufs.deadline_lock.unlock(ctx.io);
+        const connection = bufs.connection orelse continue;
+        if (!force and now < bufs.deadline_ns) continue;
+        if (bufs.timed_out.swap(true, .acq_rel)) continue;
+        connection.closing = true;
+        connection.stream_reader.stream.shutdown(ctx.io, .both) catch |err| {
+            log.debug("failed to interrupt upstream: {s}", .{@errorName(err)});
+        };
+    }
+}
+
+fn watchUpstreamDeadlines(server: *HttpServer) std.Io.Cancelable!void {
+    while (!server.handler.stopping.load(.acquire)) {
+        try server.ctx.io.sleep(.fromMilliseconds(upstream_watchdog_interval_ms), .awake);
+        expireTrackedUpstreams(server.ctx, false);
+    }
 }
 
 /// Called only after every handler thread has been joined.
@@ -178,30 +221,26 @@ pub const HttpServer = struct {
     /// can't interrupt the blocking listen, which is why Engine.stop calls
     /// stopAccepting() before Lifecycle.shutdown.
     pub fn run(self: *HttpServer) std.Io.Cancelable!void {
-        defer self.listen_done.set(self.ctx.io);
+        self.lifecycle.spawn(self.ctx.io, watchUpstreamDeadlines, .{self}) catch {
+            self.listen_done.set(self.ctx.io);
+            self.lifecycle.requestShutdown(self.ctx.io);
+            return;
+        };
         self.server.listen() catch |err| {
             log.err("httpz listen failed: {s}", .{@errorName(err)});
         };
-        if (!self.handler.stopping.load(.acquire)) self.lifecycle.requestShutdown(self.ctx.io);
+        const stopped = self.handler.stopping.load(.acquire);
+        self.listen_done.set(self.ctx.io);
+        if (!stopped) self.lifecycle.requestShutdown(self.ctx.io);
     }
 
-    /// Stop accepting work and join handler threads before httpz frees their arena.
+    /// Stop dispatch, interrupt stalled upstream I/O, and wait for httpz to join
+    /// its handler pools before returning.
     pub fn stopAccepting(self: *HttpServer) void {
-        const io = self.ctx.io;
         self.handler.stopping.store(true, .release);
-        // httpz's listen() deinits every worker, freeing its handler-pool
-        // arena, as soon as the event loop exits, without joining the pool.
-        // Join the pools while the loop still runs. Holding _mut guarantees
-        // listen() has finished constructing the workers.
-        {
-            self.server._mut.lockUncancelable(io);
-            defer self.server._mut.unlock(io);
-            if (self.server._listener != null) {
-                for (self.server._workers) |*worker| worker.thread_pool.stop();
-            }
-        }
-        self.server.stop();
-        self.listen_done.waitUncancelable(io);
+        expireTrackedUpstreams(self.ctx, true);
+        if (!self.listen_done.isSet()) self.server.stop();
+        self.listen_done.waitUncancelable(self.ctx.io);
     }
 };
 
@@ -458,9 +497,12 @@ pub const Handler = struct {
                 continue;
             };
             defer upstream_req.deinit();
+            trackUpstream(ctx.io, bufs, upstream_req.connection);
+            defer trackUpstream(ctx.io, bufs, null);
             var upstream_res = sendAndReceiveHead(&upstream_req, method, body, bufs) catch |err| {
-                if (!retryableTransportError(err)) return err;
-                self.evictUpstream(&upstream_req, req.url.path, err);
+                const may_retry = self.evictAndMayRetry(&upstream_req, req.url.path, err);
+                if (bufs.timed_out.load(.acquire)) return error.UpstreamTimeout;
+                if (!may_retry) return err;
                 if (attempt + 1 == attempts) return error.UpstreamTransportFailed;
                 // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
                 ctx.bus.info(UpstreamRetried{ .path = req.url.path, .err = @errorName(err) });
@@ -468,6 +510,10 @@ pub const Handler = struct {
             };
             const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(choice));
             self.relayResponse(res, &upstream_res, max_response, bufs) catch |err| {
+                if (bufs.timed_out.load(.acquire)) {
+                    self.evictUpstream(&upstream_req, req.url.path, err);
+                    return error.UpstreamTimeout;
+                }
                 switch (err) {
                     error.BodyTooLarge => {
                         self.evictUpstream(&upstream_req, req.url.path, err);
@@ -481,6 +527,25 @@ pub const Handler = struct {
             return;
         }
         unreachable;
+    }
+
+    /// Evicts the connection, then reports whether the caller may replay.
+    ///
+    /// Eviction is unconditional and runs before the replay decision. std covers
+    /// most of this already: `receiveHead` marks the connection closing on any
+    /// head failure, and `Request.deinit` marks it once a body was left
+    /// undrained. It does not cover a send-side failure, which leaves
+    /// `reader.state == .ready` and returns a dead socket to the pool. Evicting
+    /// on every error keeps that guarantee ours rather than the dependency's,
+    /// and costs at most one extra dial on an already-failing request.
+    fn evictAndMayRetry(
+        self: *Handler,
+        upstream_req: *std.http.Client.Request,
+        path: []const u8,
+        err: anyerror,
+    ) bool {
+        self.evictUpstream(upstream_req, path, err);
+        return retryableTransportError(err);
     }
 
     /// Destroy a failed pooled upstream connection and record it (warn). Keeps the
@@ -572,6 +637,8 @@ pub const Handler = struct {
             return;
         };
         defer upstream_req.deinit();
+        trackUpstream(ctx.io, bufs, upstream_req.connection);
+        defer trackUpstream(ctx.io, bufs, null);
         // Scope eviction to the upstream send+head phase: a reused dead keep-alive
         // fails here, so evict it from the pool. Past receiveHead the response
         // streams straight to the client, so failures there are client-disconnect
@@ -619,6 +686,7 @@ fn errorStatus(err: anyerror) u16 {
     return switch (err) {
         error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
         error.InvalidRequestBody => 400,
+        error.UpstreamTimeout => 504,
         error.OutOfMemory, error.WriteFailed => 503,
         else => 502,
     };
@@ -754,6 +822,56 @@ test "httpz worker count preserves the global connection cap" {
         const total = (config.workers.max_conn orelse 0) * config.workerCount();
         try testing.expect(total <= 256 and total > 256 - workers);
     }
+}
+
+test "more workers than connections cannot over-admit" {
+    // httpz applies max_conn to every worker, so an unclamped worker count
+    // would admit one connection per worker against a one-connection cap.
+    const limits: limits_mod.Limits = .resolve(.{
+        .max_body_size = 1024 * 1024,
+        .max_connections = 1,
+        .worker_count = 64,
+    });
+    try testing.expectEqual(@as(?u16, 1), limits.worker_count);
+
+    const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
+    try testing.expectEqual(@as(usize, 1), (config.workers.max_conn orelse 0) * config.workerCount());
+}
+
+test "a failed exchange marks the upstream connection closing" {
+    // std only marks a connection closing once the head arrived; a send or
+    // head-phase failure leaves reader.state == .ready, which std re-pools.
+    var connection: std.http.Client.Connection = undefined;
+    connection.closing = false;
+    var request: std.http.Client.Request = undefined;
+    request.connection = &connection;
+    markUpstreamClosing(&request);
+    try testing.expect(connection.closing);
+
+    // A request that never obtained a connection must not fault.
+    var connectionless: std.http.Client.Request = undefined;
+    connectionless.connection = null;
+    markUpstreamClosing(&connectionless);
+}
+
+test "head-phase protocol failures are not replayable" {
+    // A half-read head leaves the response framing indeterminate, so the
+    // exchange fails rather than replaying onto a fresh connection.
+    // `HttpRequestTruncated` is also what a watchdog socket shutdown produces
+    // once some head bytes arrived, which is why the timeout check precedes
+    // this classification in `exchange`.
+    for ([_]anyerror{
+        error.HttpHeadersOversize,
+        error.HttpRequestTruncated,
+        error.HttpHeadersInvalid,
+        error.HttpChunkInvalid,
+        error.HttpChunkTruncated,
+    }) |err| {
+        try testing.expect(!retryableTransportError(err));
+    }
+    // A pooled connection the peer already closed carries no response bytes,
+    // so it is the one head-phase failure worth replaying.
+    try testing.expect(retryableTransportError(error.HttpConnectionClosing));
 }
 
 test "httpz method maps onto service and std methods" {

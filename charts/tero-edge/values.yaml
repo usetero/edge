@@ -104,8 +104,9 @@ config:
   maxDecodedBytes: null
 
   # Optional httpz tuning (null = built-in defaults). workerCount is event-loop
-  # workers (default 1); threadPoolCount is request-handler threads (default
-  # 32) and multiplies the per-thread pipeline-scratch memory floor.
+  # workers (default 1) and is clamped to maxConnections. threadPoolCount is
+  # request-handler threads per worker (default 32); pipeline scratch is
+  # allocated on demand, so this bounds retained workspaces, not a startup floor.
   workerCount: null
   threadPoolCount: null
 
