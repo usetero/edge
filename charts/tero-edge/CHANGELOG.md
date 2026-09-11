@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.6](https://github.com/usetero/edge/compare/tero-edge-chart-v0.17.5...tero-edge-chart-v0.17.6) (2026-09-11)
+
+
+### Bug Fixes
+
+* **charts:** sync appVersion to 1.30.2 ([#265](https://github.com/usetero/edge/issues/265)) ([8519a7a](https://github.com/usetero/edge/commit/8519a7a972b4b43e701030f48c98ae1a6af8e7b8))
+
 ## [0.17.5](https://github.com/usetero/edge/compare/tero-edge-chart-v0.17.4...tero-edge-chart-v0.17.5) (2026-09-11)
 
 
