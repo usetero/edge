@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.5](https://github.com/usetero/edge/compare/tero-edge-chart-v0.17.4...tero-edge-chart-v0.17.5) (2026-09-11)
+
+
+### Bug Fixes
+
+* retry replayable log intake on stale upstream connections ([#263](https://github.com/usetero/edge/issues/263)) ([e75cfca](https://github.com/usetero/edge/commit/e75cfca1c49d0ccd902e5e664e07de9c8cfc7828))
+
 ## [0.17.4](https://github.com/usetero/edge/compare/tero-edge-chart-v0.17.3...tero-edge-chart-v0.17.4) (2026-09-09)
 
 

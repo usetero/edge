@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.30.2](https://github.com/usetero/edge/compare/v1.30.1...v1.30.2) (2026-09-11)
+
+
+### Bug Fixes
+
+* retry replayable log intake on stale upstream connections ([#263](https://github.com/usetero/edge/issues/263)) ([e75cfca](https://github.com/usetero/edge/commit/e75cfca1c49d0ccd902e5e664e07de9c8cfc7828))
+
 ## [1.30.1](https://github.com/usetero/edge/compare/v1.30.0...v1.30.1) (2026-09-09)
 
 
