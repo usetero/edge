@@ -39,6 +39,7 @@ bench/scaling/proto_gen
 equivalence-test-*/
 plots/
 PLAN*.md
+*TODO*.md
 sample*
 .rewrite/
 .venv/
