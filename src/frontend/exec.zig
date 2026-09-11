@@ -71,19 +71,7 @@ pub const SharedCtx = struct {
     /// Extension dispatch sink (s3-dump), or null when extensions are off.
     /// Threaded into per-record policy evaluation on the Datadog log path.
     extension_sink: ?policy.ExtensionSink = null,
-    /// Readiness source: `/_ready` answers 503 until the initial policy load completes.
-    policy_loader: ?*policy.Loader = null,
 };
-
-/// Readiness follows the policy loader's initial load; liveness stays on /_health.
-fn readiness(ctx: *SharedCtx) service_mod.Outcome {
-    const ready = if (ctx.policy_loader) |loader| loader.isReady() else true;
-    return .{ .respond = .{
-        .status = if (ready) 200 else 503,
-        .content_type = "application/json",
-        .body = if (ready) "{\"status\":\"ready\"}" else "{\"status\":\"loading\"}",
-    } };
-}
 
 /// Routes and plans a request from transport-neutral parts. Returns null
 /// when no route matches (the frontend answers 404).
@@ -94,7 +82,6 @@ pub fn planRequest(
     content_type: []const u8,
     content_encoding: []const u8,
 ) ?service_mod.Outcome {
-    if (method == .GET and std.mem.eql(u8, path, "/_ready")) return readiness(ctx);
     const match = ctx.router.route(path, method) orelse return null;
     const plan_request: service_mod.PlanRequest = .{
         .method = method,
@@ -148,8 +135,8 @@ pub fn contentEncodingName(ce: std.http.ContentEncoding) []const u8 {
 }
 
 /// Opens a request against the configured upstream. `headers` must already
-/// be hop-by-hop-filtered and arena-duped by the frontend (it owns the
-/// inbound header iterator); `target` is the verbatim request target.
+/// be hop-by-hop-filtered and remain valid for the request lifetime; `target`
+/// is the verbatim request target.
 pub fn openUpstream(
     ctx: *SharedCtx,
     arena: std.mem.Allocator,

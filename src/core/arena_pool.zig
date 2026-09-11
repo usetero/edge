@@ -99,13 +99,6 @@ fn testLimits() limits_mod.Limits {
     return .{
         .max_connections = 2,
         .max_body_size = 1024,
-        .max_decoded_bytes = 1024,
-        .memory_limit_bytes = 256 * 1024 * 1024,
-        .http_budget_bytes = 128 * 1024 * 1024,
-        .retry_log_intake = true,
-        .upstream_timeout_ms = 30_000,
-        .worker_count = 1,
-        .thread_pool_count = 32,
         .record_scratch = 256,
         .recv_buf = 64,
         .send_buf = 64,

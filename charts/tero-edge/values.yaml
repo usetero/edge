@@ -24,13 +24,8 @@ resources:
     cpu: 50m
     memory: 32Mi
   limits:
-    # Allow CPU bursts; set a CPU limit explicitly if required by your cluster.
-    # Edge reads this cgroup limit at startup and budgets half of it for HTTP
-    # bodies and transforms; the rest covers policies, TLS and thread stacks.
-    # A worst-case request (maxBodySize compressed, expanding to maxDecodedBytes)
-    # holds about 33 MiB, so 384Mi admits about 5 of them at once. Lower
-    # maxDecodedBytes to trade that ceiling for concurrency.
-    memory: 384Mi
+    cpu: 200m
+    memory: 64Mi
 
 nodeSelector: {}
 tolerations:
@@ -76,8 +71,7 @@ container:
     periodSeconds: 10
   readinessProbe:
     httpGet:
-      # 503 until the initial policy load completes.
-      path: /_ready
+      path: /_health
       port: 8080
     initialDelaySeconds: 2
     periodSeconds: 5
@@ -98,28 +92,22 @@ config:
   upstreamUrl: "https://agent-http-intake.logs.datadoghq.com"
   metricsUrl: "https://api.datadoghq.com"
   logLevel: "info"
-  # Raw (compressed) request body cap as received on the wire.
-  maxBodySize: 1572864
+  maxBodySize: 1048576
 
-  # Optional post-decompression ceiling. Null derives 10x maxBodySize (15 MiB).
-  # A decoded body is charged to the HTTP budget twice, so lowering this raises
-  # how many compressed requests fit at once. Startup logs the resulting count.
-  maxDecodedBytes: null
-
-  # Optional httpz tuning (null = the measured defaults: 1 event-loop worker,
-  # 32 handler threads per worker). One loop beat four on this workload; raise
-  # workerCount only with a benchmark. Also settable via TERO_WORKER_COUNT and
-  # TERO_THREAD_POOL_COUNT.
-  workerCount: null
-  threadPoolCount: null
-
-  # Process-wide inbound connection cap. Also settable via the
+  # Max concurrent connections — the dominant memory/throughput cap (memory
+  # scales ~ maxConnections x maxBodySize). Also settable via the
   # TERO_MAX_CONNECTIONS env override.
   maxConnections: 256
-  # A retry can duplicate log lines when the first acknowledgement is lost.
-  retryLogIntake: true
-  # Per-attempt deadline for one upstream exchange.
-  upstreamTimeoutMs: 30000
+
+  # Optional. Post-decompression body ceiling; defaults to maxBodySize when
+  # null. Raise to admit payloads that decompress larger than the raw cap.
+  maxDecodedBytes: null
+
+  # Optional httpz tuning (null = built-in defaults). workerCount is event-loop
+  # workers (default 1); threadPoolCount is request-handler threads (default
+  # 32) and multiplies the per-thread pipeline-scratch memory floor.
+  workerCount: null
+  threadPoolCount: null
 
   # Service identity sent to the control plane on policy sync. name, namespace,
   # and version scope/match policies to this service; set them in production.

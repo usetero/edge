@@ -9,7 +9,6 @@ const edge_bin = "zig-out/bin/edge";
 const config_path = "zig-out/upstream_pool_harness.config.json";
 const policies_path = "zig-out/upstream_pool_harness.policies.json";
 
-/// Large 'x' filler for the passthrough path. Sized well past any loopback
 /// Synthetic filler body for the passthrough path (no payload file needed).
 const filler_body_len = 1 << 20; // 1 MiB
 

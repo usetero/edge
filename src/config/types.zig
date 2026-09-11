@@ -1,6 +1,5 @@
 const std = @import("std");
 const policy = @import("policy_zig");
-const limits = @import("../core/limits.zig");
 
 const log = std.log.scoped(.config);
 
@@ -17,11 +16,14 @@ pub const LogLevel = enum(u8) {
 
 /// Prometheus module configuration
 pub const PrometheusModuleConfig = struct {
-    /// Maximum input bytes read from the upstream per scrape.
+    /// Maximum input bytes to process per scrape (limits data read from upstream)
+    /// This bounds memory usage for buffering input data.
+    /// Default: 10MB
     max_input_bytes_per_scrape: usize = 10 * 1024 * 1024,
 
-    /// Maximum output bytes forwarded to the client per scrape. Set it above
-    /// the input limit when filtering is expected to reduce the data.
+    /// Maximum output bytes to forward per scrape (limits response size to client)
+    /// Set higher than input limit if filtering reduces data significantly.
+    /// Default: 10MB
     max_output_bytes_per_scrape: usize = 10 * 1024 * 1024,
 };
 
@@ -105,37 +107,21 @@ pub const ProxyConfig = struct {
     // Inspection config
     log_level: LogLevel = .info,
 
-    /// Raw request body ceiling in bytes as received on the wire.
-    max_body_size: u32 = limits.DEFAULT_MAX_BODY_BYTES,
+    max_body_size: u32 = 1024 * 1024, // 1MB
 
-    /// Post-decompression body ceiling. Null derives it as
-    /// `limits.DECODED_BODY_RATIO` times `max_body_size`. A decoded body is
-    /// charged to the HTTP budget twice, so a high ceiling lowers concurrency;
-    /// the startup manifest reports the resulting worst-case capacity.
+    /// Post-decompression body ceiling; defaults to `max_body_size` when unset.
+    /// Raise it to admit payloads that decompress larger than the raw cap.
     max_decoded_bytes: ?u32 = null,
 
-    /// Process-wide inbound connection cap (divided across event-loop workers).
-    max_connections: u32 = limits.DEFAULT_MAX_CONNECTIONS,
+    /// Max concurrent connections; the dominant memory/throughput knob (see
+    /// limits.zig). Also honors the `TERO_MAX_CONNECTIONS` env override.
+    max_connections: u32 = 256,
 
-    /// Whole-process memory ceiling. Null reads the cgroup limit on Linux and
-    /// falls back to `limits.DEFAULT_MEMORY_LIMIT_BYTES`. Half is the HTTP
-    /// allocation budget; the rest covers policies, TLS, stacks and runtime.
-    memory_limit_bytes: ?u64 = null,
-
-    /// One fresh-connection replay for known log intake routes. A replay can
-    /// duplicate logs when the upstream accepted the first attempt but lost its ACK.
-    retry_log_intake: bool = true,
-
-    /// Per-attempt deadline for one upstream exchange (send through response body).
-    upstream_timeout_ms: u32 = limits.DEFAULT_UPSTREAM_TIMEOUT_MS,
-
-    /// httpz event-loop workers. Null uses `limits.DEFAULT_WORKERS`. Measured
-    /// on this workload, one loop beats four; raise it only with a benchmark.
-    /// Clamped to `limits.MAX_WORKERS` and to `max_connections`.
+    /// httpz event-loop worker count (null = httpz default of 1).
     worker_count: ?u16 = null,
 
-    /// httpz request-handler threads per event-loop worker. Null uses
-    /// `limits.HANDLER_THREADS_PER_WORKER`. Clamped to `limits.MAX_HANDLER_THREADS`.
+    /// httpz request-handler thread-pool count (null = httpz default of 32).
+    /// Multiplies the per-thread pipeline-scratch memory floor.
     thread_pool_count: ?u16 = null,
 
     /// Enables the `/_edge/tap/{pre,post}` debug endpoints, which stream raw
@@ -155,12 +141,9 @@ pub const ProxyConfig = struct {
 
     /// Post-load validation hook (called by zonfig).
     pub fn validate(self: *ProxyConfig) !void {
-        if (self.max_connections == 0 or self.max_connections > limits.MAX_CONNECTIONS_CAP or
-            self.max_body_size == 0 or self.upstream_timeout_ms == 0 or
-            (self.memory_limit_bytes orelse limits.MIN_MEMORY_LIMIT_BYTES) < limits.MIN_MEMORY_LIMIT_BYTES or
-            (self.max_decoded_bytes orelse 1) == 0 or
-            self.prometheus.max_input_bytes_per_scrape == 0 or
-            self.prometheus.max_output_bytes_per_scrape == 0)
+        if (self.max_connections == 0 or self.max_connections > std.math.maxInt(u16) or
+            self.max_body_size == 0 or (self.max_decoded_bytes orelse 1) == 0 or
+            (self.worker_count orelse 1) == 0 or (self.thread_pool_count orelse 1) == 0)
             return error.InvalidLimits;
         try self.s3_dump.validate();
     }
@@ -184,19 +167,17 @@ test "ProxyConfig.validate rejects zero s3_dump knobs when enabled" {
     try ok.validate();
 }
 
-test "ProxyConfig.validate rejects impossible limits" {
+test "ProxyConfig.validate rejects invalid data-plane limits" {
     var zero_connections: ProxyConfig = .{ .max_connections = 0 };
     try std.testing.expectError(error.InvalidLimits, zero_connections.validate());
-    var tiny_memory: ProxyConfig = .{ .memory_limit_bytes = 32 * 1024 * 1024 };
-    try std.testing.expectError(error.InvalidLimits, tiny_memory.validate());
-    var zero_timeout: ProxyConfig = .{ .upstream_timeout_ms = 0 };
-    try std.testing.expectError(error.InvalidLimits, zero_timeout.validate());
+    var too_many_connections: ProxyConfig = .{ .max_connections = std.math.maxInt(u16) + 1 };
+    try std.testing.expectError(error.InvalidLimits, too_many_connections.validate());
+    var zero_body: ProxyConfig = .{ .max_body_size = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_body.validate());
     var zero_decoded: ProxyConfig = .{ .max_decoded_bytes = 0 };
     try std.testing.expectError(error.InvalidLimits, zero_decoded.validate());
-    var zero_scrape: ProxyConfig = .{ .prometheus = .{ .max_output_bytes_per_scrape = 0 } };
-    try std.testing.expectError(error.InvalidLimits, zero_scrape.validate());
-    var ok: ProxyConfig = .{};
-    try ok.validate();
+    var zero_workers: ProxyConfig = .{ .worker_count = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_workers.validate());
 }
 
 test "s3_dump targets_json parses into S3TargetConfig (Lambda env-only path)" {

@@ -59,19 +59,18 @@ pub const LambdaConfig = struct {
     // Limits
     max_body_size: u32 = 5 * 1024 * 1024, // 5MB
 
-    /// Post-decompression body ceiling; null derives it from `max_body_size`.
-    /// Honors the `TERO_MAX_DECODED_BYTES` env override.
+    /// Post-decompression body ceiling; defaults to `max_body_size` when unset.
+    /// Raise it to admit payloads that decompress larger than the raw cap.
     max_decoded_bytes: ?u32 = null,
 
-    /// Max concurrent connections. Also honors the `TERO_MAX_CONNECTIONS` env override.
+    /// Max concurrent connections; the dominant memory/throughput knob (see
+    /// limits.zig). Also honors the `TERO_MAX_CONNECTIONS` env override.
     max_connections: u32 = 256,
 
-    /// httpz event-loop workers; null uses the measured default. Honors
-    /// `TERO_WORKER_COUNT`. Clamped to the connection cap by limits.resolve.
+    /// httpz event-loop worker count (null = httpz default of 1).
     worker_count: ?u16 = null,
 
-    /// httpz handler threads per worker; null uses the default. Honors
-    /// `TERO_THREAD_POOL_COUNT`.
+    /// httpz request-handler thread-pool count (null = httpz default of 32).
     thread_pool_count: ?u16 = null,
 
     // Service metadata
@@ -114,6 +113,19 @@ pub const LambdaConfig = struct {
             self.max_connections = clamped;
         }
 
+        // httpz starts one accept/event-loop thread per worker and one handler
+        // thread per pool slot. A 0 override binds the port but never accepts
+        // (or never handles), so every request hangs until timeout. Treat 0 as
+        // "use httpz default" (null) rather than wedging the data plane.
+        if (self.worker_count) |w| if (w == 0) {
+            std.log.warn("TERO_WORKER_COUNT=0 starts no accept threads; using httpz default", .{});
+            self.worker_count = null;
+        };
+        if (self.thread_pool_count) |t| if (t == 0) {
+            std.log.warn("TERO_THREAD_POOL_COUNT=0 starts no handler threads; using httpz default", .{});
+            self.thread_pool_count = null;
+        };
+
         // Lambda flush is event-driven (per-invoke + shutdown), so
         // `flush_interval_ms` is unused here — validate only the batch caps.
         try self.s3_dump.validateBatching();
@@ -155,13 +167,6 @@ var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(fal
 // =============================================================================
 // Main Entry Point
 // =============================================================================
-
-/// AWS_LAMBDA_FUNCTION_MEMORY_SIZE is in MiB; fall back to the runtime default.
-fn lambdaMemoryLimit(environ: *const std.process.Environ.Map) u64 {
-    const raw = environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE") orelse return edge.limits.DEFAULT_MEMORY_LIMIT_BYTES;
-    const mib = std.fmt.parseInt(u64, raw, 10) catch return edge.limits.DEFAULT_MEMORY_LIMIT_BYTES;
-    return @max(mib * 1024 * 1024, edge.limits.MIN_MEMORY_LIMIT_BYTES);
-}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -349,9 +354,6 @@ pub fn main(init: std.process.Init) !void {
         .max_connections = config.max_connections,
         .worker_count = config.worker_count,
         .thread_pool_count = config.thread_pool_count,
-        // The function's memory size is the whole-process ceiling in Lambda.
-        .memory_limit_bytes = lambdaMemoryLimit(init.environ_map),
-        .policy_loader = loader,
         .upstream_url = config.upstream_url,
         .logs_url = config.logs_url,
         .metrics_url = config.metrics_url,

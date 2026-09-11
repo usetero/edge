@@ -78,6 +78,7 @@ test "logs: non-json content type forwards raw (fail-open)" {
         .content_type = "text/plain",
     });
     try testing.expectEqual(service.UpstreamChoice.logs, outcome.forward_raw.upstream);
+    try testing.expect(outcome.forward_raw.replayable);
 }
 
 test "logs: unsupported content encoding forwards raw (fail-open)" {
@@ -89,6 +90,7 @@ test "logs: unsupported content encoding forwards raw (fail-open)" {
         .content_encoding = "br",
     });
     try testing.expectEqual(service.UpstreamChoice.logs, outcome.forward_raw.upstream);
+    try testing.expect(outcome.forward_raw.replayable);
 }
 
 test "metrics: json series body uses the buffered batch path" {

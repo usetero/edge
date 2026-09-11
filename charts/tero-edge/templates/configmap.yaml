@@ -15,8 +15,6 @@ data:
       "log_level": {{ .Values.config.logLevel | quote }},
       "max_body_size": {{ int .Values.config.maxBodySize }},
       "max_connections": {{ int .Values.config.maxConnections }},
-      "retry_log_intake": {{ .Values.config.retryLogIntake }},
-      "upstream_timeout_ms": {{ int .Values.config.upstreamTimeoutMs }},
       {{- with .Values.config.maxDecodedBytes }}
       "max_decoded_bytes": {{ int . }},
       {{- end }}

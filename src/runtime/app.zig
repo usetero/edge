@@ -57,13 +57,7 @@ const ServiceConfigured = struct {
 const ServerReady = struct {};
 const DataPlaneBudget = struct {
     frontend: []const u8,
-    memory_limit_bytes: u64,
-    memory_limit_source: []const u8,
-    http_budget_bytes: usize,
     max_connections: usize,
-    workers: u16,
-    handler_threads: u16,
-    retry_log_intake: bool,
     slab_reserved_bytes: ?usize,
 };
 const ShutdownHint = struct { pid: c_int };
@@ -221,17 +215,10 @@ pub const EngineOptions = struct {
     listen_address: [4]u8,
     listen_port: u16,
     max_body_size: u32,
-    /// Null derives the ceiling from `max_body_size`.
     max_decoded_bytes: ?u32 = null,
     max_connections: u32 = limits_mod.DEFAULT_MAX_CONNECTIONS,
-    memory_limit_bytes: u64 = limits_mod.DEFAULT_MEMORY_LIMIT_BYTES,
-    retry_log_intake: bool = true,
-    upstream_timeout_ms: u32 = limits_mod.DEFAULT_UPSTREAM_TIMEOUT_MS,
-    /// Null uses the measured defaults in limits.zig.
     worker_count: ?u16 = null,
     thread_pool_count: ?u16 = null,
-    /// Drives `/_ready`; null reports ready at once.
-    policy_loader: ?*policy.Loader = null,
     upstream_url: []const u8,
     logs_url: ?[]const u8 = null,
     metrics_url: ?[]const u8 = null,
@@ -271,9 +258,6 @@ pub const Engine = struct {
             .max_body_size = options.max_body_size,
             .max_decoded_bytes = options.max_decoded_bytes,
             .max_connections = options.max_connections,
-            .memory_limit_bytes = options.memory_limit_bytes,
-            .retry_log_intake = options.retry_log_intake,
-            .upstream_timeout_ms = options.upstream_timeout_ms,
             .worker_count = options.worker_count,
             .thread_pool_count = options.thread_pool_count,
         });
@@ -329,7 +313,6 @@ pub const Engine = struct {
             .limits = self.limits,
             .tap = if (options.tap_enabled) &self.tap else null,
             .extension_sink = options.extension_sink,
-            .policy_loader = options.policy_loader,
         };
 
         self.server = try .init(
@@ -385,33 +368,6 @@ pub fn serviceKindsFor(distribution: mode.Distribution) []const distro.ServiceKi
 // run
 // =============================================================================
 
-const MemoryLimit = struct { bytes: u64, source: []const u8 };
-
-/// Explicit config wins; otherwise the cgroup limit on Linux; otherwise the default.
-fn resolveMemoryLimit(io: std.Io, explicit: ?u64) MemoryLimit {
-    if (explicit) |bytes| return .{ .bytes = bytes, .source = "config" };
-    if (builtin.os.tag == .linux) {
-        if (readCgroupLimit(io, "/sys/fs/cgroup/memory.max")) |bytes|
-            return .{ .bytes = bytes, .source = "cgroup v2" };
-        if (readCgroupLimit(io, "/sys/fs/cgroup/memory/memory.limit_in_bytes")) |bytes|
-            return .{ .bytes = bytes, .source = "cgroup v1" };
-    }
-    return .{ .bytes = limits_mod.DEFAULT_MEMORY_LIMIT_BYTES, .source = "default" };
-}
-
-/// Null for "max", unreadable files, or values outside the supported range
-/// (cgroup v1 reports a huge number when unlimited).
-fn readCgroupLimit(io: std.Io, path: []const u8) ?u64 {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-    defer file.close(io);
-    var buf: [64]u8 = undefined;
-    var reader = file.reader(io, &buf);
-    const line = reader.interface.takeDelimiterExclusive('\n') catch return null;
-    const bytes = std.fmt.parseInt(u64, std.mem.trim(u8, line, " \r\n"), 10) catch return null;
-    if (bytes < limits_mod.MIN_MEMORY_LIMIT_BYTES or bytes > (1 << 40)) return null;
-    return bytes;
-}
-
 fn raiseOpenFileLimit() void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
     // A proxy holding max_connections inbound sockets + 3 upstream pools of the
@@ -459,8 +415,6 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     const config = zonfig.load(ProxyConfig, allocator, io, .{
         .json_path = config_path,
         .env_prefix = "TERO",
-        // The tap streams raw customer payloads; only the config file may enable it.
-        .env_exclude = &.{"tap_enabled"},
         .environ = init.environ_map,
     }) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
@@ -520,20 +474,14 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     installSegfaultHandler();
 
     const kinds = serviceKindsFor(distribution);
-    const memory_limit = resolveMemoryLimit(io, config.memory_limit_bytes);
     const engine = try Engine.create(allocator, io, bus, &registry, &runtime_metrics, kinds, .{
         .listen_address = config.listen_address,
         .listen_port = config.listen_port,
         .max_body_size = config.max_body_size,
         .max_decoded_bytes = config.max_decoded_bytes,
         .max_connections = config.max_connections,
-        .memory_limit_bytes = memory_limit.bytes,
-        .retry_log_intake = config.retry_log_intake,
-        .upstream_timeout_ms = config.upstream_timeout_ms,
-        // zonfig already applied TERO_WORKER_COUNT / TERO_THREAD_POOL_COUNT.
         .worker_count = config.worker_count,
         .thread_pool_count = config.thread_pool_count,
-        .policy_loader = loader,
         .upstream_url = config.upstream_url,
         .logs_url = config.logs_url,
         .metrics_url = config.metrics_url,
@@ -569,18 +517,14 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         });
     }
 
-    const stdio_frontend = build_options.frontend == .stdio;
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(DataPlaneBudget{
         .frontend = @tagName(build_options.frontend),
-        .memory_limit_bytes = memory_limit.bytes,
-        .memory_limit_source = memory_limit.source,
-        .http_budget_bytes = engine.limits.http_budget_bytes,
         .max_connections = engine.limits.max_connections,
-        .workers = engine.limits.worker_count,
-        .handler_threads = engine.limits.thread_pool_count,
-        .retry_log_intake = engine.limits.retry_log_intake,
-        .slab_reserved_bytes = if (stdio_frontend) engine.limits.steadyStateBytes() else null,
+        .slab_reserved_bytes = if (build_options.frontend == .stdio)
+            engine.limits.steadyStateBytes()
+        else
+            null,
     });
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ServerReady{});
