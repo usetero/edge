@@ -17,8 +17,12 @@ pub const LogLevel = enum(u8) {
 
 /// Prometheus module configuration
 pub const PrometheusModuleConfig = struct {
-    /// Cap on both the upstream scrape read and the filtered response.
-    max_bytes_per_scrape: usize = 10 * 1024 * 1024,
+    /// Maximum input bytes read from the upstream per scrape.
+    max_input_bytes_per_scrape: usize = 10 * 1024 * 1024,
+
+    /// Maximum output bytes forwarded to the client per scrape. Set it above
+    /// the input limit when filtering is expected to reduce the data.
+    max_output_bytes_per_scrape: usize = 10 * 1024 * 1024,
 };
 
 /// A single S3-compatible destination the s3-dump extension can write to.
@@ -101,9 +105,14 @@ pub const ProxyConfig = struct {
     // Inspection config
     log_level: LogLevel = .info,
 
-    /// Raw request body ceiling in bytes as received on the wire. Decompressed
-    /// bodies may grow to `limits.DECODED_BODY_RATIO` times this value.
+    /// Raw request body ceiling in bytes as received on the wire.
     max_body_size: u32 = limits.DEFAULT_MAX_BODY_BYTES,
+
+    /// Post-decompression body ceiling. Null derives it as
+    /// `limits.DECODED_BODY_RATIO` times `max_body_size`. A decoded body is
+    /// charged to the HTTP budget twice, so a high ceiling lowers concurrency;
+    /// the startup manifest reports the resulting worst-case capacity.
+    max_decoded_bytes: ?u32 = null,
 
     /// Process-wide inbound connection cap (divided across event-loop workers).
     max_connections: u32 = limits.DEFAULT_MAX_CONNECTIONS,
@@ -119,6 +128,15 @@ pub const ProxyConfig = struct {
 
     /// Per-attempt deadline for one upstream exchange (send through response body).
     upstream_timeout_ms: u32 = limits.DEFAULT_UPSTREAM_TIMEOUT_MS,
+
+    /// httpz event-loop workers. Null uses `limits.DEFAULT_WORKERS`. Measured
+    /// on this workload, one loop beats four; raise it only with a benchmark.
+    /// Clamped to `limits.MAX_WORKERS` and to `max_connections`.
+    worker_count: ?u16 = null,
+
+    /// httpz request-handler threads per event-loop worker. Null uses
+    /// `limits.HANDLER_THREADS_PER_WORKER`. Clamped to `limits.MAX_HANDLER_THREADS`.
+    thread_pool_count: ?u16 = null,
 
     /// Enables the `/_edge/tap/{pre,post}` debug endpoints, which stream raw
     /// in-flight telemetry records (before/after policy evaluation). Off by
@@ -140,7 +158,9 @@ pub const ProxyConfig = struct {
         if (self.max_connections == 0 or self.max_connections > limits.MAX_CONNECTIONS_CAP or
             self.max_body_size == 0 or self.upstream_timeout_ms == 0 or
             (self.memory_limit_bytes orelse limits.MIN_MEMORY_LIMIT_BYTES) < limits.MIN_MEMORY_LIMIT_BYTES or
-            self.prometheus.max_bytes_per_scrape == 0)
+            (self.max_decoded_bytes orelse 1) == 0 or
+            self.prometheus.max_input_bytes_per_scrape == 0 or
+            self.prometheus.max_output_bytes_per_scrape == 0)
             return error.InvalidLimits;
         try self.s3_dump.validate();
     }
@@ -171,6 +191,10 @@ test "ProxyConfig.validate rejects impossible limits" {
     try std.testing.expectError(error.InvalidLimits, tiny_memory.validate());
     var zero_timeout: ProxyConfig = .{ .upstream_timeout_ms = 0 };
     try std.testing.expectError(error.InvalidLimits, zero_timeout.validate());
+    var zero_decoded: ProxyConfig = .{ .max_decoded_bytes = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_decoded.validate());
+    var zero_scrape: ProxyConfig = .{ .prometheus = .{ .max_output_bytes_per_scrape = 0 } };
+    try std.testing.expectError(error.InvalidLimits, zero_scrape.validate());
     var ok: ProxyConfig = .{};
     try ok.validate();
 }

@@ -46,7 +46,9 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
 pub const MAX_CONNECTIONS_CAP: u32 = 65534;
 /// Datadog agents batch up to 5 MB uncompressed, about 1 MB compressed.
 pub const DEFAULT_MAX_BODY_BYTES: u32 = 1536 * 1024;
-/// Decompressed bodies may grow to this multiple of `max_body_size`.
+/// Default decompressed ceiling as a multiple of `max_body_size` when
+/// `max_decoded_bytes` is unset. A decoded body is charged to the HTTP budget
+/// twice (capture plus transform output), so raising it lowers concurrency.
 pub const DECODED_BODY_RATIO: usize = 10;
 pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u32 = 30_000;
 /// Used when neither config nor the cgroup provides a memory limit.
@@ -60,8 +62,10 @@ pub const DEFAULT_WORKERS: u16 = 1;
 /// Ceilings for the benchmark-only TERO_WORKER_COUNT / TERO_THREAD_POOL_COUNT overrides.
 pub const MAX_WORKERS: u16 = 64;
 pub const MAX_HANDLER_THREADS: u16 = 256;
-/// The startup manifest warns below this many concurrent maximum-size bodies.
-pub const MIN_CONCURRENT_BODIES: usize = 32;
+/// The startup manifest warns below this many concurrent worst-case requests.
+/// A worst-case request is a maximum-size body that decompresses to the decoded
+/// ceiling, so this is burst tolerance, not steady-state concurrency.
+pub const MIN_CONCURRENT_REQUESTS: usize = 4;
 pub const LARGE_BODY_BUFFER_BYTES: u32 = 64 * 1024;
 /// httpz response staging buffer, one per handler thread (httpz default).
 pub const HANDLER_THREAD_BUF_BYTES: usize = 32 * 1024;
@@ -84,7 +88,7 @@ pub const Limits = struct {
     upstream_timeout_ms: u32,
     /// Per-request body ceiling, from the frozen `ProxyConfig.max_body_size`.
     max_body_size: u32,
-    /// Post-decompression body ceiling: `DECODED_BODY_RATIO` x `max_body_size`.
+    /// Post-decompression body ceiling; defaults to `DECODED_BODY_RATIO` x `max_body_size`.
     max_decoded_bytes: usize,
     /// httpz event-loop workers (DEFAULT_WORKERS unless a benchmark override is set).
     worker_count: u16,
@@ -113,21 +117,34 @@ pub const Limits = struct {
     /// the `TERO_*` env overrides already applied by zonfig. No env reads here.
     pub const ResolveOptions = struct {
         max_body_size: u32 = DEFAULT_MAX_BODY_BYTES,
+        /// Post-decompression ceiling; null derives it from `max_body_size`.
+        max_decoded_bytes: ?u32 = null,
         max_connections: u32 = DEFAULT_MAX_CONNECTIONS,
         memory_limit_bytes: u64 = DEFAULT_MEMORY_LIMIT_BYTES,
         retry_log_intake: bool = true,
         upstream_timeout_ms: u32 = DEFAULT_UPSTREAM_TIMEOUT_MS,
-        /// Benchmark-only overrides, clamped to [1, MAX_WORKERS] / [1, MAX_HANDLER_THREADS].
+        /// Optional tuning, clamped to [1, MAX_WORKERS] / [1, MAX_HANDLER_THREADS].
+        /// Workers are clamped again so they never exceed `max_connections`.
         worker_count: ?u16 = null,
         thread_pool_count: ?u16 = null,
     };
 
     pub fn resolve(opts: ResolveOptions) Limits {
         std.debug.assert(opts.max_connections > 0);
-        const worker_count: u16 = if (opts.worker_count) |w|
+        const requested_workers: u16 = if (opts.worker_count) |w|
             std.math.clamp(w, @as(u16, 1), MAX_WORKERS)
         else
             DEFAULT_WORKERS;
+        // httpz applies the per-worker connection limit to each worker, so more
+        // workers than connections would admit more than the reserved budget.
+        const worker_count: u16 = @intCast(@min(@as(usize, requested_workers), opts.max_connections));
+        if (worker_count != requested_workers) {
+            log.warn("worker_count {d} exceeds max_connections {d}; using {d} worker(s)", .{
+                requested_workers,
+                opts.max_connections,
+                worker_count,
+            });
+        }
         const thread_pool_count: u16 = if (opts.thread_pool_count) |t|
             std.math.clamp(t, @as(u16, 1), MAX_HANDLER_THREADS)
         else
@@ -144,7 +161,10 @@ pub const Limits = struct {
             .retry_log_intake = opts.retry_log_intake,
             .upstream_timeout_ms = opts.upstream_timeout_ms,
             .max_body_size = opts.max_body_size,
-            .max_decoded_bytes = @as(usize, opts.max_body_size) * DECODED_BODY_RATIO,
+            .max_decoded_bytes = if (opts.max_decoded_bytes) |d|
+                @as(usize, d)
+            else
+                @as(usize, opts.max_body_size) * DECODED_BODY_RATIO,
             .worker_count = worker_count,
             .thread_pool_count = thread_pool_count,
             .record_scratch = RECORD_SCRATCH_BYTES,
@@ -180,6 +200,15 @@ pub const Limits = struct {
     /// owners.
     pub fn steadyStateBytes(self: Limits) usize {
         return self.max_connections * (self.perConnBytes() + self.conn_arena_reserve);
+    }
+
+    /// Worst-case HTTP bytes one in-flight request can hold at once: the raw
+    /// body httpz buffers, the streaming decoder window, and the decoded body
+    /// charged twice (capture plus transform output). The headroom check uses
+    /// this, not `max_body_size` alone, so a compression ratio cannot silently
+    /// oversubscribe the budget.
+    pub fn perRequestPeakBytes(self: Limits) usize {
+        return self.max_body_size + self.decode_buf + 2 * self.max_decoded_bytes;
     }
 
     pub fn logStartup(self: Limits) void {

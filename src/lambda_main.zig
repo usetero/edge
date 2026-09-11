@@ -59,8 +59,20 @@ pub const LambdaConfig = struct {
     // Limits
     max_body_size: u32 = 5 * 1024 * 1024, // 5MB
 
+    /// Post-decompression body ceiling; null derives it from `max_body_size`.
+    /// Honors the `TERO_MAX_DECODED_BYTES` env override.
+    max_decoded_bytes: ?u32 = null,
+
     /// Max concurrent connections. Also honors the `TERO_MAX_CONNECTIONS` env override.
     max_connections: u32 = 256,
+
+    /// httpz event-loop workers; null uses the measured default. Honors
+    /// `TERO_WORKER_COUNT`. Clamped to the connection cap by limits.resolve.
+    worker_count: ?u16 = null,
+
+    /// httpz handler threads per worker; null uses the default. Honors
+    /// `TERO_THREAD_POOL_COUNT`.
+    thread_pool_count: ?u16 = null,
 
     // Service metadata
     service: struct {
@@ -333,7 +345,10 @@ pub fn main(init: std.process.Init) !void {
         .listen_address = config.listen_address,
         .listen_port = config.listen_port,
         .max_body_size = config.max_body_size,
+        .max_decoded_bytes = config.max_decoded_bytes,
         .max_connections = config.max_connections,
+        .worker_count = config.worker_count,
+        .thread_pool_count = config.thread_pool_count,
         // The function's memory size is the whole-process ceiling in Lambda.
         .memory_limit_bytes = lambdaMemoryLimit(init.environ_map),
         .policy_loader = loader,

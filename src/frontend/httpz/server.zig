@@ -70,6 +70,12 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
     };
 }
 
+/// Connections httpz can actually admit: the per-worker limit applies to every
+/// worker, so the process total is the product, never the configured cap alone.
+pub fn admittedConnections(config: httpz.Config) !usize {
+    return std.math.mul(usize, config.workers.max_conn orelse 0, config.workerCount());
+}
+
 /// Eager httpz pools plus one recv buffer and arena reserve per admitted
 /// connection. Bodies, transforms and responses share the remaining budget.
 /// ponytail: the per-connection term is an estimate; compare it against
@@ -86,7 +92,7 @@ pub fn minimumViableBytes(limits: limits_mod.Limits, config: httpz.Config) !usiz
     return std.math.add(
         usize,
         try std.math.mul(usize, config.workerCount(), per_worker),
-        try std.math.mul(usize, limits.max_connections, per_conn),
+        try std.math.mul(usize, try admittedConnections(config), per_conn),
     );
 }
 
@@ -210,35 +216,49 @@ pub const HttpServer = struct {
 
         const config = configFromLimits(ctx.limits, listen_address, listen_port);
         const minimum = minimumViableBytes(ctx.limits, config) catch return error.InvalidLimits;
+        const admitted = admittedConnections(config) catch return error.InvalidLimits;
         const per_conn = ctx.limits.recv_buf + ctx.limits.conn_arena_reserve;
         if (minimum > memory.limit) {
             log.err(
                 "HTTP budget {d} (half of memory_limit_bytes {d}) is below the minimum viable {d} " ++
                     "({d} connections x {d} bytes + pools); raise memory_limit_bytes or lower max_connections",
-                .{ memory.limit, ctx.limits.memory_limit_bytes, minimum, ctx.limits.max_connections, per_conn },
+                .{ memory.limit, ctx.limits.memory_limit_bytes, minimum, admitted, per_conn },
             );
             return error.InsufficientMemoryBudget;
         }
         const headroom = memory.limit - minimum;
-        const concurrent_bodies = headroom / ctx.limits.max_body_size;
-        if (concurrent_bodies < limits_mod.MIN_CONCURRENT_BODIES) {
-            log.warn("only {d} maximum-size bodies ({d} bytes) fit in the HTTP headroom; " ++
-                "raise memory_limit_bytes or lower max_body_size", .{ concurrent_bodies, ctx.limits.max_body_size });
+        // A compressed request holds the raw body, the decoder window and the
+        // decoded bytes twice, so the raw cap alone overstates capacity.
+        const per_request_peak = ctx.limits.perRequestPeakBytes();
+        const concurrent_requests = headroom / per_request_peak;
+        if (concurrent_requests < limits_mod.MIN_CONCURRENT_REQUESTS) {
+            log.warn(
+                "only {d} worst-case requests ({d} bytes each: {d} raw + decoder + 2 x {d} decoded) fit in the " ++
+                    "HTTP headroom {d}; raise memory_limit_bytes, or lower max_decoded_bytes/max_body_size",
+                .{
+                    concurrent_requests,
+                    per_request_peak,
+                    ctx.limits.max_body_size,
+                    ctx.limits.max_decoded_bytes,
+                    headroom,
+                },
+            );
         }
         const server = try httpz.Server(*Handler).init(ctx.io, memory.allocator(), config, handler);
         log.info(
             "httpz manifest: memory limit {d}, HTTP budget {d}, minimum {d} ({d} connections, {d} workers x {d} " ++
-                "handler threads), headroom {d} = {d} concurrent max bodies, retry_log_intake={}; " ++
-                "excludes TLS, policies and thread stacks",
+                "handler threads), headroom {d} = {d} concurrent worst-case requests ({d} bytes each), " ++
+                "retry_log_intake={}; excludes TLS, policies and thread stacks",
             .{
                 ctx.limits.memory_limit_bytes,
                 memory.limit,
                 minimum,
-                (config.workers.max_conn orelse 0) * config.workerCount(),
+                admitted,
                 config.workerCount(),
                 config.threadPoolCount(),
                 headroom,
-                concurrent_bodies,
+                concurrent_requests,
+                per_request_peak,
                 ctx.limits.retry_log_intake,
             },
         );
@@ -899,12 +919,40 @@ test "httpz minimum viable budget is checked arithmetic below the default cap" {
         256 * (limits.recv_buf + limits.conn_arena_reserve);
     try testing.expectEqual(expected, minimum);
     try testing.expect(minimum < limits.http_budget_bytes);
-    // Default headroom admits at least the warning threshold of maximum-size bodies.
-    try testing.expect((limits.http_budget_bytes - minimum) / limits.max_body_size >= limits_mod.MIN_CONCURRENT_BODIES);
 
+    // Checked arithmetic, not wraparound, when a term is absurd.
     var absurd = limits;
-    absurd.max_connections = std.math.maxInt(usize);
+    absurd.recv_buf = std.math.maxInt(usize);
     try testing.expectError(error.Overflow, minimumViableBytes(absurd, config));
+}
+
+test "budget reserves for every connection httpz can admit, not the configured cap" {
+    // One connection with many workers must not admit one connection per worker
+    // against a single connection's reservation.
+    const limits: limits_mod.Limits = .resolve(.{ .max_connections = 1, .worker_count = 64 });
+    try testing.expectEqual(@as(u16, 1), limits.worker_count);
+
+    const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
+    const admitted = try admittedConnections(config);
+    try testing.expectEqual(@as(usize, 1), admitted);
+    const minimum = try minimumViableBytes(limits, config);
+    try testing.expectEqual(
+        @as(usize, 8) * limits_mod.LARGE_BODY_BUFFER_BYTES +
+            @as(usize, limits_mod.HANDLER_THREADS_PER_WORKER) * limits_mod.HANDLER_THREAD_BUF_BYTES +
+            (limits.recv_buf + limits.conn_arena_reserve),
+        minimum,
+    );
+}
+
+test "per-request peak charges the decoded body twice" {
+    const limits: limits_mod.Limits = .resolve(.{});
+    try testing.expectEqual(
+        limits.max_body_size + limits.decode_buf + 2 * limits.max_decoded_bytes,
+        limits.perRequestPeakBytes(),
+    );
+    // An explicit decoded ceiling lowers the peak and raises concurrency.
+    const tight: limits_mod.Limits = .resolve(.{ .max_decoded_bytes = 2 * 1024 * 1024 });
+    try testing.expect(tight.perRequestPeakBytes() < limits.perRequestPeakBytes());
 }
 
 test "httpz method maps onto service and std methods" {

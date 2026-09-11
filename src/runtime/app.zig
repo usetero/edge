@@ -221,13 +221,15 @@ pub const EngineOptions = struct {
     listen_address: [4]u8,
     listen_port: u16,
     max_body_size: u32,
+    /// Null derives the ceiling from `max_body_size`.
+    max_decoded_bytes: ?u32 = null,
     max_connections: u32 = limits_mod.DEFAULT_MAX_CONNECTIONS,
     memory_limit_bytes: u64 = limits_mod.DEFAULT_MEMORY_LIMIT_BYTES,
     retry_log_intake: bool = true,
     upstream_timeout_ms: u32 = limits_mod.DEFAULT_UPSTREAM_TIMEOUT_MS,
-    /// Benchmark-only overrides; production uses the fixed defaults in limits.zig.
-    worker_count_override: ?u16 = null,
-    thread_pool_count_override: ?u16 = null,
+    /// Null uses the measured defaults in limits.zig.
+    worker_count: ?u16 = null,
+    thread_pool_count: ?u16 = null,
     /// Drives `/_ready`; null reports ready at once.
     policy_loader: ?*policy.Loader = null,
     upstream_url: []const u8,
@@ -267,12 +269,13 @@ pub const Engine = struct {
         self.io = io;
         self.limits = .resolve(.{
             .max_body_size = options.max_body_size,
+            .max_decoded_bytes = options.max_decoded_bytes,
             .max_connections = options.max_connections,
             .memory_limit_bytes = options.memory_limit_bytes,
             .retry_log_intake = options.retry_log_intake,
             .upstream_timeout_ms = options.upstream_timeout_ms,
-            .worker_count = options.worker_count_override,
-            .thread_pool_count = options.thread_pool_count_override,
+            .worker_count = options.worker_count,
+            .thread_pool_count = options.thread_pool_count,
         });
         if (build_options.frontend == .stdio) self.limits.logStartup();
 
@@ -409,15 +412,6 @@ fn readCgroupLimit(io: std.Io, path: []const u8) ?u64 {
     return bytes;
 }
 
-/// Benchmark-only knobs. Production derives worker and handler counts.
-fn benchOverride(environ: *const std.process.Environ.Map, name: []const u8) ?u16 {
-    const raw = environ.get(name) orelse return null;
-    return std.fmt.parseInt(u16, raw, 10) catch {
-        log.warn("{s}={s} is not a valid count; ignored", .{ name, raw });
-        return null;
-    };
-}
-
 fn raiseOpenFileLimit() void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
     // A proxy holding max_connections inbound sockets + 3 upstream pools of the
@@ -531,17 +525,22 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         .listen_address = config.listen_address,
         .listen_port = config.listen_port,
         .max_body_size = config.max_body_size,
+        .max_decoded_bytes = config.max_decoded_bytes,
         .max_connections = config.max_connections,
         .memory_limit_bytes = memory_limit.bytes,
         .retry_log_intake = config.retry_log_intake,
         .upstream_timeout_ms = config.upstream_timeout_ms,
-        .worker_count_override = benchOverride(init.environ_map, "TERO_WORKER_COUNT"),
-        .thread_pool_count_override = benchOverride(init.environ_map, "TERO_THREAD_POOL_COUNT"),
+        // zonfig already applied TERO_WORKER_COUNT / TERO_THREAD_POOL_COUNT.
+        .worker_count = config.worker_count,
+        .thread_pool_count = config.thread_pool_count,
         .policy_loader = loader,
         .upstream_url = config.upstream_url,
         .logs_url = config.logs_url,
         .metrics_url = config.metrics_url,
-        .service_options = .{ .prometheus_max_bytes_per_scrape = config.prometheus.max_bytes_per_scrape },
+        .service_options = .{
+            .prometheus_max_input_bytes = config.prometheus.max_input_bytes_per_scrape,
+            .prometheus_max_output_bytes = config.prometheus.max_output_bytes_per_scrape,
+        },
         .tap_enabled = config.tap_enabled,
         .extension_sink = extension_sink,
     });

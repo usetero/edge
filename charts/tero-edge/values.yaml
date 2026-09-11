@@ -27,7 +27,10 @@ resources:
     # Allow CPU bursts; set a CPU limit explicitly if required by your cluster.
     # Edge reads this cgroup limit at startup and budgets half of it for HTTP
     # bodies and transforms; the rest covers policies, TLS and thread stacks.
-    memory: 256Mi
+    # A worst-case request (maxBodySize compressed, expanding to maxDecodedBytes)
+    # holds about 33 MiB, so 384Mi admits about 5 of them at once. Lower
+    # maxDecodedBytes to trade that ceiling for concurrency.
+    memory: 384Mi
 
 nodeSelector: {}
 tolerations:
@@ -95,8 +98,20 @@ config:
   upstreamUrl: "https://agent-http-intake.logs.datadoghq.com"
   metricsUrl: "https://api.datadoghq.com"
   logLevel: "info"
-  # Raw (compressed) request body cap. Decompressed bodies may reach 10x this.
+  # Raw (compressed) request body cap as received on the wire.
   maxBodySize: 1572864
+
+  # Optional post-decompression ceiling. Null derives 10x maxBodySize (15 MiB).
+  # A decoded body is charged to the HTTP budget twice, so lowering this raises
+  # how many compressed requests fit at once. Startup logs the resulting count.
+  maxDecodedBytes: null
+
+  # Optional httpz tuning (null = the measured defaults: 1 event-loop worker,
+  # 32 handler threads per worker). One loop beat four on this workload; raise
+  # workerCount only with a benchmark. Also settable via TERO_WORKER_COUNT and
+  # TERO_THREAD_POOL_COUNT.
+  workerCount: null
+  threadPoolCount: null
 
   # Process-wide inbound connection cap. Also settable via the
   # TERO_MAX_CONNECTIONS env override.

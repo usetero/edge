@@ -17,6 +17,15 @@ data:
       "max_connections": {{ int .Values.config.maxConnections }},
       "retry_log_intake": {{ .Values.config.retryLogIntake }},
       "upstream_timeout_ms": {{ int .Values.config.upstreamTimeoutMs }},
+      {{- with .Values.config.maxDecodedBytes }}
+      "max_decoded_bytes": {{ int . }},
+      {{- end }}
+      {{- with .Values.config.workerCount }}
+      "worker_count": {{ int . }},
+      {{- end }}
+      {{- with .Values.config.threadPoolCount }}
+      "thread_pool_count": {{ int . }},
+      {{- end }}
       {{- $svc := dict }}
       {{- with .Values.config.service }}
       {{- if .name }}{{ $svc = set $svc "name" .name }}{{ end }}
