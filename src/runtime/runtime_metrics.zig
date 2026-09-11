@@ -111,6 +111,16 @@ const BuildInfoLabels = struct {
 };
 
 const InternalMetrics = struct {
+    edge_upstream_attempts_total: m.Counter(u64) = .init(
+        "edge_upstream_attempts_total",
+        .{ .help = "Upstream attempts, including retries." },
+        .{},
+    ),
+    edge_upstream_retries_total: m.Counter(u64) = .init(
+        "edge_upstream_retries_total",
+        .{ .help = "Fresh-connection transport retries." },
+        .{},
+    ),
     edge_requests_total: RequestsTotal,
     edge_request_duration_seconds: RequestDurationSeconds,
     edge_responses_total: ResponsesTotal,
@@ -366,6 +376,11 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_request_duration_seconds.observe(.{
             .known_path = known_path,
         }, duration_seconds) catch |err| log.debug("failed to record request duration metric: {}", .{err});
+    }
+
+    pub fn recordUpstreamAttempt(self: *RuntimeMetrics, retry: bool) void {
+        self.internal.edge_upstream_attempts_total.incr();
+        if (retry) self.internal.edge_upstream_retries_total.incr();
     }
 
     pub fn recordResponse(

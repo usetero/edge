@@ -56,9 +56,9 @@ const ServiceConfigured = struct {
 };
 const ServerReady = struct {};
 const DataPlaneBudget = struct {
+    frontend: []const u8,
     max_connections: usize,
-    per_conn_bytes: usize,
-    steady_state_bytes: usize,
+    slab_reserved_bytes: ?usize,
 };
 const ShutdownHint = struct { pid: c_int };
 const ServerStopped = struct {};
@@ -261,7 +261,7 @@ pub const Engine = struct {
             .worker_count = options.worker_count,
             .thread_pool_count = options.thread_pool_count,
         });
-        self.limits.logStartup();
+        if (build_options.frontend == .stdio) self.limits.logStartup();
 
         self.upstreams = upstream_mod.UpstreamManager.init(io, allocator, self.limits.max_connections);
         errdefer self.upstreams.deinit();
@@ -519,9 +519,12 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
 
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(DataPlaneBudget{
+        .frontend = @tagName(build_options.frontend),
         .max_connections = engine.limits.max_connections,
-        .per_conn_bytes = engine.limits.perConnBytes(),
-        .steady_state_bytes = engine.limits.steadyStateBytes(),
+        .slab_reserved_bytes = if (build_options.frontend == .stdio)
+            engine.limits.steadyStateBytes()
+        else
+            null,
     });
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ServerReady{});

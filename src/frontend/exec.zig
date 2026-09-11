@@ -135,8 +135,8 @@ pub fn contentEncodingName(ce: std.http.ContentEncoding) []const u8 {
 }
 
 /// Opens a request against the configured upstream. `headers` must already
-/// be hop-by-hop-filtered and arena-duped by the frontend (it owns the
-/// inbound header iterator); `target` is the verbatim request target.
+/// be hop-by-hop-filtered and remain valid for the request lifetime; `target`
+/// is the verbatim request target.
 pub fn openUpstream(
     ctx: *SharedCtx,
     arena: std.mem.Allocator,
@@ -144,6 +144,19 @@ pub fn openUpstream(
     target: []const u8,
     headers: []const std.http.Header,
     choice: service_mod.UpstreamChoice,
+) !std.http.Client.Request {
+    return openUpstreamWithClient(ctx, arena, method, target, headers, choice, ctx.upstreams.getHttpClient());
+}
+
+/// Retry callers select the dedicated client with no idle connections.
+pub fn openUpstreamWithClient(
+    ctx: *SharedCtx,
+    arena: std.mem.Allocator,
+    method: std.http.Method,
+    target: []const u8,
+    headers: []const std.http.Header,
+    choice: service_mod.UpstreamChoice,
+    client: *std.http.Client,
 ) !std.http.Client.Request {
     const query_start = std.mem.findScalar(u8, target, '?');
     const path = if (query_start) |i| target[0..i] else target;
@@ -153,8 +166,9 @@ pub fn openUpstream(
     const uri_str = try ctx.upstreams.buildUpstreamUri(arena, upstream_id, path, query);
     const uri = try std.Uri.parse(uri_str);
 
-    return ctx.upstreams.getHttpClient().request(method, uri, .{
+    return client.request(method, uri, .{
         .extra_headers = headers,
+        .redirect_behavior = .unhandled,
         .headers = .{ .accept_encoding = .omit },
     }) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
@@ -281,7 +295,7 @@ pub fn processBuffered(
     const decode_buf = try arena.alloc(u8, pipe.codec.decoderBufferLen(ctx.limits.zstd_window_len));
     var decoder: encoding_mod.Decoder = .init(pipe.codec, &raw_reader, decode_buf, ctx.limits.zstd_window_len);
     var decoded_capture: std.Io.Writer.Allocating = .init(arena);
-    _ = try pipeline_mod.streamReaderToWriter(decoder.reader(), &decoded_capture.writer, ctx.limits.max_body_size);
+    _ = try pipeline_mod.streamReaderToWriter(decoder.reader(), &decoded_capture.writer, ctx.limits.max_decoded_bytes);
 
     var decoded_reader = std.Io.Reader.fixed(decoded_capture.written());
     var transformed: std.Io.Writer.Allocating = try .initCapacity(arena, 4096);

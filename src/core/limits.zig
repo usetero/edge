@@ -44,6 +44,32 @@ pub const CONN_ARENA_RESERVE_BYTES: usize = 16 * 1024;
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
+/// Raw request body cap. Datadog agents batch up to ~5 MB uncompressed, which
+/// gzips to well under this; OTLP collector batches are smaller again.
+pub const DEFAULT_MAX_BODY_BYTES: u32 = 1536 * 1024;
+
+/// Post-decompression cap when `max_decoded_bytes` is unset. Decoupled from
+/// `max_body_size` on purpose: agents compress, so the decoded size is roughly
+/// 10x the raw size and tying the two rejects ordinary compressed batches.
+pub const DEFAULT_MAX_DECODED_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Handler threads per event-loop worker. A handler owns its whole upstream
+/// exchange, so concurrency equals this count and throughput is roughly
+/// `count / upstream_round_trip`. Measured against a 14 ms upstream (the real
+/// Datadog intake round trip on a warm connection): 32 threads gave 1.5k req/s,
+/// 64 gave 2.7k, 128 gave 4.9k. 128 also removes queueing latency at a 100
+/// client burst (p50 17.7 ms, the bare upstream cost). 256 would need more than
+/// the 512 MiB chart limit for codec scratch alone, so 128 is the ceiling here.
+pub const DEFAULT_HANDLER_THREADS: u16 = 128;
+
+/// Inbound request and keep-alive deadlines. httpz leaves both effectively
+/// unbounded, so one idle socket would hold a connection slot forever.
+pub const REQUEST_TIMEOUT_SECONDS: u32 = 30;
+pub const KEEPALIVE_TIMEOUT_SECONDS: u32 = 30;
+/// A small reusable pool handles common payloads without reserving the full
+/// request limit for every slot. Larger bodies use request-owned allocations.
+pub const LARGE_BODY_BUFFER_BYTES: u32 = 64 * 1024;
+
 // Compile-time sanity: the recv buffer holds a whole TLS record and buffers
 // stay cache-line friendly.
 comptime {
@@ -81,9 +107,8 @@ pub const Limits = struct {
     /// max_body_size always work. Left to httpz's default (16) this pool
     /// alone cost 16 x max_body_size eagerly at startup.
     large_body_buffer_count: u16,
-    /// Each pooled buffer holds one max-size body, so large uncompressed
-    /// intakes (1-2 MiB customer payloads) ride the pool instead of falling
-    /// through to per-request allocation.
+    /// Size of each reusable body buffer. Requests above this use their
+    /// request arena and remain bounded by `max_body_size`.
     large_body_buffer_size: u32,
 
     /// Inputs to `resolve` that originate from config (`ProxyConfig`), with
@@ -98,6 +123,11 @@ pub const Limits = struct {
 
     pub fn resolve(opts: ResolveOptions) Limits {
         std.debug.assert(opts.max_connections > 0);
+        const worker_count: ?u16 = if (opts.worker_count) |count|
+            @intCast(@min(@as(u32, @max(count, 1)), opts.max_connections))
+        else
+            null;
+        const thread_pool_count: ?u16 = if (opts.thread_pool_count) |count| @max(count, 1) else DEFAULT_HANDLER_THREADS;
         const zstd_window_len = std.math.clamp(
             @as(usize, opts.max_body_size),
             ZSTD_WINDOW_MIN,
@@ -106,9 +136,11 @@ pub const Limits = struct {
         return .{
             .max_connections = opts.max_connections,
             .max_body_size = opts.max_body_size,
-            .max_decoded_bytes = opts.max_decoded_bytes orelse opts.max_body_size,
-            .worker_count = opts.worker_count,
-            .thread_pool_count = opts.thread_pool_count,
+            // Never below the raw cap: a larger body_size must stay admissible.
+            .max_decoded_bytes = opts.max_decoded_bytes orelse
+                @max(@as(usize, DEFAULT_MAX_DECODED_BYTES), @as(usize, opts.max_body_size)),
+            .worker_count = worker_count,
+            .thread_pool_count = thread_pool_count,
             .record_scratch = RECORD_SCRATCH_BYTES,
             .recv_buf = RECV_BUF_BYTES,
             .send_buf = SEND_BUF_BYTES,
@@ -119,21 +151,18 @@ pub const Limits = struct {
             .chunk_buf = CHUNK_BUF_BYTES,
             .zstd_window_len = zstd_window_len,
             .conn_arena_reserve = CONN_ARENA_RESERVE_BYTES,
-            // Only handler threads consume bodies concurrently, so pool one
-            // buffer per handler, capped at 8 total — beyond that, misses are
-            // an exact-size arena alloc, cheaper than pinning more max-size
-            // buffers forever. httpz builds one pool PER WORKER, so the cap
-            // is divided across workers to keep the process-wide total at
-            // ~8 x max_body_size regardless of worker_count.
+            // httpz builds one pool per event-loop worker. Split eight reusable
+            // entries across workers, with one per worker as the lower bound.
+            // Pool misses use an exact-size request-arena allocation.
             .large_body_buffer_count = @max(
                 1,
-                @min(opts.thread_pool_count orelse 8, 8) / (opts.worker_count orelse 1),
+                @min(thread_pool_count orelse 8, 8) / (worker_count orelse 1),
             ),
-            .large_body_buffer_size = opts.max_body_size,
+            .large_body_buffer_size = @min(opts.max_body_size, LARGE_BODY_BUFFER_BYTES),
         };
     }
 
-    /// Bytes the slab pre-allocates for one connection's fixed buffers.
+    /// Bytes the stdio slab pre-allocates for one connection's fixed buffers.
     /// Pages are reserved up front but only consume RSS once touched, so
     /// actual residency tracks concurrent connection load.
     pub fn perConnBytes(self: Limits) usize {
@@ -142,8 +171,7 @@ pub const Limits = struct {
             self.body_buf + self.chunk_buf;
     }
 
-    /// Closed-form steady-state budget for the data plane. Logged once at
-    /// startup; THE number that makes memory predictable. Excludes cold,
+    /// Closed-form steady-state budget for the stdio data plane. Excludes cold,
     /// config-proportional state (router tables, policy snapshots) and
     /// libzstd contexts, which are bounded separately and logged by their
     /// owners.
@@ -176,13 +204,17 @@ test "Limits budget formula is locked" {
     try std.testing.expectEqual(@as(usize, 1736 * 1024), limits.perConnBytes());
     try std.testing.expectEqual(@as(usize, 256 * 1752 * 1024), limits.steadyStateBytes());
     try std.testing.expectEqual(@as(u32, 1024 * 1024), limits.max_body_size);
-    // max_decoded_bytes defaults to max_body_size; thread knobs default off.
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.max_decoded_bytes);
+    // max_decoded_bytes is decoupled from max_body_size: agents compress, so a
+    // 1 MiB raw body routinely decodes to several MiB.
+    try std.testing.expectEqual(@as(usize, DEFAULT_MAX_DECODED_BYTES), limits.max_decoded_bytes);
+    // A raw cap above the decoded default still stays admissible.
+    const wide: Limits = .resolve(.{ .max_body_size = 32 * 1024 * 1024 });
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), wide.max_decoded_bytes);
     try std.testing.expectEqual(@as(?u16, null), limits.worker_count);
-    try std.testing.expectEqual(@as(?u16, null), limits.thread_pool_count);
-    // httpz body pool: 8 x max_body_size eager (was httpz's 16 x default).
+    try std.testing.expectEqual(@as(?u16, DEFAULT_HANDLER_THREADS), limits.thread_pool_count);
+    // The reusable body pool stays small even when the accepted body limit grows.
     try std.testing.expectEqual(@as(u16, 8), limits.large_body_buffer_count);
-    try std.testing.expectEqual(@as(u32, 1024 * 1024), limits.large_body_buffer_size);
+    try std.testing.expectEqual(LARGE_BODY_BUFFER_BYTES, limits.large_body_buffer_size);
 }
 
 test "Limits resolves config-supplied knobs" {
@@ -208,7 +240,7 @@ test "Limits caps the body pool below the handler count" {
     });
     // 32 handlers don't get 32 x 2 MiB pinned; overflow bodies arena-alloc.
     try std.testing.expectEqual(@as(u16, 8), limits.large_body_buffer_count);
-    try std.testing.expectEqual(@as(u32, 2 * 1024 * 1024), limits.large_body_buffer_size);
+    try std.testing.expectEqual(LARGE_BODY_BUFFER_BYTES, limits.large_body_buffer_size);
 
     const small: Limits = .resolve(.{
         .max_body_size = 2 * 1024 * 1024,

@@ -21,7 +21,7 @@ pub const Otlp = struct {
             return .{ .forward_raw = .{ .upstream = .default } };
         };
         const codec = service.resolveCodec(req.content_encoding) orelse {
-            return .{ .forward_raw = .{ .upstream = .default } };
+            return .{ .forward_raw = .{ .upstream = .default, .replayable = signal == .log } };
         };
         if (std.mem.indexOf(u8, req.content_type, "application/x-protobuf") != null) {
             return .{ .pipe_stream = .{
@@ -43,7 +43,7 @@ pub const Otlp = struct {
                 .codec = codec,
             } };
         }
-        return .{ .forward_raw = .{ .upstream = .default } };
+        return .{ .forward_raw = .{ .upstream = .default, .replayable = signal == .log } };
     }
 
     fn signalForPath(path: []const u8) ?service.Signal {
@@ -93,6 +93,14 @@ test "unknown content type and unknown path forward raw" {
         .content_type = "text/csv",
     });
     try testing.expectEqual(service.UpstreamChoice.default, weird_type.forward_raw.upstream);
+    try testing.expect(weird_type.forward_raw.replayable);
+
+    const metric = svc.plan(.{
+        .method = .POST,
+        .path = "/v1/metrics",
+        .content_type = "text/csv",
+    });
+    try testing.expect(!metric.forward_raw.replayable);
 
     const weird_path = svc.plan(.{ .method = .POST, .path = "/v1/profiles" });
     try testing.expectEqual(service.UpstreamChoice.default, weird_path.forward_raw.upstream);

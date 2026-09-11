@@ -100,11 +100,11 @@ Provide auth either via:
 | `config.upstreamUrl`                | string | `https://agent-http-intake.logs.datadoghq.com` | Default upstream URL                                          |
 | `config.metricsUrl`                 | string | `https://api.datadoghq.com`                    | Metrics upstream URL                                          |
 | `config.logLevel`                   | string | `info`                                         | Log level                                                     |
-| `config.maxBodySize`                | int    | `1048576`                                      | Max request body bytes                                        |
-| `config.maxConnections`             | int    | `256`                                          | Max concurrent connections (dominant memory cap)             |
-| `config.maxDecodedBytes`            | int    | `null`                                         | Post-decompression body ceiling (defaults to maxBodySize)    |
-| `config.workerCount`                | int    | `null`                                         | httpz event-loop workers (null = default 1)                  |
-| `config.threadPoolCount`            | int    | `null`                                         | httpz handler threads (null = default 32; scales memory)     |
+| `config.maxBodySize`                | int    | `1572864`                                      | Raw request body cap as received on the wire                  |
+| `config.maxConnections`             | int    | `256`                                          | Max concurrent connections; also caps workerCount             |
+| `config.maxDecodedBytes`            | int    | `null`                                         | Post-decompression ceiling (null = 16 MiB, min maxBodySize)   |
+| `config.workerCount`                | int    | `null`                                         | httpz event-loop workers (null = 1; max maxConnections)       |
+| `config.threadPoolCount`            | int    | `null`                                         | httpz handler threads per worker (null = 128)                 |
 | `config.service.name`               | string | `""`                                           | Service name sent on policy sync (omitted if empty)           |
 | `config.service.namespace`          | string | `""`                                           | Service namespace sent on policy sync (omitted if empty)      |
 | `config.service.version`            | string | `""`                                           | Service version sent on policy sync (omitted if empty)        |
@@ -129,6 +129,18 @@ Provide auth either via:
 
 ## Notes
 
+- Each upstream attempt has a fixed 30s deadline; a request that exceeds it
+  returns 504. Inbound requests and idle keep-alives also time out after 30s.
+  None of these are configurable.
+- A handler thread owns its whole upstream exchange, so sustained throughput is
+  about `threadPoolCount / upstream_round_trip`. The Datadog intake answers in
+  about 14ms on a warm connection, so the default 128 threads sustain roughly
+  4.8k requests/sec per pod. Raise `threadPoolCount` and `resources.limits.memory`
+  together: each thread retains up to ~2 MiB of codec scratch once it has
+  handled compressed traffic.
+- Log intake routes replay once on a fresh upstream connection when the first
+  attempt fails before a response. A replay can duplicate log lines if the
+  upstream accepted the first attempt but its acknowledgement was lost.
 - `workspace_id` is not required in `config.json`.
 - If `tero.url` is set, chart requires either `tero.apiKey` or
   `tero.existingSecret.name`.

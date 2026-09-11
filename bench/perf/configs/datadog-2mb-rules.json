@@ -4,13 +4,11 @@
   "upstream_url": "http://127.0.0.1:9999",
   "log_level": "err",
   "max_body_size": 2097152,
-  "max_upstream_retries": 10,
   "policy_providers": [
     {
       "id": "bench-policies",
       "type": "file",
       "path": "bench/perf/configs/policies.json"
     }
-  ],
-  "thread_pool_count": 8
+  ]
 }

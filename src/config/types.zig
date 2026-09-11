@@ -1,5 +1,6 @@
 const std = @import("std");
 const policy = @import("policy_zig");
+const limits = @import("../core/limits.zig");
 
 const log = std.log.scoped(.config);
 
@@ -107,10 +108,10 @@ pub const ProxyConfig = struct {
     // Inspection config
     log_level: LogLevel = .info,
 
-    max_body_size: u32 = 1024 * 1024, // 1MB
+    max_body_size: u32 = limits.DEFAULT_MAX_BODY_BYTES,
 
-    /// Post-decompression body ceiling; defaults to `max_body_size` when unset.
-    /// Raise it to admit payloads that decompress larger than the raw cap.
+    /// Post-decompression body ceiling. Null uses
+    /// `limits.DEFAULT_MAX_DECODED_BYTES`, never below `max_body_size`.
     max_decoded_bytes: ?u32 = null,
 
     /// Max concurrent connections; the dominant memory/throughput knob (see
@@ -141,6 +142,10 @@ pub const ProxyConfig = struct {
 
     /// Post-load validation hook (called by zonfig).
     pub fn validate(self: *ProxyConfig) !void {
+        if (self.max_connections == 0 or self.max_connections > std.math.maxInt(u16) or
+            self.max_body_size == 0 or (self.max_decoded_bytes orelse 1) == 0 or
+            (self.worker_count orelse 1) == 0 or (self.thread_pool_count orelse 1) == 0)
+            return error.InvalidLimits;
         try self.s3_dump.validate();
     }
 };
@@ -161,6 +166,19 @@ test "ProxyConfig.validate rejects zero s3_dump knobs when enabled" {
     // Enabled with sane defaults → accepted.
     var ok: ProxyConfig = .{ .s3_dump = .{ .enabled = true } };
     try ok.validate();
+}
+
+test "ProxyConfig.validate rejects invalid data-plane limits" {
+    var zero_connections: ProxyConfig = .{ .max_connections = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_connections.validate());
+    var too_many_connections: ProxyConfig = .{ .max_connections = std.math.maxInt(u16) + 1 };
+    try std.testing.expectError(error.InvalidLimits, too_many_connections.validate());
+    var zero_body: ProxyConfig = .{ .max_body_size = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_body.validate());
+    var zero_decoded: ProxyConfig = .{ .max_decoded_bytes = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_decoded.validate());
+    var zero_workers: ProxyConfig = .{ .worker_count = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_workers.validate());
 }
 
 test "s3_dump targets_json parses into S3TargetConfig (Lambda env-only path)" {
