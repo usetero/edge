@@ -181,6 +181,8 @@ pub const PipeBuffered = struct {
 
 pub const Forward = struct {
     upstream: UpstreamChoice,
+    /// The route permits duplicate delivery of its prepared log payload.
+    replayable: bool = false,
 };
 
 pub const FetchFiltered = struct {

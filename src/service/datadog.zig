@@ -23,10 +23,10 @@ pub const Logs = struct {
     pub fn plan(_: *const Logs, req: service.PlanRequest) service.Outcome {
         // Same gate as the old processLogsStream: only JSON is evaluated.
         if (std.mem.indexOf(u8, req.content_type, "application/json") == null) {
-            return .{ .forward_raw = .{ .upstream = .logs } };
+            return .{ .forward_raw = .{ .upstream = .logs, .replayable = true } };
         }
         const codec = service.resolveCodec(req.content_encoding) orelse {
-            return .{ .forward_raw = .{ .upstream = .logs } };
+            return .{ .forward_raw = .{ .upstream = .logs, .replayable = true } };
         };
         return .{ .pipe_stream = .{
             .format = .json_array,

@@ -53,7 +53,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN_DATE="$(date +"%Y-%m-%dT%H-%M-%S")"
 OUTPUT_BASE_DIR="$SCRIPT_DIR/results"
 OUTPUT_DIR="$OUTPUT_BASE_DIR/$RUN_DATE"
-DEBUG_DIR="$SCRIPT_DIR/debug"
+DEBUG_DIR="$OUTPUT_DIR/debug"
 PAYLOADS_DIR="$SCRIPT_DIR/payloads"
 CONFIGS_DIR="$SCRIPT_DIR/configs"
 
@@ -298,14 +298,7 @@ cleanup() {
     [[ -n "$VECTOR_PID" ]] && kill -9 "$VECTOR_PID" 2>/dev/null || true
     [[ -n "$TERO_VECTOR_PID" ]] && kill -9 "$TERO_VECTOR_PID" 2>/dev/null || true
     [[ -n "$TERO_COLLECTOR_PID" ]] && kill -9 "$TERO_COLLECTOR_PID" 2>/dev/null || true
-    # Then pkill to catch any orphans
-    pkill -9 -f "echo-server" 2>/dev/null || true
-    pkill -9 -f "edge-otlp" 2>/dev/null || true
-    pkill -9 -f "edge-datadog" 2>/dev/null || true
-    pkill -9 -f "otelcol" 2>/dev/null || true
-    pkill -9 -f "tero-collector" 2>/dev/null || true
-    pkill -9 -f "tero-vector.*--config" 2>/dev/null || true
-    pkill -9 -f "vector.*--config" 2>/dev/null || true
+    [[ -n "$MONITOR_PID" ]] && kill "$MONITOR_PID" 2>/dev/null || true
     sleep 0.5
 }
 
@@ -450,6 +443,18 @@ start_edge_proxy() {
     fi
     EDGE_PID=$!
     wait_for_server "$port" "$binary"
+    local expected actual attempt
+    expected=$(jq '.policies | length' "$(jq -r '.policy_providers[0].path' "$config")")
+    for ((attempt=0; attempt<1200; attempt++)); do
+        actual=$(curl -fsS --max-time 2 "http://127.0.0.1:$port/_edge/policies?format=json" | jq '.policies | length') || actual=-1
+        if [[ "$actual" == "$expected" ]]; then
+            return
+        fi
+        kill -0 "$EDGE_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    log_error "Policies did not become ready: expected $expected, got $actual"
+    return 1
 }
 
 # Resource monitoring (simplified from bench/run.sh)
@@ -477,10 +482,10 @@ start_resource_monitor() {
     MONITORED_PID="$target_pid"
     RESOURCE_FILE=$(mktemp /tmp/bench_mem_XXXXXX)
     CPU_START_TIME=$(get_cpu_seconds "$target_pid")
-    BENCH_START_WALL=$(date +%s.%N)
+    BENCH_START_WALL=$(python3 -c 'import time; print(time.monotonic())')
 
     (
-        trap '' TERM INT
+        trap 'exit 0' TERM INT
         while kill -0 "$target_pid" 2>/dev/null; do
             ps -o rss= -p "$target_pid" 2>/dev/null | tr -d ' ' >> "$RESOURCE_FILE"
             sleep 0.1
@@ -493,7 +498,7 @@ start_resource_monitor() {
 stop_resource_monitor() {
     local target_pid="$MONITORED_PID"
     local cpu_end_time=$(get_cpu_seconds "$target_pid")
-    local wall_end=$(date +%s.%N)
+    local wall_end=$(python3 -c 'import time; print(time.monotonic())')
 
     [[ -n "$MONITOR_PID" ]] && kill "$MONITOR_PID" 2>/dev/null || true
     wait "$MONITOR_PID" 2>/dev/null || true
@@ -527,26 +532,27 @@ run_benchmark() {
     # Run oha with the payload file
     # For binary files (protobuf), we use -D to read from file
     # For JSON, we also use -D for consistency
-    oha -n "$REQUESTS" \
+    NO_COLOR=true oha -n "$REQUESTS" \
         -c "$CONNECTIONS" \
+        -t 10s \
         -m POST \
         -H "Content-Type: $content_type" \
         -D "$payload_file" \
         --output-format json \
-        "$url" > "$output_file" 2>/dev/null
+        "$url" > "$output_file" 2>"${output_file%.json}.stderr"
 }
 
 extract_metrics() {
     local json_file=$1
     [[ ! -f "$json_file" ]] && echo "N/A,N/A,N/A,N/A" && return
 
-    jq -r '
+    jq -r --argjson offered "$REQUESTS" '
         .statusCodeDistribution as $dist |
-        ($dist | to_entries | map(.value) | add // 0) as $total |
+        $offered as $total |
         ($dist | to_entries | map(select(.key | test("^2"))) | map(.value) | add // 0) as $success |
         (if $total > 0 then ($success / $total * 100 | floor) else 0 end) as $success_pct |
         [
-            (.summary.requestsPerSec | floor),
+            ($success / .summary.total | floor),
             (.latencyPercentiles.p50 * 1000 | . * 100 | floor | . / 100),
             (.latencyPercentiles.p99 * 1000 | . * 100 | floor | . / 100),
             $success_pct
@@ -574,7 +580,6 @@ create_edge_config() {
   "upstream_url": "http://127.0.0.1:$ECHO_SERVER_PORT",
   "log_level": "err",
   "max_body_size": 4194304,
-  "max_upstream_retries": 10,
   "policy_providers": [
     {
       "id": "bench-policies",
@@ -594,9 +599,9 @@ verify_request_count() {
 
     local total_requests=$(echo "$stats" | jq -r '.total_requests')
 
-    # Allow 5% variance for sampling/rate limiting effects
-    local min_expected=$((expected_requests * 85 / 100))
-    local max_expected=$((expected_requests * 105 / 100))
+    # Passthrough must reach the sink exactly once per successful request.
+    local min_expected=$expected_requests
+    local max_expected=$expected_requests
 
     if [[ "$total_requests" -lt "$min_expected" ]] || [[ "$total_requests" -gt "$max_expected" ]]; then
         log_warn "Unexpected request count for $scenario: got $total_requests, expected ~$expected_requests"

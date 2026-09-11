@@ -113,15 +113,25 @@ pub const ProxyConfig = struct {
     /// Raise it to admit payloads that decompress larger than the raw cap.
     max_decoded_bytes: ?u32 = null,
 
-    /// Max concurrent connections; the dominant memory/throughput knob (see
-    /// limits.zig). Also honors the `TERO_MAX_CONNECTIONS` env override.
+    /// Process-wide inbound connection cap (divided across event-loop workers).
     max_connections: u32 = 256,
+
+    /// Aggregate httpz allocations, including receiving/queued bodies, response
+    /// buffers and transform arenas. Excludes policies, TLS and thread stacks.
+    max_buffered_bytes: u32 = 64 * 1024 * 1024,
+
+    /// One fresh-connection replay for known log intake routes. A replay can
+    /// duplicate logs when the upstream accepted the first attempt but lost its ACK.
+    retry_log_intake: bool = true,
+
+    /// Deadline for an established upstream exchange (send through response body).
+    upstream_timeout_ms: u32 = 5_000,
 
     /// httpz event-loop worker count (null = httpz default of 1).
     worker_count: ?u16 = null,
 
     /// httpz request-handler thread-pool count (null = httpz default of 32).
-    /// Multiplies the per-thread pipeline-scratch memory floor.
+    /// Per event-loop worker; codec scratch is allocated only on demand.
     thread_pool_count: ?u16 = null,
 
     /// Enables the `/_edge/tap/{pre,post}` debug endpoints, which stream raw
@@ -141,6 +151,12 @@ pub const ProxyConfig = struct {
 
     /// Post-load validation hook (called by zonfig).
     pub fn validate(self: *ProxyConfig) !void {
+        if (self.max_connections == 0 or self.max_connections > 65534 or
+            self.max_body_size == 0 or self.max_buffered_bytes == 0 or
+            self.upstream_timeout_ms == 0 or (self.max_decoded_bytes orelse 1) == 0 or
+            (self.worker_count orelse 1) == 0 or (self.thread_pool_count orelse 32) == 0 or
+            (self.worker_count orelse 1) > self.max_connections)
+            return error.InvalidLimits;
         try self.s3_dump.validate();
     }
 };
@@ -160,6 +176,19 @@ test "ProxyConfig.validate rejects zero s3_dump knobs when enabled" {
 
     // Enabled with sane defaults → accepted.
     var ok: ProxyConfig = .{ .s3_dump = .{ .enabled = true } };
+    try ok.validate();
+}
+
+test "ProxyConfig.validate rejects impossible limits" {
+    var zero_connections: ProxyConfig = .{ .max_connections = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_connections.validate());
+    var zero_budget: ProxyConfig = .{ .max_buffered_bytes = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_budget.validate());
+    var zero_timeout: ProxyConfig = .{ .upstream_timeout_ms = 0 };
+    try std.testing.expectError(error.InvalidLimits, zero_timeout.validate());
+    var more_workers_than_connections: ProxyConfig = .{ .max_connections = 2, .worker_count = 4 };
+    try std.testing.expectError(error.InvalidLimits, more_workers_than_connections.validate());
+    var ok: ProxyConfig = .{};
     try ok.validate();
 }
 

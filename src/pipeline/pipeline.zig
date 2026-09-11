@@ -82,7 +82,7 @@ pub fn streamReaderToWriter(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     max_bytes: usize,
-) std.Io.Reader.StreamError!usize {
+) (std.Io.Reader.StreamError || error{BodyTooLarge})!usize {
     var total_bytes: usize = 0;
     while (total_bytes < max_bytes) {
         const bytes = reader.stream(
@@ -95,6 +95,10 @@ pub fn streamReaderToWriter(
         if (bytes == 0) break;
         total_bytes += bytes;
     }
+    // EOF must be observed; merely copying the limit can turn a truncated
+    // upstream response into a successful response with missing data.
+    var excess: [1]u8 = undefined;
+    if (try reader.readSliceShort(&excess) != 0) return error.BodyTooLarge;
     return total_bytes;
 }
 
@@ -266,12 +270,10 @@ test "streamReaderToWriter streams full payload" {
     try std.testing.expectEqualStrings(input, out_buf[0..bytes]);
 }
 
-test "streamReaderToWriter respects limit" {
+test "streamReaderToWriter rejects oversized input instead of silently truncating" {
     var in_reader = std.Io.Reader.fixed("abcdef");
     var out_buf: [16]u8 = undefined;
     var out_writer = std.Io.Writer.fixed(&out_buf);
 
-    const n = try streamReaderToWriter(&in_reader, &out_writer, 3);
-    try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqualStrings("abc", out_buf[0..n]);
+    try testing.expectError(error.BodyTooLarge, streamReaderToWriter(&in_reader, &out_writer, 3));
 }

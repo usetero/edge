@@ -21,7 +21,7 @@ pub const Otlp = struct {
             return .{ .forward_raw = .{ .upstream = .default } };
         };
         const codec = service.resolveCodec(req.content_encoding) orelse {
-            return .{ .forward_raw = .{ .upstream = .default } };
+            return .{ .forward_raw = .{ .upstream = .default, .replayable = signal == .log } };
         };
         if (std.mem.indexOf(u8, req.content_type, "application/x-protobuf") != null) {
             return .{ .pipe_stream = .{
@@ -43,7 +43,7 @@ pub const Otlp = struct {
                 .codec = codec,
             } };
         }
-        return .{ .forward_raw = .{ .upstream = .default } };
+        return .{ .forward_raw = .{ .upstream = .default, .replayable = signal == .log } };
     }
 
     fn signalForPath(path: []const u8) ?service.Signal {

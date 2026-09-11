@@ -15,6 +15,9 @@ const exec = @import("../exec.zig");
 const service_mod = @import("../../service/service.zig");
 const upstream_mod = @import("../upstream.zig");
 const pipeline_mod = @import("../../pipeline/pipeline.zig");
+const encoding_mod = @import("../../pipeline/encoding.zig");
+const BudgetAllocator = @import("../../core/budget_allocator.zig").BudgetAllocator;
+const runtime_metrics = @import("../../runtime/runtime_metrics.zig");
 const limits_mod = @import("../../core/limits.zig");
 const lifecycle_mod = @import("../../core/lifecycle.zig");
 const prom = @import("../../signals/prometheus/root.zig");
@@ -22,12 +25,12 @@ const prom = @import("../../signals/prometheus/root.zig");
 const log = std.log.scoped(.httpz_server);
 
 // Named event payloads: the type name is the telemetry event name.
-const PipelineAborted = struct { err: []const u8 };
+const UpstreamRetried = struct { path: []const u8, err: []const u8 };
 /// A request threw out of dispatch (not a handled 4xx/5xx) — answered 502.
 const RequestFailed = struct { method: []const u8, path: []const u8, err: []const u8 };
 /// A pooled upstream connection failed and was destroyed instead of re-pooled,
 /// so the next request dials fresh (breaks the stale-keepalive poison loop).
-/// We do not retry in-process — the sender retries onto the fresh connection.
+/// Eligible log intakes replay the prepared payload once on a fresh connection.
 const UpstreamConnectionEvicted = struct { path: []const u8, err: []const u8 };
 /// Per-request trace, emitted at debug so it's off unless log_level=debug.
 const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
@@ -50,74 +53,133 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
         // a memory cap, not a body-size cap.
         .workers = .{
             .count = limits.worker_count,
+            .max_conn = @intCast(limits.max_connections / (limits.worker_count orelse 1)),
+            .min_conn = @intCast(@min(8, limits.max_connections / (limits.worker_count orelse 1))),
             .large_buffer_count = limits.large_body_buffer_count,
             .large_buffer_size = limits.large_body_buffer_size,
         },
-        .thread_pool = .{ .count = limits.thread_pool_count },
+        .thread_pool = .{
+            .count = limits.thread_pool_count,
+            .backlog = @intCast(@max(2, limits.max_connections / (limits.worker_count orelse 1))),
+            .buffer_size = limits_mod.HANDLER_THREAD_BUF_BYTES,
+        },
+        .timeout = .{ .request = 30, .keepalive = 30 },
     };
 }
 
-/// Per-worker-thread pipeline scratch, lazily allocated on first use and
-/// retained for the thread's lifetime (httpz pool threads live as long as
-/// the process, so this is bounded by thread_pool.count and intentionally
-/// never freed). Replaces the stdio frontend's per-connection slab regions.
+/// Eager httpz pools plus one recv buffer and arena reserve per admitted
+/// connection. Bodies, transforms and responses share the remaining budget.
+/// ponytail: the per-connection term is an estimate; compare it against
+/// edge_http_allocated_bytes at full load before trusting the headroom.
+pub fn minimumViableBytes(limits: limits_mod.Limits, config: httpz.Config) !usize {
+    const body_pool = try std.math.mul(
+        usize,
+        @as(usize, config.workers.large_buffer_count orelse 0),
+        @as(usize, config.workers.large_buffer_size orelse 0),
+    );
+    const thread_bufs = try std.math.mul(usize, config.threadPoolCount(), config.thread_pool.buffer_size orelse 0);
+    const per_worker = try std.math.add(usize, body_pool, thread_bufs);
+    const per_conn = try std.math.add(usize, limits.recv_buf, limits.conn_arena_reserve);
+    return std.math.add(
+        usize,
+        try std.math.mul(usize, config.workerCount(), per_worker),
+        try std.math.mul(usize, limits.max_connections, per_conn),
+    );
+}
+
+/// Only transport staging is allocated for passthrough. Codec and policy
+/// workspaces grow on demand and are charged to the shared HTTP memory budget.
 const ThreadBufs = struct {
-    decode: []u8,
-    encode: []u8,
-    scratch: []u8,
-    chunk: []u8,
+    decode: []u8 = &.{},
+    encode: []u8 = &.{},
+    scratch: []u8 = &.{},
+    chunk: []u8 = &.{},
     upstream: []u8,
-    /// Per-record eval state (zimdjson parser + record arena), reused across
-    /// every request this thread handles.
-    record: *exec.RecordScratch,
+    record: exec.RecordScratch,
+    /// Guards connection/deadline between the owning handler and the watchdog.
+    lock: std.Io.Mutex = .init,
+    connection: ?*std.http.Client.Connection = null,
+    deadline_ns: i128 = 0,
+    expired: std.atomic.Value(bool) = .init(false),
+
+    fn prepare(
+        self: *ThreadBufs,
+        allocator: std.mem.Allocator,
+        limits: limits_mod.Limits,
+        codec: encoding_mod.ContentEncoding,
+    ) !void {
+        try growBuffer(allocator, &self.decode, codec.decoderBufferLen(limits.zstd_window_len));
+        try growBuffer(allocator, &self.encode, codec.encoderBufferLen());
+        try growBuffer(allocator, &self.scratch, limits.record_scratch);
+        try growBuffer(allocator, &self.chunk, limits.chunk_buf);
+    }
 };
 
-threadlocal var tl_bufs: ?ThreadBufs = null;
-
-// httpz handler threads cache their pipeline scratch in tl_bufs and never free
-// it themselves. We can't free a thread-local from another thread, so each set
-// is also recorded here and swept once at shutdown — safe because the handler
-// pool is joined first (see HttpServer.deinit -> httpz worker thread_pool.stop).
-// one process-wide server, so module-global bookkeeping is fine.
+threadlocal var tl_bufs: ?*ThreadBufs = null;
 var bufs_registry_mutex: std.Io.Mutex = .init;
-var bufs_registry: std.ArrayList(ThreadBufs) = .empty;
+var bufs_registry: std.ArrayList(*ThreadBufs) = .empty;
 
-fn threadBufs(io: std.Io, gpa: std.mem.Allocator, limits: limits_mod.Limits) !ThreadBufs {
+fn growBuffer(allocator: std.mem.Allocator, buffer: *[]u8, len: usize) !void {
+    if (buffer.len < len) buffer.* = try allocator.realloc(buffer.*, len);
+}
+
+fn threadBufs(io: std.Io, allocator: std.mem.Allocator, limits: limits_mod.Limits) !*ThreadBufs {
     if (tl_bufs) |bufs| return bufs;
-    const record = try gpa.create(exec.RecordScratch);
-    record.* = .init(gpa);
-    const bufs: ThreadBufs = .{
-        .decode = try gpa.alloc(u8, limits.decode_buf),
-        .encode = try gpa.alloc(u8, limits.encode_buf),
-        .scratch = try gpa.alloc(u8, limits.record_scratch),
-        .chunk = try gpa.alloc(u8, limits.chunk_buf),
-        .upstream = try gpa.alloc(u8, limits.upstream_write_buf),
-        .record = record,
-    };
-    {
-        bufs_registry_mutex.lockUncancelable(io);
-        defer bufs_registry_mutex.unlock(io);
-        try bufs_registry.append(gpa, bufs);
-    }
+    const bufs = try allocator.create(ThreadBufs);
+    errdefer allocator.destroy(bufs);
+    const upstream = try allocator.alloc(u8, limits.upstream_write_buf);
+    errdefer allocator.free(upstream);
+    bufs.* = .{ .upstream = upstream, .record = .init(allocator) };
+    bufs_registry_mutex.lockUncancelable(io);
+    defer bufs_registry_mutex.unlock(io);
+    try bufs_registry.append(allocator, bufs);
     tl_bufs = bufs;
     return bufs;
 }
 
-/// Frees every thread's pipeline scratch. Call exactly once, after the httpz
-/// handler pool has been joined (no handler thread may touch tl_bufs after).
-fn freeThreadBufs(io: std.Io, gpa: std.mem.Allocator) void {
+fn trackConnection(io: std.Io, bufs: *ThreadBufs, connection: ?*std.http.Client.Connection, deadline_ns: i128) void {
+    bufs.lock.lockUncancelable(io);
+    defer bufs.lock.unlock(io);
+    bufs.connection = connection;
+    bufs.deadline_ns = deadline_ns;
+    if (connection != null) bufs.expired.store(false, .monotonic);
+}
+
+/// Shutdown interrupts blocked reads/writes without closing/recycling the fd.
+/// Detaching under the same lock precedes Request.deinit, so the watchdog can
+/// never touch an already-destroyed connection or a reused descriptor.
+fn expireConnections(ctx: *exec.SharedCtx) std.Io.Cancelable!void {
+    while (true) {
+        try ctx.io.sleep(.fromMilliseconds(50), .awake);
+        const now = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+        bufs_registry_mutex.lockUncancelable(ctx.io);
+        defer bufs_registry_mutex.unlock(ctx.io);
+        for (bufs_registry.items) |bufs| {
+            bufs.lock.lockUncancelable(ctx.io);
+            defer bufs.lock.unlock(ctx.io);
+            const conn = bufs.connection orelse continue;
+            if (now < bufs.deadline_ns or bufs.expired.swap(true, .monotonic)) continue;
+            conn.stream_reader.stream.shutdown(ctx.io, .both) catch |err| {
+                log.debug("upstream deadline shutdown: {s}", .{@errorName(err)});
+            };
+        }
+    }
+}
+
+/// Called only after every handler thread has been joined.
+fn freeThreadBufs(io: std.Io, allocator: std.mem.Allocator) void {
     bufs_registry_mutex.lockUncancelable(io);
     defer bufs_registry_mutex.unlock(io);
     for (bufs_registry.items) |bufs| {
-        gpa.free(bufs.decode);
-        gpa.free(bufs.encode);
-        gpa.free(bufs.scratch);
-        gpa.free(bufs.chunk);
-        gpa.free(bufs.upstream);
+        allocator.free(bufs.decode);
+        allocator.free(bufs.encode);
+        allocator.free(bufs.scratch);
+        allocator.free(bufs.chunk);
+        allocator.free(bufs.upstream);
         bufs.record.deinit();
-        gpa.destroy(bufs.record);
+        allocator.destroy(bufs);
     }
-    bufs_registry.deinit(gpa);
+    bufs_registry.deinit(allocator);
     bufs_registry = .empty;
     tl_bufs = null;
 }
@@ -127,6 +189,8 @@ pub const HttpServer = struct {
     lifecycle: *lifecycle_mod.Lifecycle,
     handler: *Handler,
     server: httpz.Server(*Handler),
+    memory: *BudgetAllocator,
+    listen_done: std.Io.Event = .unset,
 
     pub fn init(
         ctx: *exec.SharedCtx,
@@ -136,16 +200,32 @@ pub const HttpServer = struct {
     ) !HttpServer {
         const handler = try ctx.gpa.create(Handler);
         errdefer ctx.gpa.destroy(handler);
-        handler.* = .{ .ctx = ctx };
+        const memory = try ctx.gpa.create(BudgetAllocator);
+        errdefer ctx.gpa.destroy(memory);
+        memory.* = .{ .parent = ctx.gpa, .limit = ctx.limits.max_buffered_bytes };
+        handler.* = .{ .ctx = ctx, .allocator = memory.allocator(), .memory = memory };
 
         const config = configFromLimits(ctx.limits, listen_address, listen_port);
-        const server = try httpz.Server(*Handler).init(ctx.io, ctx.gpa, config, handler);
+        const minimum = minimumViableBytes(ctx.limits, config) catch return error.InvalidLimits;
+        const per_conn = ctx.limits.recv_buf + ctx.limits.conn_arena_reserve;
+        if (minimum > memory.limit) {
+            log.err(
+                "max_buffered_bytes={d} is below the minimum viable {d} ({d} connections x {d} bytes + pools); " ++
+                    "raise max_buffered_bytes or lower max_connections/thread_pool_count",
+                .{ memory.limit, minimum, ctx.limits.max_connections, per_conn },
+            );
+            return error.InsufficientMemoryBudget;
+        }
+        const server = try httpz.Server(*Handler).init(ctx.io, memory.allocator(), config, handler);
         log.info(
-            "httpz frontend: {d} pool threads x {d} bytes pipeline scratch (lazy per thread)",
+            "httpz manifest: cap {d} bytes, minimum {d} ({d} connections, {d} handler threads), headroom {d} for " ++
+                "bodies/transforms/responses; excludes TLS, policies and thread stacks",
             .{
-                config.threadPoolCount(),
-                ctx.limits.decode_buf + ctx.limits.encode_buf + ctx.limits.record_scratch +
-                    ctx.limits.chunk_buf + ctx.limits.upstream_write_buf,
+                memory.limit,
+                minimum,
+                (config.workers.max_conn orelse 0) * config.workerCount(),
+                config.threadPoolCount() * config.workerCount(),
+                memory.limit - minimum,
             },
         );
         return .{
@@ -153,13 +233,16 @@ pub const HttpServer = struct {
             .lifecycle = lifecycle,
             .handler = handler,
             .server = server,
+            .memory = memory,
         };
     }
 
     pub fn deinit(self: *HttpServer) void {
         self.server.deinit();
         // Handler pool is joined by now; reclaim each thread's pipeline scratch.
-        freeThreadBufs(self.ctx.io, self.ctx.gpa);
+        freeThreadBufs(self.ctx.io, self.memory.allocator());
+        std.debug.assert(self.memory.used.load(.monotonic) == 0);
+        self.ctx.gpa.destroy(self.memory);
         self.ctx.gpa.destroy(self.handler);
         self.* = undefined;
     }
@@ -169,33 +252,63 @@ pub const HttpServer = struct {
     /// can't interrupt the blocking listen, which is why Engine.stop calls
     /// stopAccepting() before Lifecycle.shutdown.
     pub fn run(self: *HttpServer) std.Io.Cancelable!void {
-        self.server.listen() catch |err| {
-            log.err("httpz listen failed: {s}", .{@errorName(err)});
+        defer self.listen_done.set(self.ctx.io);
+        self.lifecycle.spawn(self.ctx.io, expireConnections, .{self.ctx}) catch {
+            self.lifecycle.requestShutdown(self.ctx.io);
+            return;
         };
+        self.server.listen() catch |err| {
+            log.err("httpz listen failed: {s} (HTTP allocations {d} of {d} bytes)", .{
+                @errorName(err),
+                self.memory.used.load(.monotonic),
+                self.memory.limit,
+            });
+        };
+        if (!self.handler.stopping.load(.acquire)) self.lifecycle.requestShutdown(self.ctx.io);
     }
 
-    /// Thread-safe: breaks `run` out of its event loop, closes the listener,
-    /// then waits for in-flight handlers to finish before returning. The wait
-    /// is essential: httpz's kqueue worker `stop()` only halts the event loop
-    /// and `deinit` frees the handler thread pool WITHOUT joining it, so a
-    /// handler still in `relayResponse` would otherwise race the io/upstream
-    /// teardown that follows (Engine.stop -> lifecycle.shutdown; destroy ->
-    /// upstreams.deinit) and segfault reading a freed response head. Bounded so
-    /// a wedged handler can't block shutdown forever.
+    /// Stop producers, then join consumers. A timed-out drain exits without
+    /// running destructors against memory still referenced by live threads.
     pub fn stopAccepting(self: *HttpServer) void {
-        self.server.stop();
-
         const io = self.ctx.io;
-        const deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() +
-            5 * std.time.ns_per_s;
-        while (self.handler.in_flight.load(.acquire) > 0) {
-            if (std.Io.Timestamp.now(io, .awake).toNanoseconds() >= deadline_ns) {
-                log.warn("shutdown: {d} request(s) still in flight after 5s drain", .{
-                    self.handler.in_flight.load(.acquire),
-                });
-                break;
+        var finished: std.Io.Event = .unset;
+        const guard = std.Thread.spawn(.{}, shutdownGuard, .{ io, &finished }) catch {
+            log.err("cannot start shutdown deadline guard", .{});
+            std.process.exit(1);
+        };
+        defer {
+            finished.set(io);
+            guard.join();
+        }
+        self.handler.stopping.store(true, .release);
+        // httpz's listen() deinits every worker, freeing its handler-pool
+        // arena, as soon as the event loop exits, without joining the pool.
+        // Join the pools while the loop still runs. Holding _mut guarantees
+        // listen() has finished constructing the workers.
+        {
+            self.server._mut.lockUncancelable(io);
+            defer self.server._mut.unlock(io);
+            if (self.server._listener != null) {
+                for (self.server._workers) |*worker| worker.thread_pool.stop();
             }
-            io.sleep(.fromNanoseconds(2 * std.time.ns_per_ms), .awake) catch break;
+        }
+        self.server.stop();
+        self.listen_done.waitUncancelable(io);
+    }
+
+    fn shutdownGuard(io: std.Io, finished: *std.Io.Event) void {
+        const timeout: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } };
+        const deadline = timeout.toDeadline(io);
+        while (!finished.isSet()) {
+            finished.waitTimeout(io, deadline) catch |err| switch (err) {
+                error.Timeout => {
+                    const now_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+                    if (now_ns < deadline.deadline.raw.toNanoseconds()) continue;
+                    log.err("shutdown deadline exceeded; exiting without freeing live request state", .{});
+                    std.process.exit(1);
+                },
+                error.Canceled => return,
+            };
         }
     }
 };
@@ -230,20 +343,18 @@ fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.http.He
 
 pub const Handler = struct {
     ctx: *exec.SharedCtx,
-    /// In-flight request count. httpz's kqueue worker stops its event loop on
-    /// `stop()` but never joins its handler thread pool before `deinit` frees
-    /// it, so an in-flight handler can race shutdown's io/upstream teardown
-    /// (segfault reading a torn response head). Shutdown drains this to zero
-    /// before tearing anything down — see `HttpServer.stopAccepting`.
-    in_flight: std.atomic.Value(u32) = .init(0),
-
+    allocator: std.mem.Allocator,
+    memory: *BudgetAllocator,
+    stopping: std.atomic.Value(bool) = .init(false),
     /// httpz entry point (takes precedence over httpz's router). Must not
-    /// return errors; failures collapse to a 502 with the buffered partial
+    /// return errors; failures discard buffered headers and the partial
     /// response discarded.
     pub fn handle(self: *Handler, req: *httpz.Request, res: *httpz.Response) void {
-        _ = self.in_flight.fetchAdd(1, .acquire);
-        defer _ = self.in_flight.fetchSub(1, .release);
-
+        if (self.stopping.load(.acquire)) {
+            res.status = 503;
+            res.keepalive = false;
+            return;
+        }
         const ctx = self.ctx;
         const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
         const method = serviceMethod(req.method);
@@ -262,8 +373,13 @@ pub const Handler = struct {
                 .err = @errorName(err),
             });
             res.clearWriter();
-            res.status = 502;
+            res.headers.reset();
+            res.status = errorStatus(err);
             res.body = "";
+            if (ctx.metrics) |metrics| {
+                metrics.recordRequestError(known_path, .uncaught);
+                if (err == error.UpstreamTimeout) metrics.recordUpstreamTimeout();
+            }
         };
 
         // Lifecycle observability is emitted here, AFTER the catch applies the
@@ -272,7 +388,10 @@ pub const Handler = struct {
         // partial status dispatch had set before it errored).
         const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-        if (ctx.metrics) |metrics| metrics.recordRequestDuration(known_path, elapsed_s);
+        if (ctx.metrics) |metrics| {
+            metrics.recordRequestDuration(known_path, elapsed_s);
+            metrics.recordResponse(known_path, runtime_metrics.statusClass(res.status));
+        }
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.debug(RequestCompleted{
             .method = @tagName(req.method),
@@ -292,7 +411,10 @@ pub const Handler = struct {
         if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
             res.header("content-type", "text/plain; version=0.0.4");
             exec.refreshPolicyGauge(ctx);
-            if (ctx.metrics) |metrics| try metrics.writePrometheus(res.writer());
+            if (ctx.metrics) |metrics| {
+                metrics.recordHttpMemory(self.memory.used.load(.monotonic), self.memory.limit);
+                try metrics.writePrometheus(res.writer());
+            }
             return;
         }
 
@@ -405,15 +527,13 @@ pub const Handler = struct {
     fn relayResponse(
         self: *Handler,
         res: *httpz.Response,
-        upstream_req: *std.http.Client.Request,
+        upstream_res: *std.http.Client.Response,
         max_response_body: usize,
-        bufs: ThreadBufs,
+        bufs: *ThreadBufs,
     ) !void {
         _ = self;
-        var upstream_res = try upstream_req.receiveHead(&.{});
-
         var extra_headers: [64]std.http.Header = undefined;
-        const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, res.arena, &extra_headers);
+        const relayed = try exec.collectUpstreamResponseHeaders(upstream_res, res.arena, &extra_headers);
         res.status = @intFromEnum(upstream_res.head.status);
         for (relayed) |header| res.header(header.name, header.value);
 
@@ -421,30 +541,65 @@ pub const Handler = struct {
         _ = try pipeline_mod.streamReaderToWriter(upstream_body, res.writer(), max_response_body);
     }
 
-    fn execForwardRaw(
+    fn execForwardRaw(self: *Handler, req: *httpz.Request, res: *httpz.Response, fwd: service_mod.Forward) !void {
+        return self.exchange(req, res, fwd.upstream, req.body() orelse "", fwd.replayable);
+    }
+
+    /// Exactly one evaluation precedes this function. Only transport failure
+    /// before a response head can replay; upstream HTTP statuses pass through.
+    fn exchange(
         self: *Handler,
         req: *httpz.Request,
         res: *httpz.Response,
-        fwd: service_mod.Forward,
+        choice: service_mod.UpstreamChoice,
+        body: []const u8,
+        replayable: bool,
     ) !void {
         const ctx = self.ctx;
-        const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
-        var upstream_req = self.openUpstream(req, res.arena, fwd.upstream) catch {
-            res.status = 502;
-            res.body = "";
+        const bufs = try threadBufs(ctx.io, self.allocator, ctx.limits);
+        const headers = try collectForwardHeaders(res.arena, req.headers.iterator());
+        const method = stdMethod(req.method) orelse return error.UnsupportedMethod;
+        const deadline = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() +
+            @as(i128, ctx.limits.upstream_timeout_ms) * std.time.ns_per_ms;
+        const retry = (replayable and ctx.limits.retry_log_intake) or method == .GET or method == .HEAD;
+        const attempts: usize = if (retry) 2 else 1;
+        for (0..attempts) |attempt| {
+            const client = if (attempt == 0) ctx.upstreams.getHttpClient() else &ctx.upstreams.retry_client;
+            if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(attempt > 0);
+            var upstream_req = try exec.openUpstreamWithClient(
+                ctx,
+                res.arena,
+                method,
+                req.url.raw,
+                headers,
+                choice,
+                client,
+            );
+            defer upstream_req.deinit();
+            if (std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() >= deadline) {
+                markUpstreamClosing(&upstream_req);
+                return error.UpstreamTimeout;
+            }
+            trackConnection(ctx.io, bufs, upstream_req.connection, deadline);
+            defer trackConnection(ctx.io, bufs, null, 0);
+            var upstream_res = sendAndReceiveHead(&upstream_req, req.method, body, bufs) catch |err| {
+                self.evictUpstream(&upstream_req, req.url.path, err);
+                if (bufs.expired.load(.monotonic)) return error.UpstreamTimeout;
+                if (attempt + 1 == attempts or !retryableTransportError(err)) return error.UpstreamTransportFailed;
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                ctx.bus.info(UpstreamRetried{ .path = req.url.path, .err = @errorName(err) });
+                continue;
+            };
+            const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(choice));
+            self.relayResponse(res, &upstream_res, max_response, bufs) catch |err| {
+                self.evictUpstream(&upstream_req, req.url.path, err);
+                if (bufs.expired.load(.monotonic)) return error.UpstreamTimeout;
+                if (err == error.BodyTooLarge) return error.UpstreamResponseTooLarge;
+                return err;
+            };
             return;
-        };
-        defer upstream_req.deinit();
-        // On any upstream failure, evict the connection so it isn't re-pooled — the
-        // next request dials fresh. We do NOT retry in-process: a replay could
-        // duplicate a non-idempotent request, and the sender already retries 502s.
-        errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err);
-
-        const body = req.body() orelse "";
-        try sendBufferedBody(&upstream_req, req.method, body, bufs);
-
-        const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(fwd.upstream));
-        try self.relayResponse(res, &upstream_req, max_response, bufs);
+        }
+        unreachable;
     }
 
     /// Destroy a failed pooled upstream connection and record it (warn). Keeps the
@@ -460,74 +615,38 @@ pub const Handler = struct {
         self.ctx.bus.warn(UpstreamConnectionEvicted{ .path = path, .err = @errorName(err) });
     }
 
-    fn execPipeStream(
-        self: *Handler,
-        req: *httpz.Request,
-        res: *httpz.Response,
-        pipe: service_mod.PipeStream,
-    ) !void {
+    fn execPipeStream(self: *Handler, req: *httpz.Request, res: *httpz.Response, pipe: service_mod.PipeStream) !void {
         const ctx = self.ctx;
-        // No policy targets this signal: the pipe is an identity transform,
-        // so skip the framer/codec/chunked overhead and relay the raw bytes
-        // (master's prefilter "forward unchanged" decision).
+        const raw_body = req.body() orelse "";
         if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
-            return self.execForwardRaw(req, res, .{ .upstream = pipe.upstream });
+            return self.exchange(req, res, pipe.upstream, raw_body, pipe.signal == .log);
         }
-        const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
-        var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
-            res.status = 502;
-            res.body = "";
-            return;
-        };
-        defer upstream_req.deinit();
-        // Any failure (mid-stream send to a dead conn, or relay) evicts the conn —
-        // a partially-sent chunked body makes it unreusable anyway. No retry.
-        errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err);
-
-        // httpz already buffered the request body; the record pipeline runs
-        // over it unchanged (same framer + sink as the stdio frontend).
-        var body_reader = std.Io.Reader.fixed(req.body() orelse "");
-
-        // Filtering changes length: always chunked.
-        upstream_req.transfer_encoding = .chunked;
-        var body_writer = try upstream_req.sendBodyUnflushed(bufs.upstream);
-
-        var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, bufs.record);
+        const bufs = try threadBufs(ctx.io, self.allocator, ctx.limits);
+        try bufs.prepare(self.allocator, ctx.limits, pipe.codec);
+        var body_reader = std.Io.Reader.fixed(raw_body);
+        const initial_capacity = @min(raw_body.len, limits_mod.LARGE_BODY_BUFFER_BYTES);
+        var output: std.Io.Writer.Allocating = try .initCapacity(res.arena, initial_capacity);
+        var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
         defer sink.deinit();
-
         const stats = pipeline_mod.run(.{
             .decode = pipe.codec,
             .format = pipe.format,
             .encode = pipe.codec,
             .max_decoded_bytes = ctx.limits.max_decoded_bytes,
             .zstd_window_len = ctx.limits.zstd_window_len,
-        }, &body_reader, &body_writer.writer, .{
+        }, &body_reader, &output.writer, .{
             .decoder = bufs.decode,
             .encoder = bufs.encode,
             .scratch = bufs.scratch,
             .chunk = bufs.chunk,
-        }, &sink) catch |err| {
-            // Mid-stream failure aborts the exchange: a partial chunked body is on
-            // the wire, so evict the conn and answer 502 (close the client conn —
-            // we can't complete a clean response). Handled here, so the errdefer
-            // (which covers the trailing sends/relay) does not also fire.
-            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            ctx.bus.err(PipelineAborted{ .err = @errorName(err) });
-            self.evictUpstream(&upstream_req, req.url.path, err);
-            res.status = 502;
-            res.body = "";
-            res.keepalive = false;
-            return;
+        }, &sink) catch |err| switch (err) {
+            error.ReadFailed => return error.InvalidRequestBody,
+            else => return err,
         };
-        try body_writer.end();
-        try upstream_req.connection.?.flush();
-
         if (ctx.metrics) |metrics| {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
         }
-
-        const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
-        try self.relayResponse(res, &upstream_req, max_response, bufs);
+        try self.exchange(req, res, pipe.upstream, output.written(), pipe.signal == .log);
     }
 
     fn execPipeBuffered(
@@ -537,12 +656,12 @@ pub const Handler = struct {
         pipe: service_mod.PipeBuffered,
     ) !void {
         const ctx = self.ctx;
-        const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         const raw_body = req.body() orelse "";
 
         // res.arena is httpz's per-request fallback allocator; safe for the
         // resize-heavy transform since 5f60277 (fallback resize fix).
         const processed: exec.BufferedResult = exec.processBuffered(ctx, pipe, res.arena, raw_body) catch |err| blk: {
+            if (err == error.BodyTooLarge or err == error.DecodedBodyTooLarge) return err;
             log.warn("buffered transform failed open: {s}", .{@errorName(err)});
             break :blk .{ .body = raw_body, .all_dropped = false };
         };
@@ -555,18 +674,7 @@ pub const Handler = struct {
             return;
         }
 
-        var upstream_req = self.openUpstream(req, res.arena, pipe.upstream) catch {
-            res.status = 502;
-            res.body = "";
-            return;
-        };
-        defer upstream_req.deinit();
-        errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err); // don't re-pool; no retry
-
-        try sendBufferedBody(&upstream_req, req.method, processed.body, bufs);
-
-        const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
-        try self.relayResponse(res, &upstream_req, max_response, bufs);
+        try self.exchange(req, res, pipe.upstream, processed.body, pipe.signal == .log);
     }
 
     fn execFetchFiltered(
@@ -576,13 +684,17 @@ pub const Handler = struct {
         fetch: service_mod.FetchFiltered,
     ) !void {
         const ctx = self.ctx;
-        const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
+        const bufs = try threadBufs(ctx.io, self.allocator, ctx.limits);
         var upstream_req = self.openUpstream(req, res.arena, fetch.upstream) catch {
             res.status = 502;
             res.body = "";
             return;
         };
         defer upstream_req.deinit();
+        const deadline = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() +
+            @as(i128, ctx.limits.upstream_timeout_ms) * std.time.ns_per_ms;
+        trackConnection(ctx.io, bufs, upstream_req.connection, deadline);
+        defer trackConnection(ctx.io, bufs, null, 0);
 
         // Scope eviction to the upstream send+head phase: a reused dead keep-alive
         // fails here, so evict it from the pool. Past receiveHead the response
@@ -603,6 +715,7 @@ pub const Handler = struct {
         // Same scratch layout as the stdio frontend: 4K line + 2K metadata
         // + 8K writer staging out of the (otherwise idle on GET) record
         // scratch region.
+        try growBuffer(self.allocator, &bufs.scratch, 14336);
         const scratch = bufs.scratch;
         var filter: prom.streaming_filter.PolicyStreamingFilter = .init(.{
             .line_buffer = scratch[0..4096],
@@ -626,6 +739,39 @@ pub const Handler = struct {
     }
 };
 
+fn errorStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
+        error.InvalidRequestBody => 400,
+        error.OutOfMemory, error.WriteFailed => 503,
+        error.UpstreamTimeout => 504,
+        else => 502,
+    };
+}
+
+fn retryableTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.WriteFailed,
+        error.ReadFailed,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.UnexpectedEndOfStream,
+        => true,
+        else => false,
+    };
+}
+
+fn sendAndReceiveHead(
+    request: *std.http.Client.Request,
+    method: httpz.Method,
+    body: []const u8,
+    bufs: *ThreadBufs,
+) !std.http.Client.Response {
+    try sendBufferedBody(request, method, body, bufs);
+    return request.receiveHead(&.{});
+}
+
 /// Force a failed upstream connection out of the shared client's pool.
 ///
 /// std.http.Client only evicts on the *receive* side (receiveHead sets
@@ -647,7 +793,7 @@ fn sendBufferedBody(
     upstream_req: *std.http.Client.Request,
     method: httpz.Method,
     body: []const u8,
-    bufs: ThreadBufs,
+    bufs: *ThreadBufs,
 ) !void {
     const std_method = stdMethod(method) orelse return error.UnsupportedMethod;
     if (std_method.requestHasBody() and body.len > 0) {
@@ -709,7 +855,7 @@ test "httpz config derives from limits" {
     try testing.expectEqual(@as(?u16, null), config.thread_pool.count);
     // The large-body pool must NOT ride httpz defaults (16 x max_body_size).
     try testing.expectEqual(@as(?u16, 8), config.workers.large_buffer_count);
-    try testing.expectEqual(@as(?u32, 1024 * 1024), config.workers.large_buffer_size);
+    try testing.expectEqual(@as(?u32, limits_mod.LARGE_BODY_BUFFER_BYTES), config.workers.large_buffer_size);
     try testing.expectEqual(@as(u16, 8080), config.address.ip.ip4.port);
 }
 
@@ -722,6 +868,32 @@ test "httpz config carries configured worker/thread-pool counts" {
     const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
     try testing.expectEqual(@as(?u16, 2), config.workers.count);
     try testing.expectEqual(@as(?u16, 8), config.thread_pool.count);
+}
+
+test "httpz worker count cannot raise the global connection cap" {
+    for ([_]u16{ 1, 2, 4 }) |workers| {
+        const limits: limits_mod.Limits = .resolve(.{
+            .max_body_size = 1024 * 1024,
+            .max_connections = 256,
+            .worker_count = workers,
+        });
+        const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
+        try testing.expectEqual(@as(usize, 256), (config.workers.max_conn orelse 0) * config.workerCount());
+    }
+}
+
+test "httpz minimum viable budget is checked arithmetic below the default cap" {
+    const limits: limits_mod.Limits = .resolve(.{ .max_body_size = 1024 * 1024, .max_connections = 256 });
+    const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
+    const minimum = try minimumViableBytes(limits, config);
+    const expected = 8 * @as(usize, limits_mod.LARGE_BODY_BUFFER_BYTES) + 32 * limits_mod.HANDLER_THREAD_BUF_BYTES +
+        256 * (limits.recv_buf + limits.conn_arena_reserve);
+    try testing.expectEqual(expected, minimum);
+    try testing.expect(minimum < limits.max_buffered_bytes);
+
+    var absurd = limits;
+    absurd.max_connections = std.math.maxInt(usize);
+    try testing.expectError(error.Overflow, minimumViableBytes(absurd, config));
 }
 
 test "httpz method maps onto service and std methods" {

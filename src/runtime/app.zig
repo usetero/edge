@@ -56,9 +56,10 @@ const ServiceConfigured = struct {
 };
 const ServerReady = struct {};
 const DataPlaneBudget = struct {
+    frontend: []const u8,
     max_connections: usize,
-    per_conn_bytes: usize,
-    steady_state_bytes: usize,
+    http_allocation_limit_bytes: ?usize,
+    slab_reserved_bytes: ?usize,
 };
 const ShutdownHint = struct { pid: c_int };
 const ServerStopped = struct {};
@@ -217,6 +218,9 @@ pub const EngineOptions = struct {
     max_body_size: u32,
     max_decoded_bytes: ?u32 = null,
     max_connections: u32 = limits_mod.DEFAULT_MAX_CONNECTIONS,
+    max_buffered_bytes: u32 = 64 * 1024 * 1024,
+    retry_log_intake: bool = true,
+    upstream_timeout_ms: u32 = 5_000,
     worker_count: ?u16 = null,
     thread_pool_count: ?u16 = null,
     upstream_url: []const u8,
@@ -258,10 +262,13 @@ pub const Engine = struct {
             .max_body_size = options.max_body_size,
             .max_decoded_bytes = options.max_decoded_bytes,
             .max_connections = options.max_connections,
+            .max_buffered_bytes = options.max_buffered_bytes,
+            .retry_log_intake = options.retry_log_intake,
+            .upstream_timeout_ms = options.upstream_timeout_ms,
             .worker_count = options.worker_count,
             .thread_pool_count = options.thread_pool_count,
         });
-        self.limits.logStartup();
+        if (build_options.frontend == .stdio) self.limits.logStartup();
 
         self.upstreams = upstream_mod.UpstreamManager.init(io, allocator, self.limits.max_connections);
         errdefer self.upstreams.deinit();
@@ -480,6 +487,9 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         .max_body_size = config.max_body_size,
         .max_decoded_bytes = config.max_decoded_bytes,
         .max_connections = config.max_connections,
+        .max_buffered_bytes = config.max_buffered_bytes,
+        .retry_log_intake = config.retry_log_intake,
+        .upstream_timeout_ms = config.upstream_timeout_ms,
         .worker_count = config.worker_count,
         .thread_pool_count = config.thread_pool_count,
         .upstream_url = config.upstream_url,
@@ -517,11 +527,14 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         });
     }
 
+    const httpz_frontend = build_options.frontend == .httpz;
+    const stdio_frontend = build_options.frontend == .stdio;
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(DataPlaneBudget{
         .max_connections = engine.limits.max_connections,
-        .per_conn_bytes = engine.limits.perConnBytes(),
-        .steady_state_bytes = engine.limits.steadyStateBytes(),
+        .frontend = @tagName(build_options.frontend),
+        .http_allocation_limit_bytes = if (httpz_frontend) engine.limits.max_buffered_bytes else null,
+        .slab_reserved_bytes = if (stdio_frontend) engine.limits.steadyStateBytes() else null,
     });
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(ServerReady{});

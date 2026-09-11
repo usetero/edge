@@ -7,3 +7,7 @@ pub const std_options = app.std_options;
 pub fn main(init: std.process.Init) !void {
     try app.run(init, mode.Distribution.edge);
 }
+
+test {
+    _ = @import("core/budget_allocator.zig");
+}

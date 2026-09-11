@@ -24,8 +24,8 @@ resources:
     cpu: 50m
     memory: 32Mi
   limits:
-    cpu: 200m
-    memory: 64Mi
+    # Allow CPU bursts; set a CPU limit explicitly if required by your cluster.
+    memory: 128Mi
 
 nodeSelector: {}
 tolerations:
@@ -94,10 +94,15 @@ config:
   logLevel: "info"
   maxBodySize: 1048576
 
-  # Max concurrent connections — the dominant memory/throughput cap (memory
-  # scales ~ maxConnections x maxBodySize). Also settable via the
+  # Process-wide inbound connection cap. Also settable via the
   # TERO_MAX_CONNECTIONS env override.
   maxConnections: 256
+  # HTTP allocations, including queued bodies and transforms; leave headroom
+  # for policies, native codecs, TLS, stacks and the rest of the process.
+  maxBufferedBytes: 67108864
+  # A retry can duplicate log lines when the first acknowledgement is lost.
+  retryLogIntake: true
+  upstreamTimeoutMs: 5000
 
   # Optional. Post-decompression body ceiling; defaults to maxBodySize when
   # null. Raise to admit payloads that decompress larger than the raw cap.
@@ -105,7 +110,7 @@ config:
 
   # Optional httpz tuning (null = built-in defaults). workerCount is event-loop
   # workers (default 1); threadPoolCount is request-handler threads (default
-  # 32) and multiplies the per-thread pipeline-scratch memory floor.
+  # 32 per event-loop worker). Codec scratch is allocated only when needed.
   workerCount: null
   threadPoolCount: null
 

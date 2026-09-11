@@ -1,40 +1,7 @@
-//! End-to-end upstream connection-pool recovery harness for the REAL edge
-//! binary, exercising all three forward paths.
-//!
-//! Background: std.http.Client pools keep-alive connections but only evicts a
-//! dead one on the *receive* side (receiveHead sets connection.closing). A
-//! *send*-side failure — BrokenPipe/ConnectionReset writing to a keep-alive the
-//! remote already closed — leaves the dead connection in the pool, so every
-//! later request reuses it and fails too: a permanent loop (the still-unfixed
-//! half of ziglang/zig#30165, and the Cloud Run symptom we saw). edge's fix is
-//! eviction: on ANY upstream error every forward path marks the connection
-//! closing (markUpstreamClosing) so std destroys it instead of re-pooling it.
-//! No in-process retry — a replay could duplicate a non-idempotent POST, and the
-//! sender already retries the 502.
-//!
-//! This harness spawns the real edge between an in-process client and an
-//! in-process fake upstream that idle-closes keep-alives:
-//!
-//!   [fake upstream] <-- http -- [zig-out/bin/edge] <-- http -- [client]
-//!
-//! then drives each forward path like a real sender: every request, and on a
-//! 502 it retries once. Because edge evicted the dead conn before answering, the
-//! retry dials a fresh upstream and must succeed. The harness asserts that NO
-//! request fails twice in a row (eviction always heals the next attempt) and that
-//! the retry path was actually exercised (some request needed a retry) — proving
-//! the pool isn't poisoned (stuck reusing one dead conn forever).
-//!
-//! With one-shot upstream connections each request alternates reuse-fail / fresh-
-//! dial, so ~N/2 succeed first try and the rest succeed on the immediate retry:
-//!
-//!   forward_raw   (passthrough, /forward)      -> fail → retry → ok
-//!   pipe_stream   (dd logs, /api/v2/logs)      -> fail → retry → ok
-//!   pipe_buffered (dd metrics, /api/v2/series) -> fail → retry → ok
-//!
-//! Run: zig build upstream-pool-harness  (builds edge, then runs this)
-//! Exit 0 = every path recovers (and forward_raw fully heals). Nonzero = some
-//! path poisoned (stuck reusing one dead conn) or the fix regressed.
-
+//! Real-binary stale keep-alive regression. Log intake clients never retry:
+//! Edge must replay their prepared payload once on a fresh connection. Generic
+//! POST and metric intake retain single-attempt semantics; those scenarios
+//! separately verify that eviction permits sender-side recovery.
 const std = @import("std");
 
 const requests = 10;
@@ -52,6 +19,7 @@ const Scenario = struct {
     path: []const u8,
     content_type: []const u8,
     body_file: ?[]const u8,
+    replayable: bool = false,
 };
 
 const scenarios = [_]Scenario{
@@ -63,6 +31,7 @@ const scenarios = [_]Scenario{
     },
     .{
         .name = "pipe_stream   (dd logs)",
+        .replayable = true,
         .path = "/api/v2/logs",
         .content_type = "application/json",
         .body_file = "bench/perf/payloads/datadog-1mb.json",
@@ -321,7 +290,11 @@ pub fn main(init: std.process.Init) !void {
         var recovered: u32 = 0;
         var failed: u32 = 0;
         for (0..requests) |_| {
-            switch (sendWithRetry(&client, uri, sc.content_type, body)) {
+            const outcome: Outcome = if (sc.replayable)
+                (if (sendRequest(&client, uri, sc.content_type, body)) .first_try else .failed)
+            else
+                sendWithRetry(&client, uri, sc.content_type, body);
+            switch (outcome) {
                 .first_try => first_try += 1,
                 .recovered => recovered += 1,
                 .failed => failed += 1,
@@ -344,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
         \\
         \\=== upstream connection-pool recovery harness (real edge) ===
         \\fake upstream: one response per connection, then close (idle-closing)
-        \\{d} requests/path; a failed request is retried once (as a sender would)
+        \\{d} requests/path; log clients never retry; other paths verify sender recovery
         \\
         \\  path                          ok/N   1st  retry  fail  dials
         \\
@@ -356,7 +329,7 @@ pub fn main(init: std.process.Init) !void {
         // sender's immediate retry always lands. So NO request may fail twice in a
         // row (failed == 0), and the retry path must actually have been exercised
         // (recovered >= 1) — otherwise we never tested the self-heal.
-        const ok = r.failed == 0 and r.recovered >= 1;
+        const ok = r.failed == 0 and (if (r.sc.replayable) r.first_try == requests else r.recovered >= 1);
         if (!ok) all_ok = false;
 
         const succeeded = r.first_try + r.recovered;
@@ -366,9 +339,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (all_ok) {
-        std.debug.print("\nPASS: every failed request succeeds on immediate retry (eviction self-heals)\n", .{});
+        std.debug.print(
+            "\nPASS: log delivery succeeds without sender retries; other paths recover after eviction\n",
+            .{},
+        );
         return;
     }
-    std.debug.print("\nFAIL: a request failed twice in a row, or the retry path was never hit\n", .{});
+    std.debug.print("\nFAIL: log delivery failed or single-attempt pool recovery regressed\n", .{});
     return error.HarnessAssertionFailed;
 }

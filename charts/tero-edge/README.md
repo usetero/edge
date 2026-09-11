@@ -101,10 +101,13 @@ Provide auth either via:
 | `config.metricsUrl`                 | string | `https://api.datadoghq.com`                    | Metrics upstream URL                                          |
 | `config.logLevel`                   | string | `info`                                         | Log level                                                     |
 | `config.maxBodySize`                | int    | `1048576`                                      | Max request body bytes                                        |
-| `config.maxConnections`             | int    | `256`                                          | Max concurrent connections (dominant memory cap)             |
+| `config.maxConnections`             | int    | `256`                                          | Process-wide inbound connection cap                          |
+| `config.maxBufferedBytes`           | int    | `67108864`                                     | Cap on HTTP allocations (bodies, responses, transforms)      |
+| `config.retryLogIntake`             | bool   | `true`                                         | Replay log intake once on a fresh upstream connection        |
+| `config.upstreamTimeoutMs`          | int    | `5000`                                         | Deadline for one upstream exchange                           |
 | `config.maxDecodedBytes`            | int    | `null`                                         | Post-decompression body ceiling (defaults to maxBodySize)    |
 | `config.workerCount`                | int    | `null`                                         | httpz event-loop workers (null = default 1)                  |
-| `config.threadPoolCount`            | int    | `null`                                         | httpz handler threads (null = default 32; scales memory)     |
+| `config.threadPoolCount`            | int    | `null`                                         | httpz handler threads per worker (null = default 32)         |
 | `config.service.name`               | string | `""`                                           | Service name sent on policy sync (omitted if empty)           |
 | `config.service.namespace`          | string | `""`                                           | Service namespace sent on policy sync (omitted if empty)      |
 | `config.service.version`            | string | `""`                                           | Service version sent on policy sync (omitted if empty)        |

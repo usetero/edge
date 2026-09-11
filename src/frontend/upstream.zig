@@ -50,6 +50,8 @@ pub const UpstreamManager = struct {
     /// Shared HTTP client with connection pooling.
     /// Thread-safe for creating requests; individual requests are not thread-safe.
     http_client: std.http.Client,
+    /// No idle entries: a retry cannot accidentally acquire another stale socket.
+    retry_client: std.http.Client,
 
     /// Thread-safe allocator for HTTP client operations
     allocator: std.mem.Allocator,
@@ -70,6 +72,14 @@ pub const UpstreamManager = struct {
                 // under load and exhausts ephemeral ports (AddressUnavailable).
                 .connection_pool = .{ .free_size = pool_size },
             },
+            .retry_client = .{
+                .allocator = allocator,
+                .io = io,
+                .tls_buffer_size = tls_min_buffer,
+                .read_buffer_size = tls_min_buffer,
+                .write_buffer_size = tls_min_buffer,
+                .connection_pool = .{ .free_size = 0 },
+            },
             .allocator = allocator,
         };
     }
@@ -77,6 +87,7 @@ pub const UpstreamManager = struct {
     pub fn deinit(self: *UpstreamManager) void {
         // Deinit HTTP client first (closes all pooled connections)
         self.http_client.deinit();
+        self.retry_client.deinit();
 
         const slice = self.upstreams.slice();
 

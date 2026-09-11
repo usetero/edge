@@ -111,6 +111,31 @@ const BuildInfoLabels = struct {
 };
 
 const InternalMetrics = struct {
+    edge_http_allocated_bytes: m.Gauge(u64) = .init(
+        "edge_http_allocated_bytes",
+        .{ .help = "Currently charged HTTP allocations, excluding TLS, native codecs and policies." },
+        .{},
+    ),
+    edge_http_allocation_limit_bytes: m.Gauge(u64) = .init(
+        "edge_http_allocation_limit_bytes",
+        .{ .help = "Maximum charged HTTP allocations." },
+        .{},
+    ),
+    edge_upstream_attempts_total: m.Counter(u64) = .init(
+        "edge_upstream_attempts_total",
+        .{ .help = "Upstream attempts, including retries." },
+        .{},
+    ),
+    edge_upstream_retries_total: m.Counter(u64) = .init(
+        "edge_upstream_retries_total",
+        .{ .help = "Fresh-connection transport retries." },
+        .{},
+    ),
+    edge_upstream_timeouts_total: m.Counter(u64) = .init(
+        "edge_upstream_timeouts_total",
+        .{ .help = "Upstream exchanges exceeding their deadline." },
+        .{},
+    ),
     edge_requests_total: RequestsTotal,
     edge_request_duration_seconds: RequestDurationSeconds,
     edge_responses_total: ResponsesTotal,
@@ -366,6 +391,20 @@ pub const RuntimeMetrics = struct {
         self.internal.edge_request_duration_seconds.observe(.{
             .known_path = known_path,
         }, duration_seconds) catch |err| log.debug("failed to record request duration metric: {}", .{err});
+    }
+
+    pub fn recordHttpMemory(self: *RuntimeMetrics, used: usize, limit: usize) void {
+        self.internal.edge_http_allocated_bytes.set(@intCast(used));
+        self.internal.edge_http_allocation_limit_bytes.set(@intCast(limit));
+    }
+
+    pub fn recordUpstreamAttempt(self: *RuntimeMetrics, retry: bool) void {
+        self.internal.edge_upstream_attempts_total.incr();
+        if (retry) self.internal.edge_upstream_retries_total.incr();
+    }
+
+    pub fn recordUpstreamTimeout(self: *RuntimeMetrics) void {
+        self.internal.edge_upstream_timeouts_total.incr();
     }
 
     pub fn recordResponse(

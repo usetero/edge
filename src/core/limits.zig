@@ -43,6 +43,9 @@ pub const ZSTD_WINDOW_MAX: usize = 8 * 1024 * 1024;
 pub const CONN_ARENA_RESERVE_BYTES: usize = 16 * 1024;
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+pub const LARGE_BODY_BUFFER_BYTES: u32 = 64 * 1024;
+/// httpz response staging buffer, one per handler thread (httpz default).
+pub const HANDLER_THREAD_BUF_BYTES: usize = 32 * 1024;
 
 // Compile-time sanity: the recv buffer holds a whole TLS record and buffers
 // stay cache-line friendly.
@@ -52,8 +55,11 @@ comptime {
 }
 
 pub const Limits = struct {
-    /// Connection slab capacity; claims beyond it are load-shed with 503.
+    /// Inbound connection cap; also sizes the stdio connection slab.
     max_connections: usize,
+    max_buffered_bytes: usize = 64 * 1024 * 1024,
+    retry_log_intake: bool = true,
+    upstream_timeout_ms: u32 = 5_000,
     /// Per-request body ceiling, from the frozen `ProxyConfig.max_body_size`.
     max_body_size: u32,
     /// Post-decompression body ceiling; defaults to `max_body_size`.
@@ -74,16 +80,11 @@ pub const Limits = struct {
     /// zstd decode window cap; frames declaring more fail the decode.
     zstd_window_len: usize,
     conn_arena_reserve: usize,
-    /// httpz large-body buffer pool: pooled buffers for request bodies that
-    /// outgrow the per-connection static buffer (recv_buf). A pool miss falls
-    /// back to an exact-size per-request arena allocation inside httpz, so
-    /// this caps steady-state memory, not body size — bodies up to
-    /// max_body_size always work. Left to httpz's default (16) this pool
-    /// alone cost 16 x max_body_size eagerly at startup.
+    /// A small reusable body pool per event-loop worker. Receiving and queued
+    /// bodies also use it; overflow allocations share the HTTP allocation cap.
     large_body_buffer_count: u16,
-    /// Each pooled buffer holds one max-size body, so large uncompressed
-    /// intakes (1-2 MiB customer payloads) ride the pool instead of falling
-    /// through to per-request allocation.
+    /// Large bodies allocate their actual size instead of pinning max_body_size
+    /// for every pool entry. Chunked bodies grow from this small initial buffer.
     large_body_buffer_size: u32,
 
     /// Inputs to `resolve` that originate from config (`ProxyConfig`), with
@@ -92,6 +93,9 @@ pub const Limits = struct {
         max_body_size: u32,
         max_decoded_bytes: ?u32 = null,
         max_connections: u32 = DEFAULT_MAX_CONNECTIONS,
+        max_buffered_bytes: u32 = 64 * 1024 * 1024,
+        retry_log_intake: bool = true,
+        upstream_timeout_ms: u32 = 5_000,
         worker_count: ?u16 = null,
         thread_pool_count: ?u16 = null,
     };
@@ -105,6 +109,9 @@ pub const Limits = struct {
         );
         return .{
             .max_connections = opts.max_connections,
+            .max_buffered_bytes = opts.max_buffered_bytes,
+            .retry_log_intake = opts.retry_log_intake,
+            .upstream_timeout_ms = opts.upstream_timeout_ms,
             .max_body_size = opts.max_body_size,
             .max_decoded_bytes = opts.max_decoded_bytes orelse opts.max_body_size,
             .worker_count = opts.worker_count,
@@ -119,17 +126,13 @@ pub const Limits = struct {
             .chunk_buf = CHUNK_BUF_BYTES,
             .zstd_window_len = zstd_window_len,
             .conn_arena_reserve = CONN_ARENA_RESERVE_BYTES,
-            // Only handler threads consume bodies concurrently, so pool one
-            // buffer per handler, capped at 8 total — beyond that, misses are
-            // an exact-size arena alloc, cheaper than pinning more max-size
-            // buffers forever. httpz builds one pool PER WORKER, so the cap
-            // is divided across workers to keep the process-wide total at
-            // ~8 x max_body_size regardless of worker_count.
+            // Split eight cached buffers across event-loop workers, with one
+            // minimum per worker. All pools are charged to the same budget.
             .large_body_buffer_count = @max(
                 1,
                 @min(opts.thread_pool_count orelse 8, 8) / (opts.worker_count orelse 1),
             ),
-            .large_body_buffer_size = opts.max_body_size,
+            .large_body_buffer_size = @min(opts.max_body_size, LARGE_BODY_BUFFER_BYTES),
         };
     }
 
@@ -180,9 +183,9 @@ test "Limits budget formula is locked" {
     try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.max_decoded_bytes);
     try std.testing.expectEqual(@as(?u16, null), limits.worker_count);
     try std.testing.expectEqual(@as(?u16, null), limits.thread_pool_count);
-    // httpz body pool: 8 x max_body_size eager (was httpz's 16 x default).
+    // httpz caches small bodies; the maximum payload does not size the pool.
     try std.testing.expectEqual(@as(u16, 8), limits.large_body_buffer_count);
-    try std.testing.expectEqual(@as(u32, 1024 * 1024), limits.large_body_buffer_size);
+    try std.testing.expectEqual(LARGE_BODY_BUFFER_BYTES, limits.large_body_buffer_size);
 }
 
 test "Limits resolves config-supplied knobs" {
@@ -206,9 +209,9 @@ test "Limits caps the body pool below the handler count" {
         .max_body_size = 2 * 1024 * 1024,
         .thread_pool_count = 32,
     });
-    // 32 handlers don't get 32 x 2 MiB pinned; overflow bodies arena-alloc.
+    // Cached bodies are small even when the maximum request is large.
     try std.testing.expectEqual(@as(u16, 8), limits.large_body_buffer_count);
-    try std.testing.expectEqual(@as(u32, 2 * 1024 * 1024), limits.large_body_buffer_size);
+    try std.testing.expectEqual(LARGE_BODY_BUFFER_BYTES, limits.large_body_buffer_size);
 
     const small: Limits = .resolve(.{
         .max_body_size = 2 * 1024 * 1024,
