@@ -59,8 +59,8 @@ pub const LambdaConfig = struct {
     // Limits
     max_body_size: u32 = 5 * 1024 * 1024, // 5MB
 
-    /// Post-decompression body ceiling; defaults to `max_body_size` when unset.
-    /// Raise it to admit payloads that decompress larger than the raw cap.
+    /// Post-decompression body ceiling; null uses the runtime default, which is
+    /// never below `max_body_size`. Honors `TERO_MAX_DECODED_BYTES`.
     max_decoded_bytes: ?u32 = null,
 
     /// Max concurrent connections; the dominant memory/throughput knob (see

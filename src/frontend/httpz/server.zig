@@ -55,7 +55,8 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .max_body_size = limits.max_body_size,
             .buffer_size = limits.recv_buf,
         },
-        // An unset thread-pool count keeps httpz's 32-thread default. Its count
+        // Handler threads bound concurrency, since each owns a whole upstream
+        // exchange. limits.zig derives the count; it is never left to httpz. Its count
         // bounds the number of retained per-thread pipeline workspaces.
         // The large-buffer pool is eagerly allocated (count x size at startup)
         // and httpz's defaults are 16 x max_body_size; we bound it from limits.
@@ -68,6 +69,12 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .large_buffer_size = limits.large_body_buffer_size,
         },
         .thread_pool = .{ .count = limits.thread_pool_count },
+        // httpz defaults both to ~68 years, so a half-open or slow client would
+        // hold one of `max_connections` slots indefinitely.
+        .timeout = .{
+            .request = limits_mod.REQUEST_TIMEOUT_SECONDS,
+            .keepalive = limits_mod.KEEPALIVE_TIMEOUT_SECONDS,
+        },
     };
 }
 
@@ -793,7 +800,7 @@ test "httpz config derives from limits" {
     try testing.expectEqual(@as(?usize, limits_mod.RECV_BUF_BYTES), config.request.buffer_size);
     // One event loop with the default handler pool.
     try testing.expectEqual(@as(?u16, 1), config.workers.count);
-    try testing.expectEqual(@as(?u16, null), config.thread_pool.count);
+    try testing.expectEqual(@as(?u16, limits_mod.DEFAULT_HANDLER_THREADS), config.thread_pool.count);
     // The large-body pool must NOT ride httpz defaults (16 x max_body_size).
     try testing.expectEqual(@as(?u16, 8), config.workers.large_buffer_count);
     try testing.expectEqual(@as(?u32, limits_mod.LARGE_BODY_BUFFER_BYTES), config.workers.large_buffer_size);

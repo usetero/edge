@@ -43,6 +43,29 @@ pub const ZSTD_WINDOW_MAX: usize = 8 * 1024 * 1024;
 pub const CONN_ARENA_RESERVE_BYTES: usize = 16 * 1024;
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+/// Raw request body cap. Datadog agents batch up to ~5 MB uncompressed, which
+/// gzips to well under this; OTLP collector batches are smaller again.
+pub const DEFAULT_MAX_BODY_BYTES: u32 = 1536 * 1024;
+
+/// Post-decompression cap when `max_decoded_bytes` is unset. Decoupled from
+/// `max_body_size` on purpose: agents compress, so the decoded size is roughly
+/// 10x the raw size and tying the two rejects ordinary compressed batches.
+pub const DEFAULT_MAX_DECODED_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Handler threads per event-loop worker. A handler owns its whole upstream
+/// exchange, so concurrency equals this count and throughput is roughly
+/// `count / upstream_round_trip`. Measured against a 14 ms upstream (the real
+/// Datadog intake round trip on a warm connection): 32 threads gave 1.5k req/s,
+/// 64 gave 2.7k, 128 gave 4.9k. 128 also removes queueing latency at a 100
+/// client burst (p50 17.7 ms, the bare upstream cost). 256 would need more than
+/// the 512 MiB chart limit for codec scratch alone, so 128 is the ceiling here.
+pub const DEFAULT_HANDLER_THREADS: u16 = 128;
+
+/// Inbound request and keep-alive deadlines. httpz leaves both effectively
+/// unbounded, so one idle socket would hold a connection slot forever.
+pub const REQUEST_TIMEOUT_SECONDS: u32 = 30;
+pub const KEEPALIVE_TIMEOUT_SECONDS: u32 = 30;
 /// A small reusable pool handles common payloads without reserving the full
 /// request limit for every slot. Larger bodies use request-owned allocations.
 pub const LARGE_BODY_BUFFER_BYTES: u32 = 64 * 1024;
@@ -104,7 +127,7 @@ pub const Limits = struct {
             @intCast(@min(@as(u32, @max(count, 1)), opts.max_connections))
         else
             null;
-        const thread_pool_count: ?u16 = if (opts.thread_pool_count) |count| @max(count, 1) else null;
+        const thread_pool_count: ?u16 = if (opts.thread_pool_count) |count| @max(count, 1) else DEFAULT_HANDLER_THREADS;
         const zstd_window_len = std.math.clamp(
             @as(usize, opts.max_body_size),
             ZSTD_WINDOW_MIN,
@@ -113,7 +136,9 @@ pub const Limits = struct {
         return .{
             .max_connections = opts.max_connections,
             .max_body_size = opts.max_body_size,
-            .max_decoded_bytes = opts.max_decoded_bytes orelse opts.max_body_size,
+            // Never below the raw cap: a larger body_size must stay admissible.
+            .max_decoded_bytes = opts.max_decoded_bytes orelse
+                @max(@as(usize, DEFAULT_MAX_DECODED_BYTES), @as(usize, opts.max_body_size)),
             .worker_count = worker_count,
             .thread_pool_count = thread_pool_count,
             .record_scratch = RECORD_SCRATCH_BYTES,
@@ -179,10 +204,14 @@ test "Limits budget formula is locked" {
     try std.testing.expectEqual(@as(usize, 1736 * 1024), limits.perConnBytes());
     try std.testing.expectEqual(@as(usize, 256 * 1752 * 1024), limits.steadyStateBytes());
     try std.testing.expectEqual(@as(u32, 1024 * 1024), limits.max_body_size);
-    // max_decoded_bytes defaults to max_body_size; thread knobs default off.
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.max_decoded_bytes);
+    // max_decoded_bytes is decoupled from max_body_size: agents compress, so a
+    // 1 MiB raw body routinely decodes to several MiB.
+    try std.testing.expectEqual(@as(usize, DEFAULT_MAX_DECODED_BYTES), limits.max_decoded_bytes);
+    // A raw cap above the decoded default still stays admissible.
+    const wide: Limits = .resolve(.{ .max_body_size = 32 * 1024 * 1024 });
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), wide.max_decoded_bytes);
     try std.testing.expectEqual(@as(?u16, null), limits.worker_count);
-    try std.testing.expectEqual(@as(?u16, null), limits.thread_pool_count);
+    try std.testing.expectEqual(@as(?u16, DEFAULT_HANDLER_THREADS), limits.thread_pool_count);
     // The reusable body pool stays small even when the accepted body limit grows.
     try std.testing.expectEqual(@as(u16, 8), limits.large_body_buffer_count);
     try std.testing.expectEqual(LARGE_BODY_BUFFER_BYTES, limits.large_body_buffer_size);

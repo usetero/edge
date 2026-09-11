@@ -25,7 +25,9 @@ resources:
     memory: 32Mi
   limits:
     cpu: 200m
-    memory: 64Mi
+    # Handler threads retain codec scratch (~2 MiB each once compressed traffic
+    # is seen) and in-flight bodies decode up to maxDecodedBytes.
+    memory: 512Mi
 
 nodeSelector: {}
 tolerations:
@@ -92,15 +94,17 @@ config:
   upstreamUrl: "https://agent-http-intake.logs.datadoghq.com"
   metricsUrl: "https://api.datadoghq.com"
   logLevel: "info"
-  maxBodySize: 1048576
+  # Raw (compressed) body cap as received on the wire.
+  maxBodySize: 1572864
 
   # Max concurrent connections — the dominant memory/throughput cap (memory
   # scales ~ maxConnections x maxBodySize). Also settable via the
   # TERO_MAX_CONNECTIONS env override.
   maxConnections: 256
 
-  # Optional. Post-decompression body ceiling; defaults to maxBodySize when
-  # null. Raise to admit payloads that decompress larger than the raw cap.
+  # Optional. Post-decompression body ceiling; null uses 16 MiB, and never less
+  # than maxBodySize. Agents gzip their batches, so the decoded size is what
+  # binds: a 1 MiB compressed batch commonly expands past 10 MiB.
   maxDecodedBytes: null
 
   # Optional httpz tuning (null = built-in defaults). workerCount is event-loop

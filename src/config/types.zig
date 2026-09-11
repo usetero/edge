@@ -1,5 +1,6 @@
 const std = @import("std");
 const policy = @import("policy_zig");
+const limits = @import("../core/limits.zig");
 
 const log = std.log.scoped(.config);
 
@@ -107,10 +108,10 @@ pub const ProxyConfig = struct {
     // Inspection config
     log_level: LogLevel = .info,
 
-    max_body_size: u32 = 1024 * 1024, // 1MB
+    max_body_size: u32 = limits.DEFAULT_MAX_BODY_BYTES,
 
-    /// Post-decompression body ceiling; defaults to `max_body_size` when unset.
-    /// Raise it to admit payloads that decompress larger than the raw cap.
+    /// Post-decompression body ceiling. Null uses
+    /// `limits.DEFAULT_MAX_DECODED_BYTES`, never below `max_body_size`.
     max_decoded_bytes: ?u32 = null,
 
     /// Max concurrent connections; the dominant memory/throughput knob (see
