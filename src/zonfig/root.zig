@@ -48,6 +48,8 @@ pub const LoadOptions = struct {
     env_prefix: []const u8 = "",
     /// Whether to allow env-only mode (no JSON file required)
     allow_env_only: bool = true,
+    /// Field paths (e.g. "tap_enabled", "s3_dump_targets") that env vars may not override.
+    env_exclude: []const []const u8 = &.{},
     /// Environment variables map (env vars are no longer global in Zig 0.16+).
     /// Callers must supply this, typically from `init.environ_map`.
     environ: *const std.process.Environ.Map,
@@ -102,7 +104,7 @@ pub fn load(comptime T: type, allocator: std.mem.Allocator, io: std.Io, options:
     }
 
     // Apply environment overrides (highest priority)
-    try applyEnvOverrides(T, allocator, config, options.env_prefix, options.environ);
+    try applyEnvOverrides(T, allocator, config, options.env_prefix, options.env_exclude, options.environ);
 
     // Apply environment variable substitution to all string fields
     try applyEnvSubstitution(T, allocator, config, options.environ);
@@ -139,7 +141,7 @@ fn loadFromBytes(
     try parseJsonInto(T, allocator, config, json_bytes);
 
     // Apply environment overrides
-    try applyEnvOverrides(T, allocator, config, env_prefix, environ);
+    try applyEnvOverrides(T, allocator, config, env_prefix, &.{}, environ);
 
     return config;
 }
@@ -159,7 +161,7 @@ fn loadFromEnv(
     config.* = defaultValue(T);
 
     // Apply environment overrides
-    try applyEnvOverrides(T, allocator, config, env_prefix, environ);
+    try applyEnvOverrides(T, allocator, config, env_prefix, &.{}, environ);
 
     return config;
 }
@@ -355,13 +357,14 @@ fn applyEnvOverrides(
     allocator: std.mem.Allocator,
     config: *T,
     prefix: []const u8,
+    exclude: []const []const u8,
     environ: *const std.process.Environ.Map,
 ) LoadError!void {
     // Build env var names at runtime using the prefix. Defaults are threaded
     // through so a string field that JSON already allocated can be freed before
     // the override replaces it (see freeReplacedString).
     var env_name_buf: [256]u8 = undefined;
-    try applyEnvOverridesRecursive(T, allocator, config, defaultValue(T), prefix, "", &env_name_buf, environ);
+    try applyEnvOverridesRecursive(T, allocator, config, defaultValue(T), prefix, exclude, "", &env_name_buf, environ);
 }
 
 fn applyEnvOverridesRecursive(
@@ -370,6 +373,7 @@ fn applyEnvOverridesRecursive(
     config: *T,
     defaults: T,
     prefix: []const u8,
+    exclude: []const []const u8,
     comptime path: []const u8,
     env_name_buf: *[256]u8,
     environ: *const std.process.Environ.Map,
@@ -395,6 +399,7 @@ fn applyEnvOverridesRecursive(
                         field_ptr,
                         field_default,
                         prefix,
+                        exclude,
                         field_path,
                         env_name_buf,
                         environ,
@@ -403,18 +408,24 @@ fn applyEnvOverridesRecursive(
                     // Build env var name at runtime: PREFIX_FIELD_PATH
                     // field_path is comptime known, so we pass it directly
                     const env_name = buildEnvName(prefix, field_path, env_name_buf);
-                    if (environ.get(env_name)) |env_value| {
+                    const env_value = if (isExcluded(exclude, field_path)) null else environ.get(env_name);
+                    if (env_value) |value| {
                         // Free any JSON-allocated string before overwriting it,
                         // else applyEnvValue's dupe orphans it (deinit only frees
                         // the final pointer).
                         freeReplacedString(field.type, allocator, field_ptr, field_default);
-                        try applyEnvValue(field.type, allocator, field_ptr, env_value);
+                        try applyEnvValue(field.type, allocator, field_ptr, value);
                     }
                 }
             }
         },
         else => {},
     }
+}
+
+fn isExcluded(exclude: []const []const u8, field_path: []const u8) bool {
+    for (exclude) |name| if (std.mem.eql(u8, name, field_path)) return true;
+    return false;
 }
 
 /// Free a string field's current value if an env override is about to replace
@@ -783,6 +794,27 @@ fn createTempConfigFile(io: std.Io, dir: std.Io.Dir, content: []const u8) !void 
 // -----------------------------------------------------------------------------
 // load: baked-config override (mirrors docker/defaults/datadog.json)
 // -----------------------------------------------------------------------------
+
+test "load: env_exclude keeps a sensitive field at its JSON value" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("TERO_TAP_ENABLED", "true");
+    try env_map.put("TERO_PORT", "9000");
+
+    const Config = struct {
+        port: u16 = 8080,
+        tap_enabled: bool = false,
+    };
+    const config = try load(Config, testing.allocator, std.Options.debug_io, .{
+        .environ = &env_map,
+        .env_prefix = "TERO",
+        .env_exclude = &.{"tap_enabled"},
+    });
+    defer deinit(Config, testing.allocator, config);
+
+    try testing.expectEqual(@as(u16, 9000), config.port);
+    try testing.expect(!config.tap_enabled);
+}
 
 test "load: TERO env override replaces a baked JSON upstream_url" {
     // Mirrors the shipped datadog image: a baked config.json whose upstream_url

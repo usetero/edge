@@ -25,7 +25,9 @@ resources:
     memory: 32Mi
   limits:
     # Allow CPU bursts; set a CPU limit explicitly if required by your cluster.
-    memory: 128Mi
+    # Edge reads this cgroup limit at startup and budgets half of it for HTTP
+    # bodies and transforms; the rest covers policies, TLS and thread stacks.
+    memory: 256Mi
 
 nodeSelector: {}
 tolerations:
@@ -71,7 +73,8 @@ container:
     periodSeconds: 10
   readinessProbe:
     httpGet:
-      path: /_health
+      # 503 until the initial policy load completes.
+      path: /_ready
       port: 8080
     initialDelaySeconds: 2
     periodSeconds: 5
@@ -92,27 +95,16 @@ config:
   upstreamUrl: "https://agent-http-intake.logs.datadoghq.com"
   metricsUrl: "https://api.datadoghq.com"
   logLevel: "info"
-  maxBodySize: 1048576
+  # Raw (compressed) request body cap. Decompressed bodies may reach 10x this.
+  maxBodySize: 1572864
 
   # Process-wide inbound connection cap. Also settable via the
   # TERO_MAX_CONNECTIONS env override.
   maxConnections: 256
-  # HTTP allocations, including queued bodies and transforms; leave headroom
-  # for policies, native codecs, TLS, stacks and the rest of the process.
-  maxBufferedBytes: 67108864
   # A retry can duplicate log lines when the first acknowledgement is lost.
   retryLogIntake: true
-  upstreamTimeoutMs: 5000
-
-  # Optional. Post-decompression body ceiling; defaults to maxBodySize when
-  # null. Raise to admit payloads that decompress larger than the raw cap.
-  maxDecodedBytes: null
-
-  # Optional httpz tuning (null = built-in defaults). workerCount is event-loop
-  # workers (default 1); threadPoolCount is request-handler threads (default
-  # 32 per event-loop worker). Codec scratch is allocated only when needed.
-  workerCount: null
-  threadPoolCount: null
+  # Per-attempt deadline for one upstream exchange.
+  upstreamTimeoutMs: 30000
 
   # Service identity sent to the control plane on policy sync. name, namespace,
   # and version scope/match policies to this service; set them in production.

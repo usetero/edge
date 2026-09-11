@@ -39,6 +39,9 @@ const RequestCompleted = struct { method: []const u8, path: []const u8, status: 
 /// here (PLAN-FRONTEND-SWAP.md §5). Worker/thread-pool counts stay on httpz
 /// defaults (1 event-loop worker, 32 pool threads), the master-proven shape.
 pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) httpz.Config {
+    // Round up so the sum over workers never drops below the configured cap.
+    const per_worker: u16 = @intCast(std.math.divCeil(usize, limits.max_connections, limits.worker_count) catch
+        unreachable);
     return .{
         .address = .{ .ip = .{ .ip4 = .{ .bytes = address, .port = port } } },
         .request = .{
@@ -53,14 +56,14 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
         // a memory cap, not a body-size cap.
         .workers = .{
             .count = limits.worker_count,
-            .max_conn = @intCast(limits.max_connections / (limits.worker_count orelse 1)),
-            .min_conn = @intCast(@min(8, limits.max_connections / (limits.worker_count orelse 1))),
+            .max_conn = per_worker,
+            .min_conn = @min(8, per_worker),
             .large_buffer_count = limits.large_body_buffer_count,
             .large_buffer_size = limits.large_body_buffer_size,
         },
         .thread_pool = .{
             .count = limits.thread_pool_count,
-            .backlog = @intCast(@max(2, limits.max_connections / (limits.worker_count orelse 1))),
+            .backlog = @max(2, per_worker),
             .buffer_size = limits_mod.HANDLER_THREAD_BUF_BYTES,
         },
         .timeout = .{ .request = 30, .keepalive = 30 },
@@ -202,7 +205,7 @@ pub const HttpServer = struct {
         errdefer ctx.gpa.destroy(handler);
         const memory = try ctx.gpa.create(BudgetAllocator);
         errdefer ctx.gpa.destroy(memory);
-        memory.* = .{ .parent = ctx.gpa, .limit = ctx.limits.max_buffered_bytes };
+        memory.* = .{ .parent = ctx.gpa, .limit = ctx.limits.http_budget_bytes };
         handler.* = .{ .ctx = ctx, .allocator = memory.allocator(), .memory = memory };
 
         const config = configFromLimits(ctx.limits, listen_address, listen_port);
@@ -210,22 +213,33 @@ pub const HttpServer = struct {
         const per_conn = ctx.limits.recv_buf + ctx.limits.conn_arena_reserve;
         if (minimum > memory.limit) {
             log.err(
-                "max_buffered_bytes={d} is below the minimum viable {d} ({d} connections x {d} bytes + pools); " ++
-                    "raise max_buffered_bytes or lower max_connections/thread_pool_count",
-                .{ memory.limit, minimum, ctx.limits.max_connections, per_conn },
+                "HTTP budget {d} (half of memory_limit_bytes {d}) is below the minimum viable {d} " ++
+                    "({d} connections x {d} bytes + pools); raise memory_limit_bytes or lower max_connections",
+                .{ memory.limit, ctx.limits.memory_limit_bytes, minimum, ctx.limits.max_connections, per_conn },
             );
             return error.InsufficientMemoryBudget;
         }
+        const headroom = memory.limit - minimum;
+        const concurrent_bodies = headroom / ctx.limits.max_body_size;
+        if (concurrent_bodies < limits_mod.MIN_CONCURRENT_BODIES) {
+            log.warn("only {d} maximum-size bodies ({d} bytes) fit in the HTTP headroom; " ++
+                "raise memory_limit_bytes or lower max_body_size", .{ concurrent_bodies, ctx.limits.max_body_size });
+        }
         const server = try httpz.Server(*Handler).init(ctx.io, memory.allocator(), config, handler);
         log.info(
-            "httpz manifest: cap {d} bytes, minimum {d} ({d} connections, {d} handler threads), headroom {d} for " ++
-                "bodies/transforms/responses; excludes TLS, policies and thread stacks",
+            "httpz manifest: memory limit {d}, HTTP budget {d}, minimum {d} ({d} connections, {d} workers x {d} " ++
+                "handler threads), headroom {d} = {d} concurrent max bodies, retry_log_intake={}; " ++
+                "excludes TLS, policies and thread stacks",
             .{
+                ctx.limits.memory_limit_bytes,
                 memory.limit,
                 minimum,
                 (config.workers.max_conn orelse 0) * config.workerCount(),
-                config.threadPoolCount() * config.workerCount(),
-                memory.limit - minimum,
+                config.workerCount(),
+                config.threadPoolCount(),
+                headroom,
+                concurrent_bodies,
+                ctx.limits.retry_log_intake,
             },
         );
         return .{
@@ -559,11 +573,12 @@ pub const Handler = struct {
         const bufs = try threadBufs(ctx.io, self.allocator, ctx.limits);
         const headers = try collectForwardHeaders(res.arena, req.headers.iterator());
         const method = stdMethod(req.method) orelse return error.UnsupportedMethod;
-        const deadline = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() +
-            @as(i128, ctx.limits.upstream_timeout_ms) * std.time.ns_per_ms;
         const retry = (replayable and ctx.limits.retry_log_intake) or method == .GET or method == .HEAD;
         const attempts: usize = if (retry) 2 else 1;
         for (0..attempts) |attempt| {
+            // Each attempt gets the full deadline; a late first failure cannot starve the replay.
+            const deadline = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() +
+                @as(i128, ctx.limits.upstream_timeout_ms) * std.time.ns_per_ms;
             const client = if (attempt == 0) ctx.upstreams.getHttpClient() else &ctx.upstreams.retry_client;
             if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(attempt > 0);
             var upstream_req = try exec.openUpstreamWithClient(
@@ -845,51 +860,47 @@ fn stdMethod(method: httpz.Method) ?std.http.Method {
 const testing = std.testing;
 
 test "httpz config derives from limits" {
-    const limits: limits_mod.Limits = .resolve(.{ .max_body_size = 1024 * 1024 });
+    const limits: limits_mod.Limits = .resolve(.{});
 
     const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
-    try testing.expectEqual(@as(?usize, 1024 * 1024), config.request.max_body_size);
+    try testing.expectEqual(@as(?usize, limits_mod.DEFAULT_MAX_BODY_BYTES), config.request.max_body_size);
     try testing.expectEqual(@as(?usize, limits_mod.RECV_BUF_BYTES), config.request.buffer_size);
-    // Unset worker/thread-pool counts ride httpz defaults (null).
-    try testing.expectEqual(@as(?u16, null), config.workers.count);
-    try testing.expectEqual(@as(?u16, null), config.thread_pool.count);
+    // One event loop with the default handler pool.
+    try testing.expectEqual(@as(?u16, limits_mod.DEFAULT_WORKERS), config.workers.count);
+    try testing.expectEqual(@as(?u16, limits_mod.HANDLER_THREADS_PER_WORKER), config.thread_pool.count);
     // The large-body pool must NOT ride httpz defaults (16 x max_body_size).
     try testing.expectEqual(@as(?u16, 8), config.workers.large_buffer_count);
     try testing.expectEqual(@as(?u32, limits_mod.LARGE_BODY_BUFFER_BYTES), config.workers.large_buffer_size);
     try testing.expectEqual(@as(u16, 8080), config.address.ip.ip4.port);
 }
 
-test "httpz config carries configured worker/thread-pool counts" {
-    const limits: limits_mod.Limits = .resolve(.{
-        .max_body_size = 1024 * 1024,
-        .worker_count = 2,
-        .thread_pool_count = 8,
-    });
+test "httpz config carries benchmark overrides" {
+    const limits: limits_mod.Limits = .resolve(.{ .worker_count = 2, .thread_pool_count = 8 });
     const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
     try testing.expectEqual(@as(?u16, 2), config.workers.count);
     try testing.expectEqual(@as(?u16, 8), config.thread_pool.count);
 }
 
-test "httpz worker count cannot raise the global connection cap" {
-    for ([_]u16{ 1, 2, 4 }) |workers| {
-        const limits: limits_mod.Limits = .resolve(.{
-            .max_body_size = 1024 * 1024,
-            .max_connections = 256,
-            .worker_count = workers,
-        });
+test "httpz worker count never lowers the global connection cap" {
+    for ([_]u16{ 1, 2, 3, 4 }) |workers| {
+        const limits: limits_mod.Limits = .resolve(.{ .max_connections = 256, .worker_count = workers });
         const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
-        try testing.expectEqual(@as(usize, 256), (config.workers.max_conn orelse 0) * config.workerCount());
+        const total = (config.workers.max_conn orelse 0) * config.workerCount();
+        try testing.expect(total >= 256 and total < 256 + workers);
     }
 }
 
 test "httpz minimum viable budget is checked arithmetic below the default cap" {
-    const limits: limits_mod.Limits = .resolve(.{ .max_body_size = 1024 * 1024, .max_connections = 256 });
+    const limits: limits_mod.Limits = .resolve(.{});
     const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
     const minimum = try minimumViableBytes(limits, config);
-    const expected = 8 * @as(usize, limits_mod.LARGE_BODY_BUFFER_BYTES) + 32 * limits_mod.HANDLER_THREAD_BUF_BYTES +
+    const expected = 8 * @as(usize, limits_mod.LARGE_BODY_BUFFER_BYTES) +
+        @as(usize, limits_mod.HANDLER_THREADS_PER_WORKER) * limits_mod.HANDLER_THREAD_BUF_BYTES +
         256 * (limits.recv_buf + limits.conn_arena_reserve);
     try testing.expectEqual(expected, minimum);
-    try testing.expect(minimum < limits.max_buffered_bytes);
+    try testing.expect(minimum < limits.http_budget_bytes);
+    // Default headroom admits at least the warning threshold of maximum-size bodies.
+    try testing.expect((limits.http_budget_bytes - minimum) / limits.max_body_size >= limits_mod.MIN_CONCURRENT_BODIES);
 
     var absurd = limits;
     absurd.max_connections = std.math.maxInt(usize);

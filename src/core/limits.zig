@@ -42,7 +42,26 @@ pub const ZSTD_WINDOW_MAX: usize = 8 * 1024 * 1024;
 /// URL strings, error bodies). Debug builds assert the high-water mark.
 pub const CONN_ARENA_RESERVE_BYTES: usize = 16 * 1024;
 
-pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
+pub const MAX_CONNECTIONS_CAP: u32 = 65534;
+/// Datadog agents batch up to 5 MB uncompressed, about 1 MB compressed.
+pub const DEFAULT_MAX_BODY_BYTES: u32 = 1536 * 1024;
+/// Decompressed bodies may grow to this multiple of `max_body_size`.
+pub const DECODED_BODY_RATIO: usize = 10;
+pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u32 = 30_000;
+/// Used when neither config nor the cgroup provides a memory limit.
+pub const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MIN_MEMORY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+/// Handler threads per event-loop worker (httpz default).
+pub const HANDLER_THREADS_PER_WORKER: u16 = 32;
+/// One event loop with 32 handler threads saturates the CPU at 50 connections;
+/// four workers measured 4-10% slower and 2.5x the RSS (per-worker pools and scratch).
+pub const DEFAULT_WORKERS: u16 = 1;
+/// Ceilings for the benchmark-only TERO_WORKER_COUNT / TERO_THREAD_POOL_COUNT overrides.
+pub const MAX_WORKERS: u16 = 64;
+pub const MAX_HANDLER_THREADS: u16 = 256;
+/// The startup manifest warns below this many concurrent maximum-size bodies.
+pub const MIN_CONCURRENT_BODIES: usize = 32;
 pub const LARGE_BODY_BUFFER_BYTES: u32 = 64 * 1024;
 /// httpz response staging buffer, one per handler thread (httpz default).
 pub const HANDLER_THREAD_BUF_BYTES: usize = 32 * 1024;
@@ -57,17 +76,20 @@ comptime {
 pub const Limits = struct {
     /// Inbound connection cap; also sizes the stdio connection slab.
     max_connections: usize,
-    max_buffered_bytes: usize = 64 * 1024 * 1024,
-    retry_log_intake: bool = true,
-    upstream_timeout_ms: u32 = 5_000,
+    /// Whole-process ceiling the HTTP budget derives from.
+    memory_limit_bytes: u64,
+    /// Charged HTTP allocations: half of `memory_limit_bytes`.
+    http_budget_bytes: usize,
+    retry_log_intake: bool,
+    upstream_timeout_ms: u32,
     /// Per-request body ceiling, from the frozen `ProxyConfig.max_body_size`.
     max_body_size: u32,
-    /// Post-decompression body ceiling; defaults to `max_body_size`.
-    max_decoded_bytes: usize = 0,
-    /// httpz event-loop worker count (null = httpz default).
-    worker_count: ?u16 = null,
-    /// httpz request-handler thread-pool count (null = httpz default).
-    thread_pool_count: ?u16 = null,
+    /// Post-decompression body ceiling: `DECODED_BODY_RATIO` x `max_body_size`.
+    max_decoded_bytes: usize,
+    /// httpz event-loop workers (DEFAULT_WORKERS unless a benchmark override is set).
+    worker_count: u16,
+    /// httpz handler threads per worker.
+    thread_pool_count: u16,
     record_scratch: usize,
     recv_buf: usize,
     send_buf: usize,
@@ -90,18 +112,26 @@ pub const Limits = struct {
     /// Inputs to `resolve` that originate from config (`ProxyConfig`), with
     /// the `TERO_*` env overrides already applied by zonfig. No env reads here.
     pub const ResolveOptions = struct {
-        max_body_size: u32,
-        max_decoded_bytes: ?u32 = null,
+        max_body_size: u32 = DEFAULT_MAX_BODY_BYTES,
         max_connections: u32 = DEFAULT_MAX_CONNECTIONS,
-        max_buffered_bytes: u32 = 64 * 1024 * 1024,
+        memory_limit_bytes: u64 = DEFAULT_MEMORY_LIMIT_BYTES,
         retry_log_intake: bool = true,
-        upstream_timeout_ms: u32 = 5_000,
+        upstream_timeout_ms: u32 = DEFAULT_UPSTREAM_TIMEOUT_MS,
+        /// Benchmark-only overrides, clamped to [1, MAX_WORKERS] / [1, MAX_HANDLER_THREADS].
         worker_count: ?u16 = null,
         thread_pool_count: ?u16 = null,
     };
 
     pub fn resolve(opts: ResolveOptions) Limits {
         std.debug.assert(opts.max_connections > 0);
+        const worker_count: u16 = if (opts.worker_count) |w|
+            std.math.clamp(w, @as(u16, 1), MAX_WORKERS)
+        else
+            DEFAULT_WORKERS;
+        const thread_pool_count: u16 = if (opts.thread_pool_count) |t|
+            std.math.clamp(t, @as(u16, 1), MAX_HANDLER_THREADS)
+        else
+            HANDLER_THREADS_PER_WORKER;
         const zstd_window_len = std.math.clamp(
             @as(usize, opts.max_body_size),
             ZSTD_WINDOW_MIN,
@@ -109,13 +139,14 @@ pub const Limits = struct {
         );
         return .{
             .max_connections = opts.max_connections,
-            .max_buffered_bytes = opts.max_buffered_bytes,
+            .memory_limit_bytes = opts.memory_limit_bytes,
+            .http_budget_bytes = @intCast(opts.memory_limit_bytes / 2),
             .retry_log_intake = opts.retry_log_intake,
             .upstream_timeout_ms = opts.upstream_timeout_ms,
             .max_body_size = opts.max_body_size,
-            .max_decoded_bytes = opts.max_decoded_bytes orelse opts.max_body_size,
-            .worker_count = opts.worker_count,
-            .thread_pool_count = opts.thread_pool_count,
+            .max_decoded_bytes = @as(usize, opts.max_body_size) * DECODED_BODY_RATIO,
+            .worker_count = worker_count,
+            .thread_pool_count = thread_pool_count,
             .record_scratch = RECORD_SCRATCH_BYTES,
             .recv_buf = RECV_BUF_BYTES,
             .send_buf = SEND_BUF_BYTES,
@@ -128,10 +159,7 @@ pub const Limits = struct {
             .conn_arena_reserve = CONN_ARENA_RESERVE_BYTES,
             // Split eight cached buffers across event-loop workers, with one
             // minimum per worker. All pools are charged to the same budget.
-            .large_body_buffer_count = @max(
-                1,
-                @min(opts.thread_pool_count orelse 8, 8) / (opts.worker_count orelse 1),
-            ),
+            .large_body_buffer_count = @max(1, @min(thread_pool_count, 8) / worker_count),
             .large_body_buffer_size = @min(opts.max_body_size, LARGE_BODY_BUFFER_BYTES),
         };
     }
@@ -164,65 +192,48 @@ pub const Limits = struct {
 };
 
 test "Limits budget formula is locked" {
-    const limits: Limits = .resolve(.{ .max_body_size = 1024 * 1024 });
+    const limits: Limits = .resolve(.{});
 
-    // Hand-computed with the default 1 MiB max_body_size:
-    //   zstd window = clamp(1M, 256K, 8M)        = 1024 KiB
+    // Hand-computed with the default 1.5 MiB max_body_size:
+    //   zstd window = clamp(1.5M, 256K, 8M)      = 1536 KiB
     //   per conn = 20K+20K+20K (io bufs)
     //            + 256K (record scratch)
-    //            + 1024K+192K (decode) + 192K (encode)
-    //            + 8K (body) + 4K (chunk)         = 1736 KiB
-    //   steady state = 256 x (1736K + 16K arena) = 438.0 MiB reserved
+    //            + 1536K+192K (decode) + 192K (encode)
+    //            + 8K (body) + 4K (chunk)         = 2248 KiB
+    //   steady state = 256 x (2248K + 16K arena)
     // Any change to a buffer constant must show up as a diff in this test.
     try std.testing.expectEqual(@as(usize, 256), limits.max_connections);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.zstd_window_len);
-    try std.testing.expectEqual(@as(usize, 1736 * 1024), limits.perConnBytes());
-    try std.testing.expectEqual(@as(usize, 256 * 1752 * 1024), limits.steadyStateBytes());
-    try std.testing.expectEqual(@as(u32, 1024 * 1024), limits.max_body_size);
-    // max_decoded_bytes defaults to max_body_size; thread knobs default off.
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.max_decoded_bytes);
-    try std.testing.expectEqual(@as(?u16, null), limits.worker_count);
-    try std.testing.expectEqual(@as(?u16, null), limits.thread_pool_count);
+    try std.testing.expectEqual(@as(usize, 1536 * 1024), limits.zstd_window_len);
+    try std.testing.expectEqual(@as(usize, 2248 * 1024), limits.perConnBytes());
+    try std.testing.expectEqual(@as(usize, 256 * 2264 * 1024), limits.steadyStateBytes());
+    try std.testing.expectEqual(DEFAULT_MAX_BODY_BYTES, limits.max_body_size);
+    try std.testing.expectEqual(@as(usize, 15 * 1024 * 1024), limits.max_decoded_bytes);
+    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), limits.http_budget_bytes);
+    try std.testing.expectEqual(DEFAULT_UPSTREAM_TIMEOUT_MS, limits.upstream_timeout_ms);
+    try std.testing.expectEqual(DEFAULT_WORKERS, limits.worker_count);
+    try std.testing.expectEqual(HANDLER_THREADS_PER_WORKER, limits.thread_pool_count);
     // httpz caches small bodies; the maximum payload does not size the pool.
     try std.testing.expectEqual(@as(u16, 8), limits.large_body_buffer_count);
     try std.testing.expectEqual(LARGE_BODY_BUFFER_BYTES, limits.large_body_buffer_size);
 }
 
-test "Limits resolves config-supplied knobs" {
-    const limits: Limits = .resolve(.{
-        .max_body_size = 1024 * 1024,
-        .max_decoded_bytes = 4 * 1024 * 1024,
-        .max_connections = 32,
-        .worker_count = 2,
-        .thread_pool_count = 8,
-    });
-    try std.testing.expectEqual(@as(usize, 32), limits.max_connections);
-    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), limits.max_decoded_bytes);
-    try std.testing.expectEqual(@as(?u16, 2), limits.worker_count);
-    try std.testing.expectEqual(@as(?u16, 8), limits.thread_pool_count);
-    // Per-worker pool: 8-buffer total cap split across 2 workers.
-    try std.testing.expectEqual(@as(u16, 4), limits.large_body_buffer_count);
+test "Limits defaults to one worker and clamps benchmark overrides" {
+    try std.testing.expectEqual(DEFAULT_WORKERS, Limits.resolve(.{}).worker_count);
+    const overridden: Limits = .resolve(.{ .worker_count = 1000, .thread_pool_count = 0 });
+    try std.testing.expectEqual(MAX_WORKERS, overridden.worker_count);
+    try std.testing.expectEqual(@as(u16, 1), overridden.thread_pool_count);
 }
 
 test "Limits caps the body pool below the handler count" {
-    const limits: Limits = .resolve(.{
-        .max_body_size = 2 * 1024 * 1024,
-        .thread_pool_count = 32,
-    });
+    const limits: Limits = .resolve(.{ .max_body_size = 2 * 1024 * 1024 });
     // Cached bodies are small even when the maximum request is large.
     try std.testing.expectEqual(@as(u16, 8), limits.large_body_buffer_count);
     try std.testing.expectEqual(LARGE_BODY_BUFFER_BYTES, limits.large_body_buffer_size);
 
-    const small: Limits = .resolve(.{
-        .max_body_size = 2 * 1024 * 1024,
-        .thread_pool_count = 2,
-    });
+    const small: Limits = .resolve(.{ .thread_pool_count = 2 });
     try std.testing.expectEqual(@as(u16, 2), small.large_body_buffer_count);
 
     // Many workers: per-worker count floors at 1 (pool can't be empty).
-    const many_workers: Limits = .resolve(.{
-        .max_body_size = 2 * 1024 * 1024,
-        .worker_count = 16,
-    });
+    const many_workers: Limits = .resolve(.{ .worker_count = 16 });
     try std.testing.expectEqual(@as(u16, 1), many_workers.large_body_buffer_count);
 }

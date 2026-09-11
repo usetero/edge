@@ -23,8 +23,7 @@ pub fn servicesFor(comptime distribution: mode.Distribution) []const ServiceKind
 /// Per-service plan-state inputs that come from config. Primitive fields so
 /// any config shape (ProxyConfig, LambdaConfig) can feed them.
 pub const ServiceOptions = struct {
-    prometheus_max_input_bytes: usize = 0,
-    prometheus_max_output_bytes: usize = 0,
+    prometheus_max_bytes_per_scrape: usize = 0,
 };
 
 /// Instantiates one service's plan-state. Pure data; the heavier runtime
@@ -36,10 +35,7 @@ pub fn buildService(kind: ServiceKind, options: ServiceOptions) service_mod.Serv
         .datadog_logs => .{ .datadog_logs = .{} },
         .datadog_metrics => .{ .datadog_metrics = .{} },
         .otlp => .{ .otlp = .{} },
-        .prometheus => .{ .prometheus = .{
-            .max_input_bytes_per_scrape = options.prometheus_max_input_bytes,
-            .max_output_bytes_per_scrape = options.prometheus_max_output_bytes,
-        } },
+        .prometheus => .{ .prometheus = .{ .max_bytes_per_scrape = options.prometheus_max_bytes_per_scrape } },
     };
 }
 
@@ -67,10 +63,6 @@ test "edge distro composes all services; focused distros stay focused" {
 }
 
 test "buildService wires prometheus scrape budgets from config" {
-    const svc = buildService(.prometheus, .{
-        .prometheus_max_input_bytes = 2048,
-        .prometheus_max_output_bytes = 1024,
-    });
-    try testing.expectEqual(@as(usize, 2048), svc.prometheus.max_input_bytes_per_scrape);
-    try testing.expectEqual(@as(usize, 1024), svc.prometheus.max_output_bytes_per_scrape);
+    const svc = buildService(.prometheus, .{ .prometheus_max_bytes_per_scrape = 2048 });
+    try testing.expectEqual(@as(usize, 2048), svc.prometheus.max_bytes_per_scrape);
 }
