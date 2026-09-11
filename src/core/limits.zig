@@ -126,9 +126,9 @@ pub const Limits = struct {
             .chunk_buf = CHUNK_BUF_BYTES,
             .zstd_window_len = zstd_window_len,
             .conn_arena_reserve = CONN_ARENA_RESERVE_BYTES,
-            // httpz builds one pool per event-loop worker. Keep up to eight
-            // reusable entries process-wide for common payloads; pool misses
-            // use an exact-size request-arena allocation.
+            // httpz builds one pool per event-loop worker. Split eight reusable
+            // entries across workers, with one per worker as the lower bound.
+            // Pool misses use an exact-size request-arena allocation.
             .large_body_buffer_count = @max(
                 1,
                 @min(thread_pool_count orelse 8, 8) / (worker_count orelse 1),

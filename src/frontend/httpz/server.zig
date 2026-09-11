@@ -50,8 +50,8 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .max_body_size = limits.max_body_size,
             .buffer_size = limits.recv_buf,
         },
-        // null => httpz defaults (1 worker, 32 pool threads). thread_pool count
-        // multiplies the per-thread pipeline-scratch floor (see ThreadBufs).
+        // An unset thread-pool count keeps httpz's 32-thread default. Its count
+        // bounds the number of retained per-thread pipeline workspaces.
         // The large-buffer pool is eagerly allocated (count x size at startup)
         // and httpz's defaults are 16 x max_body_size; we bound it from limits.
         // Misses fall back to exact-size per-request arena allocs, so this is
@@ -264,9 +264,8 @@ pub const Handler = struct {
         };
 
         // Lifecycle observability is emitted here, AFTER the catch applies the
-        // final status, so the duration metric and completion event reflect what
-        // the client actually got (a thrown request returns 502, not whatever
-        // partial status dispatch had set before it errored).
+        // final status, so the duration metric and completion event reflect the
+        // bounded error response instead of dispatch's partial status.
         const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
         if (ctx.metrics) |metrics| {
@@ -663,8 +662,7 @@ fn sendAndReceiveHead(
 /// the pool and every later request reuses it and fails too. That's the
 /// still-unfixed half of ziglang/zig#30165 (the 0.16 fix only covered receive).
 /// Marking it closing here makes Request.deinit destroy it instead of pooling
-/// it, so the next request dials fresh. Pair with `errdefer` so it runs on any
-/// error path before the request's own `defer ...deinit()`.
+/// it. Callers do this before their deferred request teardown.
 fn markUpstreamClosing(upstream_req: *std.http.Client.Request) void {
     if (upstream_req.connection) |conn| conn.closing = true;
 }
