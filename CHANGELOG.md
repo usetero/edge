@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.31.0](https://github.com/usetero/edge/compare/v1.30.2...v1.31.0) (2026-09-15)
+
+
+### Features
+
+* export httpz connection metrics and fix chart sizing guidance ([#269](https://github.com/usetero/edge/issues/269)) ([f881d7a](https://github.com/usetero/edge/commit/f881d7a716006dc2e08f6a80b59d8afcd148be3a))
+
+
+### Bug Fixes
+
+* bump policy-zig to v0.7.2 ([#267](https://github.com/usetero/edge/issues/267)) ([52ed216](https://github.com/usetero/edge/commit/52ed21669be2477d0f524999e474adfc1d612b50))
+* bump policy-zig to v0.7.3 ([#270](https://github.com/usetero/edge/issues/270)) ([9e3c229](https://github.com/usetero/edge/commit/9e3c2291111c70c71741d13bc4e94f878bda15c3))
+
 ## [1.30.2](https://github.com/usetero/edge/compare/v1.30.1...v1.30.2) (2026-09-11)
 
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/usetero/edge/compare/tero-edge-chart-v0.17.6...tero-edge-chart-v0.18.0) (2026-09-15)
+
+
+### Features
+
+* export httpz connection metrics and fix chart sizing guidance ([#269](https://github.com/usetero/edge/issues/269)) ([f881d7a](https://github.com/usetero/edge/commit/f881d7a716006dc2e08f6a80b59d8afcd148be3a))
+
 ## [0.17.6](https://github.com/usetero/edge/compare/tero-edge-chart-v0.17.5...tero-edge-chart-v0.17.6) (2026-09-11)
 
 
