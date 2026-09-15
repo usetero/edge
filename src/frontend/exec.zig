@@ -225,7 +225,11 @@ pub fn encodeBody(
     plaintext: []const u8,
 ) ![]const u8 {
     if (codec == .identity) return plaintext;
-    var encoded: std.Io.Writer.Allocating = try .initCapacity(arena, @min(plaintext.len, 64 * 1024));
+    // flate.Compress.init asserts the inner writer holds more than 8 bytes, so
+    // a batch whose records were all dropped (plaintext "[]", or empty) would
+    // panic on an exactly-sized buffer. Floor the capacity above that assert.
+    const capacity = @max(@min(plaintext.len, 64 * 1024), 64);
+    var encoded: std.Io.Writer.Allocating = try .initCapacity(arena, capacity);
     var encoder: encoding_mod.Encoder = try .init(codec, &encoded.writer, encode_buf);
     defer encoder.deinit();
     try encoder.writer().writeAll(plaintext);
@@ -632,4 +636,20 @@ test "contentEncodingName round-trips through the codec layer" {
         @as(?encoding_mod.ContentEncoding, null),
         encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.deflate)),
     );
+}
+
+test "encodeBody survives a fully dropped batch" {
+    // Every record dropped leaves "[]" (2 bytes) or nothing at all. Compress
+    // asserts a >8 byte sink, so an exactly-sized buffer panics here.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var encode_buf: [encoding_mod.ContentEncoding.gzip.encoderBufferLen()]u8 = undefined;
+
+    for ([_][]const u8{ "", "[]" }) |plaintext| {
+        const out = try encodeBody(.gzip, arena, &encode_buf, plaintext);
+        try testing.expect(out.len > 0); // a gzip frame, even for empty input
+        try testing.expectEqual(@as(u8, 0x1f), out[0]);
+        try testing.expectEqual(@as(u8, 0x8b), out[1]);
+    }
 }
