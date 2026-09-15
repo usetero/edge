@@ -12,6 +12,7 @@
 const std = @import("std");
 const encoding = @import("encoding.zig");
 const framer_mod = @import("framer.zig");
+const limits = @import("../core/limits.zig");
 
 pub const PipelineSpec = struct {
     decode: encoding.ContentEncoding,
@@ -23,6 +24,8 @@ pub const PipelineSpec = struct {
     /// zstd decode window cap; frames declaring a larger window fail the
     /// decode (PLAN §6.5 — caller aborts, never silently truncates).
     zstd_window_len: usize,
+    /// Outbound compression effort, 1 (fastest) to 9 (smallest).
+    compression_level: u8 = limits.DEFAULT_COMPRESSION_LEVEL,
 };
 
 /// All fixed memory the pipeline operates on. In production these are slab
@@ -58,7 +61,7 @@ pub fn run(
     std.debug.assert(buffers.chunk.len > 0);
 
     var decoder: encoding.Decoder = .init(spec.decode, in_reader, buffers.decoder, spec.zstd_window_len);
-    var encoder: encoding.Encoder = try .init(spec.encode, out_writer, buffers.encoder);
+    var encoder: encoding.Encoder = try .init(spec.encode, out_writer, buffers.encoder, spec.compression_level);
     defer encoder.deinit();
     var framer: framer_mod.Framer = .init(spec.format, buffers.scratch);
 

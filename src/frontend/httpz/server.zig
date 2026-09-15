@@ -592,6 +592,7 @@ pub const Handler = struct {
             .encode = pipe.codec,
             .max_decoded_bytes = ctx.limits.max_decoded_bytes,
             .zstd_window_len = ctx.limits.zstd_window_len,
+            .compression_level = ctx.limits.compression_level,
         }, &body_reader, &output.writer, .{
             .decoder = bufs.decode,
             .encoder = bufs.encode,

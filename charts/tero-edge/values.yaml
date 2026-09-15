@@ -129,6 +129,13 @@ config:
   # binds: a 1 MiB compressed batch commonly expands past 10 MiB.
   maxDecodedBytes: null
 
+  # Outbound compression effort, 1 (fastest) to 9 (smallest). Re-encoding the
+  # forwarded body is the largest single CPU cost on the policy path. Measured
+  # on a 4 MiB batch with 5 policies: level 6 takes 61ms/request, level 3 takes
+  # 50ms (+2.7% egress bytes), level 1 takes 45ms (+6.4% bytes). Irrelevant
+  # when no policy targets the signal — that path forwards the bytes untouched.
+  compressionLevel: 6
+
   # Optional httpz tuning (null = built-in defaults). workerCount is event-loop
   # workers (default 1) and is clamped to maxConnections. threadPoolCount is
   # request-handler threads per worker (default 32); pipeline scratch is

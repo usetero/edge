@@ -72,6 +72,8 @@ pub const LambdaConfig = struct {
 
     /// httpz request-handler thread-pool count (null = httpz default of 32).
     thread_pool_count: ?u16 = null,
+    /// Outbound compression effort, 1 (fastest) to 9 (smallest).
+    compression_level: u8 = 6,
 
     // Service metadata
     service: struct {
@@ -354,6 +356,7 @@ pub fn main(init: std.process.Init) !void {
         .max_connections = config.max_connections,
         .worker_count = config.worker_count,
         .thread_pool_count = config.thread_pool_count,
+        .compression_level = config.compression_level,
         .upstream_url = config.upstream_url,
         .logs_url = config.logs_url,
         .metrics_url = config.metrics_url,

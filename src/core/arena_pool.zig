@@ -108,6 +108,7 @@ fn testLimits() limits_mod.Limits {
         .body_buf = 32,
         .chunk_buf = 32,
         .zstd_window_len = 64,
+        .compression_level = 6,
         .large_body_buffer_count = 1,
         .large_body_buffer_size = 1024,
         .conn_arena_reserve = 4096,

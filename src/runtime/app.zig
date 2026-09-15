@@ -219,6 +219,7 @@ pub const EngineOptions = struct {
     max_connections: u32 = limits_mod.DEFAULT_MAX_CONNECTIONS,
     worker_count: ?u16 = null,
     thread_pool_count: ?u16 = null,
+    compression_level: u8 = limits_mod.DEFAULT_COMPRESSION_LEVEL,
     upstream_url: []const u8,
     logs_url: ?[]const u8 = null,
     metrics_url: ?[]const u8 = null,
@@ -260,6 +261,7 @@ pub const Engine = struct {
             .max_connections = options.max_connections,
             .worker_count = options.worker_count,
             .thread_pool_count = options.thread_pool_count,
+            .compression_level = options.compression_level,
         });
         if (build_options.frontend == .stdio) self.limits.logStartup();
 
@@ -482,6 +484,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         .max_connections = config.max_connections,
         .worker_count = config.worker_count,
         .thread_pool_count = config.thread_pool_count,
+        .compression_level = config.compression_level,
         .upstream_url = config.upstream_url,
         .logs_url = config.logs_url,
         .metrics_url = config.metrics_url,

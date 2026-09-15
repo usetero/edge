@@ -122,16 +122,38 @@ pub const Encoder = union(ContentEncoding) {
     /// `inner` must be a buffered writer (flate asserts > 8 bytes capacity).
     /// zstd allocates its compression context inside libzstd (bounded,
     /// freed in deinit); gzip and identity allocate nothing.
+    /// `level` is 1 (fastest) to 9 (smallest); both codecs share the scale.
     pub fn init(
         encoding: ContentEncoding,
         inner: *std.Io.Writer,
         buffer: []u8,
+        level: u8,
     ) InitError!Encoder {
         std.debug.assert(buffer.len >= encoding.encoderBufferLen());
         return switch (encoding) {
             .identity => .{ .identity = inner },
-            .gzip => .{ .gzip = try flate.Compress.init(inner, buffer[0..flate.max_window_len], .gzip, .default) },
-            .zstd => .{ .zstd = try ZstdCompressor.init(inner, buffer[0..zstd.block_size_max]) },
+            .gzip => .{ .gzip = try flate.Compress.init(
+                inner,
+                buffer[0..flate.max_window_len],
+                .gzip,
+                flateOptions(level),
+            ) },
+            .zstd => .{ .zstd = try ZstdCompressor.init(inner, buffer[0..zstd.block_size_max], level) },
+        };
+    }
+
+    /// std exposes flate effort as preset option structs, not an integer.
+    fn flateOptions(level: u8) flate.Compress.Options {
+        return switch (std.math.clamp(level, 1, 9)) {
+            1 => .level_1,
+            2 => .level_2,
+            3 => .level_3,
+            4 => .level_4,
+            5 => .level_5,
+            6 => .level_6,
+            7 => .level_7,
+            8 => .level_8,
+            else => .level_9,
         };
     }
 
@@ -204,7 +226,7 @@ pub const ZstdCompressor = struct {
     output: *std.Io.Writer,
     cctx: *c.ZSTD_CCtx,
 
-    pub fn init(output: *std.Io.Writer, buffer: []u8) error{CompressionInitFailed}!ZstdCompressor {
+    pub fn init(output: *std.Io.Writer, buffer: []u8, level: u8) error{CompressionInitFailed}!ZstdCompressor {
         const cctx = cctx_cache.acquire() orelse
             (c.ZSTD_createCCtx() orelse return error.CompressionInitFailed);
         errdefer _ = c.ZSTD_freeCCtx(cctx);
@@ -215,7 +237,7 @@ pub const ZstdCompressor = struct {
         if (c.ZSTD_isError(c.ZSTD_CCtx_reset(cctx, c.ZSTD_reset_session_and_parameters)) != 0) {
             return error.CompressionInitFailed;
         }
-        if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, c.ZSTD_CLEVEL_DEFAULT)) != 0) {
+        if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, level)) != 0) {
             return error.CompressionInitFailed;
         }
         return .{
@@ -347,7 +369,7 @@ fn encodeAll(
 
     const buf = try testing.allocator.alloc(u8, encoding.encoderBufferLen());
     defer testing.allocator.free(buf);
-    var encoder: Encoder = try .init(encoding, &out.writer, buf);
+    var encoder: Encoder = try .init(encoding, &out.writer, buf, 6);
     defer encoder.deinit();
 
     var offset: usize = 0;
@@ -413,7 +435,7 @@ test "zstd compression contexts are cached and reused across encoders" {
     defer out.deinit();
     var buf: [zstd.block_size_max]u8 = undefined;
 
-    var first: Encoder = try .init(.zstd, &out.writer, &buf);
+    var first: Encoder = try .init(.zstd, &out.writer, &buf, 6);
     const first_cctx = first.zstd.cctx;
     try first.writer().writeAll("hello");
     try first.finish();
@@ -422,7 +444,7 @@ test "zstd compression contexts are cached and reused across encoders" {
     // The freed slot is refilled and re-acquired first, so the next encoder
     // gets the context just released; its stream must still decode (reset
     // cleared prior state).
-    var second: Encoder = try .init(.zstd, &out.writer, &buf);
+    var second: Encoder = try .init(.zstd, &out.writer, &buf, 6);
     defer second.deinit();
     try testing.expectEqual(first_cctx, second.zstd.cctx);
     out.clearRetainingCapacity();

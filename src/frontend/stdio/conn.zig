@@ -300,6 +300,7 @@ fn execPipeStream(
         .encode = pipe.codec,
         .max_decoded_bytes = ctx.limits.max_decoded_bytes,
         .zstd_window_len = ctx.limits.zstd_window_len,
+        .compression_level = ctx.limits.compression_level,
     }, body_reader, &body_writer.writer, .{
         .decoder = env.slab.decodeBuf(conn_id),
         .encoder = env.slab.encodeBuf(conn_id),

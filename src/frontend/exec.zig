@@ -320,7 +320,12 @@ pub fn processBuffered(
     // header stays truthful.
     var encoded: std.Io.Writer.Allocating = try .initCapacity(arena, 4096);
     const encode_buf = try arena.alloc(u8, pipe.codec.encoderBufferLen());
-    var encoder: encoding_mod.Encoder = try .init(pipe.codec, &encoded.writer, encode_buf);
+    var encoder: encoding_mod.Encoder = try .init(
+        pipe.codec,
+        &encoded.writer,
+        encode_buf,
+        ctx.limits.compression_level,
+    );
     defer encoder.deinit();
     try encoder.writer().writeAll(transformed.written());
     try encoder.finish();
