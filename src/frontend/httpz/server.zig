@@ -340,6 +340,11 @@ pub const Handler = struct {
             if (ctx.metrics) |metrics| {
                 try metrics.writePrometheus(res.writer());
             }
+            // httpz's own counters: accept rate, keepalive/request timeouts,
+            // large-buffer pool misses, and rejects for oversized bodies and
+            // headers. httpz_connections going flat while httpz_requests keeps
+            // climbing is the signature of the connection cap being reached.
+            try httpz.writeMetrics(res.writer());
             return;
         }
 
