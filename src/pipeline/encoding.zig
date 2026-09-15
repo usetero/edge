@@ -62,18 +62,6 @@ pub const ContentEncoding = enum {
     }
 };
 
-/// Largest buffer any decoder/encoder pair needs for a given zstd window cap;
-/// limits.zig uses this to size the per-connection codec region.
-pub fn maxCodecBufferLen(zstd_window_len: usize) usize {
-    var result: usize = 0;
-    inline for (@typeInfo(ContentEncoding).@"enum".fields) |field| {
-        const enc: ContentEncoding = @enumFromInt(field.value);
-        result = @max(result, enc.decoderBufferLen(zstd_window_len));
-        result = @max(result, enc.encoderBufferLen());
-    }
-    return result;
-}
-
 pub const Decoder = union(ContentEncoding) {
     identity: *std.Io.Reader,
     gzip: flate.Decompress,
