@@ -16,6 +16,11 @@
 #                            (default: 4194304). Use 0 for the small
 #                            uncompressed checked-in payload.
 #   --payload-compressed NUM Gzipped size of that batch (default: 1048576)
+#   --log-level LEVEL        edge log level: err (default), info or debug.
+#                            --debug implies info, which surfaces
+#                            RequestFailed, UpstreamRetried and
+#                            UpstreamConnectionEvicted. debug adds a
+#                            per-request trace and distorts timing.
 #   --policy-counts "A B C"  Policy counts to sweep (default: all ten). A
 #                            full sweep at the production defaults takes
 #                            hours, so narrow this for a targeted run.
@@ -46,6 +51,10 @@ MAX_CONNECTIONS=256
 # to every tool's DD Logs scenario so the comparison stays fair.
 PAYLOAD_DECODED_BYTES=4194304
 PAYLOAD_COMPRESSED_BYTES=1048576
+# err hides the events that explain a bad run. --debug raises this to info,
+# which carries RequestFailed, UpstreamRetried and UpstreamConnectionEvicted
+# without the per-request trace that debug adds.
+EDGE_LOG_LEVEL=
 SKIP_BUILD=false
 DEBUG_MODE=false
 RUN_EDGE=true
@@ -595,6 +604,14 @@ extract_metrics() {
     ' "$json_file" | tr -d '"'
 }
 
+# Explicit --log-level wins; otherwise --debug implies info, and a plain run
+# stays at err so logging never shows up in the measurement.
+edge_log_level() {
+    if [[ -n "$EDGE_LOG_LEVEL" ]]; then echo "$EDGE_LOG_LEVEL"
+    elif [[ "$DEBUG_MODE" == "true" ]]; then echo "info"
+    else echo "err"; fi
+}
+
 create_edge_config() {
     local binary=$1
     local policy_count=$2
@@ -613,7 +630,7 @@ create_edge_config() {
   "listen_address": "127.0.0.1",
   "listen_port": $port,
   "upstream_url": "http://127.0.0.1:$ECHO_SERVER_PORT",
-  "log_level": "err",
+  "log_level": "$(edge_log_level)",
   "max_body_size": 2097152,
   "max_decoded_bytes": 5242880,
   "thread_pool_count": $THREAD_POOL_COUNT,
@@ -660,6 +677,7 @@ main() {
             --payload-decoded) PAYLOAD_DECODED_BYTES="$2"; shift 2 ;;
             --payload-compressed) PAYLOAD_COMPRESSED_BYTES="$2"; shift 2 ;;
             --policy-counts) read -r -a POLICY_COUNTS <<< "$2"; shift 2 ;;
+            --log-level) EDGE_LOG_LEVEL="$2"; shift 2 ;;
             --skip-build) SKIP_BUILD=true; shift ;;
             --debug) DEBUG_MODE=true; shift ;;
             --edge-only) RUN_EDGE=true; RUN_OTELCOL=false; RUN_VECTOR=false; RUN_TERO_VECTOR=false; RUN_TERO_COLLECTOR=false; shift ;;
