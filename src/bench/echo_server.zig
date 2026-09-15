@@ -315,6 +315,12 @@ fn handleRequest(ctx: *ServerContext, request: *std.http.Server.Request, gpa: st
     if (body.len > 0) {
         ctx.capturePayload(path_copy, content_type_copy orelse "application/octet-stream", body);
     }
+    // Stand in for a real intake round trip. A loopback echo answers in
+    // microseconds, so every proxy under test looks thread-unbounded; against
+    // a remote intake a handler owns its slot for the whole exchange and
+    // throughput collapses to `handler_threads / round_trip`. Applied to the
+    // echo path only, so /stats and /reset stay instant for the harness.
+    if (latency_ms > 0) try ctx.io.sleep(.fromMilliseconds(latency_ms), .awake);
     try request.respond("{}", .{ .keep_alive = keep_alive, .status = .accepted, .extra_headers = &json_headers });
 }
 
@@ -333,6 +339,9 @@ fn serveConnection(ctx: *ServerContext, gpa: std.mem.Allocator, stream: std.Io.n
     }
 }
 
+/// Simulated upstream round trip, from ECHO_LATENCY_MS. Read once at startup.
+var latency_ms: i64 = 0;
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -348,7 +357,25 @@ pub fn main(init: std.process.Init) !void {
     else
         ".";
 
-    var ctx = ServerContext.init(allocator, init.io, output_dir);
+    if (init.environ_map.get("ECHO_LATENCY_MS")) |raw| {
+        latency_ms = std.fmt.parseInt(i64, std.mem.trim(u8, raw, " \t\r\n"), 10) catch |err| {
+            std.debug.print("invalid ECHO_LATENCY_MS '{s}': {s}\n", .{ raw, @errorName(err) });
+            return err;
+        };
+    }
+
+    // Own the io instance instead of inheriting it. std.Io.Threaded defaults
+    // async_limit to cpu_count - 1, and the latency sleep below holds a slot
+    // for its whole duration. Inherited, that caps the echo server at roughly
+    // cpu_count / latency requests per second — 11 concurrent sleeps on a
+    // 12-core box, which makes the upstream, not the proxy under test, the
+    // bottleneck. The limit has to exceed target_rate x latency; sleeping
+    // tasks are parked, so a high ceiling costs little.
+    var threaded: std.Io.Threaded = .init(allocator, .{ .async_limit = .limited(2048) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ctx = ServerContext.init(allocator, io, output_dir);
     defer ctx.deinit();
     server_context = &ctx;
 
@@ -359,11 +386,12 @@ pub fn main(init: std.process.Init) !void {
     }, null);
 
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-    var listener = try address.listen(init.io, .{ .reuse_address = true, .kernel_backlog = 1024 });
-    defer listener.deinit(init.io);
+    var listener = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 1024 });
+    defer listener.deinit(io);
 
     std.debug.print("Echo server listening on http://127.0.0.1:{d}\n", .{port});
     std.debug.print("Output directory: {s}\n", .{output_dir});
+    std.debug.print("Simulated upstream latency: {d} ms\n", .{latency_ms});
     std.debug.print("Endpoints:\n", .{});
     std.debug.print("  POST /*           - Echo and record request\n", .{});
     std.debug.print("  GET  /stats       - Get statistics\n", .{});
@@ -373,14 +401,14 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Press Ctrl+C to stop\n", .{});
 
     var group: std.Io.Group = .init;
-    defer group.cancel(init.io);
+    defer group.cancel(io);
     while (true) {
-        const stream = listener.accept(init.io) catch |err| switch (err) {
+        const stream = listener.accept(io) catch |err| switch (err) {
             error.Canceled => return,
             else => continue,
         };
-        group.concurrent(init.io, serveConnection, .{ &ctx, allocator, stream }) catch {
-            stream.close(init.io);
+        group.concurrent(io, serveConnection, .{ &ctx, allocator, stream }) catch {
+            stream.close(io);
         };
     }
 }

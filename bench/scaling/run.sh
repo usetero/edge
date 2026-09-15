@@ -7,6 +7,18 @@
 # Options:
 #   -n, --requests NUM       Number of requests per test (default: 10000)
 #   -c, --connections NUM    Number of concurrent connections (default: 50)
+#   --upstream-latency MS    Simulated intake round trip in the echo server
+#                            (default: 14, matching a real Datadog intake).
+#                            Use 0 for the old instant-loopback behaviour.
+#   --thread-pool-count NUM  Edge request-handler threads (default: 8)
+#   --max-connections NUM    Edge concurrent connection cap (default: 256)
+#   --payload-decoded NUM    Decoded size of the DD Logs batch in bytes
+#                            (default: 4194304). Use 0 for the small
+#                            uncompressed checked-in payload.
+#   --payload-compressed NUM Gzipped size of that batch (default: 1048576)
+#   --policy-counts "A B C"  Policy counts to sweep (default: all ten). A
+#                            full sweep at the production defaults takes
+#                            hours, so narrow this for a targeted run.
 #   --skip-build             Skip building binaries
 #   --edge-only              Only run Edge benchmarks
 #   --otelcol-only           Only run otelcol benchmarks
@@ -21,6 +33,19 @@ set -euo pipefail
 # Configuration
 REQUESTS=10000
 CONNECTIONS=50
+# Defaults below mirror a production deployment rather than a loopback
+# micro-benchmark. A handler owns its whole upstream exchange, so throughput is
+# roughly THREAD_POOL_COUNT / UPSTREAM_LATENCY; against an instant echo server
+# that term vanishes and every proxy looks thread-unbounded.
+UPSTREAM_LATENCY_MS=14
+THREAD_POOL_COUNT=8
+MAX_CONNECTIONS=256
+# A Datadog agent ships gzipped batches, roughly 1 MB on the wire expanding to
+# about 4 MB decoded. The checked-in payloads are 1-4 KB and uncompressed, so
+# they never exercise decompression and never approach max_body_size. Applied
+# to every tool's DD Logs scenario so the comparison stays fair.
+PAYLOAD_DECODED_BYTES=4194304
+PAYLOAD_COMPRESSED_BYTES=1048576
 SKIP_BUILD=false
 DEBUG_MODE=false
 RUN_EDGE=true
@@ -390,7 +415,8 @@ wait_for_server() {
 }
 
 start_echo_server() {
-    log_info "Starting echo server..."
+    log_info "Starting echo server (upstream latency: ${UPSTREAM_LATENCY_MS}ms)..."
+    export ECHO_LATENCY_MS="$UPSTREAM_LATENCY_MS"
     if [[ "$DEBUG_MODE" == "true" ]]; then
         "$PROJECT_ROOT/zig-out/bin/echo-server" "$ECHO_SERVER_PORT" > "$DEBUG_DIR/echo-server.log" 2>&1 &
     else
@@ -528,6 +554,14 @@ run_benchmark() {
     local payload_file=$2
     local output_file=$3
     local content_type="${4:-application/json}"
+    local content_encoding="${5:-}"
+
+    # Pre-compressed payloads go out with Content-Encoding so the proxy under
+    # test exercises its decode path, as a Datadog agent's batch would.
+    # Expanded with the ${a[@]+...} guard: macOS ships bash 3.2, where a plain
+    # "${empty[@]}" counts as unbound under `set -u`.
+    local encoding_header=()
+    [[ -n "$content_encoding" ]] && encoding_header=(-H "Content-Encoding: $content_encoding")
 
     # Run oha with the payload file
     # For binary files (protobuf), we use -D to read from file
@@ -537,6 +571,7 @@ run_benchmark() {
         -t 10s \
         -m POST \
         -H "Content-Type: $content_type" \
+        ${encoding_header[@]+"${encoding_header[@]}"} \
         -D "$payload_file" \
         --output-format json \
         "$url" > "$output_file" 2>"${output_file%.json}.stderr"
@@ -579,7 +614,10 @@ create_edge_config() {
   "listen_port": $port,
   "upstream_url": "http://127.0.0.1:$ECHO_SERVER_PORT",
   "log_level": "err",
-  "max_body_size": 4194304,
+  "max_body_size": 2097152,
+  "max_decoded_bytes": 5242880,
+  "thread_pool_count": $THREAD_POOL_COUNT,
+  "max_connections": $MAX_CONNECTIONS,
   "policy_providers": [
     {
       "id": "bench-policies",
@@ -616,6 +654,12 @@ main() {
         case $1 in
             -n|--requests) REQUESTS="$2"; shift 2 ;;
             -c|--connections) CONNECTIONS="$2"; shift 2 ;;
+            --upstream-latency) UPSTREAM_LATENCY_MS="$2"; shift 2 ;;
+            --thread-pool-count) THREAD_POOL_COUNT="$2"; shift 2 ;;
+            --max-connections) MAX_CONNECTIONS="$2"; shift 2 ;;
+            --payload-decoded) PAYLOAD_DECODED_BYTES="$2"; shift 2 ;;
+            --payload-compressed) PAYLOAD_COMPRESSED_BYTES="$2"; shift 2 ;;
+            --policy-counts) read -r -a POLICY_COUNTS <<< "$2"; shift 2 ;;
             --skip-build) SKIP_BUILD=true; shift ;;
             --debug) DEBUG_MODE=true; shift ;;
             --edge-only) RUN_EDGE=true; RUN_OTELCOL=false; RUN_VECTOR=false; RUN_TERO_VECTOR=false; RUN_TERO_COLLECTOR=false; shift ;;
@@ -664,6 +708,18 @@ main() {
         log_success "Protobuf payloads generated"
     fi
 
+    # DD Logs payload: gzipped and production-sized unless disabled.
+    DD_LOGS_PAYLOAD="$PAYLOADS_DIR/datadog-logs.json"
+    DD_LOGS_ENCODING=""
+    if [[ "$PAYLOAD_DECODED_BYTES" -gt 0 ]]; then
+        log_info "Generating gzipped bulk DD Logs payload..."
+        python3 "$SCRIPT_DIR/generate-bulk-payloads.py" \
+            --decoded-bytes "$PAYLOAD_DECODED_BYTES" \
+            --compressed-bytes "$PAYLOAD_COMPRESSED_BYTES"
+        DD_LOGS_PAYLOAD="$PAYLOADS_DIR/datadog-logs-bulk.json.gz"
+        DD_LOGS_ENCODING="gzip"
+    fi
+
     # Start echo server
     start_echo_server
 
@@ -673,6 +729,7 @@ main() {
 
     echo ""
     log_info "Running benchmarks: $REQUESTS requests, $CONNECTIONS connections"
+    log_info "Edge: $THREAD_POOL_COUNT handler threads, $MAX_CONNECTIONS max connections, ${UPSTREAM_LATENCY_MS}ms upstream"
     log_info "Policy counts: ${POLICY_COUNTS[*]}"
     echo ""
 
@@ -690,12 +747,12 @@ main() {
                 "edge-otlp|OTLP Logs|$OTLP_PORT|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "edge-otlp|OTLP Metrics|$OTLP_PORT|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
                 "edge-otlp|OTLP Traces|$OTLP_PORT|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
-                "edge-datadog|DD Logs|$DATADOG_PORT|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "edge-datadog|DD Logs|$DATADOG_PORT|/api/v2/logs|$DD_LOGS_PAYLOAD|application/json|$DD_LOGS_ENCODING"
                 "edge-datadog|DD Metrics|$DATADOG_PORT|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
 
             for scenario in "${edge_scenarios[@]}"; do
-                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
+                IFS='|' read -r binary name port endpoint payload content_type content_encoding <<< "$scenario"
 
                 local payload_size=$(wc -c < "$payload" | tr -d ' ')
                 local config=$(create_edge_config "$binary" "$count")
@@ -713,7 +770,7 @@ main() {
 
                 # Run benchmark
                 log_info "Running: $name ($binary, $count policies)..."
-                run_benchmark "$url" "$payload" "$output_json" "$content_type"
+                run_benchmark "$url" "$payload" "$output_json" "$content_type" "$content_encoding"
 
                 # Stop monitoring
                 local resource_metrics=$(stop_resource_monitor)
@@ -758,11 +815,11 @@ main() {
                 "otelcol|OTLP Logs|4318|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "otelcol|OTLP Metrics|4318|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
                 "otelcol|OTLP Traces|4318|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
-                "otelcol|DD Logs|4319|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "otelcol|DD Logs|4319|/api/v2/logs|$DD_LOGS_PAYLOAD|application/json|$DD_LOGS_ENCODING"
                 "otelcol|DD Metrics|4319|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
             for scenario in "${otelcol_scenarios[@]}"; do
-                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
+                IFS='|' read -r binary name port endpoint payload content_type content_encoding <<< "$scenario"
 
                 local payload_size=$(wc -c < "$payload" | tr -d ' ')
                 local output_json="$OUTPUT_DIR/${binary}-${name// /-}-${count}.json"
@@ -779,7 +836,7 @@ main() {
 
                 # Run benchmark
                 log_info "Running: $name ($binary, $count policies)..."
-                run_benchmark "$url" "$payload" "$output_json" "$content_type"
+                run_benchmark "$url" "$payload" "$output_json" "$content_type" "$content_encoding"
 
                 # Stop monitoring
                 local resource_metrics=$(stop_resource_monitor)
@@ -826,12 +883,12 @@ main() {
                 "vector|OTLP Logs|4320|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "vector|OTLP Metrics|4320|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
                 # "vector|OTLP Traces|4320|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
-                "vector|DD Logs|4321|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "vector|DD Logs|4321|/api/v2/logs|$DD_LOGS_PAYLOAD|application/json|$DD_LOGS_ENCODING"
                 "vector|DD Metrics|4322|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
 
             for scenario in "${vector_scenarios[@]}"; do
-                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
+                IFS='|' read -r binary name port endpoint payload content_type content_encoding <<< "$scenario"
 
                 local payload_size=$(wc -c < "$payload" | tr -d ' ')
                 local output_json="$OUTPUT_DIR/${binary}-${name// /-}-${count}.json"
@@ -848,7 +905,7 @@ main() {
 
                 # Run benchmark
                 log_info "Running: $name ($binary, $count policies)..."
-                run_benchmark "$url" "$payload" "$output_json" "$content_type"
+                run_benchmark "$url" "$payload" "$output_json" "$content_type" "$content_encoding"
 
                 # Stop monitoring
                 local resource_metrics=$(stop_resource_monitor)
@@ -894,12 +951,12 @@ main() {
             local tero_vector_scenarios=(
                 "tero-vector|OTLP Logs|4326|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "tero-vector|OTLP Metrics|4326|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
-                "tero-vector|DD Logs|4327|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "tero-vector|DD Logs|4327|/api/v2/logs|$DD_LOGS_PAYLOAD|application/json|$DD_LOGS_ENCODING"
                 "tero-vector|DD Metrics|4328|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
 
             for scenario in "${tero_vector_scenarios[@]}"; do
-                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
+                IFS='|' read -r binary name port endpoint payload content_type content_encoding <<< "$scenario"
 
                 local payload_size=$(wc -c < "$payload" | tr -d ' ')
                 local output_json="$OUTPUT_DIR/${binary}-${name// /-}-${count}.json"
@@ -911,7 +968,7 @@ main() {
                 start_resource_monitor "$TERO_VECTOR_PID"
 
                 log_info "Running: $name ($binary, $count policies)..."
-                run_benchmark "$url" "$payload" "$output_json" "$content_type"
+                run_benchmark "$url" "$payload" "$output_json" "$content_type" "$content_encoding"
 
                 local resource_metrics=$(stop_resource_monitor)
 
@@ -951,12 +1008,12 @@ main() {
                 "tero-collector|OTLP Logs|4323|/v1/logs|$PAYLOADS_DIR/otlp-logs.pb|application/x-protobuf"
                 "tero-collector|OTLP Metrics|4323|/v1/metrics|$PAYLOADS_DIR/otlp-metrics.pb|application/x-protobuf"
                 "tero-collector|OTLP Traces|4323|/v1/traces|$PAYLOADS_DIR/otlp-traces.pb|application/x-protobuf"
-                "tero-collector|DD Logs|4325|/api/v2/logs|$PAYLOADS_DIR/datadog-logs.json|application/json"
+                "tero-collector|DD Logs|4325|/api/v2/logs|$DD_LOGS_PAYLOAD|application/json|$DD_LOGS_ENCODING"
                 "tero-collector|DD Metrics|4325|/api/v2/series|$PAYLOADS_DIR/datadog-metrics.json|application/json"
             )
 
             for scenario in "${tero_collector_scenarios[@]}"; do
-                IFS='|' read -r binary name port endpoint payload content_type <<< "$scenario"
+                IFS='|' read -r binary name port endpoint payload content_type content_encoding <<< "$scenario"
 
                 local payload_size=$(wc -c < "$payload" | tr -d ' ')
                 local output_json="$OUTPUT_DIR/${binary}-${name// /-}-${count}.json"
@@ -973,7 +1030,7 @@ main() {
 
                 # Run benchmark
                 log_info "Running: $name ($binary, $count policies)..."
-                run_benchmark "$url" "$payload" "$output_json" "$content_type"
+                run_benchmark "$url" "$payload" "$output_json" "$content_type" "$content_encoding"
 
                 # Stop monitoring
                 local resource_metrics=$(stop_resource_monitor)
@@ -1019,6 +1076,10 @@ main() {
 **Date:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 **Requests per test:** $REQUESTS
 **Concurrent connections:** $CONNECTIONS
+**Upstream latency:** ${UPSTREAM_LATENCY_MS}ms
+**Edge handler threads:** $THREAD_POOL_COUNT
+**Edge max connections:** $MAX_CONNECTIONS
+**DD Logs payload:** ${PAYLOAD_COMPRESSED_BYTES} bytes gzipped / ${PAYLOAD_DECODED_BYTES} bytes decoded
 **Policy counts tested:** ${POLICY_COUNTS[*]}
 
 ## Results
