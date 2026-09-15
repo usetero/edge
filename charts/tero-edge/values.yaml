@@ -97,9 +97,31 @@ config:
   # Raw (compressed) body cap as received on the wire.
   maxBodySize: 1572864
 
-  # Max concurrent connections — the dominant memory/throughput cap (memory
-  # scales ~ maxConnections x maxBodySize). Also settable via the
-  # TERO_MAX_CONNECTIONS env override.
+  # Max concurrent connections. When every slot is held the server stops
+  # accepting: pending connections queue in the kernel backlog and are then
+  # dropped, so senders time out while edge stays near-idle on CPU and memory.
+  # Alert on rate(httpz_connections[5m]) == 0 while rate(httpz_requests[5m])
+  # is above 0: existing keepalive connections still serve while new ones are
+  # refused, so the accept counter flattens as the request counter climbs.
+  #
+  # A connection costs 20 KiB (the receive buffer), NOT maxBodySize. Sizing:
+  #
+  #   memory ~= maxConnections x 20 KiB
+  #           + threadPoolCount x (maxBodySize + 650 KiB)
+  #
+  # The second term is the per-handler codec workspace (zstd window + record
+  # scratch + encoder), allocated on demand and then retained per thread.
+  # Worked example at maxBodySize 2 MiB:
+  #
+  #   maxConnections | threadPoolCount | approx memory | suggested request
+  #   ---------------|-----------------|---------------|------------------
+  #   256 (default)  | 8               | 26 MiB        | 64Mi
+  #   2048           | 16              | 83 MiB        | 128Mi
+  #   4096           | 32              | 165 MiB       | 256Mi
+  #
+  # Raise maxConnections and threadPoolCount together: connections admitted
+  # beyond what the handler pool can serve just queue until requestTimeout.
+  # Also settable via the TERO_MAX_CONNECTIONS env override.
   maxConnections: 256
 
   # Optional. Post-decompression body ceiling; null uses 16 MiB, and never less
