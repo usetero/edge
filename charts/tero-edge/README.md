@@ -86,7 +86,7 @@ Provide auth either via:
 | `resources.requests.cpu`            | string | `50m`                                          | CPU request                                                   |
 | `resources.requests.memory`         | string | `32Mi`                                         | Memory request                                                |
 | `resources.limits.cpu`              | string | `200m`                                         | CPU limit                                                     |
-| `resources.limits.memory`           | string | `64Mi`                                         | Memory limit                                                  |
+| `resources.limits.memory`           | string | `512Mi`                                        | Memory limit                                                  |
 | `service.enabled`                   | bool   | `false`                                        | Create Service                                                |
 | `service.type`                      | string | `ClusterIP`                                    | Service type                                                  |
 | `service.port`                      | int    | `8080`                                         | Service port                                                  |

@@ -164,10 +164,10 @@ config file.
 | `TERO_SERVICE_NAMESPACE` | `service.namespace` | `production`                                   |
 | `TERO_SERVICE_VERSION`   | `service.version`   | `latest`                                       |
 | `TERO_MAX_BODY_SIZE`     | `max_body_size`     | `1048576`                                      |
-| `TERO_MAX_DECODED_BYTES` | `max_decoded_bytes` | unset (falls back to `max_body_size`)          |
+| `TERO_MAX_DECODED_BYTES` | `max_decoded_bytes` | unset (16 MiB, ≥ `max_body_size`)              |
 | `TERO_MAX_CONNECTIONS`   | `max_connections`   | `256`                                          |
 | `TERO_WORKER_COUNT`      | `worker_count`      | unset (1)                                      |
-| `TERO_THREAD_POOL_COUNT` | `thread_pool_count` | unset (32)                                     |
+| `TERO_THREAD_POOL_COUNT` | `thread_pool_count` | unset (128)                                    |
 
 `policy_providers` is a list and cannot be set this way — override the config
 file instead. Full reference, including value substitution and the remaining
