@@ -141,7 +141,7 @@ Three things bite here:
    dependsOn = [{ containerName = "tero-edge", condition = "HEALTHY" }]
    ```
 
-Fluent Bit batches decompress well past Edge's 1.5 MB default body cap, so if
+Fluent Bit batches decompress well past Edge's 1 MB default body cap, so if
 payloads start getting rejected raise `TERO_MAX_BODY_SIZE` and
 `TERO_MAX_DECODED_BYTES`.
 
@@ -163,7 +163,7 @@ config file.
 | `TERO_SERVICE_NAME`      | `service.name`      | `edge`                                         |
 | `TERO_SERVICE_NAMESPACE` | `service.namespace` | `production`                                   |
 | `TERO_SERVICE_VERSION`   | `service.version`   | `latest`                                       |
-| `TERO_MAX_BODY_SIZE`     | `max_body_size`     | `1572864`                                      |
+| `TERO_MAX_BODY_SIZE`     | `max_body_size`     | `1048576`                                      |
 | `TERO_MAX_DECODED_BYTES` | `max_decoded_bytes` | unset (16 MiB, ≥ `max_body_size`)              |
 | `TERO_MAX_CONNECTIONS`   | `max_connections`   | `256`                                          |
 | `TERO_WORKER_COUNT`      | `worker_count`      | unset (1)                                      |
