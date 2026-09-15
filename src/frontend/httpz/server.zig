@@ -586,10 +586,15 @@ pub const Handler = struct {
         var output: std.Io.Writer.Allocating = try .initCapacity(res.arena, initial_capacity);
         var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
         defer sink.deinit();
+        // Decode and evaluate into plaintext, and re-encode only if a policy
+        // actually changed something. Compressing the forwarded body is the
+        // largest single CPU cost on this path (26% of request CPU on a 4 MiB
+        // batch), and a batch where every record is kept verbatim re-encodes
+        // to bytes equivalent to the ones the client already sent.
         const stats = pipeline_mod.run(.{
             .decode = pipe.codec,
             .format = pipe.format,
-            .encode = pipe.codec,
+            .encode = .identity,
             .max_decoded_bytes = ctx.limits.max_decoded_bytes,
             .zstd_window_len = ctx.limits.zstd_window_len,
         }, &body_reader, &output.writer, .{
@@ -604,7 +609,23 @@ pub const Handler = struct {
         if (ctx.metrics) |metrics| {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
         }
-        try self.exchange(req, res, pipe.upstream, output.written(), pipe.signal == .log);
+
+        // `desynced` means the framer lost structure and copied the remainder
+        // verbatim, so the plaintext still matches the input. Either way the
+        // original bytes are the truthful thing to forward, and they already
+        // agree with the Content-Encoding header we pass through.
+        if (stats.dropped == 0 and stats.replaced == 0) {
+            if (ctx.metrics) |metrics| {
+                metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .fast_path);
+            }
+            return self.exchange(req, res, pipe.upstream, raw_body, pipe.signal == .log);
+        }
+        if (ctx.metrics) |metrics| {
+            metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .policy_path);
+        }
+
+        const body = try exec.encodeBody(pipe.codec, res.arena, bufs.encode, output.written());
+        try self.exchange(req, res, pipe.upstream, body, pipe.signal == .log);
     }
 
     fn execPipeBuffered(

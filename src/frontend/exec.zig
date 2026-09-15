@@ -214,6 +214,25 @@ pub fn policiesActiveFor(registry: *policy.Registry, signal: service_mod.Signal)
     };
 }
 
+/// Re-encode an evaluated body in `codec`, so the forwarded Content-Encoding
+/// header stays truthful. Only called when a policy actually changed the
+/// batch; an unchanged batch forwards the client's original bytes instead and
+/// skips this entirely.
+pub fn encodeBody(
+    codec: encoding_mod.ContentEncoding,
+    arena: std.mem.Allocator,
+    encode_buf: []u8,
+    plaintext: []const u8,
+) ![]const u8 {
+    if (codec == .identity) return plaintext;
+    var encoded: std.Io.Writer.Allocating = try .initCapacity(arena, @min(plaintext.len, 64 * 1024));
+    var encoder: encoding_mod.Encoder = try .init(codec, &encoded.writer, encode_buf);
+    defer encoder.deinit();
+    try encoder.writer().writeAll(plaintext);
+    try encoder.finish();
+    return encoded.written();
+}
+
 /// Mirror the active snapshot's per-signal policy counts into the gauge. Called
 /// at scrape time so the gauge always reflects the live snapshot without hooking
 /// the loader's reload path. Counts match `policiesActiveFor` (the fast-path
@@ -520,6 +539,23 @@ pub fn routeLabel(signal: service_mod.Signal, format: framer_mod.WireFormat) run
         },
         // raw/ndjson/prom_text outcomes never run the record pipeline.
         else => unreachable,
+    };
+}
+
+/// Same routes as `routeLabel`, in the label set `edge_prefilter_decisions_total`
+/// uses. The two enums overlap but are distinct types.
+pub fn prefilterRouteLabel(
+    signal: service_mod.Signal,
+    format: framer_mod.WireFormat,
+) runtime_metrics_mod.RouteKindLabel {
+    return switch (format) {
+        .json_array => .datadog_logs,
+        .otlp_protobuf => switch (signal) {
+            .log => .otlp_logs,
+            .metric => .otlp_metrics,
+            .trace => .otlp_traces,
+        },
+        else => .passthrough,
     };
 }
 
