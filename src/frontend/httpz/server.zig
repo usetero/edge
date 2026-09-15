@@ -582,50 +582,73 @@ pub const Handler = struct {
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         try bufs.prepare(ctx.gpa, ctx.limits, pipe.codec);
         var body_reader = std.Io.Reader.fixed(raw_body);
-        const initial_capacity = @min(raw_body.len, limits_mod.LARGE_BODY_BUFFER_BYTES);
-        var output: std.Io.Writer.Allocating = try .initCapacity(res.arena, initial_capacity);
-        var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
-        defer sink.deinit();
-        // Decode and evaluate into plaintext, and re-encode only if a policy
-        // actually changed something. Compressing the forwarded body is the
-        // largest single CPU cost on this path (26% of request CPU on a 4 MiB
-        // batch), and a batch where every record is kept verbatim re-encodes
-        // to bytes equivalent to the ones the client already sent.
-        const stats = pipeline_mod.run(.{
+        // flate.Compress.init asserts its sink holds more than 8 bytes, so an
+        // empty or near-empty body would panic on an exactly-sized buffer.
+        const initial_capacity = @max(@min(raw_body.len, limits_mod.LARGE_BODY_BUFFER_BYTES), 64);
+        // Probe first, retaining nothing. When a batch comes back unchanged
+        // the bytes the client sent are already the right answer, so the only
+        // thing worth knowing up front is whether any record changes at all.
+        // Re-compressing the body is the largest single cost on this path, and
+        // a batch that keeps every record verbatim would re-encode to an
+        // equivalent of what already arrived.
+        const spec: pipeline_mod.PipelineSpec = .{
             .decode = pipe.codec,
             .format = pipe.format,
             .encode = .identity,
             .max_decoded_bytes = ctx.limits.max_decoded_bytes,
             .zstd_window_len = ctx.limits.zstd_window_len,
-        }, &body_reader, &output.writer, .{
+        };
+        const buffers: pipeline_mod.Buffers = .{
             .decoder = bufs.decode,
             .encoder = bufs.encode,
             .scratch = bufs.scratch,
             .chunk = bufs.chunk,
-        }, &sink) catch |err| switch (err) {
+        };
+
+        var probe = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
+        probe.probe = true;
+        defer probe.deinit();
+        var discard: std.Io.Writer.Discarding = .init(&.{});
+        const probe_result = pipeline_mod.run(spec, &body_reader, &discard.writer, buffers, &probe);
+        const changed = if (probe_result) |probe_stats| blk: {
+            // `desynced` copies the remainder verbatim, so it still matches the
+            // input. A clean probe means nothing changed.
+            break :blk probe_stats.dropped > 0 or probe_stats.replaced > 0;
+        } else |err| switch (err) {
+            error.BatchChanged => true,
+            error.ReadFailed => return error.InvalidRequestBody,
+            else => return err,
+        };
+
+        if (!changed) {
+            if (ctx.metrics) |metrics| {
+                metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), probe.records, 0);
+                metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .fast_path);
+            }
+            return self.exchange(req, res, pipe.upstream, raw_body, pipe.signal == .log);
+        }
+
+        // Something changed, so do the real pass: decode, evaluate and encode
+        // straight through, exactly as before. `output` holds the encoded body,
+        // so peak memory matches a run without this fast path.
+        if (ctx.metrics) |metrics| {
+            metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .policy_path);
+        }
+        body_reader = .fixed(raw_body);
+        var output: std.Io.Writer.Allocating = try .initCapacity(res.arena, initial_capacity);
+        var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
+        defer sink.deinit();
+        var encode_spec = spec;
+        encode_spec.encode = pipe.codec;
+        const encoded = pipeline_mod.run(encode_spec, &body_reader, &output.writer, buffers, &sink);
+        const stats = encoded catch |err| switch (err) {
             error.ReadFailed => return error.InvalidRequestBody,
             else => return err,
         };
         if (ctx.metrics) |metrics| {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
         }
-
-        // `desynced` means the framer lost structure and copied the remainder
-        // verbatim, so the plaintext still matches the input. Either way the
-        // original bytes are the truthful thing to forward, and they already
-        // agree with the Content-Encoding header we pass through.
-        if (stats.dropped == 0 and stats.replaced == 0) {
-            if (ctx.metrics) |metrics| {
-                metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .fast_path);
-            }
-            return self.exchange(req, res, pipe.upstream, raw_body, pipe.signal == .log);
-        }
-        if (ctx.metrics) |metrics| {
-            metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .policy_path);
-        }
-
-        const body = try exec.encodeBody(pipe.codec, res.arena, bufs.encode, output.written());
-        try self.exchange(req, res, pipe.upstream, body, pipe.signal == .log);
+        try self.exchange(req, res, pipe.upstream, output.written(), pipe.signal == .log);
     }
 
     fn execPipeBuffered(

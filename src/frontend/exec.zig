@@ -214,29 +214,6 @@ pub fn policiesActiveFor(registry: *policy.Registry, signal: service_mod.Signal)
     };
 }
 
-/// Re-encode an evaluated body in `codec`, so the forwarded Content-Encoding
-/// header stays truthful. Only called when a policy actually changed the
-/// batch; an unchanged batch forwards the client's original bytes instead and
-/// skips this entirely.
-pub fn encodeBody(
-    codec: encoding_mod.ContentEncoding,
-    arena: std.mem.Allocator,
-    encode_buf: []u8,
-    plaintext: []const u8,
-) ![]const u8 {
-    if (codec == .identity) return plaintext;
-    // flate.Compress.init asserts the inner writer holds more than 8 bytes, so
-    // a batch whose records were all dropped (plaintext "[]", or empty) would
-    // panic on an exactly-sized buffer. Floor the capacity above that assert.
-    const capacity = @max(@min(plaintext.len, 64 * 1024), 64);
-    var encoded: std.Io.Writer.Allocating = try .initCapacity(arena, capacity);
-    var encoder: encoding_mod.Encoder = try .init(codec, &encoded.writer, encode_buf);
-    defer encoder.deinit();
-    try encoder.writer().writeAll(plaintext);
-    try encoder.finish();
-    return encoded.written();
-}
-
 /// Mirror the active snapshot's per-signal policy counts into the gauge. Called
 /// at scrape time so the gauge always reflects the live snapshot without hooking
 /// the loader's reload path. Counts match `policiesActiveFor` (the fast-path
@@ -389,6 +366,11 @@ pub const RecordSink = struct {
     /// Batch totals for recordPolicyBatch.
     records: u64 = 0,
     dropped: u64 = 0,
+    /// Probe mode: the caller only wants to know *whether* this batch changes,
+    /// so the first drop or replace aborts with `error.BatchChanged` instead of
+    /// producing output. Tap capture is suppressed, since the real pass that
+    /// follows a positive probe captures every record anyway.
+    probe: bool = false,
 
     pub fn init(
         ctx: *SharedCtx,
@@ -414,7 +396,9 @@ pub const RecordSink = struct {
         self.records += 1;
         const sig = @tagName(self.signal);
         const fmt = @tagName(self.format);
-        if (self.ctx.tap) |tap| tap.capture(.pre, sig, fmt, "", bytes);
+        if (!self.probe) {
+            if (self.ctx.tap) |tap| tap.capture(.pre, sig, fmt, "", bytes);
+        }
 
         const decision: framer_mod.Decision = blk: {
             if (!self.active) break :blk .keep;
@@ -432,6 +416,12 @@ pub const RecordSink = struct {
             };
         };
 
+        if (self.probe) {
+            // Unwind as soon as the answer is known, so a batch that changes
+            // early pays only for the records up to that point.
+            if (decision != .keep) return error.BatchChanged;
+            return decision;
+        }
         if (self.ctx.tap) |tap| {
             const after: []const u8 = switch (decision) {
                 .keep => bytes,
@@ -636,20 +626,4 @@ test "contentEncodingName round-trips through the codec layer" {
         @as(?encoding_mod.ContentEncoding, null),
         encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.deflate)),
     );
-}
-
-test "encodeBody survives a fully dropped batch" {
-    // Every record dropped leaves "[]" (2 bytes) or nothing at all. Compress
-    // asserts a >8 byte sink, so an exactly-sized buffer panics here.
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var encode_buf: [encoding_mod.ContentEncoding.gzip.encoderBufferLen()]u8 = undefined;
-
-    for ([_][]const u8{ "", "[]" }) |plaintext| {
-        const out = try encodeBody(.gzip, arena, &encode_buf, plaintext);
-        try testing.expect(out.len > 0); // a gzip frame, even for empty input
-        try testing.expectEqual(@as(u8, 0x1f), out[0]);
-        try testing.expectEqual(@as(u8, 0x8b), out[1]);
-    }
 }
