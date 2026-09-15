@@ -56,13 +56,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--decoded-bytes", type=int, default=4 * 1024 * 1024)
     ap.add_argument("--compressed-bytes", type=int, default=1024 * 1024)
-    ap.add_argument("--template", default=os.path.join(PAYLOADS_DIR, "datadog-logs.json"))
+    ap.add_argument(
+        "--template",
+        default=os.path.join(PAYLOADS_DIR, "datadog-logs.json"),
+        help="record template: a JSON array of records, or a single record object",
+    )
     ap.add_argument("--out", default=os.path.join(PAYLOADS_DIR, "datadog-logs-bulk.json.gz"))
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
 
     with open(args.template) as f:
         template = json.load(f)
+    # Accept a single record as well as an array, so a captured production log
+    # (bench/datadog/payloads/wrapped_log.json, a GCP object with the real
+    # payload escaped inside "message") can be used as the template directly.
+    if isinstance(template, dict):
+        template = [template]
 
     # Bisect the per-record entropy width until the gzipped size lands within
     # 3% of the target. More entropy compresses worse, so size is monotonic
