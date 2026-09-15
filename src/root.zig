@@ -72,6 +72,7 @@ pub const zonfig = @import("zonfig/root.zig");
 
 // Import modules to include their tests
 test {
+    _ = @import("v2/root.zig");
     _ = @import("config/types.zig");
     _ = @import("core/limits.zig");
     _ = @import("core/io_select.zig");

@@ -332,40 +332,35 @@ pub const Handler = struct {
         const method = serviceMethod(req.method);
         const path = req.url.path;
 
-        // Internal observability endpoint, checked before routing — parity
-        // with the stdio driver's /_edge/metrics short-circuit.
-        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
-            res.header("content-type", "text/plain; version=0.0.4");
-            exec.refreshPolicyGauge(ctx);
-            if (ctx.metrics) |metrics| {
-                try metrics.writePrometheus(res.writer());
-            }
-            return;
-        }
-
-        // Dump the loaded policy snapshot (id/signal/enabled/name). Pairs with
-        // the gauge: shows *which* policies are active, not just how many.
-        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) {
-            const json = std.mem.eql(u8, (try req.query()).get("format") orelse "", "json");
-            res.header("content-type", if (json) "application/json" else "text/plain; charset=utf-8");
-            try exec.writePolicies(ctx.registry, res.writer(), json);
-            return;
-        }
-
-        // Debug tap (config-gated): block this request up to 1s while data-plane
-        // threads stream the next N records into our buffer, before or after
-        // policy evaluation. ctx.tap is null unless enabled in config.
-        if (req.method == .GET and std.mem.startsWith(u8, path, "/_edge/tap/")) {
-            const stage: exec.TapState.Stage = if (std.mem.eql(u8, path, "/_edge/tap/pre"))
-                .pre
-            else if (std.mem.eql(u8, path, "/_edge/tap/post"))
-                .post
-            else {
+        // Admin endpoints are classified before routing — parity with the
+        // stdio driver's /_edge/metrics short-circuit.
+        if (adminRoute(req.method, path)) |admin| switch (admin) {
+            .metrics => {
+                res.header("content-type", "text/plain; version=0.0.4");
+                exec.refreshPolicyGauge(ctx);
+                if (ctx.metrics) |metrics| {
+                    try metrics.writePrometheus(res.writer());
+                }
+                return;
+            },
+            // Dump the loaded policy snapshot (id/signal/enabled/name). Pairs with
+            // the gauge: shows *which* policies are active, not just how many.
+            .policies => {
+                const json = std.mem.eql(u8, (try req.query()).get("format") orelse "", "json");
+                res.header("content-type", if (json) "application/json" else "text/plain; charset=utf-8");
+                try exec.writePolicies(ctx.registry, res.writer(), json);
+                return;
+            },
+            // Debug tap (config-gated): block this request up to 1s while data-plane
+            // threads stream the next N records into our buffer, before or after
+            // policy evaluation. ctx.tap is null unless enabled in config.
+            .tap_pre => return self.handleTap(req, res, .pre),
+            .tap_post => return self.handleTap(req, res, .post),
+            .tap_unknown => {
                 res.status = 404;
                 return;
-            };
-            return self.handleTap(req, res, stage);
-        }
+            },
+        };
 
         const outcome = exec.planRequest(
             ctx,
@@ -572,7 +567,7 @@ pub const Handler = struct {
         const ctx = self.ctx;
         const raw_body = req.body() orelse "";
         if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
-            return self.exchange(req, res, pipe.upstream, raw_body, pipe.signal == .log);
+            return self.exchange(req, res, pipe.upstream, raw_body, processedReplayable(pipe.signal));
         }
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         try bufs.prepare(ctx.gpa, ctx.limits, pipe.codec);
@@ -599,7 +594,7 @@ pub const Handler = struct {
         if (ctx.metrics) |metrics| {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
         }
-        try self.exchange(req, res, pipe.upstream, output.written(), pipe.signal == .log);
+        try self.exchange(req, res, pipe.upstream, output.written(), processedReplayable(pipe.signal));
     }
 
     fn execPipeBuffered(
@@ -627,7 +622,7 @@ pub const Handler = struct {
             return;
         }
 
-        try self.exchange(req, res, pipe.upstream, processed.body, pipe.signal == .log);
+        try self.exchange(req, res, pipe.upstream, processed.body, processedReplayable(pipe.signal));
     }
 
     fn execFetchFiltered(
@@ -697,6 +692,26 @@ fn errorStatus(err: anyerror) u16 {
         error.OutOfMemory, error.WriteFailed => 503,
         else => 502,
     };
+}
+
+pub const AdminRoute = enum { metrics, policies, tap_pre, tap_post, tap_unknown };
+
+/// Admin endpoints answer only GET and take precedence over service routing;
+/// any other method on these paths falls through to the router.
+pub fn adminRoute(method: httpz.Method, path: []const u8) ?AdminRoute {
+    if (method != .GET) return null;
+    if (std.mem.eql(u8, path, "/_edge/metrics")) return .metrics;
+    if (std.mem.eql(u8, path, "/_edge/policies")) return .policies;
+    if (!std.mem.startsWith(u8, path, "/_edge/tap/")) return null;
+    if (std.mem.eql(u8, path, "/_edge/tap/pre")) return .tap_pre;
+    if (std.mem.eql(u8, path, "/_edge/tap/post")) return .tap_post;
+    return .tap_unknown;
+}
+
+/// Processed intake replays only for logs. Metric and trace intakes are not
+/// idempotent upstream, so a transport failure after send must not resend them.
+pub fn processedReplayable(signal: service_mod.Signal) bool {
+    return signal == .log;
 }
 
 fn retryableTransportError(err: anyerror) bool {

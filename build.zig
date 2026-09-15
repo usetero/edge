@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("edge", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "proto", .module = proto_mod },
             .{ .name = "zimdjson", .module = zimdjson.module("zimdjson") },
