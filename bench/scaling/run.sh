@@ -604,6 +604,21 @@ extract_metrics() {
     ' "$json_file" | tr -d '"'
 }
 
+# Name the failures behind a success rate below 100%. oha records why each
+# request failed; without this the harness prints "success: 98%" and drops the
+# reason, which is indistinguishable from the proxy losing data. Non-2xx
+# responses and transport failures are different problems, so report both.
+failure_reasons() {
+    local json_file=$1
+    [[ ! -f "$json_file" ]] && return
+    jq -r '
+        [ (.statusCodeDistribution // {} | to_entries[] | select(.key | test("^2") | not)
+           | "HTTP \(.key) x\(.value)"),
+          (.errorDistribution // {} | to_entries[] | "\(.key) x\(.value)") ]
+        | join(", ")
+    ' "$json_file" 2>/dev/null
+}
+
 # Explicit --log-level wins; otherwise --debug implies info, and a plain run
 # stays at err so logging never shows up in the measurement.
 edge_log_level() {
@@ -739,6 +754,21 @@ main() {
     fi
 
     # Start echo server
+    # oha needs a descriptor per connection, plus edge needs one per inbound
+    # and one per upstream. macOS defaults to 256, so a run at -c 250 fails
+    # with "Too many open files" inside the load generator and looks exactly
+    # like the proxy dropping requests.
+    local want_fds=$(( CONNECTIONS * 4 + 1024 ))
+    local have_fds=$(ulimit -n)
+    if [[ "$have_fds" != "unlimited" && "$have_fds" -lt "$want_fds" ]]; then
+        if ulimit -n "$want_fds" 2>/dev/null; then
+            log_info "Raised open-file limit: $have_fds -> $(ulimit -n)"
+        else
+            log_warn "Open-file limit is $have_fds, want $want_fds for -c $CONNECTIONS."
+            log_warn "Expect 'Too many open files' failures. Raise it with: ulimit -n $want_fds"
+        fi
+    fi
+
     start_echo_server
 
     # CSV header
@@ -813,6 +843,10 @@ main() {
                 [[ "$success" != "100" ]] && success_color="${RED}"
 
                 log_success "$name: ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, echo: ${echo_requests} reqs"
+                if [[ "$success" != "100" ]]; then
+                    local reasons=$(failure_reasons "$output_json")
+                    [[ -n "$reasons" ]] && log_warn "  why: ${reasons}"
+                fi
 
                 # Write to CSV
                 echo "$binary,$name,$count,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,$echo_requests,$echo_bytes" >> "$results_file"
@@ -882,6 +916,10 @@ main() {
                 [[ "$success" != "100" ]] && success_color="${RED}"
 
                 log_success "$name: ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, echo: ${echo_requests} reqs"
+                if [[ "$success" != "100" ]]; then
+                    local reasons=$(failure_reasons "$output_json")
+                    [[ -n "$reasons" ]] && log_warn "  why: ${reasons}"
+                fi
 
                 # Write to CSV
                 echo "$binary,$name,$count,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,$echo_requests,$echo_bytes" >> "$results_file"
@@ -951,6 +989,10 @@ main() {
                 [[ "$success" != "100" ]] && success_color="${RED}"
 
                 log_success "$name: ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, echo: ${echo_requests} reqs"
+                if [[ "$success" != "100" ]]; then
+                    local reasons=$(failure_reasons "$output_json")
+                    [[ -n "$reasons" ]] && log_warn "  why: ${reasons}"
+                fi
 
                 # Write to CSV
                 echo "$binary,$name,$count,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,$echo_requests,$echo_bytes" >> "$results_file"
@@ -1008,6 +1050,10 @@ main() {
                 [[ "$success" != "100" ]] && success_color="${RED}"
 
                 log_success "$name: ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, echo: ${echo_requests} reqs"
+                if [[ "$success" != "100" ]]; then
+                    local reasons=$(failure_reasons "$output_json")
+                    [[ -n "$reasons" ]] && log_warn "  why: ${reasons}"
+                fi
 
                 echo "$binary,$name,$count,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,$echo_requests,$echo_bytes" >> "$results_file"
             done
@@ -1076,6 +1122,10 @@ main() {
                 [[ "$success" != "100" ]] && success_color="${RED}"
 
                 log_success "$name: ${rps} req/s, p50: ${p50}ms, p99: ${p99}ms, success: ${success_color}${success}%${NC}, echo: ${echo_requests} reqs"
+                if [[ "$success" != "100" ]]; then
+                    local reasons=$(failure_reasons "$output_json")
+                    [[ -n "$reasons" ]] && log_warn "  why: ${reasons}"
+                fi
 
                 # Write to CSV
                 echo "$binary,$name,$count,$payload_size,$rps,$p50,$p99,$success,$cpu_percent,$peak_mem,$echo_requests,$echo_bytes" >> "$results_file"
