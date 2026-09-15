@@ -183,8 +183,7 @@ fn openUpstream(
 }
 
 /// Relays the upstream response (status, filtered headers, body) to the
-/// client. `body_filter` optionally interposes on the body stream
-/// (prometheus). Returns bytes forwarded to the client.
+/// client.
 fn relayResponse(
     env: *Env,
     conn_id: conn_slab_mod.ConnId,
@@ -192,7 +191,6 @@ fn relayResponse(
     upstream_req: *std.http.Client.Request,
     arena: std.mem.Allocator,
     max_response_body: usize,
-    body_filter: ?*prom.streaming_filter.FilteringWriter,
 ) !void {
     var upstream_res = try upstream_req.receiveHead(&.{});
 
@@ -210,12 +208,7 @@ fn relayResponse(
     });
 
     const upstream_body = upstream_res.reader(env.slab.upstreamBuf(conn_id));
-    if (body_filter) |filter| {
-        _ = try pipeline_mod.streamReaderToWriter(upstream_body, filter.writer(), max_response_body);
-        _ = try filter.finish();
-    } else {
-        _ = try pipeline_mod.streamReaderToWriter(upstream_body, &body_writer.writer, max_response_body);
-    }
+    _ = try pipeline_mod.streamReaderToWriter(upstream_body, &body_writer.writer, max_response_body);
     try body_writer.end();
     try body_writer.flush();
 }
@@ -257,7 +250,7 @@ fn execForwardRaw(
     }
 
     const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(fwd.upstream));
-    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response, null);
+    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response);
 }
 
 fn execPipeStream(
@@ -322,7 +315,7 @@ fn execPipeStream(
     }
 
     const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
-    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response, null);
+    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response);
 }
 
 fn execPipeBuffered(
@@ -368,7 +361,7 @@ fn execPipeBuffered(
     try body_writer.end();
 
     const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
-    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response, null);
+    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response);
 }
 
 fn execFetchFiltered(
