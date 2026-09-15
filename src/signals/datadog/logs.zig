@@ -138,12 +138,16 @@ pub fn evalLogRecord(
     // structural surprises — re-parses through the fully validating
     // materializing path, so semantics never depend on the fast path. Only
     // when both fail does the record fail open to keep.
+    // Hand the reused parser down so the lazy message unwrap does not build a
+    // fresh structural index per record.
     var log_obj = DatadogLog.parseRaw(scratch, record) catch blk: {
         const document = parser.parseFromSlice(parser_gpa, record) catch return .keep;
         const value_type = document.asValue().getType() catch return .keep;
         if (value_type != .object) return .keep;
         break :blk DatadogLog.parse(scratch, document.asValue()) catch return .keep;
     };
+    log_obj.unwrap_parser = parser;
+    log_obj.unwrap_parser_gpa = parser_gpa;
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
