@@ -144,8 +144,16 @@ pub fn evalLogRecord(
         const document = parser.parseFromSlice(parser_gpa, record) catch return .keep;
         const value_type = document.asValue().getType() catch return .keep;
         if (value_type != .object) return .keep;
+        // No `unwrap_parser` on this path. `parse` keeps unknown fields as
+        // lazy AnyValues backed by `document`, which is backed by `parser`'s
+        // structural index; a later body lookup re-parsing the inner wrapper
+        // on that same parser would replace the index under them. The unwrap
+        // falls back to its own local parser instead.
         break :blk DatadogLog.parse(scratch, document.asValue()) catch return .keep;
     };
+    // Only reached when parseRaw succeeded, so the parser holds no document
+    // this log still reads from. Sharing it saves a structural index per
+    // record on the unwrap path.
     log_obj.unwrap_parser = parser;
     log_obj.unwrap_parser_gpa = parser_gpa;
 

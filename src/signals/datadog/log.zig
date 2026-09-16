@@ -539,6 +539,11 @@ pub const DatadogLog = struct {
                 2
             else
                 continue;
+            // First occurrence wins, matching `flattenValue`. A duplicate key
+            // must not change the answer: the two paths have to agree, or a
+            // body policy could be bypassed by appending a benign second
+            // `message`. Skipping the dupe also avoids leaking the loser.
+            if (hits[slot] != null) continue;
             switch (field.value.asAny() catch continue) {
                 .string => |v| {
                     const text = v.get() catch continue;
@@ -1650,6 +1655,13 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
         \\{"message":"not json at all"}
         ,
         \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":{\"nested\":\"object\"}}}}"}
+        ,
+        // Duplicate keys: the first occurrence wins in both paths. If the
+        // direct walk took the last one instead, a body policy matching the
+        // first value could be bypassed by appending a benign second.
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":\"secret\",\"message\":\"benign\"}}}"}
+        ,
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"body\":\"first\",\"body\":\"second\",\"log\":\"l\"}}}"}
         ,
     };
 
