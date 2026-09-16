@@ -144,7 +144,9 @@ pub fn expireTrackedUpstreams(ctx: *exec.SharedCtx, force: bool) void {
         if (bufs.timed_out.swap(true, .acq_rel)) continue;
         connection.closing = true;
         connection.stream_reader.stream.shutdown(ctx.io, .both) catch |err| {
-            log.debug("failed to interrupt upstream: {s}", .{@errorName(err)});
+            // The handler stays blocked on a socket nothing can interrupt, so
+            // this is the last record of that thread.
+            log.warn("failed to interrupt upstream: {s}", .{@errorName(err)});
         };
     }
 }

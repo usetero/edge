@@ -28,6 +28,7 @@ const runtime_metrics = @import("../../runtime/runtime_metrics.zig");
 const exchange = @import("../exchange.zig");
 const paths = @import("../paths.zig");
 const endpoints = @import("../endpoints.zig");
+const deadline_reader_mod = @import("deadline_reader.zig");
 
 const Inbound = exchange.Inbound;
 const InboundBody = paths.InboundBody;
@@ -39,6 +40,26 @@ const log = std.log.scoped(.conn);
 const RequestFailed = struct { method: []const u8, path: []const u8, err: []const u8 };
 /// Per-request trace at debug level.
 const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
+/// Same shape at warn level, for a request that held its connection task.
+const RequestSlow = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
+/// A connection refused before it carried a request, with the 503 sent.
+const ConnectionShed = struct { reason: []const u8, answered: u16 };
+/// An inbound read hit its deadline. `idle` is a keep-alive wait with no
+/// request in flight; `request` means a partial request stalled, which drops
+/// that request, so it answers 408 first.
+const InboundTimeout = struct { phase: []const u8, answered: u16 };
+/// A head that failed to parse. Answered 400, then closed.
+const RequestRejected = struct { reason: []const u8, answered: u16 };
+/// The response was already on the wire when the request failed. The body
+/// truncates and the connection closes, so the sender must retry: there is no
+/// status left to change.
+const ResponseTruncated = struct { path: []const u8, status: u16, err: []const u8 };
+/// Even the fixed error response failed to reach the client.
+const ResponseUndeliverable = struct { answered: u16, err: []const u8 };
+
+/// Warn past this, matching the httpz frontend: `RequestCompleted` is debug
+/// level, which production turns off.
+const slow_request_seconds: f64 = 5;
 
 /// Per-connection environment: the frontend-neutral shared context plus the
 /// stdio frontend's own state (slab slot buffers, arena pool).
@@ -46,6 +67,10 @@ const Env = struct {
     shared: *exec.SharedCtx,
     slab: *conn_slab_mod.ConnSlab,
     arenas: *arena_pool_mod.ArenaPool,
+    /// The inbound reader, so a body read that hit its deadline is reported
+    /// as the client stall it is (408) instead of a generic read failure
+    /// (502), which would point at the upstream.
+    inbound: *deadline_reader_mod.DeadlineReader,
 };
 
 /// The response side of the sink contract (exchange.zig) over a
@@ -86,38 +111,57 @@ pub fn serveConnection(
     const io = shared.io;
     defer stream.close(io);
 
-    var env: Env = .{ .shared = shared, .slab = slab, .arenas = arenas };
+    // `inbound` is filled once the slab slot provides its receive buffer.
+    var env: Env = undefined;
 
     const conn_id = slab.claim(io) orelse {
         // Load shed: no slab slot. One fixed write, then close.
+        if (shared.metrics) |metrics| metrics.recordConnectionShed(.slab_full);
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        shared.bus.warn(ConnectionShed{ .reason = "connection_slab_full", .answered = 503 });
         const shed = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-        writeRawResponse(io, stream, shed);
+        writeRawResponse(shared, io, stream, shed, 503);
         return;
     };
     defer slab.release(io, conn_id);
+    // Tracks slab occupancy, so it pairs with the claim, not with the accept:
+    // a shed connection never counts as active.
+    if (shared.metrics) |metrics| metrics.recordConnectionsActive(1);
+    defer if (shared.metrics) |metrics| metrics.recordConnectionsActive(-1);
     const arena_slot = arenas.claim(io);
     defer arenas.release(io, arena_slot);
 
-    var net_reader = std.Io.net.Stream.Reader.init(stream, io, slab.recvBuf(conn_id));
+    var inbound: deadline_reader_mod.DeadlineReader = .init(io, stream, slab.recvBuf(conn_id));
+    env = .{ .shared = shared, .slab = slab, .arenas = arenas, .inbound = &inbound };
     var net_writer = std.Io.net.Stream.Writer.init(stream, io, slab.sendBuf(conn_id));
-    var server = std.http.Server.init(&net_reader.interface, &net_writer.interface);
+    var server = std.http.Server.init(&inbound.interface, &net_writer.interface);
 
     while (server.reader.state == .ready) {
         var request = server.receiveHead() catch |err| switch (err) {
-            // Cancellation surfaces as ReadFailed through the net reader.
-            error.HttpConnectionClosing, error.ReadFailed => return,
+            // Cancellation surfaces as ReadFailed through the reader, as does
+            // a deadline; `inbound` says which.
+            error.HttpConnectionClosing, error.ReadFailed => {
+                reportReadEnd(shared, io, stream, &inbound, err);
+                return;
+            },
             else => {
                 // Malformed head (incl. unsupported content-encoding, see
                 // wiring-notes): answer 400 on the raw writer and close.
+                if (shared.metrics) |metrics| metrics.recordInvalidRequest();
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                shared.bus.warn(RequestRejected{ .reason = @errorName(err), .answered = 400 });
                 const reject = "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                writeRawResponse(io, stream, reject);
+                writeRawResponse(shared, io, stream, reject, 400);
                 return;
             },
         };
         handleRequest(&env, conn_id, arena_slot, &request) catch |err| {
+            // handleRequest already reported and answered what it could; this
+            // only decides the connection's fate.
             log.debug("request handling failed: {s}", .{@errorName(err)});
             return; // connection state unknown; close it
         };
+        inbound.endRequest();
         arenas.reset(arena_slot);
     }
 }
@@ -134,6 +178,8 @@ fn handleRequest(
     const ctx = env.shared;
     const arena = env.arenas.allocator(arena_slot);
     const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+    if (ctx.metrics) |metrics| metrics.recordInFlight(1);
+    defer if (ctx.metrics) |metrics| metrics.recordInFlight(-1);
 
     // Head strings die when the body reader is created; the target must
     // outlive that for the upstream leg, logs and metrics.
@@ -147,7 +193,15 @@ fn handleRequest(
 
     var sink: Sink = .{ .request = request, .buffer = env.slab.bodyBuf(conn_id) };
     var failed: ?anyerror = null;
-    dispatch(env, conn_id, arena, request, target, &sink) catch |err| {
+    dispatch(env, conn_id, arena, request, target, &sink) catch |raw_err| {
+        // The shared path reports a stalled read as a generic read failure.
+        // Only this frontend knows the deadline fired, so name it here: the
+        // sender stalled, the upstream did not.
+        const client_stalled = env.inbound.expired == .request;
+        const err = if (client_stalled) error.InboundBodyTimeout else raw_err;
+        if (client_stalled) {
+            if (ctx.metrics) |metrics| metrics.recordInboundTimeout(.request);
+        }
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.err(RequestFailed{
             .method = @tagName(request.head.method),
@@ -158,6 +212,14 @@ fn handleRequest(
             metrics.recordRequestError(known_path, .uncaught);
         }
         failed = err;
+        if (sink.status != 0) {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            ctx.bus.warn(ResponseTruncated{
+                .path = path,
+                .status = sink.status,
+                .err = @errorName(err),
+            });
+        }
         if (sink.status == 0) {
             sink.status = exchange.errorStatus(err);
             request.respond("", .{
@@ -175,13 +237,23 @@ fn handleRequest(
         metrics.recordRequestDuration(known_path, elapsed_s);
         metrics.recordResponse(known_path, runtime_metrics.statusClass(sink.status));
     }
-    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-    ctx.bus.debug(RequestCompleted{
-        .method = @tagName(request.head.method),
-        .path = path,
-        .status = sink.status,
-        .duration_ms = elapsed_s * std.time.ms_per_s,
-    });
+    if (elapsed_s >= slow_request_seconds) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.warn(RequestSlow{
+            .method = @tagName(request.head.method),
+            .path = path,
+            .status = sink.status,
+            .duration_ms = elapsed_s * std.time.ms_per_s,
+        });
+    } else {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.debug(RequestCompleted{
+            .method = @tagName(request.head.method),
+            .path = path,
+            .status = sink.status,
+            .duration_ms = elapsed_s * std.time.ms_per_s,
+        });
+    }
     if (failed) |err| return err;
 }
 
@@ -320,14 +392,63 @@ fn collectRequestHeaders(
     return buffer[0..count];
 }
 
-/// Best-effort fixed response on the raw stream (pre-HTTP-state failures:
-/// load shed, malformed head). Errors are ignored — the connection is being
-/// closed either way.
-fn writeRawResponse(io: std.Io, stream: std.Io.net.Stream, response: []const u8) void {
+/// Reports why the read side ended, and answers when a request was in flight.
+///
+/// Three outcomes hide behind one error: the peer closed a keep-alive
+/// connection (routine), our idle deadline reclaimed the slot (routine, but it
+/// is the capacity signal), or a partial request stalled past the request
+/// deadline. The last one drops a request the sender believes is in progress,
+/// so it gets a 408 and a warn line.
+fn reportReadEnd(
+    shared: *exec.SharedCtx,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    inbound: *deadline_reader_mod.DeadlineReader,
+    err: anyerror,
+) void {
+    const phase = inbound.expired orelse {
+        // No deadline fired: the peer went away, or we were canceled.
+        log.debug("inbound read ended: {s}", .{@errorName(inbound.err orelse err)});
+        return;
+    };
+    if (shared.metrics) |metrics| metrics.recordInboundTimeout(switch (phase) {
+        .idle => .idle,
+        .request => .request,
+    });
+    switch (phase) {
+        .idle => {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            shared.bus.debug(InboundTimeout{ .phase = "idle", .answered = 0 });
+        },
+        .request => {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            shared.bus.warn(InboundTimeout{ .phase = "request", .answered = 408 });
+            const timeout = "HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            writeRawResponse(shared, io, stream, timeout, 408);
+        },
+    }
+}
+
+/// Fixed response on the raw stream, for failures before the HTTP state
+/// machine can answer (load shed, malformed head, read deadline). A failure
+/// here means the client never learned the status, which is the one drop we
+/// cannot back-propagate, so it is logged rather than ignored.
+fn writeRawResponse(
+    shared: *exec.SharedCtx,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    response: []const u8,
+    status: u16,
+) void {
     var buf: [256]u8 = undefined;
     var writer = std.Io.net.Stream.Writer.init(stream, io, &buf);
-    writer.interface.writeAll(response) catch return;
-    writer.interface.flush() catch return;
+    writer.interface.writeAll(response) catch |err| return undeliverable(shared, status, err);
+    writer.interface.flush() catch |err| return undeliverable(shared, status, err);
+}
+
+fn undeliverable(shared: *exec.SharedCtx, status: u16, err: anyerror) void {
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    shared.bus.warn(ResponseUndeliverable{ .answered = status, .err = @errorName(err) });
 }
 
 // ============================== Tests ==============================

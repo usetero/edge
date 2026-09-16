@@ -130,6 +130,13 @@ const log = std.log.scoped(.httpz_server);
 const RequestFailed = struct { method: []const u8, path: []const u8, err: []const u8 };
 /// Per-request trace at debug level.
 const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
+/// Same shape at warn level, for a request that held its handler thread.
+const RequestSlow = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
+
+/// Warn past this. `RequestCompleted` is debug level, which production turns
+/// off, so without this line a handler that sat on a stalled upstream for
+/// seconds leaves no record at all.
+const slow_request_seconds: f64 = 5;
 
 pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) httpz.Config {
     const requested_workers = limits.worker_count orelse 1;
@@ -241,6 +248,8 @@ pub const Handler = struct {
         }
         const ctx = self.ctx;
         const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+        if (ctx.metrics) |metrics| metrics.recordInFlight(1);
+        defer if (ctx.metrics) |metrics| metrics.recordInFlight(-1);
         const method = serviceMethod(req.method);
         const known_path = exec.classifyKnownPath(req.url.path, method);
         if (ctx.metrics) |metrics| {
@@ -269,13 +278,23 @@ pub const Handler = struct {
             metrics.recordRequestDuration(known_path, elapsed_s);
             metrics.recordResponse(known_path, runtime_metrics.statusClass(res.status));
         }
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.debug(RequestCompleted{
-            .method = @tagName(req.method),
-            .path = req.url.path,
-            .status = res.status,
-            .duration_ms = elapsed_s * std.time.ms_per_s,
-        });
+        if (elapsed_s >= slow_request_seconds) {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            ctx.bus.warn(RequestSlow{
+                .method = @tagName(req.method),
+                .path = req.url.path,
+                .status = res.status,
+                .duration_ms = elapsed_s * std.time.ms_per_s,
+            });
+        } else {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            ctx.bus.debug(RequestCompleted{
+                .method = @tagName(req.method),
+                .path = req.url.path,
+                .status = res.status,
+                .duration_ms = elapsed_s * std.time.ms_per_s,
+            });
+        }
     }
 
     fn dispatch(self: *Handler, req: *httpz.Request, res: *httpz.Response) !void {

@@ -18,6 +18,10 @@ const thread_bufs = @import("../thread_bufs.zig");
 
 const log = std.log.scoped(.http_server);
 
+// Named event payloads: the type name is the telemetry event name.
+/// A connection refused before it carried a request, with the 503 sent.
+const ConnectionShed = struct { reason: []const u8, answered: u16 };
+
 pub const HttpServer = struct {
     listener: std.Io.net.Server,
     ctx: *exec.SharedCtx,
@@ -91,12 +95,16 @@ pub const HttpServer = struct {
                     continue;
                 },
             };
+            if (self.ctx.metrics) |metrics| metrics.recordConnectionAccepted();
             self.lifecycle.spawn(io, conn_mod.serveConnection, .{
                 self.ctx, &self.slab, &self.arenas, stream,
             }) catch |err| switch (err) {
                 error.ConcurrencyUnavailable => {
                     // The Io implementation is at its task limit; the slab
                     // would also have shed. Tell the client to back off.
+                    if (self.ctx.metrics) |metrics| metrics.recordConnectionShed(.concurrency);
+                    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                    self.ctx.bus.warn(ConnectionShed{ .reason = "io_concurrency_unavailable", .answered = 503 });
                     shedConnection(io, stream);
                 },
             };
