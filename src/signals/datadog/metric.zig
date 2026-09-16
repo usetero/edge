@@ -271,17 +271,43 @@ pub const MetricSeries = struct {
             } else {
                 // Store unknown fields in extra map - need to dupe the key since it's from the parser buffer
                 const key_copy = try allocator.dupe(u8, key);
-                const any = try field.value.asAny();
-                try series.extra.put(allocator, key_copy, any);
+                const any = field.value.asAny() catch |err| {
+                    allocator.free(key_copy);
+                    return err;
+                };
+                // getOrPut may allocate; guard key_copy until the map owns it.
+                const extra_gop = series.extra.getOrPut(allocator, key_copy) catch |err| {
+                    allocator.free(key_copy);
+                    return err;
+                };
+                if (extra_gop.found_existing) {
+                    // key_copy is a duplicate; the map already owns the original key.
+                    allocator.free(key_copy);
+                }
+                // On error after this point, series.deinit (via errdefer series.deinit above)
+                // will free all keys and values already inserted into the maps.
+                extra_gop.value_ptr.* = any;
                 // Nested containers alias the parser's shared cursor and cannot
                 // be re-iterated after the top-level loop advances; eagerly
                 // serialize them now while the cursor is still inside them.
                 switch (any) {
                     .object, .array => {
                         const raw_json = try stringifyAnyValue(allocator, any);
-                        try series.extra_raw_json.put(allocator, key_copy, raw_json);
+                        errdefer allocator.free(raw_json);
+                        // Free the old raw JSON value if this key already had one.
+                        const raw_gop = try series.extra_raw_json.getOrPut(allocator, extra_gop.key_ptr.*);
+                        if (raw_gop.found_existing) {
+                            allocator.free(raw_gop.value_ptr.*);
+                        }
+                        raw_gop.value_ptr.* = raw_json;
                     },
-                    else => {},
+                    else => {
+                        // A non-container value overwrites any previously stored raw JSON
+                        // for this key; remove and free it so the scalar takes precedence.
+                        if (series.extra_raw_json.fetchRemove(extra_gop.key_ptr.*)) |removed| {
+                            allocator.free(removed.value);
+                        }
+                    },
                 }
             }
         }
