@@ -139,8 +139,8 @@ pub const Runtime = struct {
     /// `deinit` and silently dropped. Scoped to `.tail`/`.checkpoint`: `.head`
     /// re-reads the whole file from 0 on restart, so emitting at shutdown would
     /// duplicate it on the next run (status quo for `.head` is unchanged).
-    /// `catch {}` keeps `output.flush()` running even if the trailing partial
-    /// is a half-record that fails parsing under `.json`/`.logfmt`.
+    /// Parse errors (malformed JSON/logfmt half-record) are swallowed so
+    /// `output.flush()` still runs; allocation and writer errors propagate.
     fn drainFramer(
         read_from: types.ReadFrom,
         framer: *framer_mod.LineFramer,
@@ -148,8 +148,10 @@ pub const Runtime = struct {
         evaluator: *eval_stream.StreamEvaluator,
     ) !void {
         if (read_from != .head) {
-            // ziglint-ignore: Z026 (intentional: swallow a half-record's parse error so flush still runs)
-            framer.finish(output.writer(), evaluator, Runtime.evalLineFilter) catch {};
+            framer.finish(output.writer(), evaluator, Runtime.evalLineFilter) catch |err| switch (err) {
+                error.OutOfMemory, error.WriteFailed => return err,
+                else => {}, // swallow half-record parse errors so flush still runs
+            };
         }
         try output.flush();
     }
@@ -264,6 +266,12 @@ pub const Runtime = struct {
             },
         }
 
+        errdefer {
+            lifecycle.requestShutdown(self.io);
+            lifecycle.shutdown(self.io);
+            if (signal_waiter) |waiter| teardownSignalWaiter(waiter, &shutdown_waiter);
+        }
+
         try checkpoint.start(&lifecycle);
 
         var loop: PollLoop = .{
@@ -289,8 +297,10 @@ pub const Runtime = struct {
         // The canceled tasks can't reliably do final file IO; drain and
         // flush on this (uncanceled) thread. See drainFramer for why the
         // trailing partial is finished only in .tail/.checkpoint.
-        checkpoint.finalize();
+        // Drain and flush before finalizing the checkpoint so that an output
+        // failure does not advance persisted offsets past an unwritten record.
         try Runtime.drainFramer(self.cfg.read_from, &framer, output, &evaluator);
+        checkpoint.finalize();
         if (loop.failure) |err| return err;
     }
 };
@@ -782,10 +792,10 @@ test "runtime public API: file-tail drain skips finish() in .head mode (recovere
 test "runtime public API: file-tail drain swallows half-record parse error (.json policy)" {
     // Under .json with an active policy, finish() runs the trailing partial
     // through evalLine -> parseJsonAttrs -> std.json.parseFromSliceLeaky, which
-    // errors on a half-record. drainFramer's catch {} swallows that error so
-    // output.flush() still runs and the already-emitted complete record is not
-    // lost (at-worst-neutral for .json/.logfmt; a valid trailing record still
-    // emits normally).
+    // errors on a half-record. drainFramer catches parse errors (letting
+    // allocation and writer errors propagate) so output.flush() still runs and
+    // the already-emitted complete record is not lost (at-worst-neutral for
+    // .json/.logfmt; a valid trailing record still emits normally).
     const io = std.Options.debug_io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -824,7 +834,7 @@ test "runtime public API: file-tail drain swallows half-record parse error (.jso
     try testing.expectEqual(@as(usize, 4), framer.inner.scratch_len); // "{\"ms" buffered
 
     // drainFramer(.tail): finish() tries to eval "{\"ms" -> JSON parse error,
-    // caught -> output.flush() still runs. drainFramer must NOT return error.
+    // parse error swallowed -> output.flush() still runs. drainFramer must NOT return error.
     try Runtime.drainFramer(.tail, &framer, &output, &evaluator);
 
     const got = try tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
