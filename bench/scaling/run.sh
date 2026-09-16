@@ -21,6 +21,8 @@
 #                            RequestFailed, UpstreamRetried and
 #                            UpstreamConnectionEvicted. debug adds a
 #                            per-request trace and distorts timing.
+#   --frontend NAME          Edge inbound frontend to build: httpz (default)
+#                            or stdio (std.Io-native, one task per connection).
 #   --policy-counts "A B C"  Policy counts to sweep (default: all ten). A
 #                            full sweep at the production defaults takes
 #                            hours, so narrow this for a targeted run.
@@ -51,6 +53,8 @@ MAX_CONNECTIONS=256
 # to every tool's DD Logs scenario so the comparison stays fair.
 PAYLOAD_DECODED_BYTES=4194304
 PAYLOAD_COMPRESSED_BYTES=1048576
+# Which inbound frontend the edge binaries are built with (-Dfrontend=).
+FRONTEND=httpz
 # err hides the events that explain a bad run. --debug raises this to info,
 # which carries RequestFailed, UpstreamRetried and UpstreamConnectionEvicted
 # without the per-request trace that debug adds.
@@ -692,6 +696,7 @@ main() {
             --payload-decoded) PAYLOAD_DECODED_BYTES="$2"; shift 2 ;;
             --payload-compressed) PAYLOAD_COMPRESSED_BYTES="$2"; shift 2 ;;
             --policy-counts) read -r -a POLICY_COUNTS <<< "$2"; shift 2 ;;
+            --frontend) FRONTEND="$2"; shift 2 ;;
             --log-level) EDGE_LOG_LEVEL="$2"; shift 2 ;;
             --skip-build) SKIP_BUILD=true; shift ;;
             --debug) DEBUG_MODE=true; shift ;;
@@ -730,7 +735,7 @@ main() {
     # Build if needed
     if [[ "$SKIP_BUILD" == "false" ]]; then
         log_info "Building release binaries..."
-        zig build echo-server datadog otlp -Doptimize=ReleaseFast
+        zig build echo-server datadog otlp -Doptimize=ReleaseFast -Dfrontend="$FRONTEND"
         log_success "Build complete"
     fi
 
@@ -777,7 +782,7 @@ main() {
 
     echo ""
     log_info "Running benchmarks: $REQUESTS requests, $CONNECTIONS connections"
-    log_info "Edge: $THREAD_POOL_COUNT handler threads, $MAX_CONNECTIONS max connections, ${UPSTREAM_LATENCY_MS}ms upstream"
+    log_info "Edge: frontend=$FRONTEND, $THREAD_POOL_COUNT handler threads, $MAX_CONNECTIONS max connections, ${UPSTREAM_LATENCY_MS}ms upstream"
     log_info "Policy counts: ${POLICY_COUNTS[*]}"
     echo ""
 
@@ -1145,6 +1150,7 @@ main() {
 **Requests per test:** $REQUESTS
 **Concurrent connections:** $CONNECTIONS
 **Upstream latency:** ${UPSTREAM_LATENCY_MS}ms
+**Edge frontend:** $FRONTEND
 **Edge handler threads:** $THREAD_POOL_COUNT
 **Edge max connections:** $MAX_CONNECTIONS
 **DD Logs payload:** ${PAYLOAD_COMPRESSED_BYTES} bytes gzipped / ${PAYLOAD_DECODED_BYTES} bytes decoded
