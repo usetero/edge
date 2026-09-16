@@ -22,12 +22,17 @@ securityContext: {}
 resources:
   requests:
     cpu: 50m
-    memory: 32Mi
+    # Handler workspace is allocated on demand and then retained, so a pod
+    # under sustained load holds far more than it does at startup.
+    memory: 256Mi
   limits:
     cpu: 200m
-    # Handler threads retain codec scratch (~2 MiB each once compressed traffic
-    # is seen) and in-flight bodies decode up to maxDecodedBytes.
-    memory: 512Mi
+    # Sized for the default threadPoolCount of 128 at the maxBodySize below:
+    # ~540 MiB of retained per-thread workspace once every handler has seen
+    # compressed traffic. See the sizing formula under proxy.maxConnections.
+    # Set proxy.threadPoolCount lower to trade throughput for a smaller
+    # footprint: 32 threads need about 140 MiB.
+    memory: 768Mi
 
 nodeSelector: {}
 tolerations:
@@ -107,17 +112,26 @@ config:
   # A connection costs 20 KiB (the receive buffer), NOT maxBodySize. Sizing:
   #
   #   memory ~= maxConnections x 20 KiB
-  #           + threadPoolCount x (maxBodySize + 650 KiB)
+  #           + threadPoolCount x (2 x maxBodySize + 1.2 MiB)
   #
-  # The second term is the per-handler codec workspace (zstd window + record
-  # scratch + encoder), allocated on demand and then retained per thread.
-  # Worked example at maxBodySize 2 MiB:
+  # The second term is the per-handler workspace: the zstd window, record
+  # scratch and encoder, plus a resident body buffer and a streaming pump.
+  # It is allocated on demand and then retained for the life of the thread,
+  # so memory tracks the number of threads that have served a compressed
+  # body, not the number in flight now. Worked example at maxBodySize 2 MiB:
   #
   #   maxConnections | threadPoolCount | approx memory | suggested request
   #   ---------------|-----------------|---------------|------------------
-  #   256 (default)  | 8               | 26 MiB        | 64Mi
-  #   2048           | 16              | 83 MiB        | 128Mi
-  #   4096           | 32              | 165 MiB       | 256Mi
+  #   256            | 8               | 46 MiB        | 64Mi
+  #   256 (default)  | 128 (default)   | 666 MiB       | 256Mi
+  #   2048           | 16              | 123 MiB       | 192Mi
+  #   4096           | 32              | 246 MiB       | 320Mi
+  #
+  # threadPoolCount is the dominant term. Lower it before you raise the
+  # memory limit if throughput allows: it is the only knob that bounds
+  # retained workspace. At this chart's own maxBodySize of 1.5 MiB the
+  # default 256/128 shape works out at about 540 MiB, which is what the
+  # resources block above is sized for.
   #
   # Raise maxConnections and threadPoolCount together: connections admitted
   # beyond what the handler pool can serve just queue until requestTimeout.
@@ -131,8 +145,9 @@ config:
 
   # Optional httpz tuning (null = built-in defaults). workerCount is event-loop
   # workers (default 1) and is clamped to maxConnections. threadPoolCount is
-  # request-handler threads per worker (default 32); pipeline scratch is
-  # allocated on demand, so this bounds retained workspaces, not a startup floor.
+  # request-handler threads per worker (default 128, raised from 32 in v1.30.2);
+  # pipeline scratch is allocated on demand, so this bounds retained workspaces,
+  # not a startup floor. It is the dominant memory term — see maxConnections.
   workerCount: null
   threadPoolCount: null
 

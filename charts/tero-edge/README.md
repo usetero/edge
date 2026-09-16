@@ -84,9 +84,9 @@ Provide auth either via:
 | `container.hostPort.enabled`        | bool   | `true`                                         | Enable hostPort                                               |
 | `container.hostPort.port`           | int    | `8080`                                         | Host port                                                     |
 | `resources.requests.cpu`            | string | `50m`                                          | CPU request                                                   |
-| `resources.requests.memory`         | string | `32Mi`                                         | Memory request                                                |
+| `resources.requests.memory`         | string | `256Mi`                                        | Memory request (see Sizing)                                   |
 | `resources.limits.cpu`              | string | `200m`                                         | CPU limit                                                     |
-| `resources.limits.memory`           | string | `64Mi`                                         | Memory limit                                                  |
+| `resources.limits.memory`           | string | `768Mi`                                        | Memory limit (see Sizing)                                     |
 | `service.enabled`                   | bool   | `false`                                        | Create Service                                                |
 | `service.type`                      | string | `ClusterIP`                                    | Service type                                                  |
 | `service.port`                      | int    | `8080`                                         | Service port                                                  |
@@ -127,6 +127,41 @@ Provide auth either via:
 | `serviceAccount.name`               | string | `""`                                           | Service account name override                                 |
 | `serviceAccount.automount`          | bool   | `true`                                         | Automount SA token                                            |
 
+## Sizing
+
+Memory is dominated by `config.threadPoolCount`, not by connection count. A
+handler thread allocates its workspace on first use and then retains it for
+the life of the thread, so a pod's memory tracks the number of threads that
+have served a compressed body:
+
+```
+memory ~= maxConnections x 20 KiB
+        + threadPoolCount x (2 x maxBodySize + 1.2 MiB)
+```
+
+A connection itself costs 20 KiB, the receive buffer — not `maxBodySize`.
+
+Worked example at `maxBodySize` 2 MiB:
+
+| maxConnections | threadPoolCount | approx memory | suggested request |
+| -------------- | --------------- | ------------- | ----------------- |
+| 256            | 8               | 46 MiB        | 64Mi              |
+| 256 (default)  | 128 (default)   | 666 MiB       | 256Mi             |
+| 2048           | 16              | 123 MiB       | 192Mi             |
+| 4096           | 32              | 246 MiB       | 320Mi             |
+
+At this chart's own `maxBodySize` of 1.5 MiB the default 256/128 shape works
+out at about 540 MiB, which is what the shipped `resources` block is sized
+for. `threadPoolCount` rose from 32 to 128 in v1.30.2, so a chart pinned to
+the old resource values will not hold the current default.
+
+To cut the footprint, lower `threadPoolCount` before you raise the memory
+limit: it is the only knob that bounds retained workspace. 32 threads need
+about 140 MiB, at lower throughput against a slow upstream.
+
+If a pod is OOMKilled with nothing in its logs, suspect this first. The
+kernel gives the process no chance to log.
+
 ## Notes
 
 - Each upstream attempt has a fixed 30s deadline; a request that exceeds it
@@ -136,8 +171,7 @@ Provide auth either via:
   about `threadPoolCount / upstream_round_trip`. The Datadog intake answers in
   about 14ms on a warm connection, so the default 128 threads sustain roughly
   4.8k requests/sec per pod. Raise `threadPoolCount` and `resources.limits.memory`
-  together: each thread retains up to ~2 MiB of codec scratch once it has
-  handled compressed traffic.
+  together — see Sizing below.
 - Log intake routes replay once on a fresh upstream connection when the first
   attempt fails before a response. A replay can duplicate log lines if the
   upstream accepted the first attempt but its acknowledgement was lost.
