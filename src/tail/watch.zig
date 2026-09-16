@@ -533,7 +533,7 @@ pub const Watcher = struct {
             // re-emit already-delivered bytes.  The checkpoint-lane reset to
             // 0 (which triggers a conservative at-least-once re-emit) is
             // handled earlier in processDirtyIndex.
-            if (self.offsets.items[i] > size) self.offsets.items[i] = size;
+            if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
             // The prefix is unchanged, but the identity fingerprint may have been
             // computed on a shorter file (e.g. after a partially written
             // copytruncate).  Refresh it so that ongoing checkpoints and a
