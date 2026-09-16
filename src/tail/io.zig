@@ -125,7 +125,7 @@ pub const Output = struct {
         // so the descriptor is opened directly via `std.posix.openat` against
         // the current working directory.
         const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
-            .ACCMODE = .WRONLY,
+            .ACCMODE = .RDWR,
             .APPEND = true,
             .CREAT = true,
             .CLOEXEC = true,
