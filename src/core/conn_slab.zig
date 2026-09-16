@@ -200,37 +200,11 @@ pub const ConnSlab = struct {
         return self.bufRegion(id, self.limits.recv_buf, self.limits.send_buf);
     }
 
-    pub fn upstreamBuf(self: *ConnSlab, id: ConnId) []u8 {
-        return self.bufRegion(id, self.limits.recv_buf + self.limits.send_buf, self.limits.upstream_write_buf);
-    }
-
-    pub fn recordScratch(self: *ConnSlab, id: ConnId) []u8 {
-        const offset = self.limits.recv_buf + self.limits.send_buf + self.limits.upstream_write_buf;
-        return self.bufRegion(id, offset, self.limits.record_scratch);
-    }
-
-    pub fn decodeBuf(self: *ConnSlab, id: ConnId) []u8 {
-        return self.bufRegion(id, self.offsetAfterScratch(), self.limits.decode_buf);
-    }
-
-    pub fn encodeBuf(self: *ConnSlab, id: ConnId) []u8 {
-        return self.bufRegion(id, self.offsetAfterScratch() + self.limits.decode_buf, self.limits.encode_buf);
-    }
-
+    /// Request-body reader buffer, then response BodyWriter staging; the two
+    /// never overlap in time. Codec and record scratch are per thread
+    /// (frontend/thread_bufs.zig), not per connection.
     pub fn bodyBuf(self: *ConnSlab, id: ConnId) []u8 {
-        const offset = self.offsetAfterScratch() + self.limits.decode_buf + self.limits.encode_buf;
-        return self.bufRegion(id, offset, self.limits.body_buf);
-    }
-
-    pub fn chunkBuf(self: *ConnSlab, id: ConnId) []u8 {
-        const offset = self.offsetAfterScratch() + self.limits.decode_buf +
-            self.limits.encode_buf + self.limits.body_buf;
-        return self.bufRegion(id, offset, self.limits.chunk_buf);
-    }
-
-    fn offsetAfterScratch(self: *const ConnSlab) usize {
-        return self.limits.recv_buf + self.limits.send_buf +
-            self.limits.upstream_write_buf + self.limits.record_scratch;
+        return self.bufRegion(id, self.limits.recv_buf + self.limits.send_buf, self.limits.body_buf);
     }
 
     pub fn inUse(self: *ConnSlab, io: std.Io) usize {
@@ -322,15 +296,15 @@ test "buffer regions are disjoint per connection and per region" {
 
     @memset(slab.recvBuf(a), 0xAA);
     @memset(slab.sendBuf(a), 0xBB);
-    @memset(slab.recordScratch(a), 0xCC);
+    @memset(slab.bodyBuf(a), 0xCC);
     @memset(slab.recvBuf(b), 0xDD);
 
     try testing.expectEqual(@as(u8, 0xAA), slab.recvBuf(a)[0]);
     try testing.expectEqual(@as(u8, 0xBB), slab.sendBuf(a)[0]);
-    try testing.expectEqual(@as(u8, 0xCC), slab.recordScratch(a)[0]);
+    try testing.expectEqual(@as(u8, 0xCC), slab.bodyBuf(a)[0]);
     try testing.expectEqual(@as(u8, 0xDD), slab.recvBuf(b)[0]);
     try testing.expectEqual(@as(usize, 64), slab.recvBuf(a).len);
-    try testing.expectEqual(@as(usize, 256), slab.recordScratch(a).len);
+    try testing.expectEqual(@as(usize, 32), slab.bodyBuf(a).len);
 }
 
 test "state machine transitions are tracked" {

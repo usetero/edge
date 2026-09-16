@@ -70,6 +70,19 @@ pub fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.htt
     return out[0..count];
 }
 
+/// Bounded HTTP status for an error that escaped a request path; every
+/// frontend answers with this when nothing has reached the wire yet.
+pub fn errorStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
+        error.InboundBodyTimeout => 408,
+        error.InvalidRequestBody => 400,
+        error.UpstreamTimeout => 504,
+        error.OutOfMemory, error.WriteFailed => 503,
+        else => 502,
+    };
+}
+
 /// Single-attempt open on the pooled client; the scrape path uses this.
 pub fn openUpstream(
     ctx: *exec.SharedCtx,

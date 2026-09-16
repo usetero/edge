@@ -1,8 +1,9 @@
-//! Per-handler-thread scratch for the httpz frontend, and the watchdog that
-//! interrupts a stalled upstream exchange.
+//! Per-thread scratch for both frontends, and the watchdog that interrupts a
+//! stalled upstream exchange.
 //!
-//! One `ThreadBufs` per handler thread, created on first use and retained for
-//! the thread's life. Everything body-sized lives here on purpose: draining a
+//! One `ThreadBufs` per thread that runs requests (an httpz handler thread, a
+//! stdio connection task's pool thread), created on first use and retained
+//! for the thread's life. Everything body-sized lives here on purpose: draining a
 //! lazy body into the per-connection request arena freed correctly, but the
 //! production allocator is libc malloc, which kept the nodes mapped, and RSS
 //! grew with connections instead of threads.

@@ -32,10 +32,10 @@ pub const frontend_select = @import("frontend/select.zig");
 pub const frontend_stdio_server = @import("frontend/stdio/server.zig");
 pub const frontend_stdio_conn = @import("frontend/stdio/conn.zig");
 pub const frontend_httpz_server = @import("frontend/httpz/server.zig");
-pub const frontend_httpz_exchange = @import("frontend/exchange.zig");
-pub const frontend_httpz_paths = @import("frontend/paths.zig");
-pub const frontend_httpz_endpoints = @import("frontend/endpoints.zig");
-pub const frontend_httpz_thread_bufs = @import("frontend/thread_bufs.zig");
+pub const frontend_exchange = @import("frontend/exchange.zig");
+pub const frontend_paths = @import("frontend/paths.zig");
+pub const frontend_endpoints = @import("frontend/endpoints.zig");
+pub const frontend_thread_bufs = @import("frontend/thread_bufs.zig");
 pub const service_router = @import("service/router.zig");
 
 // Services + distro composition (PLAN.md §8)

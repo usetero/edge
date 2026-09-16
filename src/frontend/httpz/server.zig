@@ -31,8 +31,54 @@ const thread_bufs = @import("../thread_bufs.zig");
 const Inbound = exchange.Inbound;
 const InboundBody = paths.InboundBody;
 
-/// Read timeout for pulling a lazy body off the client socket.
+/// Per-read timeout for pulling a lazy body off the client socket. This is
+/// SO_RCVTIMEO, so it bounds one read, not the transfer; `DeadlineReader`
+/// bounds the transfer.
 const lazy_read_timeout_ms: usize = limits_mod.REQUEST_TIMEOUT_SECONDS * 1000;
+
+/// Whole-body deadline for a lazy inbound body.
+const inbound_body_timeout_ns: i128 = @as(i128, limits_mod.REQUEST_TIMEOUT_SECONDS) * std.time.ns_per_s;
+
+/// Absolute deadline over a lazy body read.
+///
+/// `req.reader(ms)` sets SO_RCVTIMEO, which restarts on every read, so a
+/// client that sends one byte just inside the timeout holds its handler
+/// thread for as long as it likes. A few dozen such clients take the whole
+/// pool and the server stops answering, health checks included, which on ECS
+/// or Kubernetes gets the container replaced. This wraps the httpz reader and
+/// fails the transfer once the deadline passes.
+pub const DeadlineReader = struct {
+    interface: std.Io.Reader,
+    inner: *std.Io.Reader,
+    io: std.Io,
+    deadline_ns: i128,
+    /// Set when the deadline fired, so the handler closes the connection
+    /// instead of leaving an undrained body on it.
+    expired: bool = false,
+
+    pub fn init(io: std.Io, inner: *std.Io.Reader) DeadlineReader {
+        return .{
+            .interface = .{
+                .end = 0,
+                .seek = 0,
+                .buffer = &.{},
+                .vtable = &.{ .stream = DeadlineReader.stream },
+            },
+            .inner = inner,
+            .io = io,
+            .deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() + inbound_body_timeout_ns,
+        };
+    }
+
+    fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *DeadlineReader = @alignCast(@fieldParentPtr("interface", io_r));
+        if (std.Io.Timestamp.now(self.io, .awake).toNanoseconds() > self.deadline_ns) {
+            self.expired = true;
+            return error.ReadFailed;
+        }
+        return self.inner.stream(w, limit);
+    }
+};
 
 /// The response side of the sink contract (exchange.zig) over an httpz
 /// response. httpz commits status and headers when the handler returns, so
@@ -63,11 +109,18 @@ fn inboundOf(req: *httpz.Request, arena: std.mem.Allocator) !Inbound {
 /// `req.body()` on a lazy request holds only the prefix that arrived with the
 /// headers. `lazy_reader` must outlive the returned body; it is only
 /// initialized when the body is lazy.
-fn inboundBodyOf(req: *httpz.Request, limits: limits_mod.Limits, lazy_reader: *httpz.Request.Reader) !InboundBody {
+fn inboundBodyOf(
+    io: std.Io,
+    req: *httpz.Request,
+    limits: limits_mod.Limits,
+    lazy_reader: *httpz.Request.Reader,
+    bounded: *DeadlineReader,
+) !InboundBody {
     if (req.unread_body == 0) return .{ .bytes = req.body() orelse "" };
     if (req.body_len > limits.max_body_size) return error.BodyTooLarge;
     lazy_reader.* = try req.reader(lazy_read_timeout_ms);
-    return .{ .lazy = .{ .reader = &lazy_reader.interface, .len = req.body_len } };
+    bounded.* = .init(io, &lazy_reader.interface);
+    return .{ .lazy = .{ .reader = &bounded.interface, .len = req.body_len } };
 }
 
 const log = std.log.scoped(.httpz_server);
@@ -203,12 +256,8 @@ pub const Handler = struct {
             });
             res.clearWriter();
             res.headers.reset();
-            res.status = errorStatus(err);
+            res.status = exchange.errorStatus(err);
             res.body = "";
-            // The body is part-read, so the connection cannot be reused: httpz
-            // would drain the remainder, which is the same unbounded wait we
-            // just escaped.
-            if (err == error.InboundBodyTimeout) res.keepalive = false;
             if (ctx.metrics) |metrics| {
                 metrics.recordRequestError(known_path, .uncaught);
             }
@@ -276,14 +325,26 @@ pub const Handler = struct {
         }
         const in = try inboundOf(req, res.arena);
         var lazy_reader: httpz.Request.Reader = undefined;
-        const body = try inboundBodyOf(req, ctx.limits, &lazy_reader);
-        switch (outcome) {
+        var bounded: DeadlineReader = undefined;
+        const body = try inboundBodyOf(ctx.io, req, ctx.limits, &lazy_reader, &bounded);
+        const served = switch (outcome) {
             .respond => unreachable,
-            .forward_raw => |fwd| try paths.execForwardRaw(ctx, in, &sink, body, fwd),
-            .pipe_stream => |pipe| try paths.execPipeStream(ctx, in, &sink, body, pipe),
-            .pipe_buffered => |pipe| try paths.execPipeBuffered(ctx, in, &sink, body, pipe),
-            .fetch_filtered => |fetch| try paths.execFetchFiltered(ctx, in, &sink, body, fetch),
-        }
+            .forward_raw => |fwd| paths.execForwardRaw(ctx, in, &sink, body, fwd),
+            .pipe_stream => |pipe| paths.execPipeStream(ctx, in, &sink, body, pipe),
+            .pipe_buffered => |pipe| paths.execPipeBuffered(ctx, in, &sink, body, pipe),
+            .fetch_filtered => |fetch| paths.execFetchFiltered(ctx, in, &sink, body, fetch),
+        };
+        served catch |err| {
+            // The shared path reports a stalled read as a generic read
+            // failure. Only this frontend knows the deadline fired, so name it
+            // here, and close the connection: the body is part-read, and httpz
+            // would drain the remainder — the same unbounded wait again.
+            if (body == .lazy and bounded.expired) {
+                res.keepalive = false;
+                return error.InboundBodyTimeout;
+            }
+            return err;
+        };
     }
 };
 
@@ -311,17 +372,6 @@ fn stdMethod(method: httpz.Method) ?std.http.Method {
         .OPTIONS => .OPTIONS,
         .CONNECT => .CONNECT,
         .OTHER => null,
-    };
-}
-
-fn errorStatus(err: anyerror) u16 {
-    return switch (err) {
-        error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
-        error.InboundBodyTimeout => 408,
-        error.InvalidRequestBody => 400,
-        error.UpstreamTimeout => 504,
-        error.OutOfMemory, error.WriteFailed => 503,
-        else => 502,
     };
 }
 

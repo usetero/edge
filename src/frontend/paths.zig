@@ -1,6 +1,6 @@
 //! The four request executors the router can choose: raw forward, streamed
 //! record pipeline, whole-body transform, and filtered scrape. Free functions
-//! on `SharedCtx`; the httpz `Handler` only dispatches to them.
+//! on `SharedCtx`; each frontend's dispatch only calls into them.
 //!
 //! Frontend-neutral: the request arrives as an `exchange.Inbound` plus an
 //! `InboundBody`, and the response leaves through a `sink` (see exchange.zig
@@ -87,6 +87,12 @@ pub fn execPipeStream(
     if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
         return forwardInbound(ctx, in, sink, pipe.upstream, body, pipe.signal == .log);
     }
+    // A probe is a dry run and captures no tap records, and an unchanged
+    // batch then skips the real pass entirely — so an armed tap would report
+    // nothing exactly when policies are loaded and match nothing. Give up the
+    // fast path while a tap is armed. It is a debug endpoint, armed for about
+    // a second, so the extra pass costs nothing real.
+    const tap_armed = if (ctx.tap) |tap| tap.isArmed() else false;
     const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
     const raw_body = try residentBody(ctx, body);
     try bufs.prepare(ctx.gpa, ctx.limits, pipe.codec);
@@ -119,7 +125,7 @@ pub fn execPipeStream(
         else => return err,
     };
 
-    if (!changed) {
+    if (!changed and !tap_armed) {
         if (ctx.metrics) |metrics| {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), probe.records, 0);
             metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .fast_path);
