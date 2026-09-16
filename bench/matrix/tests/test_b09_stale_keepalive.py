@@ -9,6 +9,8 @@ from harness import MatrixCase
 
 
 class StaleKeepalive(MatrixCase):
+    EXPECT_METRICS = {"edge_upstream_retries_total": 1}
+    EXPECT_LOGS = ["upstream.retried"]
     def test_a_dead_pooled_connection_is_replaced(self):
         self.assert_status(self.post_logs(timeout=30), 202)
         self.intake.arm("stale_keepalive", count=1)

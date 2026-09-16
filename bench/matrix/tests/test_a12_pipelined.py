@@ -8,6 +8,7 @@ from harness import MatrixCase
 
 
 class Pipelined(MatrixCase):
+    EXPECT_METRICS = {'edge_responses_total{known_path="api_v2_logs",status_class="s2xx"}': 2}
     DEFECTS = {"httpz": "answers 400 to a pipelined pair"}
 
     def test_pipelined_requests_are_both_served(self):

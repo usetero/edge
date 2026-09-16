@@ -13,6 +13,8 @@ from harness import MatrixCase
 
 
 class SlowDripBody(MatrixCase):
+    EXPECT_METRICS_FOR = {"stdio": {'edge_inbound_timeouts_total{phase="request"}': 1}}
+    FORBID_LOGS = ["upstream"]
     SLOW = True
     DEFECTS = {"httpz": "its per-read timeout restarts on every byte, so the sender holds a handler thread"}
 

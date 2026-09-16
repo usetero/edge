@@ -8,6 +8,8 @@ from harness import MatrixCase
 
 
 class IntakeHang(MatrixCase):
+    EXPECT_METRICS = {"edge_upstream_timeouts_total": 1}
+    EXPECT_LOGS = ["upstream.timed.out", "request.failed", "request.slow"]
     SLOW = True
 
     def test_a_hung_intake_becomes_a_gateway_timeout(self):

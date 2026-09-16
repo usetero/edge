@@ -10,6 +10,7 @@ from harness import MatrixCase
 
 
 class IdleSocketFlood(MatrixCase):
+    EXPECT_METRICS_FOR = {"stdio": {'edge_inbound_timeouts_total{phase="idle"}': 1}}
     EDGE_CONFIG = {"max_connections": 8}
     EXPECT_SHED = True
     SLOW = True

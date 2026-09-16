@@ -22,6 +22,8 @@ def _compress(raw: bytes):
 
 
 class ZstdBody(MatrixCase):
+    EXPECT_METRICS = {'edge_responses_total{known_path="api_v2_logs",status_class="s2xx"}': 1}
+    FORBID_LOGS = ["request.failed"]
     def test_zstd_batch_is_accepted(self):
         payload = _compress(b'[{"message":"zstd batch","ddsource":"matrix"}]')
         if payload is None:

@@ -8,6 +8,9 @@ from harness import MatrixCase
 
 
 class PartialHead(MatrixCase):
+    EXPECT_METRICS_FOR = {"stdio": {'edge_inbound_timeouts_total{phase="request"}': 1}}
+    EXPECT_LOGS_FOR = {"stdio": ["inbound.timeout"]}
+    FORBID_LOGS = ["upstream"]
     SLOW = True
     DEFECTS = {"httpz": "closes the connection with no status, so the sender cannot tell a timeout from a crash"}
 

@@ -4,6 +4,8 @@ from harness import MatrixCase
 
 
 class ChunkedBody(MatrixCase):
+    EXPECT_METRICS = {'edge_responses_total{known_path="api_v2_logs",status_class="s2xx"}': 1}
+    FORBID_LOGS = ["request.failed"]
     def test_chunked_body_reaches_the_intake(self):
         payload = b'[{"message":"chunked","ddsource":"matrix"}]'
         framed = b"%x\r\n%s\r\n0\r\n\r\n" % (len(payload), payload)

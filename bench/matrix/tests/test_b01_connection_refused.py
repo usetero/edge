@@ -4,6 +4,8 @@ from harness import MatrixCase
 
 
 class ConnectionRefused(MatrixCase):
+    EXPECT_METRICS = {"edge_upstream_retries_total": 1, 'edge_responses_total{known_path="api_v2_logs",status_class="s5xx"}': 1}
+    EXPECT_LOGS = ["upstream.retried", "request.failed"]
     def test_refused_dial_is_a_bad_gateway(self):
         self.intake.stop()  # the port is now dead
         response = self.post_logs()

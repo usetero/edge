@@ -33,6 +33,13 @@ it.
 - [x] `run.py`: builds both binaries, runs the suite per frontend, prints the table and the findings.
 - [x] Declared defects report as `xfail` with their note, and as `XPASS` once fixed.
 - [x] `README.md`.
+- [x] Declarative telemetry: `EXPECT_METRICS`, `EXPECT_METRICS_FOR`, `EXPECT_LOGS`,
+      `EXPECT_LOGS_FOR`, `FORBID_LOGS`, asserted for every case by the base class.
+- [x] Universal pairing rule: a counter that moved must be explainable from the
+      log (`METRIC_NEEDS_LOG`), so a case that declares nothing still cannot
+      pass with silent telemetry.
+- [x] 24 of 31 case files declare telemetry; the rest are covered by the
+      pairing rule alone. Verified by breaking one expectation on purpose.
 
 ### Cases: sender to edge
 
@@ -72,6 +79,25 @@ it.
 - [x] c01 shed above `max_connections`.
 - [x] c02 health probe under a synchronised burst with a slow intake.
 - [x] c03 idle socket flood.
+
+## Harness defects found while adding the telemetry assertions
+
+These were mine, not the product's, and each one had produced a false finding
+before it was fixed:
+
+- Both edge streams were captured into one file. The edge writes INFO and WARN
+  to stdout and ERROR to stderr through independent buffers, so the single file
+  interleaved and cut lines in half. `request.failed` appeared at byte 0, ahead
+  of the startup lines. Fixed by capturing the streams separately.
+- Case-scoped logs were sliced by byte offset, which assumes one append-ordered
+  file. Now diffed by line.
+- Log assertions read once, so a line that arrived just after the response read
+  as missing. Now they poll, and the forbidden-line check settles first.
+- The invariant "every 5xx must leave a log line" was wrong: a 5xx relayed from
+  the intake is not our failure and owes no log. Replaced by the pairing rule,
+  which only covers errors we produce ourselves.
+- `FORBID_LOGS = ["upstream"]` matched the startup line `upstream.configured`,
+  which the case-scoped diff now excludes.
 
 ## Findings
 

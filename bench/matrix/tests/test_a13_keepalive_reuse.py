@@ -6,6 +6,8 @@ from harness import MatrixCase
 
 
 class KeepaliveReuse(MatrixCase):
+    EXPECT_METRICS = {'edge_responses_total{known_path="api_v2_logs",status_class="s2xx"}': 50}
+    FORBID_LOGS = ["request.failed"]
     def test_one_connection_serves_many_requests(self):
         session = requests.Session()
         try:

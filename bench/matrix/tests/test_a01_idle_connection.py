@@ -9,6 +9,9 @@ from harness import MatrixCase
 
 
 class IdleConnection(MatrixCase):
+    # Nothing was requested, so nothing may be blamed on the intake.
+    EXPECT_METRICS_FOR = {"stdio": {'edge_inbound_timeouts_total{phase="idle"}': 1}}
+    FORBID_LOGS = ["upstream", "request.failed"]
     SLOW = True
 
     def test_idle_connection_is_reclaimed(self):

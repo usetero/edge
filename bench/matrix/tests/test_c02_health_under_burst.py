@@ -13,6 +13,7 @@ from harness import MatrixCase
 
 
 class HealthUnderBurst(MatrixCase):
+    FORBID_LOGS = ["request.failed"]
     INTAKE_LATENCY = 3000
     DEFECTS = {"httpz": "a batch of up to 16 requests goes to one pool thread, so a probe waits behind it"}
 

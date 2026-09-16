@@ -10,6 +10,8 @@ from harness import MatrixCase
 
 
 class RejectEarly(MatrixCase):
+    EXPECT_METRICS = {'edge_responses_total{known_path="api_v2_logs",status_class="s4xx"}': 1}
+    FORBID_LOGS = ["request.failed"]
     def test_an_early_rejection_is_relayed(self):
         self.intake.arm("reject_early", count=1)
         response = self.post_logs(timeout=60)

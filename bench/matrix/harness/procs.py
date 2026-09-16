@@ -114,14 +114,16 @@ class Edge:
         self.config_path = handle.name
         self.config = merged
 
-        self.log_path = tempfile.mktemp(suffix=".edge.log")
-        self._log = open(self.log_path, "wb")
+        self.out_path = tempfile.mktemp(suffix=".edge.out.log")
+        self.err_path = tempfile.mktemp(suffix=".edge.err.log")
+        self._out = open(self.out_path, "wb")
+        self._err = open(self.err_path, "wb")
         process_env = dict(os.environ)
         process_env.update(env or {})
         self.proc = subprocess.Popen(
             [self.binary, self.config_path],
-            stdout=self._log,
-            stderr=self._log,
+            stdout=self._out,
+            stderr=self._err,
             env=process_env,
         )
         self._wait_ready()
@@ -146,9 +148,14 @@ class Edge:
         return self.proc.poll() is None
 
     def logs(self) -> str:
-        self._log.flush()
-        with open(self.log_path, "r", errors="replace") as handle:
-            return handle.read()
+        """Both streams. INFO and WARN land on stdout, ERROR on stderr."""
+        self._out.flush()
+        self._err.flush()
+        parts = []
+        for path in (self.out_path, self.err_path):
+            with open(path, "r", errors="replace") as handle:
+                parts.append(handle.read())
+        return "".join(parts)
 
     def metrics(self) -> dict[str, float]:
         """The Prometheus scrape as a flat {series: value} map, labels kept."""
@@ -176,7 +183,8 @@ class Edge:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
-        self._log.close()
+        self._out.close()
+        self._err.close()
         try:
             os.unlink(self.config_path)
         except OSError:

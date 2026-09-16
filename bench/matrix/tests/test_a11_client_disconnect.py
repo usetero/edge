@@ -8,6 +8,7 @@ from harness import MatrixCase
 
 
 class ClientDisconnect(MatrixCase):
+    FORBID_LOGS = ["upstream.timed.out"]
     def test_disconnect_frees_the_slot(self):
         for _ in range(5):
             client = self.raw(timeout=10)

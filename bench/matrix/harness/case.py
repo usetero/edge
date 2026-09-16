@@ -23,6 +23,18 @@ Class attributes a case may set:
     SLOW            true when the case waits for a 30 s deadline
     EXPECT_SHED     true when the case shed connections on purpose
     DEFECTS         {frontend: note} for behaviour we know is wrong today
+
+Telemetry is part of the expectation, not an afterthought. A fault an operator
+cannot see is still a fault, so declare it:
+
+    EXPECT_METRICS      {series: minimum delta} for both frontends
+    EXPECT_METRICS_FOR  {frontend: {series: minimum delta}} where a series is
+                        frontend specific, such as the connection gauges
+    EXPECT_LOGS         substrings that must appear in the edge log
+    EXPECT_LOGS_FOR     {frontend: [substrings]}
+    FORBID_LOGS         substrings that must NOT appear. This is the half that
+                        earns its keep: it is how a sender-side fault is kept
+                        from ever reading as an intake fault.
 """
 
 from __future__ import annotations
@@ -53,6 +65,22 @@ class MatrixCase(unittest.TestCase):
     SLOW: bool = False
     EXPECT_SHED: bool = False
     DEFECTS: dict = {}
+    EXPECT_METRICS: dict = {}
+    EXPECT_METRICS_FOR: dict = {}
+    EXPECT_LOGS: list = []
+    EXPECT_LOGS_FOR: dict = {}
+    FORBID_LOGS: list = []
+
+    # A counter that moved must be explainable from the log. Checked in every
+    # case, so a case that declares nothing still cannot pass with silent
+    # telemetry.
+    METRIC_NEEDS_LOG = (
+        ("edge_request_errors_total", "request.failed"),
+        ("edge_upstream_timeouts_total", "upstream.timed.out"),
+        ("edge_upstream_retries_total", "upstream.retried"),
+        ("edge_connections_shed_total", "connection.shed"),
+        ("edge_requests_invalid_total", "request.rejected"),
+    )
 
     intake: EchoIntake
     edge: Edge
@@ -106,9 +134,14 @@ class MatrixCase(unittest.TestCase):
             self.intake.stop()
             raise
         self.baseline = self.edge.metrics()
+        # Expectations are about what this case produced, so the startup lines
+        # (which name the configured upstream) must not count. Diff by line,
+        # because stdout and stderr are flushed independently.
+        self.log_snapshot = set(self.edge.logs().splitlines())
 
     def tearDown(self) -> None:
         try:
+            self.assert_telemetry()
             self.assert_invariants()
         finally:
             self.edge.stop()
@@ -151,12 +184,28 @@ class MatrixCase(unittest.TestCase):
             got = getattr(response, "status_code", None)
         self.assertEqual(got, expected, "%s (response: %r)" % (why or "wrong status", response))
 
+    def case_logs(self) -> str:
+        """Only the lines this case produced."""
+        return "\n".join(
+            line for line in self.edge.logs().splitlines() if line not in self.log_snapshot
+        )
+
+    def wait_for_log(self, needle: str, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if needle in self.case_logs():
+                return True
+            time.sleep(0.2)
+        return False
+
     def assert_logged(self, needle: str, why: str = "") -> None:
-        logs = self.edge.logs()
+        if self.wait_for_log(needle):
+            return
+        logs = self.case_logs()
         self.assertIn(needle, logs, "%s\n--- edge log ---\n%s" % (why or "missing log line", logs))
 
     def assert_not_logged(self, needle: str) -> None:
-        self.assertNotIn(needle, self.edge.logs())
+        self.assertNotIn(needle, self.case_logs())
 
     def metric_delta(self, name: str) -> float:
         """How much a counter moved since the case started."""
@@ -178,6 +227,45 @@ class MatrixCase(unittest.TestCase):
             time.sleep(0.1)
             seen = self.intake.requests_seen()
         return seen
+
+    # ------------------------------------------------------------- telemetry
+
+    def assert_telemetry(self) -> None:
+        """The declared metrics and logs, plus the universal pairing rule."""
+        expected = dict(self.EXPECT_METRICS)
+        expected.update(self.EXPECT_METRICS_FOR.get(self.frontend, {}))
+        for series, minimum in expected.items():
+            self.wait_for_metric(series, minimum, timeout=8)
+
+        wanted = list(self.EXPECT_LOGS) + list(self.EXPECT_LOGS_FOR.get(self.frontend, []))
+        for needle in wanted:
+            self.assertTrue(
+                self.wait_for_log(needle),
+                "missing %r in the edge log:\n%s" % (needle, self.case_logs()),
+            )
+
+        # A forbidden line may still be on its way, so settle before looking.
+        time.sleep(1.5)
+        logs = self.case_logs()
+        for needle in self.FORBID_LOGS:
+            self.assertNotIn(
+                needle,
+                logs,
+                "%r must not appear for this fault; it points at the wrong "
+                "subsystem:\n%s" % (needle, logs),
+            )
+
+        metrics = self.edge.metrics()
+        for prefix, needle in self.METRIC_NEEDS_LOG:
+            moved = sum(v for k, v in metrics.items() if k.startswith(prefix))
+            base = sum(v for k, v in self.baseline.items() if k.startswith(prefix))
+            if moved > base:
+                self.assertIn(
+                    needle,
+                    logs,
+                    "%s moved but %r never appeared, so the event is "
+                    "unexplainable from the log:\n%s" % (prefix, needle, logs),
+                )
 
     # ------------------------------------------------------------ invariants
 
@@ -213,16 +301,6 @@ class MatrixCase(unittest.TestCase):
             base = sum(v for k, v in self.baseline.items() if k.startswith("edge_connections_shed_total"))
             self.assertEqual(shed, base, "connections were shed unexpectedly")
 
-        # Every 5xx the edge produced itself must have a log line naming it.
-        logs = self.edge.logs()
-        errors = sum(
-            v for k, v in metrics.items() if k.startswith("edge_responses_total") and 's5xx' in k
-        )
-        base_errors = sum(
-            v for k, v in self.baseline.items() if k.startswith("edge_responses_total") and 's5xx' in k
-        )
-        if errors > base_errors:
-            self.assertTrue(
-                "request.failed" in logs or "upstream" in logs,
-                "a 5xx was answered with nothing in the log:\n%s" % logs,
-            )
+        # A 5xx relayed from the intake is not our failure and owes no log
+        # line; b06 asserts that relay. The errors we produce ourselves are
+        # covered by METRIC_NEEDS_LOG in assert_telemetry.

@@ -8,6 +8,8 @@ from harness import MatrixCase
 
 
 class ShedAtCapacity(MatrixCase):
+    EXPECT_METRICS_FOR = {"stdio": {'edge_connections_shed_total{reason="slab_full"}': 1}}
+    EXPECT_LOGS_FOR = {"stdio": ["connection.shed"]}
     EDGE_CONFIG = {"max_connections": 8}
     EXPECT_SHED = True
 

@@ -11,6 +11,7 @@ from harness import MatrixCase
 
 
 class TruncatedResponse(MatrixCase):
+    EXPECT_LOGS_FOR = {"stdio": ["response.truncated"]}
     DEFECTS = {
         "httpz": "answers 202 for a truncated intake response",
         "stdio": "answers 202 for a truncated intake response",
