@@ -307,6 +307,18 @@ fn handleRequest(ctx: *ServerContext, request: *std.http.Server.Request, gpa: st
                 else => return err,
             };
             if (n == 0) break;
+            if (early_status_after_bytes > 0 and captured.written().len >= early_status_after_bytes) {
+                // keep_alive=false so respond() does not drain the rest: the
+                // unread body stays in the socket and the connection closes,
+                // which is the shape the proxy has to cope with.
+                ctx.recordRequest(path_copy, captured.written().len);
+                try request.respond("{\"errors\":[{\"status\":\"403\",\"title\":\"Forbidden\"}]}", .{
+                    .keep_alive = false,
+                    .status = .forbidden,
+                    .extra_headers = &json_headers,
+                });
+                return;
+            }
         }
     }
     const body = captured.written();
@@ -342,6 +354,12 @@ fn serveConnection(ctx: *ServerContext, gpa: std.mem.Allocator, stream: std.Io.n
 /// Simulated upstream round trip, from ECHO_LATENCY_MS. Read once at startup.
 var latency_ms: i64 = 0;
 
+/// Simulated early rejection, from ECHO_EARLY_STATUS_AFTER_BYTES: once this
+/// many body bytes have arrived, answer 403 and stop reading, exactly as an
+/// intake does for a bad API key. Reproduces the case where the proxy's body
+/// write fails against a peer that has already responded. 0 disables.
+var early_status_after_bytes: usize = 0;
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -357,6 +375,12 @@ pub fn main(init: std.process.Init) !void {
     else
         ".";
 
+    if (init.environ_map.get("ECHO_EARLY_STATUS_AFTER_BYTES")) |raw| {
+        early_status_after_bytes = std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10) catch |err| {
+            std.debug.print("invalid ECHO_EARLY_STATUS_AFTER_BYTES '{s}': {s}\n", .{ raw, @errorName(err) });
+            return err;
+        };
+    }
     if (init.environ_map.get("ECHO_LATENCY_MS")) |raw| {
         latency_ms = std.fmt.parseInt(i64, std.mem.trim(u8, raw, " \t\r\n"), 10) catch |err| {
             std.debug.print("invalid ECHO_LATENCY_MS '{s}': {s}\n", .{ raw, @errorName(err) });
@@ -392,6 +416,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Echo server listening on http://127.0.0.1:{d}\n", .{port});
     std.debug.print("Output directory: {s}\n", .{output_dir});
     std.debug.print("Simulated upstream latency: {d} ms\n", .{latency_ms});
+    if (early_status_after_bytes > 0)
+        std.debug.print("Simulated early 403 after {d} body bytes\n", .{early_status_after_bytes});
     std.debug.print("Endpoints:\n", .{});
     std.debug.print("  POST /*           - Echo and record request\n", .{});
     std.debug.print("  GET  /stats       - Get statistics\n", .{});
