@@ -277,3 +277,43 @@ test "streamReaderToWriter rejects oversized input instead of silently truncatin
 
     try testing.expectError(error.BodyTooLarge, streamReaderToWriter(&in_reader, &out_writer, 3));
 }
+
+// The httpz frontend forwards the client's original compressed body, skipping
+// the re-encode, whenever a batch comes back with `dropped == 0 and
+// replaced == 0`. That is only safe if those two counters are the complete set
+// of ways a record can differ from its input, so lock both directions here: a
+// keep-everything pass must report zero, and a transform must report non-zero.
+test "unchanged batches report no drops and no replacements" {
+    const body = "keep1\nkeep2\nkeep3\n";
+    const compressed = try buffered.compressGzip(testing.allocator, body);
+    defer testing.allocator.free(compressed);
+
+    const spec: PipelineSpec = .{
+        .decode = .gzip,
+        .format = .ndjson,
+        .encode = .identity,
+        .max_decoded_bytes = 1024,
+        .zstd_window_len = TEST_WINDOW,
+    };
+    const buffers = try testBuffers(spec);
+    defer freeBuffers(buffers);
+
+    var in: std.Io.Reader = .fixed(compressed);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    var sink: KeepAllSink = .{};
+    const stats = try run(spec, &in, &out.writer, buffers, &sink);
+
+    try testing.expectEqual(@as(u64, 0), stats.dropped);
+    try testing.expectEqual(@as(u64, 0), stats.replaced);
+    try testing.expect(!stats.desynced);
+    // Plaintext round-trips unchanged, so the original bytes are equivalent.
+    try testing.expectEqualStrings(body, out.written());
+}
+
+const KeepAllSink = struct {
+    pub fn onRecord(_: *KeepAllSink, _: []const u8) !framer_mod.Decision {
+        return .keep;
+    }
+};

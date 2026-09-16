@@ -8,7 +8,7 @@
 # What it does:
 # - Checks that your PR title follows conventional commit format
 # - Examples: "feat: add user auth", "fix: resolve memory leak", "chore: update deps"
-# - Runs on every PR to master
+# - Runs on every PR, including stacked PRs that target another branch
 #
 # If it fails:
 # Just edit your PR title to match the format. The check will re-run automatically.
@@ -17,8 +17,6 @@
 name: Conventional PR title
 "on":
   pull_request:
-    branches:
-      - master
     types:
       - opened
       - edited

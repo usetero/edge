@@ -366,6 +366,11 @@ pub const RecordSink = struct {
     /// Batch totals for recordPolicyBatch.
     records: u64 = 0,
     dropped: u64 = 0,
+    /// Probe mode: the caller only wants to know *whether* this batch changes,
+    /// so the first drop or replace aborts with `error.BatchChanged` instead of
+    /// producing output. Tap capture is suppressed, since the real pass that
+    /// follows a positive probe captures every record anyway.
+    probe: bool = false,
 
     pub fn init(
         ctx: *SharedCtx,
@@ -391,7 +396,9 @@ pub const RecordSink = struct {
         self.records += 1;
         const sig = @tagName(self.signal);
         const fmt = @tagName(self.format);
-        if (self.ctx.tap) |tap| tap.capture(.pre, sig, fmt, "", bytes);
+        if (!self.probe) {
+            if (self.ctx.tap) |tap| tap.capture(.pre, sig, fmt, "", bytes);
+        }
 
         const decision: framer_mod.Decision = blk: {
             if (!self.active) break :blk .keep;
@@ -409,6 +416,12 @@ pub const RecordSink = struct {
             };
         };
 
+        if (self.probe) {
+            // Unwind as soon as the answer is known, so a batch that changes
+            // early pays only for the records up to that point.
+            if (decision != .keep) return error.BatchChanged;
+            return decision;
+        }
         if (self.ctx.tap) |tap| {
             const after: []const u8 = switch (decision) {
                 .keep => bytes,
@@ -428,7 +441,10 @@ pub const RecordSink = struct {
             self.ctx.registry,
             self.ctx.bus,
             bytes,
-            self.ctx.extension_sink,
+            // A probe is a dry run: the real pass that follows dispatches
+            // these actions, and a sink that saw both would record every
+            // record before the first change twice.
+            if (self.probe) null else self.ctx.extension_sink,
         );
         switch (verdict) {
             .keep => return .keep,
@@ -520,6 +536,23 @@ pub fn routeLabel(signal: service_mod.Signal, format: framer_mod.WireFormat) run
         },
         // raw/ndjson/prom_text outcomes never run the record pipeline.
         else => unreachable,
+    };
+}
+
+/// Same routes as `routeLabel`, in the label set `edge_prefilter_decisions_total`
+/// uses. The two enums overlap but are distinct types.
+pub fn prefilterRouteLabel(
+    signal: service_mod.Signal,
+    format: framer_mod.WireFormat,
+) runtime_metrics_mod.RouteKindLabel {
+    return switch (format) {
+        .json_array => .datadog_logs,
+        .otlp_protobuf => switch (signal) {
+            .log => .otlp_logs,
+            .metric => .otlp_metrics,
+            .trace => .otlp_traces,
+        },
+        else => .passthrough,
     };
 }
 
