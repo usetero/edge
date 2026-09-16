@@ -109,8 +109,9 @@ pub const LineFramer = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{}; // getOrPut leaves new slots undefined
         const cap = if (gop.value_ptr.bytes) |b| b.len else 0;
         if (cap < len) {
+            const new_bytes = try self.allocator.alloc(u8, len);
             if (gop.value_ptr.bytes) |b| self.allocator.free(b);
-            gop.value_ptr.bytes = try self.allocator.alloc(u8, len);
+            gop.value_ptr.bytes = new_bytes;
         }
         if (len > 0) @memcpy(gop.value_ptr.bytes.?[0..len], self.inner.scratch[0..len]);
         gop.value_ptr.len = len;
@@ -163,6 +164,11 @@ pub const LineFramer = struct {
         try self.inner.ingest(chunk, writer, &sink);
     }
 
+    /// Flushes all streams — the active one and every parked stream — emitting
+    /// any unterminated trailing line from each file. When a multi-file batch
+    /// ends, the active stream holds the last file's partial, while earlier
+    /// files' partials are parked in `streams`; both must be drained here so
+    /// no unterminated final line is silently dropped.
     pub fn finish(
         self: *LineFramer,
         writer: *std.Io.Writer,
@@ -170,7 +176,21 @@ pub const LineFramer = struct {
         filter_fn: *const LineFilterFn,
     ) !void {
         const sink: FilterSink = .{ .filter_ctx = filter_ctx, .filter_fn = filter_fn };
+        // Flush the active stream first.
         try self.inner.finish(writer, &sink);
+        // Drain every parked stream: load it into `inner`, flush, then discard.
+        // We collect the keys up front because draining empties the map.
+        var keys: std.ArrayListUnmanaged(u64) = .empty;
+        defer keys.deinit(self.allocator);
+        {
+            var it = self.streams.iterator();
+            while (it.next()) |entry| try keys.append(self.allocator, entry.key_ptr.*);
+        }
+        for (keys.items) |k| {
+            try self.loadStream(k);
+            try self.inner.finish(writer, &sink);
+        }
+        self.active_key = null;
     }
 
     /// Pumps from any Reader endpoint into this framer with no per-iteration
