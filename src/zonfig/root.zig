@@ -637,8 +637,17 @@ fn applyEnvSubstitutionWithDefaults(
                             if (field_ptr.*) |current| {
                                 const result = try env_subst.substitute(allocator, current, environ);
                                 if (result.was_substituted) {
-                                    // Free old value (optional strings are always allocated if non-null)
-                                    if (current.len > 0) {
+                                    // Skip the free if the field still points at
+                                    // its comptime default (a non-heap string
+                                    // literal produced by defaultValue) — e.g.
+                                    // a default like `?[]const u8 = "Bearer ${X}"`.
+                                    // Only heap-allocated values (from JSON, env
+                                    // overrides, or a prior substitution) may be
+                                    // freed. Mirrors the ptr != default_field.ptr
+                                    // guard used by the adjacent non-optional
+                                    // branch and by freeReplacedString.
+                                    const is_default = default_field != null and default_field.?.ptr == current.ptr;
+                                    if (!is_default and current.len > 0) {
                                         allocator.free(current);
                                     }
                                     field_ptr.* = result.value;
@@ -714,8 +723,16 @@ fn freeAllocatedFieldsWithDefaults(comptime T: type, allocator: std.mem.Allocato
                         const p = @typeInfo(ChildType).pointer;
                         if (p.size == .slice and p.child == u8) {
                             if (field_ptr.*) |slice| {
-                                // For optionals, default is null, so any non-null value was allocated
-                                if (slice.len > 0) {
+                                // Skip the free if the field still points at
+                                // its comptime default (a non-heap string literal
+                                // produced by defaultValue). Only heap-allocated
+                                // values (from JSON, env overrides, or ${VAR}
+                                // substitution) may be freed. Mirrors the
+                                // ptr != default_field.ptr guard used by the
+                                // adjacent non-optional branch and by
+                                // freeReplacedString.
+                                const is_default = default_field != null and default_field.?.ptr == slice.ptr;
+                                if (!is_default and slice.len > 0) {
                                     allocator.free(slice);
                                 }
                             }
@@ -1427,6 +1444,76 @@ test "load: memory - no leaks with optional strings" {
     );
     deinit(Config, testing.allocator, config);
     // testing.allocator will detect leaks
+}
+
+test "load: memory - no leaks with optional string with non-null default" {
+    // Regression for invalid free of a comptime optional-string default in
+    // deinit (freeAllocatedFieldsWithDefaults). A non-null `?[]const u8 = "..."`
+    // default is a comptime string literal, not heap-allocated; deinit must not
+    // free it. The defaults-only path (no JSON, no env) leaves the field at its
+    // comptime default and then deinit must free nothing.
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const Config = struct {
+        greeting: ?[]const u8 = "hello",
+    };
+
+    const config = try load(Config, testing.allocator, std.Options.debug_io, .{ .environ = &env_map });
+    defer deinit(Config, testing.allocator, config);
+
+    try testing.expectEqualStrings("hello", config.greeting.?);
+}
+
+test "load: memory - no leaks with optional string default containing ${VAR}" {
+    // Regression for invalid free of a comptime optional-string default in the
+    // ${VAR} substitution pass (applyEnvSubstitutionWithDefaults). When the
+    // default itself contains `${VAR}` and is substituted, the comptime default
+    // pointer must not be freed; only the freshly-substituted heap value is
+    // owned (and deinit will free it).
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("MYAPP_TOKEN", "secret");
+
+    const Config = struct {
+        auth: ?[]const u8 = "Bearer ${MYAPP_TOKEN}",
+    };
+
+    const config = try load(Config, testing.allocator, std.Options.debug_io, .{
+        .environ = &env_map,
+        .env_prefix = "MYAPP",
+    });
+    defer deinit(Config, testing.allocator, config);
+
+    try testing.expectEqualStrings("Bearer secret", config.auth.?);
+}
+
+test "load: optional string with non-null default is overridden by JSON" {
+    // Non-null default + a JSON value: the JSON value is heap-allocated and
+    // must be freed by deinit (the default never entered the field, so the
+    // is_default guard must notFalse-negatively skip the free and leak).
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try createTempConfigFile(std.Options.debug_io, tmp_dir.dir,
+        \\{"greeting": "from-json"}
+    );
+
+    const Config = struct {
+        greeting: ?[]const u8 = "hello",
+    };
+
+    const path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "config.json", testing.allocator);
+    defer testing.allocator.free(path);
+
+    const config = try load(Config, testing.allocator, std.Options.debug_io, .{
+        .environ = &env_map,
+        .json_path = path,
+    });
+    defer deinit(Config, testing.allocator, config);
+
+    try testing.expectEqualStrings("from-json", config.greeting.?);
 }
 
 // -----------------------------------------------------------------------------
