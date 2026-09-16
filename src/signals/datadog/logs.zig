@@ -1007,6 +1007,137 @@ test "evalLogRecord - malformed and non-object records fail open to keep" {
     try std.testing.expectEqual(RecordVerdict.keep, scalar);
 }
 
+test "evalLogRecord - malformed unknown-field container fails open to keep under matching policy" {
+    // Regression (Datadog logs / json_scan): FieldWalker.valueEnd used to
+    // accept bracket-balanced-but-structurally-malformed container values in
+    // unknown fields and store them verbatim, so a matching drop policy
+    // returned `.drop` and a matching mutating policy returned `.replace` —
+    // making verdicts depend on the fast path, contrary to the contract on
+    // evalLogRecord. After the fix, parseRaw rejects these records, the
+    // materializing `DatadogLog.parse` rejects them too, and both policy
+    // shapes fail open to `.keep` (the record is forwarded verbatim).
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    const bus = noop_bus.eventBus();
+
+    // Every input has a malformed container in an UNKNOWN field `x` whose
+    // brackets balance but whose interior violates JSON grammar. The buggy
+    // fast path accepted these and let the policy run; the corrected path
+    // rejects them (parseRaw -> DatadogLog.parse) and fail-opens to `.keep`.
+    // Each of these is verified to be rejected by the materializing fallback
+    // (zimdjson ondemand is lazy; DatadogLog.parse's field iteration rejects
+    // them), mirroring the bug report's corrected-path verdicts table.
+    const malformed_values = [_][]const u8{
+        "[1,]", // trailing comma in array
+        "[,]", // leading comma in array
+        "{,}", // leading comma in object
+        "{\"k\":}", // missing object value
+        "{1:2}", // non-string object key
+        "[\"a\",,]", // missing value in array
+    };
+
+    // --- Drop policy (keep = "none"), matched on LOG_FIELD_BODY regex "matched".
+    {
+        var registry = PolicyRegistry.init(allocator, bus);
+        defer registry.deinit();
+        var drop_policy: proto.policy.Policy = .{
+            .id = try allocator.dupe(u8, "drop-matched"),
+            .name = try allocator.dupe(u8, "drop-matched"),
+            .enabled = true,
+            .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        };
+        try drop_policy.target.?.log.match.append(allocator, .{
+            .field = .{ .log_field = .LOG_FIELD_BODY },
+            .match = .{ .regex = try allocator.dupe(u8, "matched") },
+        });
+        defer drop_policy.deinit(allocator);
+        try registry.updatePolicies(&.{drop_policy}, "drop", .file);
+
+        for (malformed_values) |val| {
+            var buf: [128]u8 = undefined;
+            const record = std.fmt.bufPrint(
+                &buf,
+                "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
+                .{val},
+            ) catch unreachable;
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            try std.testing.expectEqual(
+                RecordVerdict.keep,
+                try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, record, null),
+            );
+        }
+
+        // Contrast: a well-formed matching record IS dropped (the fallback
+        // accepts a valid object, so the policy runs). Guards against the
+        // fix over-broadening into a keep-everything regression.
+        const good = "{\"message\":\"matched\",\"service\":\"s\",\"x\":[1,2]}";
+        var good_arena = std.heap.ArenaAllocator.init(allocator);
+        defer good_arena.deinit();
+        try std.testing.expectEqual(
+            RecordVerdict.drop,
+            try evalLogRecord(good_arena.allocator(), &parser, allocator, &registry, bus, good, null),
+        );
+    }
+
+    // --- Mutating policy (keep = "all", removes `service`), matched on the body.
+    {
+        var registry = PolicyRegistry.init(allocator, bus);
+        defer registry.deinit();
+        var transform: proto.policy.LogTransform = .{};
+        var remove_attr_path: proto.policy.AttributePath = .{};
+        try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
+        try transform.remove.append(allocator, .{
+            .field = .{ .log_attribute = remove_attr_path },
+        });
+        var mutate_policy: proto.policy.Policy = .{
+            .id = try allocator.dupe(u8, "remove-service"),
+            .name = try allocator.dupe(u8, "remove-service"),
+            .enabled = true,
+            .target = .{ .log = .{
+                .keep = try allocator.dupe(u8, "all"),
+                .transform = transform,
+            } },
+        };
+        try mutate_policy.target.?.log.match.append(allocator, .{
+            .field = .{ .log_field = .LOG_FIELD_BODY },
+            .match = .{ .regex = try allocator.dupe(u8, "matched") },
+        });
+        defer mutate_policy.deinit(allocator);
+        try registry.updatePolicies(&.{mutate_policy}, "mutate", .file);
+
+        for (malformed_values) |val| {
+            var buf: [128]u8 = undefined;
+            const record = std.fmt.bufPrint(
+                &buf,
+                "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
+                .{val},
+            ) catch unreachable;
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            try std.testing.expectEqual(
+                RecordVerdict.keep,
+                try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, record, null),
+            );
+        }
+
+        // Contrast: a well-formed matching record IS replaced (`service`
+        // removed). The malformed path used to also `.replace` with the bad
+        // span baked in; the fix sends malformed records to `.keep` instead.
+        const good = "{\"message\":\"matched\",\"service\":\"s\",\"x\":[1,2]}";
+        var good_arena = std.heap.ArenaAllocator.init(allocator);
+        defer good_arena.deinit();
+        const verdict = try evalLogRecord(good_arena.allocator(), &parser, allocator, &registry, bus, good, null);
+        try std.testing.expect(verdict == .replace);
+        try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "\"service\"") == null);
+    }
+}
+
 test "processLogs - no policies keeps all logs in array" {
     const allocator = std.testing.allocator;
 

@@ -299,7 +299,14 @@ pub const DatadogLog = struct {
                 try jws.writer.writeAll(raw_json);
                 jws.endWriteRaw();
             } else {
-                try writeAnyValue(jws, entry.value_ptr.*);
+                // `extra` values were materialized by the validating parse, so
+                // `writeAnyValue` only fails with the writer's `WriteFailed`
+                // here. Non-write errors are impossible in practice; coerce
+                // them to `WriteFailed` to keep this method within the
+                // `std.json.Stringify` contract (`error{WriteFailed}!void`)
+                // now that `writeAnyValue` propagates malformed-container
+                // errors for the parse-time `stringifyAnyValue` path.
+                writeAnyValue(jws, entry.value_ptr.*) catch return error.WriteFailed;
             }
         }
         // parseRaw extras: verbatim spans of the input, all value types.
@@ -651,7 +658,17 @@ pub const DatadogLog = struct {
         return out.toOwnedSlice();
     }
 
-    /// Write a zimdjson AnyValue to a JSON writer
+    /// Write a zimdjson AnyValue to a JSON writer.
+    ///
+    /// Malformed containers (e.g. a trailing comma that zimdjson's ondemand
+    /// parser tokenized structurally but didn't reject until an element is
+    /// materialized) surface as errors from `iterator().next()`, `key.get()`,
+    /// or `value.asAny()`. Those errors are propagated — NOT swallowed — so a
+    /// malformed container aborts serialization cleanly. Swallowing them
+    /// would advance the writer past a `beginObject`/`objectField` without a
+    /// matching value, leaving it in the `.the_beginning`/`.colon` state where
+    /// `endObject` is `unreachable` and would crash the process. Callers
+    /// route that error to the validating-path fail-open.
     fn writeAnyValue(jws: anytype, value: AnyValue) !void {
         switch (value) {
             .null => try jws.write(null),
@@ -665,17 +682,17 @@ pub const DatadogLog = struct {
             .array => |arr| {
                 try jws.beginArray();
                 var arr_it = arr.iterator();
-                while (arr_it.next() catch null) |item| {
-                    try writeAnyValue(jws, item.asAny() catch continue);
+                while (arr_it.next() catch return error.Malformed) |item| {
+                    try writeAnyValue(jws, try item.asAny());
                 }
                 try jws.endArray();
             },
             .object => |obj| {
                 try jws.beginObject();
                 var obj_it = obj.iterator();
-                while (obj_it.next() catch null) |field| {
-                    try jws.objectField(field.key.get() catch continue);
-                    try writeAnyValue(jws, field.value.asAny() catch continue);
+                while (obj_it.next() catch return error.Malformed) |field| {
+                    try jws.objectField(try field.key.get());
+                    try writeAnyValue(jws, try field.value.asAny());
                 }
                 try jws.endObject();
             },
@@ -1102,6 +1119,57 @@ test "DatadogLog - parseRaw rejects comma separator violations (parse parity)" {
     );
     defer log.deinit(allocator);
     try std.testing.expectEqualStrings("info", log.status.?);
+}
+
+test "DatadogLog - parseRaw rejects malformed container interiors (parse parity)" {
+    // Regression: FieldWalker.valueEnd used to skip every non-bracket,
+    // non-string interior byte of a container, so bracket-balanced but
+    // structurally malformed unknown-field values (trailing/missing commas,
+    // missing values, non-string keys, malformed scalar tokens) were stored
+    // verbatim in `extra_spans` and never routed to the validating fallback.
+    // A full parser rejects each of these; parseRaw must too, so semantics
+    // never depend on the fast path (logs.zig evalLogRecord contract).
+    const allocator = std.testing.allocator;
+
+    const bad_record_values = [_][]const u8{
+        "[1,]", // trailing comma in array
+        "[,]", // leading comma in array
+        "[1 2]", // missing comma in array
+        "[1,,2]", // double comma / missing value in array
+        "{\"k\":}", // missing object value
+        "{1:2}", // non-string object key
+        "{\"a\":1,}", // trailing comma in object
+        "[tru]", // malformed scalar token in array
+        "[1e+]", // incomplete number in array
+        "{\"a\":1 \"b\":2}", // missing comma between object pairs
+    };
+    for (bad_record_values) |val| {
+        var buf: [128]u8 = undefined;
+        const json = std.fmt.bufPrint(
+            &buf,
+            "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
+            .{val},
+        ) catch unreachable;
+        try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator, json));
+    }
+
+    // The known-field boundary: a malformed container in a KNOWN string field
+    // already routed to the validating path via `stringSpan` before this fix.
+    // Pin that the known-field path still rejects a container-shaped value.
+    try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator,
+        \\{"message":[1,],"service":"s"}
+    ));
+
+    // Valid containers in unknown fields still parse byte-for-byte.
+    var ok = try DatadogLog.parseRaw(allocator,
+        \\{"message":"m","http":{"method":"GET","code":200},"tags":["a","b"],"empty":{},"n":42,"ok":true}
+    );
+    defer ok.deinit(allocator);
+    try std.testing.expectEqualStrings("{\"method\":\"GET\",\"code\":200}", ok.extra_spans.get("http").?);
+    try std.testing.expectEqualStrings("[\"a\",\"b\"]", ok.extra_spans.get("tags").?);
+    try std.testing.expectEqualStrings("{}", ok.extra_spans.get("empty").?);
+    try std.testing.expectEqualStrings("42", ok.extra_spans.get("n").?);
+    try std.testing.expectEqualStrings("true", ok.extra_spans.get("ok").?);
 }
 
 test "DatadogLog - parse basic fields" {
