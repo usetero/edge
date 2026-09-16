@@ -653,14 +653,20 @@ pub const Handler = struct {
         defer trackUpstream(ctx.io, bufs, null);
         // Scope eviction to the upstream send+head phase: a reused dead keep-alive
         // fails here, so evict it from the pool. Past receiveHead the response
-        // streams straight to the client, so failures there are client-disconnect
-        // or local filter errors — those must NOT mark a healthy upstream conn
-        // closing and churn the pool. Genuine upstream receive-side failures during
-        // the body are handled by std (it sets connection.closing on its own).
+        // streams straight to the client, so non-timeout failures there are
+        // client-disconnect or local filter errors — those must NOT mark a healthy
+        // upstream conn closing and churn the pool. A watchdog timeout during the
+        // head or body phase has already set connection.closing, so translating it
+        // to error.UpstreamTimeout (504) and evicting is harmless and matches
+        // `exchange`. Genuine upstream receive-side failures during the body are
+        // handled by std (it sets connection.closing on its own).
         var upstream_res = blk: {
-            errdefer |err| self.evictUpstream(&upstream_req, req.url.path, err);
-            try upstream_req.sendBodiless();
-            break :blk try upstream_req.receiveHead(&.{});
+            upstream_req.sendBodiless() catch |err| break :blk err;
+            break :blk upstream_req.receiveHead(&.{}) catch |err| break :blk err;
+        } catch |err| {
+            self.evictUpstream(&upstream_req, req.url.path, err);
+            if (bufs.timed_out.load(.acquire)) return error.UpstreamTimeout;
+            return err;
         };
         var extra_headers: [64]std.http.Header = undefined;
         const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, res.arena, &extra_headers);
@@ -689,7 +695,13 @@ pub const Handler = struct {
 
         const upstream_body = upstream_res.reader(bufs.upstream);
         const max_in = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes;
-        _ = try pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in);
+        _ = pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in) catch |err| {
+            if (bufs.timed_out.load(.acquire)) {
+                self.evictUpstream(&upstream_req, req.url.path, err);
+                return error.UpstreamTimeout;
+            }
+            return err;
+        };
         _ = try filtering.finish();
     }
 };
@@ -899,6 +911,26 @@ test "only transport failures are replayable" {
     try testing.expect(retryableTransportError(error.ConnectionRefused));
     try testing.expect(!retryableTransportError(error.OutOfMemory));
     try testing.expect(!retryableTransportError(error.UnsupportedUriScheme));
+}
+
+test "errorStatus maps upstream timeout to 504 and watchdog errors to 502" {
+    // errorStatus is the final status-code mapper for dispatch failures. The
+    // watchdog in `execFetchFiltered`/`exchange` shutdowns the upstream socket
+    // on a 30s stall, surfacing as a transport error (ReadFailed/
+    // HttpRequestTruncated). Those checks translate it to error.UpstreamTimeout
+    // before it reaches here, so the client sees 504, not 502. Asserting both
+    // arms pins the contract: only the explicit UpstreamTimeout maps to 504,
+    // and the raw transport errors a watchdog shutdown produces fall through to
+    // 502 — exactly the mislabeling the timed_out check exists to prevent.
+    try testing.expectEqual(@as(u16, 504), errorStatus(error.UpstreamTimeout));
+    try testing.expectEqual(@as(u16, 502), errorStatus(error.ReadFailed));
+    try testing.expectEqual(@as(u16, 502), errorStatus(error.HttpRequestTruncated));
+    // The remaining arms must stay stable for the other dispatch paths.
+    try testing.expectEqual(@as(u16, 413), errorStatus(error.BodyTooLarge));
+    try testing.expectEqual(@as(u16, 413), errorStatus(error.DecodedBodyTooLarge));
+    try testing.expectEqual(@as(u16, 400), errorStatus(error.InvalidRequestBody));
+    try testing.expectEqual(@as(u16, 503), errorStatus(error.OutOfMemory));
+    try testing.expectEqual(@as(u16, 503), errorStatus(error.WriteFailed));
 }
 
 const HeaderPair = struct { key: []const u8, value: []const u8 };
