@@ -480,7 +480,15 @@ pub const Watcher = struct {
         }
 
         const observed = try prefixHash(self.io, file, prefix_len);
-        if (observed == self.head_prefix_hashes.items[i]) return;
+        if (observed == self.head_prefix_hashes.items[i]) {
+            // The prefix is unchanged, but the identity fingerprint may have been
+            // computed on a shorter file (e.g. after a partially written
+            // copytruncate).  Refresh it so that ongoing checkpoints and a
+            // future checkpoint-based restart both use a fingerprint that covers
+            // the current file content rather than the partial prefix.
+            try self.refreshIdentityFingerprint(idx, file);
+            return;
+        }
 
         if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
         self.head_prefix_hashes.items[i] = observed;
