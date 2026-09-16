@@ -244,8 +244,16 @@ pub const Watcher = struct {
         // only grows via emitted appends, so the stored prefix hash predates any
         // truncation and maybeHandleContentRewrite is allowed to gate the reset
         // on the prefix comparison.
-        if (checkpoint_lane != null) {
-            if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
+        //
+        // Additionally, after resetting the in-memory offset we immediately
+        // update the lane's in-memory store so that applyCheckpointOffsetOne
+        // cannot resurrect the stale (higher) checkpoint value on the very next
+        // collect call before the async worker has drained the new offset.
+        if (checkpoint_lane) |lane| {
+            if (size < self.offsets.items[i]) {
+                self.offsets.items[i] = 0;
+                if (self.identities.items[i]) |id| lane.resetOffset(id, 0);
+            }
         }
         try self.maybeHandleContentRewrite(idx, size);
 
@@ -492,7 +500,13 @@ pub const Watcher = struct {
 
         const observed = try prefixHash(self.io, file, prefix_len);
         if (observed == self.head_prefix_hashes.items[i]) {
-            if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
+            // Prefix unchanged: the file may have shrunk (partial truncation).
+            // Clamp the offset to the new size so emitReadableRange finds
+            // nothing to deliver.  Do NOT reset to 0 here — that would
+            // re-emit already-delivered bytes.  The checkpoint-lane reset to
+            // 0 (which triggers a conservative at-least-once re-emit) is
+            // handled earlier in processDirtyIndex.
+            if (size < self.offsets.items[i]) self.offsets.items[i] = size;
             return;
         }
 
@@ -979,4 +993,11 @@ test "watch: checkpoint resume with offset above size re-emits conservatively wi
     try testing.expectEqual(@as(u64, 0), events.items[0].start_offset);
     try testing.expectEqual(@as(u64, 8), events.items[0].end_offset);
     try testing.expectEqual(@as(u64, 8), w.offsets.items[0]);
+
+    // A second collect must NOT re-emit the same range even though the async
+    // checkpoint worker has not yet drained the new offset update from the
+    // queue (the in-memory store was updated synchronously by resetOffset).
+    events.clearRetainingCapacity();
+    try w.collect(&events, .checkpoint, &lane);
+    try testing.expectEqual(@as(usize, 0), events.items.len);
 }
