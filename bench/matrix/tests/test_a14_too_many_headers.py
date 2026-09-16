@@ -1,19 +1,23 @@
-"""A14: more forward headers than the edge will carry.
+"""A14: more headers than the edge will carry.
 
-The cap is ours, and the sender is at fault, so the status must be a 4xx.
-A 5xx would send an agent into a retry loop against a request that can never
-succeed.
+Two answers are defensible: forward every header, or refuse the request. What
+is not defensible is accepting the request, dropping the headers above the cap
+and answering 202, because the sender then believes an API key or a trace
+header was forwarded when it was not.
 """
 
 from harness import MatrixCase
 
 
 class TooManyHeaders(MatrixCase):
-    def test_header_flood_is_a_client_error(self):
+    DEFECTS = {"httpz": "drops the headers above its cap and answers 202"}
+
+    def test_a_header_flood_is_never_silently_truncated(self):
         headers = {"X-Matrix-%d" % i: "v" for i in range(80)}
         response = self.post_logs(headers=headers)
         self.assertEqual(
             response.status_code // 100,
             4,
-            "too many headers is the sender's fault, got %d" % response.status_code,
+            "headers above the cap must be refused, not dropped in silence "
+            "(got %d)" % response.status_code,
         )

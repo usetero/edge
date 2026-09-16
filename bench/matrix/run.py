@@ -5,9 +5,10 @@
     ./bin/uv run --with requests bench/matrix/run.py --fast
     ./bin/uv run --with requests bench/matrix/run.py --frontend stdio -k b05
 
-httpz is the oracle: for most cases the right answer is "stdio does what httpz
-does". A case that must differ calls `expect_difference`, which reports as
-`diff` rather than a failure.
+Every case asserts what a customer needs. Neither frontend is the oracle, and
+either can fail. A case may declare `DEFECTS = {frontend: note}` for behaviour
+we have already found and recorded: it then reports as `xfail` with the note,
+so the defect stays counted, and as `XPASS` on the day it is fixed.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ import subprocess
 import sys
 import time
 import unittest
+
+sys.stdout.reconfigure(line_buffering=True)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -85,6 +88,47 @@ def first_cause(trace: str) -> str:
     return trace.strip().splitlines()[-1][:200]
 
 
+class Progress(unittest.TextTestResult):
+    """Prints each case as it finishes, so a slow sweep shows its progress."""
+
+    def __init__(self, frontend, *args):
+        super().__init__(*args)
+        self.frontend = frontend
+        self.started_at = 0.0
+
+    def startTest(self, test):
+        self.started_at = time.monotonic()
+        super().startTest(test)
+
+    def _note(self, test, status):
+        print("  %-6s %-6s %.0fs  %s" % (
+            self.frontend, status, time.monotonic() - self.started_at, short_id(test.id())))
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        self._note(test, "pass")
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self._note(test, "FAIL")
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        self._note(test, "ERROR")
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        self._note(test, "skip")
+
+    def addExpectedFailure(self, test, err):
+        super().addExpectedFailure(test, err)
+        self._note(test, "xfail")
+
+    def addUnexpectedSuccess(self, test):
+        super().addUnexpectedSuccess(test)
+        self._note(test, "XPASS")
+
+
 def run_one(frontend: str, pattern: str | None, fast: bool) -> dict[str, tuple[str, str]]:
     os.environ["EDGE_BIN"] = BINARIES[frontend]
     os.environ["EDGE_FRONTEND"] = frontend
@@ -99,7 +143,11 @@ def run_one(frontend: str, pattern: str | None, fast: bool) -> dict[str, tuple[s
     names = [short_id(case.id()) for case in iterate(suite)]
 
     stream = io.StringIO()
-    runner = unittest.TextTestRunner(stream=stream, verbosity=0)
+    runner = unittest.TextTestRunner(
+        stream=stream,
+        verbosity=0,
+        resultclass=lambda *args: Progress(frontend, *args),
+    )
     started = time.monotonic()
     result = runner.run(suite)
     elapsed = time.monotonic() - started
@@ -108,8 +156,11 @@ def run_one(frontend: str, pattern: str | None, fast: bool) -> dict[str, tuple[s
     for case, trace in result.failures + result.errors:
         outcomes[short_id(case.id())] = ("FAIL", first_cause(trace))
     for case, reason in result.skipped:
-        label = "diff" if reason.startswith("known difference") else "skip"
-        outcomes[short_id(case.id())] = (label, reason[:160])
+        outcomes[short_id(case.id())] = ("skip", reason[:200])
+    for case, note in result.expectedFailures:
+        outcomes[short_id(case.id())] = ("xfail", first_cause(note))
+    for case in result.unexpectedSuccesses:
+        outcomes[short_id(case.id())] = ("XPASS", "the declared defect no longer reproduces; drop the DEFECTS note")
 
     print("  %s: %d cases in %.0f s" % (frontend, len(outcomes), elapsed))
     return outcomes
@@ -148,7 +199,29 @@ def main() -> int:
         for name, frontend, detail in failures:
             print("  %s [%s]\n    %s" % (name, frontend, detail))
 
-    print("\n%d case(s), %d failure(s)" % (len(names), len(failures)))
+    known = [
+        (name, frontend, results[frontend][name][1])
+        for name in names
+        for frontend in frontends
+        if results[frontend].get(name, ("", ""))[0] == "xfail"
+    ]
+    if known:
+        print("\nknown defects that reproduced:")
+        for name, frontend, detail in known:
+            print("  %s [%s]\n    %s" % (name, frontend, detail))
+
+    fixed = [
+        (name, frontend)
+        for name in names
+        for frontend in frontends
+        if results[frontend].get(name, ("", ""))[0] == "XPASS"
+    ]
+    if fixed:
+        print("\nno longer failing (remove the DEFECTS note):")
+        for name, frontend in fixed:
+            print("  %s [%s]" % (name, frontend))
+
+    print("\n%d case(s), %d failure(s), %d known defect(s)" % (len(names), len(failures), len(known)))
     return 1 if failures else 0
 
 

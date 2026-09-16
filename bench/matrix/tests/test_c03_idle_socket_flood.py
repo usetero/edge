@@ -1,6 +1,7 @@
 """C03: every slot taken by senders that never send.
 
-The edge must recover on its own, without the senders closing anything.
+The edge must reclaim the slots on its own, without the senders closing
+anything, or one misbehaved client wedges the sidecar until it restarts.
 """
 
 import time
@@ -14,12 +15,10 @@ class IdleSocketFlood(MatrixCase):
     SLOW = True
 
     def test_idle_sockets_do_not_wedge_the_edge(self):
-        self.expect_difference("httpz", "reclaims through its own request timeout")
         held = [self.raw(timeout=90) for _ in range(12)]
+        recovered_at = None
         try:
             time.sleep(1)
-            # The ceiling is reached, so health is expected to fail here.
-            recovered_at = None
             started = time.monotonic()
             while time.monotonic() - started < 60:
                 try:
@@ -34,4 +33,4 @@ class IdleSocketFlood(MatrixCase):
                 client.close()
 
         self.assertIsNotNone(recovered_at, "the edge never recovered while sockets were held")
-        self.wait_for_metric('edge_inbound_timeouts_total{phase="idle"}', 1, timeout=10)
+        self.assertLess(recovered_at, 45, "reclaim took %.0f s" % recovered_at)

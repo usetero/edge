@@ -8,10 +8,14 @@ class OversizeResponse(MatrixCase):
 
     def test_an_oversize_response_is_bounded(self):
         self.intake.arm("oversize", arg=1_048_576, count=1)
+        status = None
         try:
-            response = self.post_logs(timeout=60)
-        except Exception as err:  # a truncated relay is also an acceptable answer
-            self.assert_logged("upstream")
-            self.skipTest("relay closed rather than answering: %s" % err)
-        self.assertEqual(response.status_code // 100, 5, "got %d" % response.status_code)
+            status = self.post_logs(timeout=60).status_code
+        except Exception:
+            status = None  # the relay closed rather than answering
+
+        # Either answer is honest. What must not happen is a clean 2xx that
+        # hides a response the edge refused to carry.
+        if status is not None:
+            self.assertEqual(status // 100, 5, "an oversize relay reported %d" % status)
         self.assert_logged("upstream")

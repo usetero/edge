@@ -368,6 +368,16 @@ fn inboundBodyOf(
     if (len == 0) return .{ .bytes = "" };
     if (len > limits.max_body_size) return error.BodyTooLarge;
     const reader = try request.readerExpectContinue(buffer);
+    // A streamed body is consumed by its first send and can never be
+    // replayed, and log intake clients do not retry. Streaming every body
+    // therefore turned one stale pooled connection into lost logs. Keep
+    // bodies below the streaming threshold resident so the upstream leg can
+    // dial again; httpz draws the same line at `lazy_read_size`.
+    if (len <= limits.large_body_buffer_size) {
+        var capture: std.Io.Writer.Allocating = .init(arena);
+        _ = try pipeline_mod.streamReaderToWriter(reader, &capture.writer, limits.max_body_size);
+        return .{ .bytes = capture.written() };
+    }
     return .{ .lazy = .{ .reader = reader, .len = @intCast(len) } };
 }
 

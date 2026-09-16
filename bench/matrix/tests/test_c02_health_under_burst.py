@@ -1,44 +1,58 @@
-"""C02: a health probe during a burst against a slow intake.
+"""C02: a health probe that arrives with a burst, against a slow intake.
 
-This is the ECS failure: the probe shares the request path with a burst of log
-batches, and an unlucky probe misses its window. Three misses and the
-scheduler kills the task.
+This is the ECS failure the customer reported. The probe is a static route, so
+it can only be slow if it cannot reach a thread. Arrivals are synchronised
+here, because the effect depends on the probe landing in the same event batch
+as the batches ahead of it: with per-thread queues the probe waits for every
+request queued in front of it, however many threads are idle.
 """
 
-import time
+import threading
 
 from harness import MatrixCase
-from harness import load
 
 
 class HealthUnderBurst(MatrixCase):
     INTAKE_LATENCY = 3000
+    DEFECTS = {"httpz": "a batch of up to 16 requests goes to one pool thread, so a probe waits behind it"}
 
-    def test_health_stays_fast_while_the_intake_is_slow(self):
-        self.expect_difference("httpz", "one batch of 16 goes to a single pool thread")
-        if not load.available():
-            self.skipTest("oha is not installed")
+    BURSTS = 8
+    SENDERS = 15
 
-        import threading
+    def test_health_stays_fast_when_a_burst_arrives_with_it(self):
+        worst = 0.0
+        for _ in range(self.BURSTS):
+            start = threading.Barrier(self.SENDERS + 1)
+            probe_seconds = {}
 
-        worst = {"seconds": 0.0}
-
-        def probe():
-            deadline = time.monotonic() + 12
-            while time.monotonic() < deadline:
-                started = time.monotonic()
+            def sender():
+                start.wait()
                 try:
-                    self.health(timeout=30)
+                    self.post_logs(timeout=60)
                 except Exception:
-                    worst["seconds"] = 999
-                    return
-                worst["seconds"] = max(worst["seconds"], time.monotonic() - started)
-                time.sleep(0.25)
+                    pass
 
-        watcher = threading.Thread(target=probe, daemon=True)
-        watcher.start()
-        load.run(self.edge.url + "/api/v2/logs", b'[{"message":"burst"}]', connections=15, seconds=10)
-        watcher.join(timeout=30)
+            def probe():
+                start.wait()
+                import time
+                began = time.monotonic()
+                try:
+                    self.health(timeout=60)
+                    probe_seconds["value"] = time.monotonic() - began
+                except Exception:
+                    probe_seconds["value"] = 999.0
 
-        self.assertLess(worst["seconds"], 1.0,
-                        "a health probe waited %.1f s behind the burst" % worst["seconds"])
+            threads = [threading.Thread(target=sender, daemon=True) for _ in range(self.SENDERS)]
+            threads.append(threading.Thread(target=probe, daemon=True))
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=90)
+            worst = max(worst, probe_seconds.get("value", 0.0))
+
+        self.assertLess(
+            worst,
+            1.0,
+            "a health probe waited %.1f s behind the burst; three such misses "
+            "take the task down" % worst,
+        )

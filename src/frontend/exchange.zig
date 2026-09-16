@@ -90,6 +90,9 @@ pub fn errorStatus(err: anyerror) u16 {
         error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
         error.InboundBodyTimeout => 408,
         error.InvalidRequestBody => 400,
+        // Our cap, and the sender can act on it. A 5xx would send an agent
+        // into a retry loop against a request that can never succeed.
+        error.TooManyHeaders => 431,
         error.UpstreamTimeout => 504,
         error.OutOfMemory, error.WriteFailed => 503,
         else => 502,
@@ -129,6 +132,9 @@ fn dialUpstream(
     return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.info(UpstreamRetried{ .path = in.path, .err = @errorName(err) });
+        // Counted like any other retry: a dial storm is invisible otherwise,
+        // since only this log line records it.
+        if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(true);
         return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client);
     };
 }

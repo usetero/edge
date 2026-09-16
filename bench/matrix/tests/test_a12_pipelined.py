@@ -1,9 +1,15 @@
-"""A12: two requests written in one packet."""
+"""A12: two requests written in one packet.
+
+Pipelining is legal HTTP/1.1. An agent that reconnects under load can produce
+it, and rejecting the pair loses the second batch.
+"""
 
 from harness import MatrixCase
 
 
 class Pipelined(MatrixCase):
+    DEFECTS = {"httpz": "answers 400 to a pipelined pair"}
+
     def test_pipelined_requests_are_both_served(self):
         body = b'[{"message":"pipelined"}]'
         one = self.head(body_len=len(body)) + body
@@ -12,4 +18,4 @@ class Pipelined(MatrixCase):
             first = client.read_response()
             self.assert_status(first, 202)
 
-        self.assertGreaterEqual(self.intake_saw(1), 1)
+        self.assertGreaterEqual(self.intake_saw(2), 2, "the second pipelined batch was lost")
