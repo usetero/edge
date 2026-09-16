@@ -217,7 +217,10 @@ test "read scheduler uring non-fixed path: multi-event batch keeps read buffers 
         defer framer.deinit();
         var out: std.Io.Writer.Allocating = .init(testing.allocator);
         defer out.deinit();
-        var scheduler = try uring_mod.Scheduler.init(moving_alloc, io);
+        var scheduler = uring_mod.Scheduler.init(moving_alloc, io) catch |err| switch (err) {
+            error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
+            else => return err,
+        };
         defer scheduler.deinit();
         scheduler.fixed_enabled = false;
 
