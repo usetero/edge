@@ -89,14 +89,21 @@ pub fn streamReaderToWriter(
             writer,
             std.Io.Limit.limited(max_bytes - total_bytes),
         ) catch |err| switch (err) {
-            error.EndOfStream => break,
+            error.EndOfStream => return total_bytes,
             else => return err,
         };
-        if (bytes == 0) break;
         total_bytes += bytes;
+        // A 0 return does NOT indicate end of stream (std.Io.Reader.VTable
+        // contract); only error.EndOfStream does. The std gzip/zstd indirect
+        // decompressor vtable decodes a block into the reader's internal
+        // buffer and returns 0 — the bytes appear on the next `stream` call.
+        // Breaking here would prematurely terminate the copy and make the
+        // trailing excess probe spuriously report error.BodyTooLarge.
     }
-    // EOF must be observed; merely copying the limit can turn a truncated
-    // upstream response into a successful response with missing data.
+    // Reached the bound: EOF was not observed, so ensure upstream is actually
+    // done. Merely copying the limit can turn a truncated upstream response
+    // (or a body that exceeds the bound) into a successful response with
+    // missing/truncated data.
     var excess: [1]u8 = undefined;
     if (try reader.readSliceShort(&excess) != 0) return error.BodyTooLarge;
     return total_bytes;
@@ -276,4 +283,73 @@ test "streamReaderToWriter rejects oversized input instead of silently truncatin
     var out_writer = std.Io.Writer.fixed(&out_buf);
 
     try testing.expectError(error.BodyTooLarge, streamReaderToWriter(&in_reader, &out_writer, 3));
+}
+
+// The std gzip/zstd decompressors select an *indirect* reader vtable when
+// given a non-zero decode buffer (the production path always supplies one).
+// That vtable's `stream` may decode a block into the reader's internal
+// buffer and return `0`; per the `std.Io.Reader.VTable` contract, a `0`
+// return "does not indicate end of stream" — only `error.EndOfStream` does.
+// These tests exercise a real `encoding.Decoder` reader (the production
+// call site, exec.zig:298) rather than `std.Io.Reader.fixed`, which can
+// never return `0` mid-stream and so never exercised the contract.
+
+test "streamReaderToWriter over gzip decoder copies full body" {
+    const body = "a" ** 10_000;
+    const compressed = try buffered.compressGzip(testing.allocator, body);
+    defer testing.allocator.free(compressed);
+
+    var in: std.Io.Reader = .fixed(compressed);
+    const dbuf = try testing.allocator.alloc(u8, encoding.ContentEncoding.gzip.decoderBufferLen(TEST_WINDOW));
+    defer testing.allocator.free(dbuf);
+    var decoder: encoding.Decoder = .init(.gzip, &in, dbuf, TEST_WINDOW);
+    const decoded = decoder.reader();
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 4096);
+    defer out.deinit();
+
+    // max_bytes well above body length: a spurious BodyTooLarge here cannot
+    // be blamed on the bound itself.
+    const result = try streamReaderToWriter(decoded, &out.writer, body.len * 4);
+    try testing.expectEqual(body.len, result);
+    try testing.expectEqualStrings(body, out.written());
+}
+
+test "streamReaderToWriter over zstd decoder copies full body" {
+    const body = "a" ** 10_000;
+    const compressed = try buffered.compressZstd(testing.allocator, body);
+    defer testing.allocator.free(compressed);
+
+    var in: std.Io.Reader = .fixed(compressed);
+    const dbuf = try testing.allocator.alloc(u8, encoding.ContentEncoding.zstd.decoderBufferLen(TEST_WINDOW));
+    defer testing.allocator.free(dbuf);
+    var decoder: encoding.Decoder = .init(.zstd, &in, dbuf, TEST_WINDOW);
+    const decoded = decoder.reader();
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 4096);
+    defer out.deinit();
+
+    const result = try streamReaderToWriter(decoded, &out.writer, body.len * 4);
+    try testing.expectEqual(body.len, result);
+    try testing.expectEqualStrings(body, out.written());
+}
+
+test "streamReaderToWriter over gzip decoder rejects a genuinely oversized body" {
+    const body = "a" ** 10_000;
+    const compressed = try buffered.compressGzip(testing.allocator, body);
+    defer testing.allocator.free(compressed);
+
+    var in: std.Io.Reader = .fixed(compressed);
+    const dbuf = try testing.allocator.alloc(u8, encoding.ContentEncoding.gzip.decoderBufferLen(TEST_WINDOW));
+    defer testing.allocator.free(dbuf);
+    var decoder: encoding.Decoder = .init(.gzip, &in, dbuf, TEST_WINDOW);
+    const decoded = decoder.reader();
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 4096);
+    defer out.deinit();
+
+    // max_bytes below the decoded length: the bound must still be enforced
+    // through the decompressor path, returning BodyTooLarge rather than a
+    // silent truncation.
+    try testing.expectError(error.BodyTooLarge, streamReaderToWriter(decoded, &out.writer, 100));
 }
