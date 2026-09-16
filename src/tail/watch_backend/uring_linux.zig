@@ -242,7 +242,10 @@ const testing = std.testing;
 
 test "ensureDirectoryWatch does not leak when parent directory is missing" {
     if (comptime builtin.os.tag != .linux) return;
-    var u = try init(std.testing.allocator, std.Options.debug_io);
+    var u = init(std.testing.allocator, std.Options.debug_io) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
     defer deinit(&u);
 
     var tmp = testing.tmpDir(.{});
