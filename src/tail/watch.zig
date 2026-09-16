@@ -256,8 +256,16 @@ pub const Watcher = struct {
         // only grows via emitted appends, so the stored prefix hash predates any
         // truncation and maybeHandleContentRewrite is allowed to gate the reset
         // on the prefix comparison.
-        if (checkpoint_lane != null) {
-            if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
+        //
+        // Additionally, after resetting the in-memory offset we immediately
+        // update the lane's in-memory store so that applyCheckpointOffsetOne
+        // cannot resurrect the stale (higher) checkpoint value on the very next
+        // collect call before the async worker has drained the new offset.
+        if (checkpoint_lane) |lane| {
+            if (size < self.offsets.items[i]) {
+                self.offsets.items[i] = 0;
+                if (self.identities.items[i]) |id| lane.resetOffset(id, 0);
+            }
         }
         try self.maybeHandleContentRewrite(idx, size);
 
@@ -533,7 +541,7 @@ pub const Watcher = struct {
             // re-emit already-delivered bytes.  The checkpoint-lane reset to
             // 0 (which triggers a conservative at-least-once re-emit) is
             // handled earlier in processDirtyIndex.
-            if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
+            if (size < self.offsets.items[i]) self.offsets.items[i] = size;
             // The prefix is unchanged, but the identity fingerprint may have been
             // computed on a shorter file (e.g. after a partially written
             // copytruncate).  Refresh it so that ongoing checkpoints and a
@@ -829,7 +837,6 @@ test "watch public API: collect emits appended file bytes" {
     try w.collect(&events, .tail, null);
     try testing.expectEqual(@as(usize, 1), events.items.len);
 }
-
 
 // Open `name` in `dir` for read/write, returning the handle. Caller closes.
 fn openRw(io: std.Io, dir: std.Io.Dir, name: []const u8) !std.Io.File {
@@ -1209,4 +1216,3 @@ test "checkpoint resume after copytruncate emits full new content (no silent ski
     try testing.expectEqual(@as(u64, 0), events.items[0].start_offset);
     try testing.expectEqual(@as(u64, 8192), events.items[0].end_offset);
 }
-
