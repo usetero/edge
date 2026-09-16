@@ -996,6 +996,50 @@ test "DatadogLog - unwrappedAttribute returns null after deleteWrapped removes t
     try std.testing.expect(std.mem.indexOf(u8, output, "keep") != null);
 }
 
+test "DatadogLog - unwrappedAttribute returns null when an ancestor object key was deleted" {
+    // Regression for: deleteWrapped(["data","jsonPayload"]) followed by
+    // unwrappedAttribute(["data","jsonPayload","email"]) must return null, not
+    // the stale message_flat value.  Before the fix, navigateParent returned
+    // null when the parent object no longer contained "jsonPayload", and the
+    // code fell through to message_flat which still held the original value.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"email\":\"alice@example.com\"}}}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    const email_path = [_][]const u8{ "data", "jsonPayload", "email" };
+    const payload_path = [_][]const u8{ "data", "jsonPayload" };
+
+    // Prime the flat cache with a read.
+    try std.testing.expectEqualStrings(
+        "alice@example.com",
+        log.unwrappedAttribute(allocator, &email_path).?,
+    );
+
+    // Delete the ancestor object ("jsonPayload"), not the leaf directly.
+    try std.testing.expect(log.deleteWrapped(allocator, &payload_path));
+
+    // Reading through the now-absent ancestor must return null, not the stale
+    // flat entry for "data.jsonPayload.email".
+    try std.testing.expect(log.unwrappedAttribute(allocator, &email_path) == null);
+
+    // The forwarded record must not carry the removed subtree.
+    log.finalizeWrapped(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(log, .{}, &out.writer);
+    const output = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, output, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "jsonPayload") == null);
+}
+
 test "DatadogLog - unwrappedAttribute still resolves array-of-objects paths after an unrelated edit" {
     // Guard against an over-eager tree-first fix: the flattener reaches
     // string leaves inside array-of-objects (arrays don't extend the dotted

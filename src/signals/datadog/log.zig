@@ -517,10 +517,13 @@ pub const DatadogLog = struct {
     /// operate on): a present string leaf returns the live (possibly edited)
     /// value, a missing leaf returns null (a `deleteWrapped` removal must read
     /// as absent, not the stale flat), and a non-string leaf returns null.
-    /// When `navigateParent` fails or the parent isn't an object (an ancestor
-    /// is missing or an array that the flattener reaches but `navigateParent`
-    /// doesn't descend into), fall through to `message_flat`, which stays
-    /// authoritative for never-edited and array-flattened paths.
+    /// When an ancestor in the path is not an object (e.g. an array that the
+    /// flattener reaches but the object walker does not descend into), fall
+    /// through to `message_flat`, which stays authoritative for never-edited
+    /// and array-flattened paths.  When an ancestor is an object but a
+    /// segment key is absent — meaning a prior `deleteWrapped` or
+    /// `setWrapped` removed it — return null directly so a stale
+    /// `message_flat` entry cannot surface deleted data.
     pub fn unwrappedAttribute(
         self: *DatadogLog,
         allocator: std.mem.Allocator,
@@ -531,12 +534,38 @@ pub const DatadogLog = struct {
 
         // See the doc comment above: when the tree was edited this pass, the
         // live `message_tree` wins over the one-shot `message_flat` snapshot
-        // for paths it resolves through an object parent; otherwise defer.
+        // for object-ancestor paths.  Walk the ancestors manually so we can
+        // distinguish "key absent from object" (ancestor deleted → return null)
+        // from "ancestor is an array" (array-flattened path → defer to flat).
         if (self.message_dirty) {
             if (self.message_tree) |*parsed| {
-                const root = &parsed.value;
-                if (navigateParent(root, path)) |parent| {
-                    switch (parent.*) {
+                var current = &parsed.value;
+                // Walk all but the last segment (the ancestors).
+                var deferred_to_flat = false;
+                for (path[0 .. path.len - 1]) |segment| {
+                    switch (current.*) {
+                        .object => |*obj| {
+                            if (obj.getPtr(segment)) |child| {
+                                current = child;
+                            } else {
+                                // Segment is absent from an object ancestor: the
+                                // key was deleted or never written via setWrapped/
+                                // deleteWrapped.  Return null so the stale flat
+                                // snapshot does not surface removed data.
+                                return null;
+                            }
+                        },
+                        // Non-object ancestor (e.g. array): the path passes
+                        // through an array the flattener handles; defer to flat.
+                        else => {
+                            deferred_to_flat = true;
+                            break;
+                        },
+                    }
+                }
+                if (!deferred_to_flat) {
+                    // `current` is now the parent node.
+                    switch (current.*) {
                         .object => |*obj| {
                             if (obj.getPtr(path[path.len - 1])) |entry| switch (entry.*) {
                                 .string => |s| return s,
