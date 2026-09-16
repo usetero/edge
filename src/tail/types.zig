@@ -79,6 +79,7 @@ pub fn validateConfig(cfg: TailConfig) !void {
     if (cfg.write_buf == 0) return error.InvalidWriteBuffer;
     if (cfg.flush_interval_ms == 0) return error.InvalidFlushInterval;
     if (cfg.flush_line_threshold == 0) return error.InvalidFlushThreshold;
+    if (cfg.checkpoint_interval_ms == 0) return error.InvalidCheckpointInterval;
     if (cfg.checkpoint_sync_batch == 0) return error.InvalidCheckpointSyncBatch;
     if (cfg.checkpoint_snapshot_interval_ms == 0) return error.InvalidCheckpointSnapshotInterval;
 }
@@ -106,6 +107,24 @@ test "types public API: validateConfig rejects zero limits" {
     var cfg: TailConfig = .{};
     cfg.read_buf = 0;
     try testing.expectError(error.InvalidReadBuffer, validateConfig(cfg));
+}
+
+test "types public API: validateConfig rejects zero checkpoint cadences" {
+    const cases = [_]struct { field: []const u8, err: anyerror }{
+        .{ .field = "checkpoint_interval_ms", .err = error.InvalidCheckpointInterval },
+        .{ .field = "checkpoint_sync_batch", .err = error.InvalidCheckpointSyncBatch },
+        .{ .field = "checkpoint_snapshot_interval_ms", .err = error.InvalidCheckpointSnapshotInterval },
+    };
+    for (cases) |case| {
+        var cfg: TailConfig = .{};
+        if (std.mem.eql(u8, case.field, "checkpoint_interval_ms")) cfg.checkpoint_interval_ms = 0;
+        if (std.mem.eql(u8, case.field, "checkpoint_sync_batch")) cfg.checkpoint_sync_batch = 0;
+        if (std.mem.eql(u8, case.field, "checkpoint_snapshot_interval_ms")) cfg.checkpoint_snapshot_interval_ms = 0;
+        try testing.expectError(case.err, validateConfig(cfg));
+    }
+
+    // Default config (non-zero checkpoint cadences) must still validate.
+    try validateConfig(.{});
 }
 
 test "types public API: identity hash helpers are stable" {
