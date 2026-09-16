@@ -106,6 +106,9 @@ fn handleRequest(
     if (request.head.method == .GET and std.mem.eql(u8, requestPath(request), "/_edge/metrics")) {
         return execEdgeMetrics(env, arena_slot, request);
     }
+    if (request.head.method == .GET and std.mem.eql(u8, requestPath(request), "/_edge/policies")) {
+        return execEdgePolicies(env, arena_slot, request);
+    }
 
     const outcome = exec.planRequest(
         ctx,
@@ -138,6 +141,23 @@ fn execEdgeMetrics(env: *Env, arena_slot: u16, request: *std.http.Server.Request
     if (env.shared.metrics) |metrics| try metrics.writePrometheus(&out.writer);
     try request.respond(out.written(), .{
         .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; version=0.0.4" }},
+    });
+}
+
+/// Loaded policy snapshot, as on the httpz frontend. The bench harness polls
+/// this to know when a policy file has been picked up.
+fn execEdgePolicies(env: *Env, arena_slot: u16, request: *std.http.Server.Request) !void {
+    const arena = env.arenas.allocator(arena_slot);
+    const target = request.head.target;
+    const query = if (std.mem.findScalar(u8, target, '?')) |i| target[i + 1 ..] else "";
+    const json = std.mem.indexOf(u8, query, "format=json") != null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try exec.writePolicies(env.shared.registry, &out.writer, json);
+    try request.respond(out.written(), .{
+        .extra_headers = &.{.{
+            .name = "content-type",
+            .value = if (json) "application/json" else "text/plain; charset=utf-8",
+        }},
     });
 }
 
