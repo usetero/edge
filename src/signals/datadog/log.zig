@@ -521,7 +521,12 @@ pub const DatadogLog = struct {
                         .object => |*obj| {
                             if (obj.getPtr(path[path.len - 1])) |entry| switch (entry.*) {
                                 .string => |s| return s,
-                                else => return null,
+                                // Non-string leaf (array, object, number, …): the tree
+                                // value is not a scalar string, but `flattenValue` may
+                                // have stored a string from inside it (e.g. array
+                                // containing a string).  Fall through to `message_flat`
+                                // so those entries are not silently dropped.
+                                else => {},
                             } else return null;
                         },
                         // Parent isn't an object (e.g. an array the flattener
@@ -1643,6 +1648,50 @@ test "DatadogLog - unwrappedAttribute still resolves array-of-objects paths afte
         log.unwrappedAttribute(allocator, &arr_path).?,
     );
     // The edited sibling reflects the live tree value, not the stale flat.
+    try std.testing.expectEqualStrings(
+        "new",
+        log.unwrappedAttribute(allocator, &note_path).?,
+    );
+}
+
+test "DatadogLog - unwrappedAttribute falls through for array-string entries after an unrelated edit" {
+    // Guard the fix for the case where `items` is an array whose direct
+    // elements are strings (not objects).  `flattenValue` stores the first
+    // string element under the parent key ("items"), so `message_flat` has
+    // the value, but before the fix the tree-first branch returned null for
+    // the array leaf instead of falling through to `message_flat`.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"{\"items\":[\"secret\"],\"note\":\"orig\"}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    const items_path = [_][]const u8{"items"};
+    const note_path = [_][]const u8{"note"};
+
+    // Before any edit the flat is authoritative.
+    try std.testing.expectEqualStrings(
+        "secret",
+        log.unwrappedAttribute(allocator, &items_path).?,
+    );
+
+    // Dirty the tree with an unrelated edit.
+    try std.testing.expect(log.setWrapped(allocator, &note_path, "new"));
+
+    // The array-string leaf must still resolve via the flat fallback; before
+    // the fix the tree branch returned null for the array value and left the
+    // secret visible to a subsequent redact check.
+    try std.testing.expectEqualStrings(
+        "secret",
+        log.unwrappedAttribute(allocator, &items_path).?,
+    );
+    // The edited sibling reflects the live tree value.
     try std.testing.expectEqualStrings(
         "new",
         log.unwrappedAttribute(allocator, &note_path).?,
