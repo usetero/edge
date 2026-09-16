@@ -76,7 +76,13 @@ pub const Watcher = struct {
         }
         for (inputs) |p| try input_copy.append(allocator, try allocator.dupe(u8, p));
         const out_copy = try allocator.dupe(u8, output_path);
-        errdefer allocator.free(out_copy);
+        // `out_copy` needs no errdefer of its own: it is moved into
+        // `self.output_path` below by a non-errorable struct literal, after
+        // which `errdefer self.deinit()` owns its lifetime. There is no
+        // errorable window between this dupe and that errdefer registration, so
+        // a per-allocation errdefer would only double-free on the
+        // post-`self.deinit()` failure path (e.g. watcher backend registration
+        // errors out of `refreshPaths`).
 
         var self: Watcher = .{
             .allocator = allocator,
@@ -104,6 +110,12 @@ pub const Watcher = struct {
             .next_glob_refresh_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds(),
             .backend_state = .{ .poll = {} },
         };
+        // `self` now owns the backing of `input_copy`/`out_copy`. Detach the
+        // local so the input_copy errdefer above does not double-free what
+        // `self.deinit()` releases on a post-construction failure
+        // (initBackend/refreshPaths errors, incl. watcher backend registration
+        // failures that close a just-committed file handle).
+        input_copy = .empty;
         errdefer self.deinit();
 
         try self.initBackend();
@@ -398,7 +410,10 @@ pub const Watcher = struct {
             error.FileNotFound => return,
             else => return err,
         };
-        errdefer file.close(self.io);
+        errdefer {
+            file.close(self.io);
+            self.files.items[idx] = null;
+        }
 
         const st = try fstatHandle(file.handle);
         const size: u64 = st.size;
@@ -764,4 +779,76 @@ test "watch public API: collect emits appended file bytes" {
 
     try w.collect(&events, .tail, null);
     try testing.expectEqual(@as(usize, 1), events.items.len);
+}
+
+test "watch public API: init cleans up cleanly when backend registration fails after slot commit (no double-close)" {
+    // Regression test for the double-close defect: `openTracked` commits the
+    // file handle into `self.files.items[idx]` *before* the final
+    // `try self.backendTrackOpenFile(...)`. Its errdefer must close the file AND
+    // null the slot, otherwise `deinit`'s cleanup loop re-closes the already-
+    // closed handle (Debug: `unreachable` panic on `EBADF`).
+    //
+    // The failure is driven through the Linux io_uring watcher backend, whose
+    // `trackOpenFile` can return `error.OutOfMemory` from hashmap puts / the
+    // dir-path dupe *after* the slot is committed. The `.poll` backend's
+    // `trackOpenFile` is a no-op (never errors), and the macOS `kqueue` backend
+    // is gated to `.macos` (and exercised there via a `--x`-dir AccessDenied).
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Options.debug_io;
+    {
+        const f = try tmp.dir.createFile(io, "tail.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "seed\n");
+    }
+    const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
+    defer testing.allocator.free(abs);
+
+    // `total_poll` counts every allocation a successful `.poll` construct+destroy
+    // performs. `.poll`'s `initBackend` and `backendTrackOpenFile` are both
+    // no-ops and `uring_backend.init` performs zero *allocator* allocations
+    // (inotify/io_uring setup is syscalls/mmap), so the allocations in
+    // `[total_poll, total_uring)` are exactly the io_uring `backendTrackOpenFile`
+    // allocations — i.e. the ones that run *after* `openTracked` committed the
+    // file handle into `self.files.items[idx]`. Failing just those preserves the
+    // parallel-array consistency established by `appendTracked` and isolates the
+    // post-slot-commit failure window this bug lives in.
+    const total_poll: usize = blk: {
+        var probe = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const pa = probe.allocator();
+        var w = Watcher.init(pa, io, .poll, &.{abs}, "-", .tail, 1000, 50, 1000) catch return error.SkipZigTest;
+        w.deinit();
+        break :blk probe.alloc_index;
+    };
+    const total_uring: usize = blk: {
+        var probe = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const pa = probe.allocator();
+        var w = Watcher.init(pa, io, .uring, &.{abs}, "-", .tail, 1000, 50, 1000) catch return error.SkipZigTest;
+        w.deinit();
+        break :blk probe.alloc_index;
+    };
+    if (total_uring <= total_poll) return error.SkipZigTest; // no post-commit allocs to exercise
+
+    // For every post-commit `backendTrackOpenFile` allocation, `init` must
+    // either succeed (then deinit cleanly) or return a clean error — never
+    // panic. Without the fix, the failing `fail_index` leaves the file slot
+    // non-null after `openTracked`'s errdefer closed the handle, and `init`'s
+    // `errdefer self.deinit()` re-closes it, tripping `unreachable` in Debug.
+    // `total_uring` itself is the no-failure success case (deinit must be clean).
+    var fail_index: usize = total_poll;
+    while (fail_index <= total_uring) : (fail_index += 1) {
+        var st = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const fa = st.allocator();
+        if (Watcher.init(fa, io, .uring, &.{abs}, "-", .tail, 1000, 50, 1000)) |w| {
+            var watcher = w;
+            watcher.deinit();
+        } else |_| {
+            // Expected: clean error propagation; init's errdefer already ran deinit.
+        }
+    }
 }
