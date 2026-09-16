@@ -231,6 +231,18 @@ pub const Runtime = struct {
             },
         }
 
+        // If startup fails after the signal waiter is installed (i.e. before
+        // the lifecycle tasks are running and awaited), shut down the lifecycle
+        // and tear down the waiter before propagating the error so that no
+        // background threads are left pointing at stack-local state and the
+        // signal mask is restored.
+        var startup_done = false;
+        errdefer if (!startup_done) {
+            lifecycle.requestShutdown(self.io);
+            lifecycle.shutdown(self.io);
+            if (signal_waiter) |waiter| teardownSignalWaiter(waiter, &shutdown_waiter);
+        };
+
         try checkpoint.start(&lifecycle);
 
         var loop: PollLoop = .{
@@ -245,6 +257,7 @@ pub const Runtime = struct {
             .lifecycle = &lifecycle,
         };
         try lifecycle.spawn(self.io, PollLoop.run, .{&loop});
+        startup_done = true;
 
         lifecycle.awaitShutdown(self.io) catch |err| switch (err) {
             error.Canceled => {},
