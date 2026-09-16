@@ -106,8 +106,13 @@ any customer whose logger nests JSON inside `message`, which is common.
 `src/signals/datadog/log.zig:407` is the only production site; the other `Parser = .init` uses in
 that file are tests.
 
-**Start here.** It is bounded, and it directly attacks the per-document setup
-cost that is the likely reason the hot path avoids zimdjson at all.
+**Measured afterwards: worth nothing.** 12.564 ms against a 12.559 ms
+baseline. `parseFromSlice` is 0.20% of the profile because zimdjson is lazy —
+the cost is in navigation, not construction, so there is no setup to amortize.
+This section originally said "start here"; that was wrong, and the measurement
+is left in place as the correction. The change is still carried, because
+building a structural index per record is the wrong shape and the borrowed
+parser is what makes item 2 cheap — but on its own it earns nothing.
 
 ### 2. Per-field search versus one structural pass
 
@@ -120,9 +125,20 @@ SIMD path barely engages and per-call overhead dominates. That is roughly
 zimdjson's `indexer.zig` does one pass per document, producing bitmasks of
 every structural character, after which field navigation is bit manipulation.
 
-**Estimated:** a 2x improvement on the ~33% scan slice is worth ~16% overall,
-which beats the parallelism ceiling with no threading and no ordering problem.
-Not measured. Test it before building it.
+**Measured afterwards, on a different target than this section proposed.** The
+win was not in `FieldWalker`'s scanning at all. On GCP-shaped logs the real
+cost is `ensureUnwrapped`, 68.5% inclusive, of which `flattenValue` is 58.0%:
+answering "does the body match" materialized every string leaf of the wrapped
+document into a hash map. Navigating straight to `data.jsonPayload` and
+reading only its immediate fields gives:
+
+| | latency | throughput |
+|---|---|---|
+| baseline | 12.56 ms | 1,003 req/s |
+| direct lookup | 8.80 ms | 1,415 req/s |
+
+−30% latency, +41% throughput. The `FieldWalker` scanning shape described
+above remains untested.
 
 ### 3. Index the whole batch at once — rejected
 
@@ -143,6 +159,16 @@ measured decision to accept raw control bytes because rejecting them costs
 mode and a `wrapped_log.json` payload wired in at `build.zig:283`. That is the
 right harness for items 1 and 2: it isolates record evaluation from HTTP,
 gzip, and the upstream.
+
+## What the measurements changed
+
+Both items in this section were written before they were measured, and both
+guesses were wrong in instructive ways. Item 1 targeted a setup cost that a
+lazy parser does not have. Item 2 aimed at the per-field scanning when the
+real cost was eager materialization one layer up. The profile pointed at
+`flattenValue` in both cases; the prose did not read it closely enough.
+
+Profile first, and read inclusive time before picking a target.
 
 ## Loose end
 
