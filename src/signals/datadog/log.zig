@@ -501,6 +501,26 @@ pub const DatadogLog = struct {
     /// Attribute fallback: look up `path` (joined with '.') inside the
     /// unwrapped JSON message. Returns null when the message is not JSON or
     /// the path is absent.
+    ///
+    /// When the wrapper tree has been edited in this transform pass
+    /// (`message_dirty`), consult the live `message_tree` first so a prior
+    /// `setWrapped`/`deleteWrapped` wins over the one-shot `message_flat`
+    /// snapshot. `ensureUnwrapped` builds `message_flat` from the ORIGINAL
+    /// `message` exactly once and never refreshes it, so without this check
+    /// every wrapped-attribute read after the first write observes the
+    /// pre-transform value — a redaction policy with more than one regex
+    /// `redact` on the same path would lose every earlier rule's edit and
+    /// leak the scrubbed content back into the forwarded record.
+    ///
+    /// The tree is only authoritative when it actually resolves the path
+    /// through an object parent (the shape `setWrapped`/`deleteWrapped`
+    /// operate on): a present string leaf returns the live (possibly edited)
+    /// value, a missing leaf returns null (a `deleteWrapped` removal must read
+    /// as absent, not the stale flat), and a non-string leaf returns null.
+    /// When `navigateParent` fails or the parent isn't an object (an ancestor
+    /// is missing or an array that the flattener reaches but `navigateParent`
+    /// doesn't descend into), fall through to `message_flat`, which stays
+    /// authoritative for never-edited and array-flattened paths.
     pub fn unwrappedAttribute(
         self: *DatadogLog,
         allocator: std.mem.Allocator,
@@ -508,6 +528,29 @@ pub const DatadogLog = struct {
     ) ?[]const u8 {
         if (path.len == 0) return null;
         self.ensureUnwrapped(allocator);
+
+        // See the doc comment above: when the tree was edited this pass, the
+        // live `message_tree` wins over the one-shot `message_flat` snapshot
+        // for paths it resolves through an object parent; otherwise defer.
+        if (self.message_dirty) {
+            if (self.message_tree) |*parsed| {
+                const root = &parsed.value;
+                if (navigateParent(root, path)) |parent| {
+                    switch (parent.*) {
+                        .object => |*obj| {
+                            if (obj.getPtr(path[path.len - 1])) |entry| switch (entry.*) {
+                                .string => |s| return s,
+                                else => return null,
+                            } else return null;
+                        },
+                        // Parent isn't an object (e.g. an array the flattener
+                        // reaches via array-of-objects); defer to `message_flat`.
+                        else => {},
+                    }
+                }
+            }
+        }
+
         if (self.message_flat.count() == 0) return null;
 
         var buf: [512]u8 = undefined;
