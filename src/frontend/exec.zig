@@ -597,3 +597,42 @@ test "contentEncodingName round-trips through the codec layer" {
         encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.deflate)),
     );
 }
+
+test "collectUpstreamResponseHeaders strips hop-by-hop Connection and transport headers" {
+    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
+        "content-type: application/json\r\n" ++
+        "connection: close\r\n" ++
+        "x-foo: bar\r\n" ++
+        "content-length: 42\r\n" ++
+        "transfer-encoding: chunked\r\n\r\n";
+
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+    var upstream_res: std.http.Client.Response = .{ .request = undefined, .head = head };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var buffer: [16]std.http.Header = undefined;
+    const relayed = try collectUpstreamResponseHeaders(&upstream_res, arena.allocator(), &buffer);
+
+    // Exactly the two end-to-end headers survive; hop-by-hop Connection and
+    // transport-owned content-length/transfer-encoding are dropped.
+    try testing.expectEqual(@as(usize, 2), relayed.len);
+
+    var saw_content_type = false;
+    var saw_x_foo = false;
+    for (relayed) |header| {
+        try testing.expect(!upstream_mod.shouldSkipResponseHeader(header.name));
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            try testing.expectEqualStrings("application/json", header.value);
+            saw_content_type = true;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-foo")) {
+            try testing.expectEqualStrings("bar", header.value);
+            saw_x_foo = true;
+        } else {
+            return error.UnexpectedRelayedHeader;
+        }
+    }
+    try testing.expect(saw_content_type);
+    try testing.expect(saw_x_foo);
+}
