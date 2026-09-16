@@ -181,6 +181,7 @@ pub const Scheduler = struct {
         var processed: usize = 0;
         for (self.ops.items) |op| {
             if (op.result < 0) {
+                try framer.selectStream(common.eventKey(op.event));
                 try framer.readRange(
                     self.io,
                     op.event.file,
@@ -195,6 +196,7 @@ pub const Scheduler = struct {
             }
             if (op.result == 0) continue;
 
+            try framer.selectStream(common.eventKey(op.event));
             const n: usize = @intCast(@min(@as(usize, @intCast(op.result)), op.submitted_len));
             const buf = self.scratch.items[op.buf_off .. op.buf_off + n];
             try framer.ingestChunk(buf, writer, filter_ctx, filter_fn);
