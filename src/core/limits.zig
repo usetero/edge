@@ -166,9 +166,7 @@ pub const Limits = struct {
     /// Pages are reserved up front but only consume RSS once touched, so
     /// actual residency tracks concurrent connection load.
     pub fn perConnBytes(self: Limits) usize {
-        return self.recv_buf + self.send_buf + self.upstream_write_buf +
-            self.record_scratch + self.decode_buf + self.encode_buf +
-            self.body_buf + self.chunk_buf;
+        return self.recv_buf + self.send_buf + self.body_buf;
     }
 
     /// Closed-form steady-state budget for the stdio data plane. Excludes cold,
@@ -193,16 +191,15 @@ test "Limits budget formula is locked" {
 
     // Hand-computed with the default 1 MiB max_body_size:
     //   zstd window = clamp(1M, 256K, 8M)        = 1024 KiB
-    //   per conn = 20K+20K+20K (io bufs)
-    //            + 256K (record scratch)
-    //            + 1024K+192K (decode) + 192K (encode)
-    //            + 8K (body) + 4K (chunk)         = 1736 KiB
-    //   steady state = 256 x (1736K + 16K arena) = 438.0 MiB reserved
+    //   per conn = 20K+20K (socket bufs) + 8K (body staging) = 48 KiB
+    //   steady state = 256 x (48K + 16K arena)  = 16 MiB reserved
+    // Codec, record and upstream scratch are per thread, not per connection
+    // (frontend/thread_bufs.zig), so they are outside this budget.
     // Any change to a buffer constant must show up as a diff in this test.
     try std.testing.expectEqual(@as(usize, 256), limits.max_connections);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.zstd_window_len);
-    try std.testing.expectEqual(@as(usize, 1736 * 1024), limits.perConnBytes());
-    try std.testing.expectEqual(@as(usize, 256 * 1752 * 1024), limits.steadyStateBytes());
+    try std.testing.expectEqual(@as(usize, 48 * 1024), limits.perConnBytes());
+    try std.testing.expectEqual(@as(usize, 256 * 64 * 1024), limits.steadyStateBytes());
     try std.testing.expectEqual(@as(u32, 1024 * 1024), limits.max_body_size);
     // max_decoded_bytes is decoupled from max_body_size: agents compress, so a
     // 1 MiB raw body routinely decodes to several MiB.

@@ -6,13 +6,15 @@
 //!
 //! Owns the frontend-specific per-connection state — the conn slab and the
 //! arena pool (PLAN-FRONTEND-SWAP.md §2) — so composing a different frontend
-//! never pays this one's memory reservation.
+//! never pays this one's memory reservation. Body-sized scratch and the
+//! upstream deadline watchdog are shared with httpz (../thread_bufs.zig).
 const std = @import("std");
 const conn_mod = @import("conn.zig");
 const exec = @import("../exec.zig");
 const lifecycle_mod = @import("../../core/lifecycle.zig");
 const conn_slab_mod = @import("../../core/conn_slab.zig");
 const arena_pool_mod = @import("../../core/arena_pool.zig");
+const thread_bufs = @import("../thread_bufs.zig");
 
 const log = std.log.scoped(.http_server);
 
@@ -59,21 +61,26 @@ pub const HttpServer = struct {
         self.listener.deinit(self.ctx.io);
         self.arenas.deinit(self.ctx.gpa);
         self.slab.deinit(self.ctx.gpa);
+        thread_bufs.freeAll(self.ctx.io, self.ctx.gpa);
         self.* = undefined;
     }
 
-    /// No-op: Lifecycle cancellation already unblocks the accept loop
-    /// (accept() returns error.Canceled). Part of the frontend interface
-    /// shape shared with the httpz frontend, whose listen loop is NOT
-    /// Io-cancelable and needs this hook.
+    /// Lifecycle cancellation already unblocks the accept loop (accept()
+    /// returns error.Canceled); this only cuts every in-flight upstream
+    /// exchange so connection tasks stop promptly. The httpz frontend, whose
+    /// listen loop is NOT Io-cancelable, does more here.
     pub fn stopAccepting(self: *HttpServer) void {
-        _ = self;
+        thread_bufs.expireTrackedUpstreams(self.ctx, true);
     }
 
     /// The accept loop; itself spawned into the lifecycle group, so
     /// cancellation lands here as error.Canceled out of accept().
     pub fn run(self: *HttpServer) std.Io.Cancelable!void {
         const io = self.ctx.io;
+        self.lifecycle.spawn(io, watchUpstreamDeadlines, .{ self.ctx, self.lifecycle }) catch {
+            self.lifecycle.requestShutdown(io);
+            return;
+        };
         while (!self.lifecycle.isShuttingDown()) {
             const stream = self.listener.accept(io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -96,6 +103,13 @@ pub const HttpServer = struct {
         }
     }
 };
+
+fn watchUpstreamDeadlines(ctx: *exec.SharedCtx, lifecycle: *lifecycle_mod.Lifecycle) std.Io.Cancelable!void {
+    while (!lifecycle.isShuttingDown()) {
+        try ctx.io.sleep(.fromMilliseconds(thread_bufs.watchdog_interval_ms), .awake);
+        thread_bufs.expireTrackedUpstreams(ctx, false);
+    }
+}
 
 fn shedConnection(io: std.Io, stream: std.Io.net.Stream) void {
     defer stream.close(io);

@@ -6,11 +6,11 @@
 //! limits, and the per-request `handle` → `dispatch` that turns a routed
 //! outcome into a call on one of the sibling files.
 //!
-//!   paths.zig       the four request executors (raw forward, streamed
+//!   ../paths.zig       the four request executors (raw forward, streamed
 //!                   pipeline, buffered transform, filtered scrape)
-//!   exchange.zig    the upstream leg: dial, send, receive, relay, retry
-//!   thread_bufs.zig per-thread scratch and the upstream deadline watchdog
-//!   endpoints.zig   /_edge/* observability endpoints
+//!   ../exchange.zig    the upstream leg: dial, send, receive, relay, retry
+//!   ../thread_bufs.zig per-thread scratch and the upstream deadline watchdog
+//!   ../endpoints.zig   /_edge/* observability endpoints
 //!
 //! Bodies at or above the 64 KiB pool buffer arrive unread and stream when
 //! no policy needs them; smaller ones arrive buffered. Both cases are owned
@@ -21,11 +21,107 @@ const httpz = @import("httpz");
 const exec = @import("../exec.zig");
 const runtime_metrics = @import("../../runtime/runtime_metrics.zig");
 const limits_mod = @import("../../core/limits.zig");
+const service_mod = @import("../../service/service.zig");
 const lifecycle_mod = @import("../../core/lifecycle.zig");
-const exchange = @import("exchange.zig");
-const paths = @import("paths.zig");
-const endpoints = @import("endpoints.zig");
-const thread_bufs = @import("thread_bufs.zig");
+const exchange = @import("../exchange.zig");
+const paths = @import("../paths.zig");
+const endpoints = @import("../endpoints.zig");
+const thread_bufs = @import("../thread_bufs.zig");
+
+const Inbound = exchange.Inbound;
+const InboundBody = paths.InboundBody;
+
+/// Per-read timeout for pulling a lazy body off the client socket. This is
+/// SO_RCVTIMEO, so it bounds one read, not the transfer; `DeadlineReader`
+/// bounds the transfer.
+const lazy_read_timeout_ms: usize = limits_mod.REQUEST_TIMEOUT_SECONDS * 1000;
+
+/// Whole-body deadline for a lazy inbound body.
+const inbound_body_timeout_ns: i128 = @as(i128, limits_mod.REQUEST_TIMEOUT_SECONDS) * std.time.ns_per_s;
+
+/// Absolute deadline over a lazy body read.
+///
+/// `req.reader(ms)` sets SO_RCVTIMEO, which restarts on every read, so a
+/// client that sends one byte just inside the timeout holds its handler
+/// thread for as long as it likes. A few dozen such clients take the whole
+/// pool and the server stops answering, health checks included, which on ECS
+/// or Kubernetes gets the container replaced. This wraps the httpz reader and
+/// fails the transfer once the deadline passes.
+pub const DeadlineReader = struct {
+    interface: std.Io.Reader,
+    inner: *std.Io.Reader,
+    io: std.Io,
+    deadline_ns: i128,
+    /// Set when the deadline fired, so the handler closes the connection
+    /// instead of leaving an undrained body on it.
+    expired: bool = false,
+
+    pub fn init(io: std.Io, inner: *std.Io.Reader) DeadlineReader {
+        return .{
+            .interface = .{
+                .end = 0,
+                .seek = 0,
+                .buffer = &.{},
+                .vtable = &.{ .stream = DeadlineReader.stream },
+            },
+            .inner = inner,
+            .io = io,
+            .deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() + inbound_body_timeout_ns,
+        };
+    }
+
+    fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *DeadlineReader = @alignCast(@fieldParentPtr("interface", io_r));
+        if (std.Io.Timestamp.now(self.io, .awake).toNanoseconds() > self.deadline_ns) {
+            self.expired = true;
+            return error.ReadFailed;
+        }
+        return self.inner.stream(w, limit);
+    }
+};
+
+/// The response side of the sink contract (exchange.zig) over an httpz
+/// response. httpz commits status and headers when the handler returns, so
+/// `end` has nothing to do.
+pub const Sink = struct {
+    res: *httpz.Response,
+    pub fn begin(self: Sink, status: u16, headers: []const std.http.Header) !*std.Io.Writer {
+        self.res.status = status;
+        for (headers) |h| self.res.header(h.name, h.value);
+        return self.res.writer();
+    }
+    pub fn end(_: Sink) !void {}
+};
+
+/// Lift the request into the frontend-neutral shape.
+fn inboundOf(req: *httpz.Request, arena: std.mem.Allocator) !Inbound {
+    return .{
+        .method = stdMethod(req.method) orelse return error.UnsupportedMethod,
+        .target = req.url.raw,
+        .path = req.url.path,
+        .headers = try exchange.collectForwardHeaders(arena, req.headers.iterator()),
+        .arena = arena,
+    };
+}
+
+/// Classify the body and enforce the cap httpz skips for lazy reads: with
+/// lazy_read_size set, httpz does not check max_body_size (request.zig), and
+/// `req.body()` on a lazy request holds only the prefix that arrived with the
+/// headers. `lazy_reader` must outlive the returned body; it is only
+/// initialized when the body is lazy.
+fn inboundBodyOf(
+    io: std.Io,
+    req: *httpz.Request,
+    limits: limits_mod.Limits,
+    lazy_reader: *httpz.Request.Reader,
+    bounded: *DeadlineReader,
+) !InboundBody {
+    if (req.unread_body == 0) return .{ .bytes = req.body() orelse "" };
+    if (req.body_len > limits.max_body_size) return error.BodyTooLarge;
+    lazy_reader.* = try req.reader(lazy_read_timeout_ms);
+    bounded.* = .init(io, &lazy_reader.interface);
+    return .{ .lazy = .{ .reader = &bounded.interface, .len = req.body_len } };
+}
 
 const log = std.log.scoped(.httpz_server);
 
@@ -145,7 +241,7 @@ pub const Handler = struct {
         }
         const ctx = self.ctx;
         const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
-        const method = exchange.serviceMethod(req.method);
+        const method = serviceMethod(req.method);
         const known_path = exec.classifyKnownPath(req.url.path, method);
         if (ctx.metrics) |metrics| {
             metrics.recordRequest(exec.methodLabel(method), known_path);
@@ -160,12 +256,8 @@ pub const Handler = struct {
             });
             res.clearWriter();
             res.headers.reset();
-            res.status = errorStatus(err);
+            res.status = exchange.errorStatus(err);
             res.body = "";
-            // The body is part-read, so the connection cannot be reused: httpz
-            // would drain the remainder, which is the same unbounded wait we
-            // just escaped.
-            if (err == error.InboundBodyTimeout) res.keepalive = false;
             if (ctx.metrics) |metrics| {
                 metrics.recordRequestError(known_path, .uncaught);
             }
@@ -188,12 +280,17 @@ pub const Handler = struct {
 
     fn dispatch(self: *Handler, req: *httpz.Request, res: *httpz.Response) !void {
         const ctx = self.ctx;
-        const method = exchange.serviceMethod(req.method);
+        const method = serviceMethod(req.method);
         const path = req.url.path;
 
-        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) return endpoints.metrics(ctx, res);
-
-        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) return endpoints.policies(ctx, req, res);
+        var sink: Sink = .{ .res = res };
+        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
+            return endpoints.metrics(ctx, &sink, &httpz.writeMetrics);
+        }
+        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) {
+            const json = std.mem.eql(u8, (try req.query()).get("format") orelse "", "json");
+            return endpoints.policies(ctx, &sink, json);
+        }
 
         if (req.method == .GET and std.mem.startsWith(u8, path, "/_edge/tap/")) {
             const stage: exec.TapState.Stage = if (std.mem.eql(u8, path, "/_edge/tap/pre"))
@@ -204,7 +301,8 @@ pub const Handler = struct {
                 res.status = 404;
                 return;
             };
-            return endpoints.recordTap(ctx, req, res, stage);
+            const n: u32 = if ((try req.query()).get("n")) |raw| std.fmt.parseInt(u32, raw, 10) catch 50 else 50;
+            return endpoints.recordTap(ctx, &sink, stage, n);
         }
 
         const outcome = exec.planRequest(
@@ -218,28 +316,62 @@ pub const Handler = struct {
             res.body = "";
             return;
         };
-        switch (outcome) {
-            .respond => |static| {
-                res.status = static.status;
-                res.header("content-type", static.content_type);
-                res.body = static.body;
-            },
-            .forward_raw => |fwd| try paths.execForwardRaw(ctx, req, res, fwd),
-            .pipe_stream => |pipe| try paths.execPipeStream(ctx, req, res, pipe),
-            .pipe_buffered => |pipe| try paths.execPipeBuffered(ctx, req, res, pipe),
-            .fetch_filtered => |fetch| try paths.execFetchFiltered(ctx, req, res, fetch),
+        if (outcome == .respond) {
+            const static = outcome.respond;
+            res.status = static.status;
+            res.header("content-type", static.content_type);
+            res.body = static.body;
+            return;
         }
+        const in = try inboundOf(req, res.arena);
+        var lazy_reader: httpz.Request.Reader = undefined;
+        var bounded: DeadlineReader = undefined;
+        const body = try inboundBodyOf(ctx.io, req, ctx.limits, &lazy_reader, &bounded);
+        const served = switch (outcome) {
+            .respond => unreachable,
+            .forward_raw => |fwd| paths.execForwardRaw(ctx, in, &sink, body, fwd),
+            .pipe_stream => |pipe| paths.execPipeStream(ctx, in, &sink, body, pipe),
+            .pipe_buffered => |pipe| paths.execPipeBuffered(ctx, in, &sink, body, pipe),
+            .fetch_filtered => |fetch| paths.execFetchFiltered(ctx, in, &sink, body, fetch),
+        };
+        served catch |err| {
+            // The shared path reports a stalled read as a generic read
+            // failure. Only this frontend knows the deadline fired, so name it
+            // here, and close the connection: the body is part-read, and httpz
+            // would drain the remainder — the same unbounded wait again.
+            if (body == .lazy and bounded.expired) {
+                res.keepalive = false;
+                return error.InboundBodyTimeout;
+            }
+            return err;
+        };
     }
 };
 
-fn errorStatus(err: anyerror) u16 {
-    return switch (err) {
-        error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
-        error.InboundBodyTimeout => 408,
-        error.InvalidRequestBody => 400,
-        error.UpstreamTimeout => 504,
-        error.OutOfMemory, error.WriteFailed => 503,
-        else => 502,
+pub fn serviceMethod(method: httpz.Method) service_mod.HttpMethod {
+    return switch (method) {
+        .GET => .GET,
+        .POST => .POST,
+        .PUT => .PUT,
+        .DELETE => .DELETE,
+        .PATCH => .PATCH,
+        .HEAD => .HEAD,
+        .OPTIONS => .OPTIONS,
+        .CONNECT, .OTHER => .OTHER,
+    };
+}
+
+fn stdMethod(method: httpz.Method) ?std.http.Method {
+    return switch (method) {
+        .GET => .GET,
+        .POST => .POST,
+        .PUT => .PUT,
+        .DELETE => .DELETE,
+        .PATCH => .PATCH,
+        .HEAD => .HEAD,
+        .OPTIONS => .OPTIONS,
+        .CONNECT => .CONNECT,
+        .OTHER => null,
     };
 }
 
@@ -298,4 +430,11 @@ test "more workers than connections cannot over-admit" {
 
     const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
     try testing.expectEqual(@as(usize, 1), (config.workers.max_conn orelse 0) * config.workerCount());
+}
+
+test "httpz method maps onto service and std methods" {
+    try testing.expectEqual(service_mod.HttpMethod.POST, serviceMethod(.POST));
+    try testing.expectEqual(service_mod.HttpMethod.OTHER, serviceMethod(.CONNECT));
+    try testing.expectEqual(@as(?std.http.Method, .GET), stdMethod(.GET));
+    try testing.expectEqual(@as(?std.http.Method, null), stdMethod(.OTHER));
 }

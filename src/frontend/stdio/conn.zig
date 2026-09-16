@@ -4,14 +4,17 @@
 //! concurrency model is whatever Io implementation the composition root
 //! selected.
 //!
-//! Transport glue only: body acquisition, response writing, and slab buffer
-//! plumbing live here; routing, planning, and all policy/transform logic is
-//! in frontend/exec.zig, shared with the httpz frontend
-//! (PLAN-FRONTEND-SWAP.md §3).
+//! Transport glue only: it lifts a std.http.Server request into the
+//! frontend-neutral `exchange.Inbound` + `paths.InboundBody`, and answers
+//! through a `Sink` over `respondStreaming`. Routing, planning, the upstream
+//! leg and every policy path are shared with the httpz frontend
+//! (../paths.zig, ../exchange.zig, ../endpoints.zig).
 //!
-//! All hot-path memory comes from the connection's slab regions; the only
-//! per-request allocations are cold (upstream URL string, duped headers,
-//! record transforms) and come from reset-retained arenas.
+//! Per-connection memory is the slab's socket and staging buffers plus a
+//! reset-retained arena for cold per-request data (duped head strings,
+//! transforms). Body-sized scratch is per thread (../thread_bufs.zig): a
+//! connection task runs to completion on one pool thread under the Threaded
+//! Io, so thread-local scratch is per concurrent connection here too.
 const std = @import("std");
 
 const exec = @import("../exec.zig");
@@ -20,12 +23,22 @@ const upstream_mod = @import("../upstream.zig");
 const pipeline_mod = @import("../../pipeline/pipeline.zig");
 const conn_slab_mod = @import("../../core/conn_slab.zig");
 const arena_pool_mod = @import("../../core/arena_pool.zig");
-const prom = @import("../../signals/prometheus/root.zig");
+const limits_mod = @import("../../core/limits.zig");
+const runtime_metrics = @import("../../runtime/runtime_metrics.zig");
+const exchange = @import("../exchange.zig");
+const paths = @import("../paths.zig");
+const endpoints = @import("../endpoints.zig");
+
+const Inbound = exchange.Inbound;
+const InboundBody = paths.InboundBody;
 
 const log = std.log.scoped(.conn);
 
 // Named event payloads: the type name is the telemetry event name.
-const PipelineAborted = struct { err: []const u8 };
+/// A request threw out of dispatch and was mapped to a bounded error response.
+const RequestFailed = struct { method: []const u8, path: []const u8, err: []const u8 };
+/// Per-request trace at debug level.
+const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 
 /// Per-connection environment: the frontend-neutral shared context plus the
 /// stdio frontend's own state (slab slot buffers, arena pool).
@@ -33,6 +46,33 @@ const Env = struct {
     shared: *exec.SharedCtx,
     slab: *conn_slab_mod.ConnSlab,
     arenas: *arena_pool_mod.ArenaPool,
+};
+
+/// The response side of the sink contract (exchange.zig) over a
+/// std.http.Server request. `begin` opens a streaming response; `end`
+/// terminates and flushes it. `status` is 0 until `begin` runs, which is how
+/// the error path knows whether anything is on the wire yet.
+pub const Sink = struct {
+    request: *std.http.Server.Request,
+    /// Staging for the response BodyWriter. The request body is fully
+    /// consumed before `begin`, so its slab region is reused here.
+    buffer: []u8,
+    body: ?std.http.BodyWriter = null,
+    status: u16 = 0,
+
+    pub fn begin(self: *Sink, status: u16, headers: []const std.http.Header) !*std.Io.Writer {
+        self.status = status;
+        self.body = try self.request.respondStreaming(self.buffer, .{
+            .respond_options = .{ .status = @enumFromInt(status), .extra_headers = headers },
+        });
+        return &self.body.?.writer;
+    }
+
+    pub fn end(self: *Sink) !void {
+        const body = &(self.body orelse return);
+        try body.end();
+        try body.flush();
+    }
 };
 
 /// Entry point spawned via Lifecycle.spawn. Only error.Canceled escapes;
@@ -82,6 +122,9 @@ pub fn serveConnection(
     }
 }
 
+/// One request: metrics bookkeeping around `dispatch`, and the bounded error
+/// response when dispatch throws before anything reached the wire. Returns
+/// the error afterwards so the caller closes the connection.
 fn handleRequest(
     env: *Env,
     conn_id: conn_slab_mod.ConnId,
@@ -89,65 +132,171 @@ fn handleRequest(
     request: *std.http.Server.Request,
 ) !void {
     const ctx = env.shared;
+    const arena = env.arenas.allocator(arena_slot);
     const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+
+    // Head strings die when the body reader is created; the target must
+    // outlive that for the upstream leg, logs and metrics.
+    const target = try arena.dupe(u8, request.head.target);
+    const path = pathOf(target);
     const method = service_mod.HttpMethod.fromStd(request.head.method);
-    const known_path = exec.classifyKnownPath(requestPath(request), method);
+    const known_path = exec.classifyKnownPath(path, method);
     if (ctx.metrics) |metrics| {
         metrics.recordRequest(exec.methodLabel(method), known_path);
     }
-    defer if (ctx.metrics) |metrics| {
-        const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
-        const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-        metrics.recordRequestDuration(known_path, elapsed_s);
+
+    var sink: Sink = .{ .request = request, .buffer = env.slab.bodyBuf(conn_id) };
+    var failed: ?anyerror = null;
+    dispatch(env, conn_id, arena, request, target, &sink) catch |err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.err(RequestFailed{
+            .method = @tagName(request.head.method),
+            .path = path,
+            .err = @errorName(err),
+        });
+        if (ctx.metrics) |metrics| {
+            metrics.recordRequestError(known_path, .uncaught);
+        }
+        failed = err;
+        if (sink.status == 0) {
+            sink.status = exchange.errorStatus(err);
+            request.respond("", .{
+                .status = @enumFromInt(sink.status),
+                .keep_alive = false,
+            }) catch |respond_err| {
+                log.debug("error response failed: {s}", .{@errorName(respond_err)});
+            };
+        }
     };
 
-    // Internal observability endpoint, checked before routing — parity with
-    // the old proxyHandler's /_edge/metrics short-circuit.
-    if (request.head.method == .GET and std.mem.eql(u8, requestPath(request), "/_edge/metrics")) {
-        return execEdgeMetrics(env, arena_slot, request);
+    const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    if (ctx.metrics) |metrics| {
+        metrics.recordRequestDuration(known_path, elapsed_s);
+        metrics.recordResponse(known_path, runtime_metrics.statusClass(sink.status));
+    }
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    ctx.bus.debug(RequestCompleted{
+        .method = @tagName(request.head.method),
+        .path = path,
+        .status = sink.status,
+        .duration_ms = elapsed_s * std.time.ms_per_s,
+    });
+    if (failed) |err| return err;
+}
+
+fn dispatch(
+    env: *Env,
+    conn_id: conn_slab_mod.ConnId,
+    arena: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    target: []const u8,
+    sink: *Sink,
+) !void {
+    const ctx = env.shared;
+    const path = pathOf(target);
+    const method = service_mod.HttpMethod.fromStd(request.head.method);
+
+    if (request.head.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
+        // std.http.Server keeps no counters of its own.
+        return endpoints.metrics(ctx, sink, null);
+    }
+    if (request.head.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) {
+        const json = std.mem.eql(u8, queryParam(target, "format") orelse "", "json");
+        return endpoints.policies(ctx, sink, json);
+    }
+    if (request.head.method == .GET and std.mem.startsWith(u8, path, "/_edge/tap/")) {
+        const stage: exec.TapState.Stage = if (std.mem.eql(u8, path, "/_edge/tap/pre"))
+            .pre
+        else if (std.mem.eql(u8, path, "/_edge/tap/post"))
+            .post
+        else {
+            sink.status = 404;
+            return request.respond("", .{ .status = .not_found });
+        };
+        const n: u32 = if (queryParam(target, "n")) |raw| std.fmt.parseInt(u32, raw, 10) catch 50 else 50;
+        return endpoints.recordTap(ctx, sink, stage, n);
     }
 
     const outcome = exec.planRequest(
         ctx,
         method,
-        requestPath(request),
+        path,
         request.head.content_type orelse "",
         exec.contentEncodingName(request.head.transfer_compression),
     ) orelse {
-        try request.respond("", .{ .status = .not_found });
-        return;
+        sink.status = 404;
+        return request.respond("", .{ .status = .not_found });
     };
+    if (outcome == .respond) {
+        const static = outcome.respond;
+        sink.status = static.status;
+        return request.respond(static.body, .{
+            .status = @enumFromInt(static.status),
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = static.content_type },
+            },
+        });
+    }
+
+    const headers_buf = try arena.alloc(std.http.Header, 64);
+    const in: Inbound = .{
+        .method = request.head.method,
+        .target = target,
+        .path = path,
+        .headers = try collectRequestHeaders(request, arena, headers_buf),
+        .arena = arena,
+    };
+    const body = try inboundBodyOf(request, ctx.limits, env.slab.bodyBuf(conn_id), arena);
     switch (outcome) {
-        .respond => |static| try execRespond(request, static),
-        .forward_raw => |fwd| try execForwardRaw(env, conn_id, arena_slot, request, fwd),
-        .pipe_stream => |pipe| try execPipeStream(env, conn_id, arena_slot, request, pipe),
-        .pipe_buffered => |pipe| try execPipeBuffered(env, conn_id, arena_slot, request, pipe),
-        .fetch_filtered => |fetch| try execFetchFiltered(env, conn_id, arena_slot, request, fetch),
+        .respond => unreachable,
+        .forward_raw => |fwd| try paths.execForwardRaw(ctx, in, sink, body, fwd),
+        .pipe_stream => |pipe| try paths.execPipeStream(ctx, in, sink, body, pipe),
+        .pipe_buffered => |pipe| try paths.execPipeBuffered(ctx, in, sink, body, pipe),
+        .fetch_filtered => |fetch| try paths.execFetchFiltered(ctx, in, sink, body, fetch),
     }
 }
 
-fn requestPath(request: *const std.http.Server.Request) []const u8 {
-    const target = request.head.target;
+fn pathOf(target: []const u8) []const u8 {
     const query_start = std.mem.findScalar(u8, target, '?');
     return if (query_start) |i| target[0..i] else target;
 }
 
-fn execEdgeMetrics(env: *Env, arena_slot: u16, request: *std.http.Server.Request) !void {
-    const arena = env.arenas.allocator(arena_slot);
-    var out: std.Io.Writer.Allocating = .init(arena);
-    if (env.shared.metrics) |metrics| try metrics.writePrometheus(&out.writer);
-    try request.respond(out.written(), .{
-        .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; version=0.0.4" }},
-    });
+/// Value of `name` in the target's query string, undecoded.
+fn queryParam(target: []const u8, name: []const u8) ?[]const u8 {
+    const query_start = std.mem.findScalar(u8, target, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, target[query_start + 1 ..], '&');
+    while (it.next()) |pair| {
+        if (pair.len > name.len and pair[name.len] == '=' and std.mem.eql(u8, pair[0..name.len], name)) {
+            return pair[name.len + 1 ..];
+        }
+    }
+    return null;
 }
 
-fn execRespond(request: *std.http.Server.Request, static: service_mod.StaticResponse) !void {
-    try request.respond(static.body, .{
-        .status = @enumFromInt(static.status),
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = static.content_type },
-        },
-    });
+/// Classify the body and enforce max_body_size before the shared path sees
+/// it. A Content-Length body stays on the socket as `.lazy`; the shared path
+/// streams or drains it. A chunked body has no declared length, so it is
+/// drained into the arena here. Invalidates the head strings.
+fn inboundBodyOf(
+    request: *std.http.Server.Request,
+    limits: limits_mod.Limits,
+    buffer: []u8,
+    arena: std.mem.Allocator,
+) !InboundBody {
+    const head = request.head;
+    if (!head.method.requestHasBody()) return .{ .bytes = "" };
+    if (head.transfer_encoding == .chunked) {
+        const reader = try request.readerExpectContinue(buffer);
+        var capture: std.Io.Writer.Allocating = .init(arena);
+        _ = try pipeline_mod.streamReaderToWriter(reader, &capture.writer, limits.max_body_size);
+        return .{ .bytes = capture.written() };
+    }
+    const len = head.content_length orelse 0;
+    if (len == 0) return .{ .bytes = "" };
+    if (len > limits.max_body_size) return error.BodyTooLarge;
+    const reader = try request.readerExpectContinue(buffer);
+    return .{ .lazy = .{ .reader = reader, .len = @intCast(len) } };
 }
 
 /// Collected, arena-duped request headers. Must run BEFORE the body reader
@@ -171,259 +320,6 @@ fn collectRequestHeaders(
     return buffer[0..count];
 }
 
-fn openUpstream(
-    env: *Env,
-    request: *std.http.Server.Request,
-    arena: std.mem.Allocator,
-    choice: service_mod.UpstreamChoice,
-) !std.http.Client.Request {
-    var headers_buf: [64]std.http.Header = undefined;
-    const headers = try collectRequestHeaders(request, arena, &headers_buf);
-    return exec.openUpstream(env.shared, arena, request.head.method, request.head.target, headers, choice);
-}
-
-/// Relays the upstream response (status, filtered headers, body) to the
-/// client. `body_filter` optionally interposes on the body stream
-/// (prometheus). Returns bytes forwarded to the client.
-fn relayResponse(
-    env: *Env,
-    conn_id: conn_slab_mod.ConnId,
-    request: *std.http.Server.Request,
-    upstream_req: *std.http.Client.Request,
-    arena: std.mem.Allocator,
-    max_response_body: usize,
-    body_filter: ?*prom.streaming_filter.FilteringWriter,
-) !void {
-    var upstream_res = try upstream_req.receiveHead(&.{});
-
-    var extra_headers: [64]std.http.Header = undefined;
-    const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, arena, &extra_headers);
-
-    const status: std.http.Status = upstream_res.head.status;
-    // Request body is fully consumed by now; its slab region backs the
-    // response BodyWriter staging.
-    var body_writer = try request.respondStreaming(env.slab.bodyBuf(conn_id), .{
-        .respond_options = .{
-            .status = status,
-            .extra_headers = relayed,
-        },
-    });
-
-    const upstream_body = upstream_res.reader(env.slab.upstreamBuf(conn_id));
-    if (body_filter) |filter| {
-        _ = try pipeline_mod.streamReaderToWriter(upstream_body, filter.writer(), max_response_body);
-        _ = try filter.finish();
-    } else {
-        _ = try pipeline_mod.streamReaderToWriter(upstream_body, &body_writer.writer, max_response_body);
-    }
-    try body_writer.end();
-    try body_writer.flush();
-}
-
-fn execForwardRaw(
-    env: *Env,
-    conn_id: conn_slab_mod.ConnId,
-    arena_slot: u16,
-    request: *std.http.Server.Request,
-    fwd: service_mod.Forward,
-) !void {
-    const ctx = env.shared;
-    const arena = env.arenas.allocator(arena_slot);
-    var upstream_req = openUpstream(env, request, arena, fwd.upstream) catch {
-        try request.respond("", .{ .status = .bad_gateway });
-        return;
-    };
-    defer upstream_req.deinit();
-
-    const head = request.head;
-    const has_body = head.method.requestHasBody() and
-        (head.transfer_encoding == .chunked or (head.content_length orelse 0) > 0);
-
-    if (has_body) {
-        const body_reader = try request.readerExpectContinue(env.slab.bodyBuf(conn_id));
-        upstream_req.transfer_encoding = if (head.content_length) |len|
-            .{ .content_length = len }
-        else
-            .chunked;
-        var body_writer = try upstream_req.sendBodyUnflushed(env.slab.upstreamBuf(conn_id));
-        _ = try pipeline_mod.streamReaderToWriter(body_reader, &body_writer.writer, std.math.maxInt(usize));
-        try body_writer.end();
-    } else if (head.method.requestHasBody()) {
-        upstream_req.transfer_encoding = .{ .content_length = 0 };
-        var body_writer = try upstream_req.sendBodyUnflushed(env.slab.upstreamBuf(conn_id));
-        try body_writer.end();
-    } else {
-        try upstream_req.sendBodiless();
-    }
-
-    const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(fwd.upstream));
-    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response, null);
-}
-
-fn execPipeStream(
-    env: *Env,
-    conn_id: conn_slab_mod.ConnId,
-    arena_slot: u16,
-    request: *std.http.Server.Request,
-    pipe: service_mod.PipeStream,
-) !void {
-    const ctx = env.shared;
-    // No policy targets this signal: the pipe is an identity transform, so
-    // skip the framer/codec/chunked overhead and relay the raw bytes
-    // (master's prefilter "forward unchanged" decision).
-    if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
-        return execForwardRaw(env, conn_id, arena_slot, request, .{ .upstream = pipe.upstream });
-    }
-    const arena = env.arenas.allocator(arena_slot);
-    var upstream_req = openUpstream(env, request, arena, pipe.upstream) catch {
-        try request.respond("", .{ .status = .bad_gateway });
-        return;
-    };
-    defer upstream_req.deinit();
-
-    const body_reader = try request.readerExpectContinue(env.slab.bodyBuf(conn_id));
-
-    // Filtering changes length: always chunked.
-    upstream_req.transfer_encoding = .chunked;
-    var body_writer = try upstream_req.sendBodyUnflushed(env.slab.upstreamBuf(conn_id));
-
-    // ponytail: per-request scratch; hoist to the conn slab if stdio ever
-    // becomes a hot path (httpz reuses it per thread).
-    var record_scratch = exec.RecordScratch.init(ctx.gpa);
-    defer record_scratch.deinit();
-    var sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &record_scratch);
-    defer sink.deinit();
-
-    const stats = pipeline_mod.run(.{
-        .decode = pipe.codec,
-        .format = pipe.format,
-        .encode = pipe.codec,
-        .max_decoded_bytes = ctx.limits.max_decoded_bytes,
-        .zstd_window_len = ctx.limits.zstd_window_len,
-    }, body_reader, &body_writer.writer, .{
-        .decoder = env.slab.decodeBuf(conn_id),
-        .encoder = env.slab.encodeBuf(conn_id),
-        .scratch = env.slab.recordScratch(conn_id),
-        .chunk = env.slab.chunkBuf(conn_id),
-    }, &sink) catch |err| {
-        // PLAN §6.5.1: mid-stream decode/transport failure aborts the
-        // exchange; bytes already sent upstream stay sent. The client gets
-        // a 502 if its response hasn't started (it hasn't), then we close.
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.err(PipelineAborted{ .err = @errorName(err) });
-        if (upstream_req.connection) |conn| conn.closing = true;
-        try request.respond("", .{ .status = .bad_gateway, .keep_alive = false });
-        return error.PipelineAborted;
-    };
-    try body_writer.end();
-
-    if (ctx.metrics) |metrics| {
-        metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
-    }
-
-    const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
-    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response, null);
-}
-
-fn execPipeBuffered(
-    env: *Env,
-    conn_id: conn_slab_mod.ConnId,
-    arena_slot: u16,
-    request: *std.http.Server.Request,
-    pipe: service_mod.PipeBuffered,
-) !void {
-    const ctx = env.shared;
-    const arena = env.arenas.allocator(arena_slot);
-
-    // Capture the RAW body first so any later failure fails open by
-    // forwarding the original bytes — exact old-module semantics.
-    const body_reader = try request.readerExpectContinue(env.slab.bodyBuf(conn_id));
-    var raw_capture: std.Io.Writer.Allocating = .init(arena);
-    _ = try pipeline_mod.streamReaderToWriter(body_reader, &raw_capture.writer, ctx.limits.max_body_size);
-    const raw_body = raw_capture.written();
-
-    const processed: exec.BufferedResult = exec.processBuffered(ctx, pipe, arena, raw_body) catch |err| blk: {
-        log.warn("buffered transform failed open: {s}", .{@errorName(err)});
-        break :blk .{ .body = raw_body, .all_dropped = false };
-    };
-
-    if (processed.all_dropped) {
-        // Nothing left to forward: old modules answered for the upstream.
-        try request.respond("{}", .{
-            .status = .ok,
-            .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
-        });
-        return;
-    }
-
-    var upstream_req = openUpstream(env, request, arena, pipe.upstream) catch {
-        try request.respond("", .{ .status = .bad_gateway });
-        return;
-    };
-    defer upstream_req.deinit();
-    upstream_req.transfer_encoding = .{ .content_length = processed.body.len };
-    var body_writer = try upstream_req.sendBodyUnflushed(env.slab.upstreamBuf(conn_id));
-    var fixed = std.Io.Reader.fixed(processed.body);
-    _ = try pipeline_mod.streamReaderToWriter(&fixed, &body_writer.writer, processed.body.len);
-    try body_writer.end();
-
-    const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(pipe.upstream));
-    try relayResponse(env, conn_id, request, &upstream_req, arena, max_response, null);
-}
-
-fn execFetchFiltered(
-    env: *Env,
-    conn_id: conn_slab_mod.ConnId,
-    arena_slot: u16,
-    request: *std.http.Server.Request,
-    fetch: service_mod.FetchFiltered,
-) !void {
-    const ctx = env.shared;
-    const arena = env.arenas.allocator(arena_slot);
-    var upstream_req = openUpstream(env, request, arena, fetch.upstream) catch {
-        try request.respond("", .{ .status = .bad_gateway });
-        return;
-    };
-    defer upstream_req.deinit();
-    try upstream_req.sendBodiless();
-
-    var upstream_res = try upstream_req.receiveHead(&.{});
-    var extra_headers: [64]std.http.Header = undefined;
-    const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, arena, &extra_headers);
-
-    var body_writer = try request.respondStreaming(env.slab.bodyBuf(conn_id), .{
-        .respond_options = .{
-            .status = upstream_res.head.status,
-            .extra_headers = relayed,
-        },
-    });
-
-    // The prometheus filter's working buffers live in the (otherwise idle on
-    // GET) record-scratch region: 4K line + 2K metadata + 8K writer staging.
-    const scratch = env.slab.recordScratch(conn_id);
-    var filter: prom.streaming_filter.PolicyStreamingFilter = .init(.{
-        .line_buffer = scratch[0..4096],
-        .metadata_buffer = scratch[4096..6144],
-        .max_input_bytes = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes,
-        .max_output_bytes = if (fetch.max_output_bytes == 0) std.math.maxInt(usize) else fetch.max_output_bytes,
-        .registry = ctx.registry,
-        .bus = ctx.bus,
-        .allocator = arena,
-    });
-    var filtering: prom.streaming_filter.FilteringWriter = .init(.{
-        .filter = &filter,
-        .inner = &body_writer.writer,
-        .buffer = scratch[6144..14336],
-    });
-
-    const upstream_body = upstream_res.reader(env.slab.upstreamBuf(conn_id));
-    const max_in = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes;
-    _ = try pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in);
-    _ = try filtering.finish();
-    try body_writer.end();
-    try body_writer.flush();
-}
-
 /// Best-effort fixed response on the raw stream (pre-HTTP-state failures:
 /// load shed, malformed head). Errors are ignored — the connection is being
 /// closed either way.
@@ -432,4 +328,17 @@ fn writeRawResponse(io: std.Io, stream: std.Io.net.Stream, response: []const u8)
     var writer = std.Io.net.Stream.Writer.init(stream, io, &buf);
     writer.interface.writeAll(response) catch return;
     writer.interface.flush() catch return;
+}
+
+// ============================== Tests ==============================
+
+const testing = std.testing;
+
+test "query parameters are read from the target" {
+    try testing.expectEqualStrings("json", queryParam("/_edge/policies?format=json", "format").?);
+    try testing.expectEqualStrings("20", queryParam("/_edge/tap/pre?x=1&n=20", "n").?);
+    try testing.expectEqual(@as(?[]const u8, null), queryParam("/_edge/tap/pre?nn=20", "n"));
+    try testing.expectEqual(@as(?[]const u8, null), queryParam("/_edge/tap/pre", "n"));
+    try testing.expectEqualStrings("/a/b", pathOf("/a/b?c=d"));
+    try testing.expectEqualStrings("/a/b", pathOf("/a/b"));
 }
