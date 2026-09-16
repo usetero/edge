@@ -235,6 +235,36 @@ pub const LineFramer = struct {
         try self.finish(writer, filter_ctx, filter_fn);
     }
 
+    /// Pumps from a streaming `File` (e.g. stdin) using short `readStreaming`
+    /// reads directly into `read_buf` — one `readv` per iteration with no
+    /// reader-side internal-buffer prefetch and no `File.Reader` `ReadFailed`
+    /// conversion. This matters for cooperative signal shutdown: a cancel
+    /// interrupts the blocking `readv` and surfaces here as `error.Canceled`
+    /// (not converted to `ReadFailed` by `File.Reader.readVecStreaming`), and
+    /// because each iteration reads only what is immediately available, no
+    /// prefetched bytes are stranded when the pump unwinds. The only residual
+    /// at cancel time is the write buffer, which the caller flushes on the
+    /// (uncanceled) main thread — eliminating the lost-residual-on-signal bug.
+    pub fn pumpFileStreaming(
+        self: *LineFramer,
+        io: std.Io,
+        file: std.Io.File,
+        writer: *std.Io.Writer,
+        filter_ctx: *anyopaque,
+        filter_fn: *const LineFilterFn,
+    ) !void {
+        while (true) {
+            const n = file.readStreaming(io, &.{self.read_buf}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err, // includes error.Canceled on cooperative shutdown
+            };
+            if (n == 0) break;
+            try self.ingestChunk(self.read_buf[0..n], writer, filter_ctx, filter_fn);
+        }
+
+        try self.finish(writer, filter_ctx, filter_fn);
+    }
+
     /// Reads `[start_offset, end_offset)` from `file` using positional reads
     /// and frames newline-delimited lines to the writer.
     pub fn readRange(
@@ -346,6 +376,36 @@ test "framer public API: readRange emits file bytes as lines" {
     try framer.readRange(io, &file, 0, size, &out.writer, &ctx, keepAll);
     try framer.finish(&out.writer, &ctx, keepAll);
     try testing.expectEqualStrings("x\ny\n", out.written());
+}
+
+test "framer public API: pumpFileStreaming frames bytes across short reads to EOF" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Options.debug_io;
+    {
+        const f = try tmp.dir.createFile(io, "in.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "a\nbc\ndef\n");
+    }
+
+    const in_path = try tmp.dir.realPathFileAlloc(io, "in.log", testing.allocator);
+    defer testing.allocator.free(in_path);
+
+    const file = try std.Io.Dir.cwd().openFile(io, in_path, .{ .mode = .read_only });
+    defer file.close(io);
+
+    // Small read_buf forces several short readv iterations across line
+    // boundaries, exercising the same chunk-spanning path the stdin pump uses.
+    var framer = try LineFramer.init(testing.allocator, 4, 1024);
+    defer framer.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    var ctx: u8 = 0;
+    try framer.pumpFileStreaming(io, file, &out.writer, &ctx, keepAll);
+
+    try testing.expectEqualStrings("a\nbc\ndef\n", out.written());
 }
 
 test "framer public API: trailing line without newline is preserved byte-exactly" {
