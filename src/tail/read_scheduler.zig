@@ -237,6 +237,12 @@ test "read scheduler uring non-fixed path: multi-event batch keeps read buffers 
 
         const n = try scheduler.processBatch(&framer, &out.writer, events, &framer, keepAll);
         try framer.finish(&out.writer, &framer, keepAll);
+        // Verify the io_uring submission-and-completion path was actually
+        // exercised: `cqes` is populated only after `submit_and_wait` and
+        // `copy_cqes` succeed (scalar fallbacks return before that resize).
+        // A zero count means every event fell back to the scalar path, so
+        // the buffer-lifetime fix was not exercised at all.
+        try testing.expect(scheduler.cqes.items.len == event_count);
         try testing.expectEqual(@as(usize, event_count), n);
         try testing.expectEqualStrings(expected.items, out.written());
     }
