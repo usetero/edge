@@ -95,6 +95,26 @@ pub const LineFramer = struct {
         self.active_key = key;
     }
 
+    /// Discards any saved (parked) partial-line state for `key` without loading
+    /// it. Use cases:
+    /// - **Truncation/rewrite**: call before `selectStream` when the watcher
+    ///   resets a file's read offset to zero, so stale pre-rewrite bytes are
+    ///   not concatenated onto the new contents.
+    /// - **Rotation/removal**: call when the watcher evicts a tracked path so
+    ///   the `streams` map does not hold the file's partial buffer indefinitely.
+    ///   Without this, repeated log rotation grows the map without bound.
+    pub fn resetStream(self: *LineFramer, key: u64) void {
+        if (self.streams.fetchRemove(key)) |kv| if (kv.value.bytes) |b| self.allocator.free(b);
+        // If this key is currently active, clear inner state too.
+        if (self.active_key) |ak| {
+            if (ak == key) {
+                self.inner.scratch_len = 0;
+                self.inner.overflowed = false;
+                self.active_key = null;
+            }
+        }
+    }
+
     /// Parks the active stream's partial state in `streams[key]`.
     fn saveStream(self: *LineFramer, key: u64) !void {
         const len = self.inner.scratch_len;
