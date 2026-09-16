@@ -32,10 +32,10 @@ pub const frontend_select = @import("frontend/select.zig");
 pub const frontend_stdio_server = @import("frontend/stdio/server.zig");
 pub const frontend_stdio_conn = @import("frontend/stdio/conn.zig");
 pub const frontend_httpz_server = @import("frontend/httpz/server.zig");
-pub const frontend_httpz_exchange = @import("frontend/httpz/exchange.zig");
-pub const frontend_httpz_paths = @import("frontend/httpz/paths.zig");
-pub const frontend_httpz_endpoints = @import("frontend/httpz/endpoints.zig");
-pub const frontend_httpz_thread_bufs = @import("frontend/httpz/thread_bufs.zig");
+pub const frontend_httpz_exchange = @import("frontend/exchange.zig");
+pub const frontend_httpz_paths = @import("frontend/paths.zig");
+pub const frontend_httpz_endpoints = @import("frontend/endpoints.zig");
+pub const frontend_httpz_thread_bufs = @import("frontend/thread_bufs.zig");
 pub const service_router = @import("service/router.zig");
 
 // Services + distro composition (PLAN.md §8)
@@ -103,10 +103,10 @@ test {
     // so the unselected one can't rot (PLAN-FRONTEND-SWAP.md §6).
     _ = @import("frontend/stdio/server.zig");
     _ = @import("frontend/httpz/server.zig");
-    _ = @import("frontend/httpz/exchange.zig");
-    _ = @import("frontend/httpz/paths.zig");
-    _ = @import("frontend/httpz/endpoints.zig");
-    _ = @import("frontend/httpz/thread_bufs.zig");
+    _ = @import("frontend/exchange.zig");
+    _ = @import("frontend/paths.zig");
+    _ = @import("frontend/endpoints.zig");
+    _ = @import("frontend/thread_bufs.zig");
     _ = @import("runtime/distro.zig");
     _ = @import("runtime/extensions.zig");
     _ = @import("signals/prometheus/root.zig");

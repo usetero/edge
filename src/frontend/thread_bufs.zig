@@ -7,9 +7,9 @@
 //! production allocator is libc malloc, which kept the nodes mapped, and RSS
 //! grew with connections instead of threads.
 const std = @import("std");
-const exec = @import("../exec.zig");
-const encoding_mod = @import("../../pipeline/encoding.zig");
-const limits_mod = @import("../../core/limits.zig");
+const exec = @import("exec.zig");
+const encoding_mod = @import("../pipeline/encoding.zig");
+const limits_mod = @import("../core/limits.zig");
 
 const log = std.log.scoped(.httpz_server);
 

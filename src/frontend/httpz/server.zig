@@ -6,11 +6,11 @@
 //! limits, and the per-request `handle` → `dispatch` that turns a routed
 //! outcome into a call on one of the sibling files.
 //!
-//!   paths.zig       the four request executors (raw forward, streamed
+//!   ../paths.zig       the four request executors (raw forward, streamed
 //!                   pipeline, buffered transform, filtered scrape)
-//!   exchange.zig    the upstream leg: dial, send, receive, relay, retry
-//!   thread_bufs.zig per-thread scratch and the upstream deadline watchdog
-//!   endpoints.zig   /_edge/* observability endpoints
+//!   ../exchange.zig    the upstream leg: dial, send, receive, relay, retry
+//!   ../thread_bufs.zig per-thread scratch and the upstream deadline watchdog
+//!   ../endpoints.zig   /_edge/* observability endpoints
 //!
 //! Bodies at or above the 64 KiB pool buffer arrive unread and stream when
 //! no policy needs them; smaller ones arrive buffered. Both cases are owned
@@ -23,10 +23,10 @@ const runtime_metrics = @import("../../runtime/runtime_metrics.zig");
 const limits_mod = @import("../../core/limits.zig");
 const service_mod = @import("../../service/service.zig");
 const lifecycle_mod = @import("../../core/lifecycle.zig");
-const exchange = @import("exchange.zig");
-const paths = @import("paths.zig");
-const endpoints = @import("endpoints.zig");
-const thread_bufs = @import("thread_bufs.zig");
+const exchange = @import("../exchange.zig");
+const paths = @import("../paths.zig");
+const endpoints = @import("../endpoints.zig");
+const thread_bufs = @import("../thread_bufs.zig");
 
 const Inbound = exchange.Inbound;
 const InboundBody = paths.InboundBody;

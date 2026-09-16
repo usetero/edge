@@ -3,7 +3,7 @@
 //! plane; nothing here touches an upstream. Frontend-neutral: responses go
 //! through a `sink` (contract in exchange.zig); the frontend parses the query.
 const std = @import("std");
-const exec = @import("../exec.zig");
+const exec = @import("exec.zig");
 
 /// `write_frontend_metrics` appends the HTTP server's own counters (httpz has
 /// them; std.http.Server does not).

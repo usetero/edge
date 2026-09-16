@@ -8,11 +8,11 @@
 //! buffered or still on the socket, and enforces max_body_size before
 //! handing over a lazy one; everything after that is shared.
 const std = @import("std");
-const exec = @import("../exec.zig");
-const service_mod = @import("../../service/service.zig");
-const pipeline_mod = @import("../../pipeline/pipeline.zig");
-const limits_mod = @import("../../core/limits.zig");
-const prom = @import("../../signals/prometheus/root.zig");
+const exec = @import("exec.zig");
+const service_mod = @import("../service/service.zig");
+const pipeline_mod = @import("../pipeline/pipeline.zig");
+const limits_mod = @import("../core/limits.zig");
+const prom = @import("../signals/prometheus/root.zig");
 const exchange = @import("exchange.zig");
 const thread_bufs = @import("thread_bufs.zig");
 

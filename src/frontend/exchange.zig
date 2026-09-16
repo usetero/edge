@@ -4,10 +4,10 @@
 //! the httpz and stdio frontends share every retry, eviction and early-
 //! response rule here.
 const std = @import("std");
-const exec = @import("../exec.zig");
-const service_mod = @import("../../service/service.zig");
-const upstream_mod = @import("../upstream.zig");
-const pipeline_mod = @import("../../pipeline/pipeline.zig");
+const exec = @import("exec.zig");
+const service_mod = @import("../service/service.zig");
+const upstream_mod = @import("upstream.zig");
+const pipeline_mod = @import("../pipeline/pipeline.zig");
 const thread_bufs = @import("thread_bufs.zig");
 
 const ThreadBufs = thread_bufs.ThreadBufs;
