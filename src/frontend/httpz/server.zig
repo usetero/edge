@@ -576,9 +576,12 @@ pub const Handler = struct {
     fn execPipeStream(self: *Handler, req: *httpz.Request, res: *httpz.Response, pipe: service_mod.PipeStream) !void {
         const ctx = self.ctx;
         const raw_body = req.body() orelse "";
+        const route_kind = exec.routeKindLabel(pipe.signal, pipe.format);
         if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
+            if (ctx.metrics) |metrics| metrics.recordPrefilterDecision(route_kind, .fast_path);
             return self.exchange(req, res, pipe.upstream, raw_body, pipe.signal == .log);
         }
+        if (ctx.metrics) |metrics| metrics.recordPrefilterDecision(route_kind, .policy_path);
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         try bufs.prepare(ctx.gpa, ctx.limits, pipe.codec);
         var body_reader = std.Io.Reader.fixed(raw_body);

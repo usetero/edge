@@ -455,3 +455,70 @@ pub fn statusClass(status: u16) StatusClassLabel {
     if (status >= 500 and status < 600) return .s5xx;
     return .other;
 }
+
+// ============================== Tests ==============================
+
+const testing = std.testing;
+
+// Regression guard for the #187 bug: `recordPrefilterDecision` lost its only
+// caller when the proxy server was deleted, so `initializeStaticSeries` seeds
+// 24 zero series that nothing ever increments. This test pins the seeded
+// all-zero state and proves the counter increments correctly when the method
+// is wired (the frontends' `policiesActiveFor` fork calls it on every piped
+// request). The seeded-zero half is the failing state production reaches when
+// the wiring regresses; the increment half proves the counter itself works.
+test "edge_prefilter_decisions_total seeds 24 zero series and increments on recordPrefilterDecision" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var metrics = try RuntimeMetrics.init(testing.allocator, io, .edge);
+    defer metrics.deinit();
+
+    var scrape: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer scrape.deinit();
+    try metrics.writePrometheus(&scrape.writer);
+    const initial = scrape.written();
+
+    // Every one of the 8 RouteKindLabel x 3 PrefilterDecisionLabel series is
+    // seeded at 0 after init — the permanently-stuck state production reaches
+    // when recordPrefilterDecision has no caller.
+    var zero_count: usize = 0;
+    var total_series: usize = 0;
+    var it = std.mem.splitScalar(u8, initial, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "edge_prefilter_decisions_total")) continue;
+        if (line[0] == '#') continue;
+        total_series += 1;
+        const tok = std.mem.lastIndexOfScalar(u8, line, ' ') orelse continue;
+        if (std.mem.eql(u8, line[tok + 1 ..], "0")) zero_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 24), total_series);
+    try testing.expectEqual(@as(usize, 24), zero_count);
+
+    // Wire the metric the way the frontends do: each call lifts exactly one
+    // series by 1 and leaves every other series untouched.
+    metrics.recordPrefilterDecision(.otlp_logs, .policy_path);
+    metrics.recordPrefilterDecision(.datadog_logs, .fast_path);
+
+    var scrape2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer scrape2.deinit();
+    try metrics.writePrometheus(&scrape2.writer);
+    const after = scrape2.written();
+
+    const policy_path_line = "edge_prefilter_decisions_total{route_kind=\"otlp_logs\",decision=\"policy_path\"} 1";
+    const fast_path_line = "edge_prefilter_decisions_total{route_kind=\"datadog_logs\",decision=\"fast_path\"} 1";
+    try testing.expect(std.mem.indexOf(u8, after, policy_path_line) != null);
+    try testing.expect(std.mem.indexOf(u8, after, fast_path_line) != null);
+
+    // Exactly the two series above moved off zero.
+    var moved: usize = 0;
+    it = std.mem.splitScalar(u8, after, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "edge_prefilter_decisions_total")) continue;
+        if (line[0] == '#') continue;
+        const tok = std.mem.lastIndexOfScalar(u8, line, ' ') orelse continue;
+        if (!std.mem.eql(u8, line[tok + 1 ..], "0")) moved += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), moved);
+}
