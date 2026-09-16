@@ -492,7 +492,7 @@ pub const Watcher = struct {
 
         const observed = try prefixHash(self.io, file, prefix_len);
         if (observed == self.head_prefix_hashes.items[i]) {
-            if (self.offsets.items[i] > size) self.offsets.items[i] = size;
+            if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
             return;
         }
 
