@@ -1782,6 +1782,104 @@ test "processLogs - rewrites fields inside a JSON-wrapped message and re-seriali
     try std.testing.expect(std.mem.indexOf(u8, result.data, "jsonPayload") != null);
 }
 
+test "processLogs - two regex redacts on the same wrapped path compose" {
+    // Regression (PR #203): the policy engine re-reads a field via the
+    // accessor before each transform write. For a wrapped `message`, reads
+    // go through `unwrappedAttribute`, which served a one-shot `message_flat`
+    // snapshot built from the ORIGINAL `message`; `setWrapped` mutated the
+    // live `message_tree` but never refreshed the flat, so rule N+1 read the
+    // pre-transform value and overwrote rule N's edit. Two regex `redact`s on
+    // the same nested path would then lose every earlier rule's substitution
+    // and leak the scrubbed content back into the forwarded record.
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // keep=all + two regex redacts on data.jsonPayload.email, one per token
+    // of the address: scrub the local-part, then scrub the domain. Each rule
+    // needs its own replacement template, which a single alternation regex
+    // cannot express — exactly the routine configuration that triggered the
+    // leak.
+    var transform: proto.policy.LogTransform = .{};
+
+    var email_path: proto.policy.AttributePath = .{};
+    try email_path.path.append(allocator, try allocator.dupe(u8, "data"));
+    try email_path.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
+    try email_path.path.append(allocator, try allocator.dupe(u8, "email"));
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = email_path },
+        .regex = try allocator.dupe(u8, "alice"),
+        .replacement = try allocator.dupe(u8, "ALICE_R"),
+    });
+
+    var email_path2: proto.policy.AttributePath = .{};
+    try email_path2.path.append(allocator, try allocator.dupe(u8, "data"));
+    try email_path2.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
+    try email_path2.path.append(allocator, try allocator.dupe(u8, "email"));
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = email_path2 },
+        .regex = try allocator.dupe(u8, "example"),
+        .replacement = try allocator.dupe(u8, "EXAMPLE_R"),
+    });
+
+    var test_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "redact-email"),
+        .name = try allocator.dupe(u8, "redact-email"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all"), .transform = transform } },
+    };
+    try test_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .exact = try allocator.dupe(u8, "evidence skipped") },
+    });
+    defer test_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{test_policy}, "test", .file);
+
+    const logs = "[" ++ comptime wrap(
+        \\{"data":{"jsonPayload":{
+        \\"email":"alice@example.com",
+        \\"message":"evidence skipped"
+        \\}}}
+    ) ++ "]";
+
+    var in_reader = std.Io.Reader.fixed(logs);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processLogsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+        null,
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expect(result.was_transformed);
+
+    // Both redactions compose: the forwarded email carries BOTH replacement
+    // tokens and neither original PII substring.
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "ALICE_R@EXAMPLE_R.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "alice") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "example") == null);
+    // The body and wrapper shape survive the transform.
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "evidence skipped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "jsonPayload") != null);
+}
+
 test "processLogs - filter on nested extra field with exists" {
     // Tests using exists matching on dynamic extra fields
     const allocator = std.testing.allocator;
