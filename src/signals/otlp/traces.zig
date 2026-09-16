@@ -539,6 +539,21 @@ fn processJsonTraces(
     // fields are raw bytes in memory now (decoded above), same as protobuf.
     const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus, false);
 
+    // Fast path: if nothing was modified, return original data without re-encoding.
+    // Re-encoding would strip unknown span-level fields the compiled schema doesn't
+    // know about (JSON decode uses ignore_unknown_fields, so unknown fields are
+    // dropped on decode and cannot be re-emitted). Mirrors the OTLP logs path.
+    if (counts.dropped_count == 0 and !counts.was_transformed) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = counts.original_count,
+            .was_transformed = false,
+        };
+    }
+
     // Re-serialize to JSON, hex-encoding the same identifier fields back out.
     const output = try parsed.value.jsonEncode(.{}, .{
         .emit_oneof_field_name = false,
@@ -596,6 +611,21 @@ fn processProtobufTraces(
     // Filter spans in-place (arena_alloc used for tracestate updates).
     // Protobuf identifier fields are raw bytes.
     const counts = filterSpansInPlace(arena_alloc, &traces_data, registry, bus, false);
+
+    // Fast path: if nothing was modified, return original data without re-encoding.
+    // Re-encoding would strip unknown span-level fields the compiled schema doesn't
+    // know about (the generated Span struct has no _unknown_fields, so unknown fields
+    // are dropped on decode and cannot be re-emitted). Mirrors the OTLP logs path.
+    if (counts.dropped_count == 0 and !counts.was_transformed) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = counts.original_count,
+            .was_transformed = false,
+        };
+    }
 
     // Re-serialize to protobuf - use main allocator for output since we return it
     var output_writer = std.Io.Writer.Allocating.init(allocator);
@@ -968,4 +998,153 @@ test "processTraces - unknown content type returns unchanged" {
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(data, result.data);
+}
+
+// =============================================================================
+// Unknown-field preservation tests (parity with the OTLP logs path)
+// =============================================================================
+
+/// Builds a trace policy that keeps 100% of matching spans but never matches
+/// (regex is a literal that no span name will contain). Using a loaded-but-
+/// non-matching policy exercises the decode → filterSpansInPlace → guard path
+/// without dropping or transforming any span.
+fn loadNoMatchTracePolicy(allocator: std.mem.Allocator, registry: *PolicyRegistry) !void {
+    var no_match_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "no-match"),
+        .name = try allocator.dupe(u8, "no-match"),
+        .enabled = true,
+        .target = .{ .trace = .{ .keep = .{ .percentage = 100 } } },
+    };
+    try no_match_policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "zzz-never-matches-zzz") },
+    });
+    defer no_match_policy.deinit(allocator);
+    try registry.updatePolicies(&.{no_match_policy}, "file-provider", .file);
+}
+
+test "processJsonTraces preserves unknown span fields when policies don't match" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try loadNoMatchTracePolicy(allocator, &registry);
+
+    const traces =
+        "{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"traceId\":\"0123456789abcdef0123456789abcdef\"," ++
+        "\"spanId\":\"0123456789abcdef\",\"name\":\"span-1\",\"kind\":1," ++
+        "\"startTimeUnixNano\":\"1000000000\",\"endTimeUnixNano\":\"2000000000\"," ++
+        "\"futureOtelField\":42}]}]}]}";
+
+    var in_reader = std.Io.Reader.fixed(traces);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processTracesStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+    try std.testing.expect(!result.wasModified());
+    // Nothing modified → original bytes returned verbatim, unknown field intact.
+    try std.testing.expectEqualStrings(traces, result.data);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "futureOtelField") != null);
+}
+
+test "processProtobufTraces preserves unknown span fields when policies don't match" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    try loadNoMatchTracePolicy(allocator, &registry);
+
+    // Hand-encoded TracesData: one ResourceSpans > ScopeSpans > Span with
+    // trace_id="abcd" (field 1, LEN 4) + unknown field 999 (varint 42). The
+    // generated Span struct has no _unknown_fields, so a re-encode would drop
+    // the (184, 62, 42) bytes; the nothing-modified guard must return the
+    // original bytes so the unknown field survives.
+    const td = [_]u8{ 10, 13, 18, 11, 18, 9, 10, 4, 97, 98, 99, 100, 184, 62, 42 };
+
+    const result = try processProtobufTraces(allocator, &registry, noop_bus.eventBus(), &td);
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+    try std.testing.expect(!result.wasModified());
+    // Nothing modified → original bytes returned verbatim, unknown field intact.
+    try std.testing.expectEqualSlices(u8, &td, result.data);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, &[_]u8{ 184, 62 }) != null);
+}
+
+test "processJsonTraces still re-encodes and drops when a policy matches" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // percentage = 0 → keep none → every matching span is dropped (deterministic).
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-by-name"),
+        .name = try allocator.dupe(u8, "drop-by-name"),
+        .enabled = true,
+        .target = .{ .trace = .{ .keep = .{ .percentage = 0 } } },
+    };
+    try drop_policy.target.?.trace.match.append(allocator, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "drop-me") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    const traces =
+        "{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"traceId\":\"0123456789abcdef0123456789abcdef\"," ++
+        "\"spanId\":\"0123456789abcdef\",\"name\":\"drop-me\",\"kind\":1," ++
+        "\"startTimeUnixNano\":\"1000000000\",\"endTimeUnixNano\":\"2000000000\"}," ++
+        "{\"traceId\":\"0123456789abcdef0123456789abcdef\",\"spanId\":\"fedcba9876543210\"," ++
+        "\"name\":\"keep-me\",\"kind\":1,\"startTimeUnixNano\":\"1000000000\"," ++
+        "\"endTimeUnixNano\":\"2000000000\"}]}]}]}";
+
+    var in_reader = std.Io.Reader.fixed(traces);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processTracesStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    // dropped_count > 0 → guard does not fire → re-encode runs.
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    try std.testing.expect(result.wasModified());
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "drop-me") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "keep-me") != null);
 }
