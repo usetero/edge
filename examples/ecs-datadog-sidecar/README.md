@@ -48,6 +48,10 @@ edge_container = {
   name       = "tero-edge"
   image      = "ghcr.io/usetero/edge-datadog:latest"
   cpu        = 0
+  # Always set this. Without it the container can consume the whole task
+  # allocation, and the kernel OOM killer stops it with nothing in the logs.
+  # See "Sizing" below for how to pick the number.
+  memory     = 768
   essential  = true
   portMappings = [
     { "containerPort" : 8080, "protocol" : "tcp" }
@@ -167,11 +171,38 @@ config file.
 | `TERO_MAX_DECODED_BYTES` | `max_decoded_bytes` | unset (falls back to `max_body_size`)          |
 | `TERO_MAX_CONNECTIONS`   | `max_connections`   | `256`                                          |
 | `TERO_WORKER_COUNT`      | `worker_count`      | unset (1)                                      |
-| `TERO_THREAD_POOL_COUNT` | `thread_pool_count` | unset (32)                                     |
+| `TERO_THREAD_POOL_COUNT` | `thread_pool_count` | unset (128)                                    |
 
 `policy_providers` is a list and cannot be set this way — override the config
 file instead. Full reference, including value substitution and the remaining
 fields: https://docs.usetero.com/edge/edge-reference/config
+
+## Sizing
+
+Set `memory` on the container. Edge holds a per-handler-thread workspace that
+is allocated on first use and then retained, so memory tracks the number of
+handler threads that have served a compressed body:
+
+```
+memory ~= max_connections x 20 KiB
+        + thread_pool_count x (2 x max_body_size + 1.2 MiB)
+```
+
+At the defaults (256 connections, 128 threads, 1 MiB `max_body_size`) that is
+about **420 MiB**, which is why the example sets `memory = 768`.
+
+`thread_pool_count` is the dominant term, and it rose from 32 to 128 in
+v1.30.2. Two ways to cut the footprint:
+
+- Set `TERO_THREAD_POOL_COUNT=32`. About 110 MiB at the same body size, at
+  lower throughput against a slow upstream.
+- Lower `TERO_MAX_BODY_SIZE` if your agents send smaller batches.
+
+If the task stops with no error in the logs, suspect the memory limit first.
+The OOM killer gives the process no chance to log, `essential = true` then
+takes the whole task down, and the `non-blocking` awslogs mode below drops
+whatever was still buffered. Check the stopped-task reason for
+`OutOfMemoryError`.
 
 ## Managing policies locally instead of Tero sync
 
