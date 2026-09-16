@@ -17,7 +17,11 @@ class HealthUnderBurst(MatrixCase):
     INTAKE_LATENCY = 3000
     DEFECTS = {"httpz": "a batch of up to 16 requests goes to one pool thread, so a probe waits behind it"}
 
-    BURSTS = 8
+    # The stall depends on the probe landing in the same event batch as the
+    # senders, which is probabilistic: measured at roughly 3 in 10 bursts.
+    # Eight bursts flapped, so run twenty.
+    SLOW = True
+    BURSTS = 20
     SENDERS = 15
 
     def test_health_stays_fast_when_a_burst_arrives_with_it(self):

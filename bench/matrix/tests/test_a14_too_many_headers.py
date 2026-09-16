@@ -12,7 +12,6 @@ from harness import MatrixCase
 class TooManyHeaders(MatrixCase):
     EXPECT_LOGS = ["request.failed", "TooManyHeaders"]
     FORBID_LOGS = ["upstream"]
-    DEFECTS = {"httpz": "drops the headers above its cap and answers 202"}
 
     def test_a_header_flood_is_never_silently_truncated(self):
         headers = {"X-Matrix-%d" % i: "v" for i in range(80)}

@@ -44,6 +44,11 @@ pub const CONN_ARENA_RESERVE_BYTES: usize = 16 * 1024;
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
+/// Forwardable request headers per request. The frontend's own parser must
+/// admit more than this, or it drops the excess before this cap can refuse
+/// the request, and the sender is told 202 for headers that never left.
+pub const MAX_FORWARD_HEADERS: usize = 64;
+
 /// Raw request body cap. Datadog agents batch up to ~5 MB uncompressed, which
 /// gzips to well under this; OTLP collector batches are smaller again.
 pub const DEFAULT_MAX_BODY_BYTES: u32 = 1536 * 1024;

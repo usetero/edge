@@ -12,10 +12,7 @@ from harness import MatrixCase
 
 class TruncatedResponse(MatrixCase):
     EXPECT_LOGS_FOR = {"stdio": ["response.truncated"]}
-    DEFECTS = {
-        "httpz": "answers 202 for a truncated intake response",
-        "stdio": "answers 202 for a truncated intake response",
-    }
+    EXPECT_LOGS = ["UpstreamResponseTruncated"]
 
     def test_a_truncated_relay_is_never_reported_as_success(self):
         self.intake.arm("truncate", count=1)
@@ -27,4 +24,3 @@ class TruncatedResponse(MatrixCase):
 
         if status == 202:
             self.fail("a truncated intake response was reported as success")
-        self.assert_logged("upstream")

@@ -21,10 +21,7 @@ class CorruptGzip(MatrixCase):
 class CorruptGzipWithPolicies(MatrixCase):
     """The same body with policies loaded, so the decode path actually runs."""
 
-    DEFECTS = {
-        "stdio": "drops a body the policy path cannot decode instead of failing open",
-        "httpz": "drops a body the policy path cannot decode instead of failing open",
-    }
+    EXPECT_LOGS = ["policy.failed.open"]
     EDGE_POLICIES = {
         "policies": [
             {

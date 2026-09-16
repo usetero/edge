@@ -151,6 +151,12 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .max_body_size = limits.max_body_size,
             .buffer_size = limits.recv_buf,
             .lazy_read_size = limits.large_body_buffer_size,
+            // Above our own forward cap on purpose. httpz's default of 32
+            // drops the excess in silence, so a request with more headers
+            // than that was forwarded incomplete and answered 202. With room
+            // to spare, our cap refuses the request instead. Past this count
+            // httpz truncates again, which needs a fix in httpz itself.
+            .max_header_count = limits_mod.MAX_FORWARD_HEADERS + 32,
         },
         .workers = .{
             .count = worker_count,

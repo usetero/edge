@@ -75,11 +75,12 @@ class MatrixCase(unittest.TestCase):
     # case, so a case that declares nothing still cannot pass with silent
     # telemetry.
     METRIC_NEEDS_LOG = (
-        ("edge_request_errors_total", "request.failed"),
-        ("edge_upstream_timeouts_total", "upstream.timed.out"),
-        ("edge_upstream_retries_total", "upstream.retried"),
-        ("edge_connections_shed_total", "connection.shed"),
-        ("edge_requests_invalid_total", "request.rejected"),
+        (("edge_request_errors_total", 'class="uncaught"'), "request.failed"),
+        (("edge_request_errors_total", 'class="module"'), "policy.failed.open"),
+        (("edge_upstream_timeouts_total",), "upstream.timed.out"),
+        (("edge_upstream_retries_total",), "upstream.retried"),
+        (("edge_connections_shed_total",), "connection.shed"),
+        (("edge_requests_invalid_total",), "request.rejected"),
     )
 
     intake: EchoIntake
@@ -133,6 +134,17 @@ class MatrixCase(unittest.TestCase):
         except Exception:
             self.intake.stop()
             raise
+        # A stdio build without --prefix overwrites the httpz binary, which
+        # would silently test one frontend twice. The edge reports its own
+        # frontend, so trust that, not the path.
+        running = self.edge.frontend()
+        if running is not None and self.frontend in ("stdio", "httpz"):
+            self.assertEqual(
+                running,
+                self.frontend,
+                "EDGE_BIN carries the %s frontend, not %s; rebuild with "
+                "--prefix zig-out-stdio" % (running, self.frontend),
+            )
         self.baseline = self.edge.metrics()
         # Expectations are about what this case produced, so the startup lines
         # (which name the configured upstream) must not count. Diff by line,
@@ -256,15 +268,18 @@ class MatrixCase(unittest.TestCase):
             )
 
         metrics = self.edge.metrics()
-        for prefix, needle in self.METRIC_NEEDS_LOG:
-            moved = sum(v for k, v in metrics.items() if k.startswith(prefix))
-            base = sum(v for k, v in self.baseline.items() if k.startswith(prefix))
+        for parts, needle in self.METRIC_NEEDS_LOG:
+            def matches(name: str, parts=parts) -> bool:
+                return all(part in name for part in parts)
+
+            moved = sum(v for k, v in metrics.items() if matches(k))
+            base = sum(v for k, v in self.baseline.items() if matches(k))
             if moved > base:
-                self.assertIn(
-                    needle,
-                    logs,
+                self.assertTrue(
+                    self.wait_for_log(needle),
                     "%s moved but %r never appeared, so the event is "
-                    "unexplainable from the log:\n%s" % (prefix, needle, logs),
+                    "unexplainable from the log:\n%s"
+                    % ("+".join(parts), needle, self.case_logs()),
                 )
 
     # ------------------------------------------------------------ invariants

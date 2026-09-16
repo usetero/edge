@@ -147,6 +147,14 @@ class Edge:
     def alive(self) -> bool:
         return self.proc.poll() is None
 
+    def frontend(self) -> str | None:
+        """Which frontend this binary actually carries, from its own log."""
+        for line in self.logs().splitlines():
+            marker = 'data.plane.budget frontend="'
+            if marker in line:
+                return line.split(marker, 1)[1].split('"', 1)[0]
+        return None
+
     def logs(self) -> str:
         """Both streams. INFO and WARN land on stdout, ERROR on stderr."""
         self._out.flush()

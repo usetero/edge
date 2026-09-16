@@ -101,43 +101,59 @@ before it was fixed:
 
 ## Findings
 
-### Fixed while building the suite
+### Fixed
 
 1. **stdio never retried any batch.** Every body with a `Content-Length` was
    streamed, and a stream cannot be replayed, so one stale pooled connection
    lost the batch. Log intake clients do not retry, so this was silent data
-   loss. Bodies below the streaming threshold are now resident, which is where
-   httpz already drew the line. Caught by b04, b09 and b10.
-2. **A header flood answered 502.** Our cap, the sender's fault, so it now
-   answers 431. A 5xx sent the agent into a retry loop it could never win.
-   Caught by a14.
-3. **A retried dial was uncounted.** `edge_upstream_retries_total` missed the
-   second dial, so a dial storm was invisible in metrics. Caught by b01.
+   loss. Bodies below the streaming threshold are resident now, which is where
+   httpz already drew the line. Caught by b04, b09, b10.
+2. **A header flood answered 502.** Our cap, the sender's fault, so it answers
+   431. Caught by a14.
+3. **A retried dial was uncounted**, so a dial storm was invisible in
+   `edge_upstream_retries_total`. Caught by b01.
+4. **The streamed policy path dropped a body it could not decode.** With a
+   policy loaded, an undecodable batch never reached the intake, though
+   `execPipeBuffered` already failed open for the same condition. It now
+   forwards the raw batch, emits `policy.failed.open` with the stage, and
+   counts a module error. Caught by a09.
+5. **A truncated intake response was reported as 202.** The relay compares the
+   bytes copied against the declared `content-length` and fails with
+   `UpstreamResponseTruncated`, so the frontend closes without finishing the
+   body and the sender retries instead of recording a success. Caught by b11.
+6. **httpz dropped headers above its own cap in silence.** Its default
+   `max_header_count` is 32, below our 64-header forward cap, so a request
+   with more headers was forwarded incomplete and answered 202. The httpz
+   config now sits above our cap, and `MAX_FORWARD_HEADERS` in limits.zig is
+   the single source of truth. Caught by a14.
 
-### Open, both frontends
+### Corrected findings
 
-4. **An undecodable body is dropped when policies are loaded.** With a policy
-   active, a body the decoder rejects never reaches the intake, though
-   `service/datadog` documents fail-open. The edge becomes the reason the data
-   disappears. Caught by a09.
-5. **A truncated intake response is reported as success.** The intake declares
-   more body than it sends; the edge relays what arrived and answers 202. An
-   agent that reads 202 deletes its copy. Caught by b11.
-6. **An unsupported content encoding drops the batch.** Intent is forward-raw.
-   httpz answers 502 and blames the intake; stdio answers 400. Caught by a10.
+- **httpz does not mishandle an unsupported encoding.** The 502 came from our
+  own `std.http.Server` based echo intake refusing brotli. Verified against a
+  lenient intake: httpz forwards the batch and relays 200. The earlier entry
+  blaming httpz was wrong.
+- **httpz does cut off a dribbling sender.** Its request timeout runs from
+  accept, not per read, so a small dribbled body is caught. The per-read
+  restart only applies to a body above `lazy_read_size`. The declared defect
+  was removed after the runner reported XPASS.
 
-### Open, httpz only
+### Open: needs a change in a dependency
 
-7. **A batch of up to 16 requests goes to one pool thread.** A health probe that
-   arrives with a burst waited 6.0 s against a 3 s intake. This is the reported
-   ECS failure. Caught by c02.
-8. **Pipelined requests are refused** with 400. Caught by a12.
-9. **Headers above the cap are dropped in silence**, and the request still
-   answers 202. Caught by a14.
-10. **A stalled sender gets no status**: partial head, short body and dribbled
-    body all close with nothing. Caught by a02, a03, a04.
-
-### Open, stdio only
-
-11. **A broken chunk waits for the request deadline** instead of being refused
-    at once, so bad framing holds a connection slot for 30 s. Caught by a07.
+- **httpz hands a batch of up to 16 requests to one pool thread** (c02). A
+  health probe that arrives with a burst waited 3.0 to 6.0 s against a 3 s
+  intake. This is the reported ECS failure. Fix: one shared queue in
+  `thread_pool.zig`, plus a `received_at` stamp for a queue-wait metric.
+- **httpz refuses a pipelined pair** with 400 (a12). Fix: after
+  `requestDone`, parse the bytes already buffered as the next request.
+- **httpz closes a stalled sender with no status** (a02, a03). Fix: answer 408
+  before closing, and add a whole-request deadline.
+- **stdio cannot accept an unknown content encoding** (a10).
+  `std.http.Server` maps `content-encoding` through `ContentEncoding.fromString`
+  and fails the whole head with `HttpHeadersInvalid` for anything else, with no
+  distinct error to match on. An agent using brotli gets 400 and retries
+  forever. Fix: accept unknown encodings as opaque in std, or parse the head
+  ourselves.
+- **stdio waits for the request deadline on a broken chunk** (a07), so bad
+  framing holds a connection slot for 30 s. httpz refuses it at once. Fix:
+  std's chunked parser must error on an invalid size line.

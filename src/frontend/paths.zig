@@ -20,6 +20,12 @@ const log = std.log.scoped(.httpz_server);
 const BodySource = exchange.BodySource;
 const Inbound = exchange.Inbound;
 
+// Named event payloads: the type name is the telemetry event name.
+/// A policy stage could not read the batch, so the batch went upstream
+/// untouched. The edge must never be the reason data disappears: only the
+/// intake can accept or reject a payload.
+const PolicyFailedOpen = struct { path: []const u8, stage: []const u8, err: []const u8 };
+
 pub const InboundBody = union(enum) {
     /// Fully buffered by the frontend. Zero-copy slice.
     bytes: []const u8,
@@ -77,6 +83,26 @@ pub fn execForwardRaw(
     return forwardInbound(ctx, in, sink, fwd.upstream, body, fwd.replayable);
 }
 
+/// Forward the untouched batch after a policy stage failed to read it, and
+/// say so. Counted as a module error, because the policy module failed even
+/// though the request succeeds.
+fn failOpen(
+    ctx: *exec.SharedCtx,
+    in: Inbound,
+    sink: anytype,
+    pipe: service_mod.PipeStream,
+    raw_body: []const u8,
+    stage: []const u8,
+    err: anyerror,
+) !void {
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    ctx.bus.warn(PolicyFailedOpen{ .path = in.path, .stage = stage, .err = @errorName(err) });
+    if (ctx.metrics) |metrics| {
+        metrics.recordRequestError(exec.classifyKnownPath(in.path, .POST), .module);
+    }
+    return exchange.exchange(ctx, in, sink, pipe.upstream, .{ .bytes = raw_body }, pipe.signal == .log);
+}
+
 pub fn execPipeStream(
     ctx: *exec.SharedCtx,
     in: Inbound,
@@ -121,7 +147,9 @@ pub fn execPipeStream(
         break :blk probe_stats.dropped > 0 or probe_stats.replaced > 0;
     } else |err| switch (err) {
         error.BatchChanged => true,
-        error.ReadFailed => return error.InvalidRequestBody,
+        // A body we cannot read is still the customer's data. Forward it and
+        // let the intake judge it, exactly as execPipeBuffered does.
+        error.ReadFailed => return failOpen(ctx, in, sink, pipe, raw_body, "probe", err),
         else => return err,
     };
 
@@ -144,7 +172,7 @@ pub fn execPipeStream(
     encode_spec.encode = pipe.codec;
     const encoded = pipeline_mod.run(encode_spec, &body_reader, &output.writer, buffers, &record_sink);
     const stats = encoded catch |err| switch (err) {
-        error.ReadFailed => return error.InvalidRequestBody,
+        error.ReadFailed => return failOpen(ctx, in, sink, pipe, raw_body, "encode", err),
         else => return err,
     };
     if (ctx.metrics) |metrics| {
@@ -164,7 +192,15 @@ pub fn execPipeBuffered(
 
     const processed: exec.BufferedResult = exec.processBuffered(ctx, pipe, in.arena, raw_body) catch |err| blk: {
         if (err == error.BodyTooLarge or err == error.DecodedBodyTooLarge) return err;
-        log.warn("buffered transform failed open: {s}", .{@errorName(err)});
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.warn(PolicyFailedOpen{
+            .path = in.path,
+            .stage = "buffered",
+            .err = @errorName(err),
+        });
+        if (ctx.metrics) |metrics| {
+            metrics.recordRequestError(exec.classifyKnownPath(in.path, .POST), .module);
+        }
         break :blk .{ .body = raw_body, .all_dropped = false };
     };
 

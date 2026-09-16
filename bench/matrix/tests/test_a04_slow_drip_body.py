@@ -1,9 +1,12 @@
 """A04: the sender never stops, and never finishes.
 
-One byte at a time keeps a per-read timeout alive forever, so only a
-whole-request deadline cuts this off. The edge must stop reading and free the
-slot; whether the sender learns that through a 408 or through a closed socket
-depends on how far its own write buffer got.
+The edge must stop reading and free the slot. Whether the sender learns that
+through a 408 or through a closed socket depends on how far its own write
+buffer got, so both count.
+
+Both frontends pass: httpz measures its request timeout from accept, not per
+read, so it catches a small dribbled body too. Its per-read timeout only
+restarts for a body above `lazy_read_size`, which a handler thread reads.
 """
 
 import socket
@@ -16,7 +19,6 @@ class SlowDripBody(MatrixCase):
     EXPECT_METRICS_FOR = {"stdio": {'edge_inbound_timeouts_total{phase="request"}': 1}}
     FORBID_LOGS = ["upstream"]
     SLOW = True
-    DEFECTS = {"httpz": "its per-read timeout restarts on every byte, so the sender holds a handler thread"}
 
     def test_a_dribbling_sender_is_cut_off(self):
         body = b'[{"message":"' + b"x" * 30 + b'"}]'
