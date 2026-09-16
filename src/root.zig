@@ -99,6 +99,7 @@ test {
     // so the unselected one can't rot (PLAN-FRONTEND-SWAP.md §6).
     _ = @import("frontend/stdio/server.zig");
     _ = @import("frontend/httpz/server.zig");
+    _ = @import("runtime/mode.zig");
     _ = @import("runtime/distro.zig");
     _ = @import("runtime/extensions.zig");
     _ = @import("signals/prometheus/root.zig");
