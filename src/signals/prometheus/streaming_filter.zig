@@ -480,7 +480,9 @@ pub const PolicyStreamingFilter = struct {
         const suffix = sample_name[family.len..];
         return std.mem.eql(u8, suffix, "_bucket") or
             std.mem.eql(u8, suffix, "_sum") or
-            std.mem.eql(u8, suffix, "_count");
+            std.mem.eql(u8, suffix, "_count") or
+            std.mem.eql(u8, suffix, "_created") or
+            std.mem.eql(u8, suffix, "_total");
     }
 
     /// Write metadata lines if not already written for current metric
