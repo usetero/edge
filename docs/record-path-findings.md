@@ -59,7 +59,7 @@ problem this codebase does not have.
 
 The idea: split a batch into N slices and evaluate them concurrently.
 
-It is structurally possible. `matcher_index.zig:648-672` already has a 64-slot
+It is structurally possible. `policy-zig src/policy/matcher_index.zig:648-672` already has a 64-slot
 hyperscan scratch pool with per-thread slot assignment and atomic locks, so
 concurrent scanning is supported today. That is the hard part and it is done.
 
@@ -67,7 +67,7 @@ It still does not pay, for three reasons.
 
 1. **Most of the work cannot be split.** gzip decode is a sequential stream
    with a back-referencing window, so block N needs N-1. Record delimitation
-   is a depth-and-string state machine (`frame_json_array.zig:94-103`) that
+   is a depth-and-string state machine (`src/pipeline/frame_json_array.zig:94-103`) that
    has to run serially to find where records begin. You would decode
    serially, delimit serially, and only then fan out.
 2. **The parallelizable slice is ~20%.** Amdahl caps the speedup at about
@@ -85,7 +85,7 @@ is no missing-SIMD problem. The opportunity is the shape of the access.
 
 ### 1. The zimdjson parser is rebuilt per record
 
-`signals/datadog/log.zig:407-409` constructs a fresh `Parser` and tears it
+`src/signals/datadog/log.zig:407-409` constructs a fresh `Parser` and tears it
 down on every call:
 
 ```zig
@@ -103,7 +103,7 @@ is a signature change, not a redesign.
 This is invisible in every number above, because the bench payload's `message`
 fields are plain text and bail at the `head[0] != '{'` check. It is hot for
 any customer whose logger nests JSON inside `message`, which is common.
-`log.zig:407` is the only production site; the other `Parser = .init` uses in
+`src/signals/datadog/log.zig:407` is the only production site; the other `Parser = .init` uses in
 that file are tests.
 
 **Start here.** It is bounded, and it directly attacks the per-document setup
@@ -112,7 +112,7 @@ cost that is the likely reason the hot path avoids zimdjson at all.
 ### 2. Per-field search versus one structural pass
 
 `json_scan.FieldWalker` walks fields one at a time, calling `findScalarPos`
-for each closing quote (`json_scan.zig:114`). On a ~500 byte record with ~12
+for each closing quote (`src/signals/json_scan.zig:114`). On a ~500 byte record with ~12
 fields each search covers 10-20 bytes, shorter than the vector width, so the
 SIMD path barely engages and per-call overhead dominates. That is roughly
 100,000 short searches per batch.
@@ -133,9 +133,9 @@ codebase is built around. Not recommended.
 
 ## Read the existing comments first
 
-`json_scan.zig` is tuned, and its header says so. The per-record path avoids
+`src/signals/json_scan.zig` is tuned, and its header says so. The per-record path avoids
 zimdjson deliberately ("Single-pass zero-copy parse for the per-record eval
-path — no zimdjson", `log.zig:129`), and the `json_scan.zig` header records a
+path — no zimdjson", `src/signals/datadog/log.zig:129`), and that header records a
 measured decision to accept raw control bytes because rejecting them costs
 10-15% per record (lines 14-21, repeated at line 432). Assume these choices had reasons.
 
@@ -146,7 +146,7 @@ gzip, and the upstream.
 
 ## Loose end
 
-`frontend/exec.zig:207` says the per-record prefilter port is "tracked in
+`src/frontend/exec.zig:207` says the per-record prefilter port is "tracked in
 TODO.md". **There is no TODO.md in this repo.** That work — short-circuiting
 evaluation per record even when policies are loaded — is referenced nowhere
 else. It needs a real home, or the comment needs to stop pointing at a file
