@@ -234,7 +234,19 @@ pub const Watcher = struct {
 
         try self.detectPathReplacement(idx);
         const size = self.readActiveSizeOrReset(idx) orelse return;
-        if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
+        // A checkpoint lane may hold an offset above the current file size (the
+        // file shrank after that checkpoint was saved). The prefix hash
+        // recomputed at open cannot then tell a benign truncation from an
+        // in-place rewrite, so reset and re-emit conservatively (at-least-once);
+        // the emitted event lets the runtime reconcile the stale checkpoint, and
+        // a no-emit here would loop (applyCheckpointOffsetOne would keep
+        // resurrecting the stale offset). With no checkpoint lane the offset
+        // only grows via emitted appends, so the stored prefix hash predates any
+        // truncation and maybeHandleContentRewrite is allowed to gate the reset
+        // on the prefix comparison.
+        if (checkpoint_lane != null) {
+            if (size < self.offsets.items[i]) self.offsets.items[i] = 0;
+        }
         try self.maybeHandleContentRewrite(idx, size);
 
         const emitted = try self.emitReadableRange(out, idx, size);
@@ -456,6 +468,7 @@ pub const Watcher = struct {
         const i: usize = @intCast(idx);
         const file = self.files.items[i] orelse return;
         if (size == 0) {
+            if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
             self.head_prefix_lens.items[i] = 0;
             self.head_prefix_hashes.items[i] = 0;
             return;
@@ -478,7 +491,10 @@ pub const Watcher = struct {
         }
 
         const observed = try prefixHash(self.io, file, prefix_len);
-        if (observed == self.head_prefix_hashes.items[i]) return;
+        if (observed == self.head_prefix_hashes.items[i]) {
+            if (self.offsets.items[i] > size) self.offsets.items[i] = size;
+            return;
+        }
 
         if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
         self.head_prefix_hashes.items[i] = observed;
@@ -764,4 +780,203 @@ test "watch public API: collect emits appended file bytes" {
 
     try w.collect(&events, .tail, null);
     try testing.expectEqual(@as(usize, 1), events.items.len);
+}
+
+// Open `name` in `dir` for read/write, returning the handle. Caller closes.
+fn openRw(io: std.Io, dir: std.Io.Dir, name: []const u8) !std.Io.File {
+    return dir.openFile(io, name, .{ .mode = .read_write });
+}
+
+// Truncate the tracked log to `len` bytes in place.
+fn truncTo(io: std.Io, dir: std.Io.Dir, name: []const u8, len: u64) !void {
+    const f = try openRw(io, dir, name);
+    defer f.close(io);
+    try f.setLength(io, len);
+}
+
+// Append `bytes` to the tracked log at its current end.
+fn appendBytes(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    const f = try openRw(io, dir, name);
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    try f.writePositionalAll(io, bytes, size);
+}
+
+test "REPRO: partial truncation with unchanged prefix re-emits already-delivered bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Options.debug_io;
+    {
+        const f = try tmp.dir.createFile(io, "tail.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "seed...\n"); // 8 bytes
+    }
+    const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
+    defer testing.allocator.free(abs);
+
+    var w = try Watcher.init(testing.allocator, std.Options.debug_io, .poll, &.{abs}, "-", .head, 1000, 50, 1000);
+    defer w.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+
+    try w.collect(&events, .head, null); // Collect #1: emit [0, 8]
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 0), events.items[0].start_offset);
+    try testing.expectEqual(@as(u64, 8), events.items[0].end_offset);
+
+    try appendBytes(io, tmp.dir, "tail.log", "more...\n"); // -> 16 bytes
+    try w.collect(&events, .head, null); // Collect #2: emit [8, 16] (collect clears `events`)
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 8), events.items[0].start_offset);
+    try testing.expectEqual(@as(u64, 16), events.items[0].end_offset);
+
+    try truncTo(io, tmp.dir, "tail.log", 8); // partial truncate to 8, prefix "seed...\n" preserved
+
+    events.clearRetainingCapacity();
+    try w.collect(&events, .head, null); // Collect #3: must emit nothing
+    try testing.expectEqual(@as(usize, 0), events.items.len);
+}
+
+test "watch: partial truncation with unchanged prefix does not inject stale bytes under .tail" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Options.debug_io;
+    {
+        const f = try tmp.dir.createFile(io, "tail.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "seed...\n"); // pre-existing 8 bytes (never delivered under .tail)
+    }
+    const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
+    defer testing.allocator.free(abs);
+
+    var w = try Watcher.init(testing.allocator, std.Options.debug_io, .poll, &.{abs}, "-", .tail, 1000, 50, 1000);
+    defer w.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+
+    try w.collect(&events, .tail, null); // Collect #1: .tail starts at offset=size -> 0 events
+    try testing.expectEqual(@as(usize, 0), events.items.len);
+
+    try appendBytes(io, tmp.dir, "tail.log", "more...\n"); // -> 16 bytes
+    try w.collect(&events, .tail, null); // Collect #2: emit [8, 16]
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 8), events.items[0].start_offset);
+    try testing.expectEqual(@as(u64, 16), events.items[0].end_offset);
+
+    try truncTo(io, tmp.dir, "tail.log", 8); // partial truncate to 8, prefix preserved
+
+    events.clearRetainingCapacity();
+    try w.collect(&events, .tail, null); // Collect #3: must NOT inject stale [0, 8]
+    try testing.expectEqual(@as(usize, 0), events.items.len);
+}
+
+test "watch: copytruncate to zero then append emits new content from start" {
+    // Regression guard for removing the unconditional reset in processDirtyIndex:
+    // a truncate-to-zero must still bring the offset down to 0 so that content
+    // written afterwards is delivered from byte 0.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Options.debug_io;
+    {
+        const f = try tmp.dir.createFile(io, "tail.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "seed...\n"); // 8 bytes
+    }
+    const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
+    defer testing.allocator.free(abs);
+
+    var w = try Watcher.init(testing.allocator, std.Options.debug_io, .poll, &.{abs}, "-", .head, 1000, 50, 1000);
+    defer w.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+
+    try w.collect(&events, .head, null); // emit [0, 8]
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+
+    try truncTo(io, tmp.dir, "tail.log", 0); // copytruncate to zero
+    events.clearRetainingCapacity();
+    try w.collect(&events, .head, null); // nothing to emit while empty
+    try testing.expectEqual(@as(usize, 0), events.items.len);
+
+    try appendBytes(io, tmp.dir, "tail.log", "fresh\n"); // new content -> 6 bytes
+    events.clearRetainingCapacity();
+    try w.collect(&events, .head, null); // new content must be emitted from byte 0
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 0), events.items[0].start_offset);
+    try testing.expectEqual(@as(u64, 6), events.items[0].end_offset);
+}
+
+test "watch: checkpoint resume with offset above size re-emits conservatively without looping" {
+    // Regression guard for the checkpoint resume path. A durable lane may hold
+    // an offset above the live file size (the file was truncated after the
+    // checkpoint was saved). The conservative reset+re-emit must terminate: a
+    // no-emit would let applyCheckpointOffsetOne keep resurrecting the stale
+    // offset and re-queueing the index forever (collect would never return).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Options.debug_io;
+    {
+        const f = try tmp.dir.createFile(io, "tail.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "seed...\n"); // 8 bytes
+    }
+    const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
+    defer testing.allocator.free(abs);
+
+    // Open once under .checkpoint purely to discover the file identity the
+    // watcher computes for the live file, then release it.
+    var w0 = try Watcher.init(
+        testing.allocator,
+        std.Options.debug_io,
+        .poll,
+        &.{abs},
+        "-",
+        .checkpoint,
+        1000,
+        50,
+        1000,
+    );
+    const id = w0.identities.items[0] orelse return error.NoIdentity;
+    w0.deinit();
+
+    // Persist a stale checkpoint offset (16) above the file size (8) for that
+    // identity, then recover it synchronously into a Lane (no worker required).
+    const state_dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(state_dir);
+    {
+        var wal = try checkpoint_mod.wal.Wal.init(testing.allocator, io, state_dir);
+        try wal.append(1, .{ .identity = id, .offset = 16, .last_seen_ns = 1 });
+        try wal.sync();
+        wal.deinit();
+    }
+    var lane = try checkpoint_mod.Lane.init(
+        testing.allocator,
+        io,
+        state_dir,
+        16,
+        64,
+        5,
+        72 * 60 * 60 * 1000,
+        64,
+        60_000,
+    );
+    defer lane.deinit();
+    try testing.expectEqual(@as(?u64, 16), lane.getOffset(id));
+
+    // Restart the watcher under .checkpoint; the lane pushes the in-memory
+    // offset to 16, above the file size (8).
+    var w = try Watcher.init(testing.allocator, std.Options.debug_io, .poll, &.{abs}, "-", .checkpoint, 1000, 50, 1000);
+    defer w.deinit();
+    w.applyCheckpointLane(&lane);
+    try testing.expectEqual(@as(u64, 16), w.offsets.items[0]);
+
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+    // Must terminate (no infinite re-queue loop) and re-emit the surviving range
+    // once, conservatively, from byte 0.
+    try w.collect(&events, .checkpoint, &lane);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 0), events.items[0].start_offset);
+    try testing.expectEqual(@as(u64, 8), events.items[0].end_offset);
+    try testing.expectEqual(@as(u64, 8), w.offsets.items[0]);
 }
