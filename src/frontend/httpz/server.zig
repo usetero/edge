@@ -36,6 +36,9 @@ const RequestFailed = struct { method: []const u8, path: []const u8, err: []cons
 /// so the next request dials fresh (breaks the stale-keepalive poison loop).
 /// Eligible log intakes replay the prepared payload once on a fresh connection.
 const UpstreamConnectionEvicted = struct { path: []const u8, err: []const u8 };
+/// The upstream answered before the request body was fully sent and stopped
+/// reading, so the send failed but a real status was already on the wire.
+const UpstreamEarlyResponse = struct { path: []const u8, status: u16, err: []const u8 };
 /// Per-request trace, emitted at debug so it's off unless log_level=debug.
 const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 
@@ -54,6 +57,15 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
         .request = .{
             .max_body_size = limits.max_body_size,
             .buffer_size = limits.recv_buf,
+            // Bodies at or above this arrive unread: httpz hands the connection
+            // over after the headers and the handler pulls the body from the
+            // socket. Below it, httpz buffers as before. Set to the pool buffer
+            // size so anything that would have missed the pool (and gone to an
+            // arena allocation of body size, growing 1.5x) streams instead.
+            // Two consequences are owned by `inboundBody`: httpz skips its own
+            // max_body_size check for lazy bodies, and `req.body()` then holds
+            // only the prefix that arrived with the headers.
+            .lazy_read_size = limits.large_body_buffer_size,
         },
         // Handler threads bound concurrency, since each owns a whole upstream
         // exchange. limits.zig derives the count; it is never left to httpz. Its count
@@ -90,7 +102,35 @@ const ThreadBufs = struct {
     deadline_lock: std.Io.Mutex = .init,
     connection: ?*std.http.Client.Connection = null,
     deadline_ns: i128 = 0,
+    /// Staging for a streamed body. `Reader.stream` reads from the client
+    /// socket straight into the upstream writer's buffer, so this size is the
+    /// chunk size of the whole pump. At the 20 KiB upstream write buffer a
+    /// 1 MB body is ~52 blocking read/write round trips on the handler thread,
+    /// and throughput fell to a third of the buffered path; a larger window
+    /// keeps the client's TCP window open and amortizes the syscalls.
+    pump: []u8 = &.{},
+    /// Landing buffer for a lazy body the policy path must hold resident.
+    /// Per thread and never freed per request: the alternative, draining into
+    /// the per-connection request arena, frees the node back into libc malloc
+    /// after every request and malloc keeps it mapped, so RSS grew ~1.1 MB per
+    /// connection (67/128/322 MB at 16/64/250 connections, measured) even
+    /// though only `thread_pool_count` bodies are ever live at once. Sized to
+    /// max_body_size, so it is bounded by threads alone.
+    body: []u8 = &.{},
     timed_out: std.atomic.Value(bool) = .init(false),
+
+    /// Lazily sized on first streamed body; retained for the thread like the
+    /// codec workspaces. Freed in freeThreadBufs.
+    fn ensurePump(self: *ThreadBufs, allocator: std.mem.Allocator) ![]u8 {
+        if (self.pump.len == 0) self.pump = try allocator.alloc(u8, pump_buffer_bytes);
+        return self.pump;
+    }
+
+    /// Lazily sized on the first lazy body a policy path has to buffer.
+    fn ensureBody(self: *ThreadBufs, allocator: std.mem.Allocator, max_body_size: usize) ![]u8 {
+        if (self.body.len == 0) self.body = try allocator.alloc(u8, max_body_size);
+        return self.body;
+    }
 
     fn prepare(
         self: *ThreadBufs,
@@ -133,6 +173,10 @@ fn trackUpstream(io: std.Io, bufs: *ThreadBufs, connection: ?*std.http.Client.Co
     defer bufs.deadline_lock.unlock(io);
     bufs.connection = connection;
     if (connection) |_| {
+        // From now, not from when the inbound request arrived. A slow client
+        // that took most of the request timeout to deliver its body would
+        // otherwise leave the upstream almost no budget, and a healthy
+        // upstream would be cut off and reported as a 504.
         bufs.deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() + upstream_attempt_timeout_ns;
         bufs.timed_out.store(false, .release);
     }
@@ -172,6 +216,8 @@ fn freeThreadBufs(io: std.Io, allocator: std.mem.Allocator) void {
         allocator.free(bufs.scratch);
         allocator.free(bufs.chunk);
         allocator.free(bufs.upstream);
+        allocator.free(bufs.pump);
+        allocator.free(bufs.body);
         bufs.record.deinit();
         allocator.destroy(bufs);
     }
@@ -271,6 +317,102 @@ fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.http.He
     return out[0..count];
 }
 
+/// What `exchange` forwards upstream: a slice httpz already buffered, or a
+/// body still on the inbound socket with its declared length.
+const BodySource = union(enum) {
+    bytes: []const u8,
+    /// Read once, straight from the client socket to the upstream socket.
+    /// Cannot be replayed, so `exchange` never retries it.
+    stream: struct { reader: *std.Io.Reader, len: usize },
+};
+
+/// Inbound body as the handler must treat it.
+const InboundBody = union(enum) {
+    /// Fully buffered by httpz. Zero-copy slice.
+    bytes: []const u8,
+    /// At or above lazy_read_size; still on the socket. The declared
+    /// Content-Length, already checked against max_body_size.
+    lazy: usize,
+};
+
+/// Chunk size for pumping a streamed body client socket -> upstream socket.
+const pump_buffer_bytes: usize = 512 * 1024;
+
+/// Per-read timeout for pulling a lazy body off the client socket. This is
+/// SO_RCVTIMEO, so it bounds one read, not the transfer; `DeadlineReader`
+/// bounds the transfer.
+const lazy_read_timeout_ms: usize = limits_mod.REQUEST_TIMEOUT_SECONDS * 1000;
+
+/// Whole-body deadline for a lazy inbound body.
+const inbound_body_timeout_ns: i128 = @as(i128, limits_mod.REQUEST_TIMEOUT_SECONDS) * std.time.ns_per_s;
+
+/// Absolute deadline over a lazy body read.
+///
+/// `req.reader(ms)` sets SO_RCVTIMEO, which restarts on every read, so a
+/// client that sends one byte just inside the timeout holds its handler
+/// thread for as long as it likes. A few dozen such clients take the whole
+/// pool and the server stops answering, health checks included. This wraps
+/// the httpz reader and fails the transfer once the deadline passes.
+const DeadlineReader = struct {
+    interface: std.Io.Reader,
+    inner: *std.Io.Reader,
+    io: std.Io,
+    deadline_ns: i128,
+    /// Set when the deadline fired, so the handler can close the connection
+    /// instead of leaving an undrained body on it.
+    expired: bool = false,
+
+    fn init(io: std.Io, inner: *std.Io.Reader) DeadlineReader {
+        return .{
+            .interface = .{
+                .end = 0,
+                .seek = 0,
+                .buffer = &.{},
+                .vtable = &.{ .stream = DeadlineReader.stream },
+            },
+            .inner = inner,
+            .io = io,
+            .deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() + inbound_body_timeout_ns,
+        };
+    }
+
+    fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *DeadlineReader = @alignCast(@fieldParentPtr("interface", io_r));
+        if (std.Io.Timestamp.now(self.io, .awake).toNanoseconds() > self.deadline_ns) {
+            self.expired = true;
+            return error.ReadFailed;
+        }
+        return self.inner.stream(w, limit);
+    }
+};
+
+/// Classify the inbound body and enforce the cap httpz skips for lazy reads
+/// (request.zig: the max_body_size check is bypassed when lazy_read_size is
+/// set). Checked from the declared length before any body byte is read.
+fn inboundBody(req: *httpz.Request, limits: limits_mod.Limits) !InboundBody {
+    if (req.unread_body == 0) return .{ .bytes = req.body() orelse "" };
+    if (req.body_len > limits.max_body_size) return error.BodyTooLarge;
+    return .{ .lazy = req.body_len };
+}
+
+/// Drain a lazy body into the request arena. Used by the paths that must
+/// read the body twice (the policy probe, the buffered transforms); the
+/// result is what `req.body()` would have held had httpz buffered it, at the
+/// same one-exact-copy cost.
+fn bufferLazyBody(io: std.Io, req: *httpz.Request, dst: []u8, len: usize) ![]const u8 {
+    // `len` was checked against max_body_size by inboundBody, and `dst` is
+    // sized to max_body_size, so this cannot overrun.
+    std.debug.assert(len <= dst.len);
+    var reader = try req.reader(lazy_read_timeout_ms);
+    var bounded = DeadlineReader.init(io, &reader.interface);
+    var sink: std.Io.Writer = .fixed(dst[0..len]);
+    bounded.interface.streamExact(&sink, len) catch |err| {
+        if (bounded.expired) return error.InboundBodyTimeout;
+        return err;
+    };
+    return dst[0..len];
+}
+
 pub const Handler = struct {
     ctx: *exec.SharedCtx,
     stopping: std.atomic.Value(bool) = .init(false),
@@ -304,6 +446,10 @@ pub const Handler = struct {
             res.headers.reset();
             res.status = errorStatus(err);
             res.body = "";
+            // The body is part-read, so the connection cannot be reused: httpz
+            // would drain the remainder, which is the same unbounded wait we
+            // just escaped.
+            if (err == error.InboundBodyTimeout) res.keepalive = false;
             if (ctx.metrics) |metrics| {
                 metrics.recordRequestError(known_path, .uncaught);
             }
@@ -472,46 +618,98 @@ pub const Handler = struct {
     }
 
     fn execForwardRaw(self: *Handler, req: *httpz.Request, res: *httpz.Response, fwd: service_mod.Forward) !void {
-        return self.exchange(req, res, fwd.upstream, req.body() orelse "", fwd.replayable);
+        switch (try inboundBody(req, self.ctx.limits)) {
+            .bytes => |b| return self.exchange(req, res, fwd.upstream, .{ .bytes = b }, fwd.replayable),
+            .lazy => |len| {
+                var reader = try req.reader(lazy_read_timeout_ms);
+                var bounded = DeadlineReader.init(self.ctx.io, &reader.interface);
+                const body: BodySource = .{ .stream = .{ .reader = &bounded.interface, .len = len } };
+                self.exchange(req, res, fwd.upstream, body, false) catch |err| {
+                    if (bounded.expired) return error.InboundBodyTimeout;
+                    return err;
+                };
+            },
+        }
     }
 
     /// Exactly one evaluation precedes this function. Only transport failure
     /// before a response head can replay; upstream HTTP statuses pass through.
+    /// Open the upstream request, dialing a second time if the first dial
+    /// fails. A failed dial has sent nothing, so this is safe regardless of
+    /// the body's replayability or the error's name — unlike the send-side
+    /// retry in `exchange`, which needs both. Observed as a 1-in-5000
+    /// `error.Unexpected` at phase="connect" in the first 200 ms after
+    /// startup, when every handler dials at once; std does not surface the
+    /// errno, and "Unexpected" is not in the send-side retry's list, so the
+    /// request went straight to 502.
+    fn dialUpstream(
+        self: *Handler,
+        req: *httpz.Request,
+        res: *httpz.Response,
+        method: std.http.Method,
+        headers: []const std.http.Header,
+        choice: service_mod.UpstreamChoice,
+        client: *std.http.Client,
+    ) !std.http.Client.Request {
+        const ctx = self.ctx;
+        return exec.openUpstreamWithClient(ctx, res.arena, method, req.url.raw, headers, choice, client) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            ctx.bus.info(UpstreamRetried{ .path = req.url.path, .err = @errorName(err) });
+            return exec.openUpstreamWithClient(ctx, res.arena, method, req.url.raw, headers, choice, client);
+        };
+    }
+
     fn exchange(
         self: *Handler,
         req: *httpz.Request,
         res: *httpz.Response,
         choice: service_mod.UpstreamChoice,
-        body: []const u8,
+        body: BodySource,
         replayable: bool,
     ) !void {
         const ctx = self.ctx;
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
         const headers = try collectForwardHeaders(res.arena, req.headers.iterator());
         const method = stdMethod(req.method) orelse return error.UnsupportedMethod;
-        const retry = replayable or method == .GET or method == .HEAD;
+        // The pump is per-thread and lazily sized; allocate it here with the
+        // gpa that freeThreadBufs releases it with.
+        if (body == .stream) _ = try bufs.ensurePump(ctx.gpa);
+        // A streamed body is consumed by the first attempt; there is nothing
+        // left to replay, whatever the caller asked for.
+        const retry = body == .bytes and (replayable or method == .GET or method == .HEAD);
         const attempts: usize = if (retry) 2 else 1;
         for (0..attempts) |attempt| {
             const client = if (attempt == 0) ctx.upstreams.getHttpClient() else &ctx.upstreams.retry_client;
             if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(attempt > 0);
-            var upstream_req = exec.openUpstreamWithClient(
-                ctx,
-                res.arena,
-                method,
-                req.url.raw,
-                headers,
-                choice,
-                client,
-            ) catch |err| {
-                if (attempt + 1 == attempts or !retryableTransportError(err)) return err;
-                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-                ctx.bus.info(UpstreamRetried{ .path = req.url.path, .err = @errorName(err) });
-                continue;
-            };
+            var upstream_req = try self.dialUpstream(req, res, method, headers, choice, client);
             defer upstream_req.deinit();
             trackUpstream(ctx.io, bufs, upstream_req.connection);
             defer trackUpstream(ctx.io, bufs, null);
-            var upstream_res = sendAndReceiveHead(&upstream_req, method, body, bufs) catch |err| {
+            var upstream_res = sendAndReceiveHead(&upstream_req, method, body, bufs) catch |err| blk: {
+                // An intake that rejects a request (403 bad key, 413, 429) often
+                // answers as soon as it has seen the headers and stops reading.
+                // Our body write then fails against a peer that has closed its
+                // read side, but the response is already in our socket. Read it
+                // and relay it: the agent learns the real status instead of a
+                // 502 from the proxy, and nothing is retried against a verdict.
+                // Only for write-side failures — on anything else the peer may
+                // never answer and receiveHead would sit on the read until the
+                // upstream watchdog fires.
+                if (!bufs.timed_out.load(.acquire) and isSendSideFailure(err)) {
+                    if (upstream_req.receiveHead(&.{})) |early| {
+                        // Peer stopped reading mid-body; this connection can
+                        // never carry another request. Quietly, not evict():
+                        // this is the upstream's answer, not a transport fault.
+                        markUpstreamClosing(&upstream_req);
+                        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                        ctx.bus.info(UpstreamEarlyResponse{
+                            .path = req.url.path,
+                            .status = @intFromEnum(early.head.status),
+                            .err = @errorName(err),
+                        });
+                        break :blk early;
+                    } else |_| {}
+                }
                 const may_retry = self.evictAndMayRetry(&upstream_req, req.url.path, err);
                 if (bufs.timed_out.load(.acquire)) return error.UpstreamTimeout;
                 if (!may_retry) return err;
@@ -575,9 +773,24 @@ pub const Handler = struct {
 
     fn execPipeStream(self: *Handler, req: *httpz.Request, res: *httpz.Response, pipe: service_mod.PipeStream) !void {
         const ctx = self.ctx;
-        const raw_body = req.body() orelse "";
+        const inbound = try inboundBody(req, ctx.limits);
         if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
-            return self.exchange(req, res, pipe.upstream, raw_body, pipe.signal == .log);
+            // Passthrough never looks at the body, so a lazy one goes socket to
+            // socket and peak memory stops scaling with body size. Streaming
+            // forfeits the replay retry: a consumed socket cannot be re-sent.
+            switch (inbound) {
+                .bytes => |b| return self.exchange(req, res, pipe.upstream, .{ .bytes = b }, pipe.signal == .log),
+                .lazy => |len| {
+                    var reader = try req.reader(lazy_read_timeout_ms);
+                    var bounded = DeadlineReader.init(ctx.io, &reader.interface);
+                    const body: BodySource = .{ .stream = .{ .reader = &bounded.interface, .len = len } };
+                    self.exchange(req, res, pipe.upstream, body, false) catch |err| {
+                        if (bounded.expired) return error.InboundBodyTimeout;
+                        return err;
+                    };
+                    return;
+                },
+            }
         }
         // A probe is a dry run and captures no tap records, and an unchanged
         // batch then skips the real pass entirely — so an armed tap would
@@ -586,6 +799,18 @@ pub const Handler = struct {
         // armed for about a second, so the extra pass costs nothing real.
         const tap_armed = if (ctx.tap) |tap| tap.isArmed() else false;
         const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
+        // The probe re-reads the body when a policy changes it, so this path
+        // needs it resident either way — in the thread's buffer, not the
+        // connection's arena.
+        const raw_body = switch (inbound) {
+            .bytes => |b| b,
+            .lazy => |len| try bufferLazyBody(
+                ctx.io,
+                req,
+                try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size),
+                len,
+            ),
+        };
         try bufs.prepare(ctx.gpa, ctx.limits, pipe.codec);
         var body_reader = std.Io.Reader.fixed(raw_body);
         // flate.Compress.init asserts its sink holds more than 8 bytes, so an
@@ -631,7 +856,7 @@ pub const Handler = struct {
                 metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), probe.records, 0);
                 metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .fast_path);
             }
-            return self.exchange(req, res, pipe.upstream, raw_body, pipe.signal == .log);
+            return self.exchange(req, res, pipe.upstream, .{ .bytes = raw_body }, pipe.signal == .log);
         }
 
         // Something changed, so do the real pass: decode, evaluate and encode
@@ -654,7 +879,7 @@ pub const Handler = struct {
         if (ctx.metrics) |metrics| {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
         }
-        try self.exchange(req, res, pipe.upstream, output.written(), pipe.signal == .log);
+        try self.exchange(req, res, pipe.upstream, .{ .bytes = output.written() }, pipe.signal == .log);
     }
 
     fn execPipeBuffered(
@@ -664,7 +889,18 @@ pub const Handler = struct {
         pipe: service_mod.PipeBuffered,
     ) !void {
         const ctx = self.ctx;
-        const raw_body = req.body() orelse "";
+        const raw_body = switch (try inboundBody(req, ctx.limits)) {
+            .bytes => |b| b,
+            .lazy => |len| blk: {
+                const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
+                break :blk try bufferLazyBody(
+                    ctx.io,
+                    req,
+                    try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size),
+                    len,
+                );
+            },
+        };
 
         // res.arena is httpz's per-request fallback allocator; safe for the
         // resize-heavy transform since 5f60277 (fallback resize fix).
@@ -682,7 +918,7 @@ pub const Handler = struct {
             return;
         }
 
-        try self.exchange(req, res, pipe.upstream, processed.body, pipe.signal == .log);
+        try self.exchange(req, res, pipe.upstream, .{ .bytes = processed.body }, pipe.signal == .log);
     }
 
     fn execFetchFiltered(
@@ -747,10 +983,23 @@ pub const Handler = struct {
 fn errorStatus(err: anyerror) u16 {
     return switch (err) {
         error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
+        error.InboundBodyTimeout => 408,
         error.InvalidRequestBody => 400,
         error.UpstreamTimeout => 504,
         error.OutOfMemory, error.WriteFailed => 503,
         else => 502,
+    };
+}
+
+/// Failures that mean "the peer's read side went away while we were writing"
+/// — the only case where an early response can be waiting in the socket.
+fn isSendSideFailure(err: anyerror) bool {
+    return switch (err) {
+        error.WriteFailed,
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        => true,
+        else => false,
     };
 }
 
@@ -776,7 +1025,7 @@ fn retryableTransportError(err: anyerror) bool {
 fn sendAndReceiveHead(
     request: *std.http.Client.Request,
     method: std.http.Method,
-    body: []const u8,
+    body: BodySource,
     bufs: *ThreadBufs,
 ) !std.http.Client.Response {
     try sendBufferedBody(request, method, body, bufs);
@@ -802,13 +1051,28 @@ fn markUpstreamClosing(upstream_req: *std.http.Client.Request) void {
 fn sendBufferedBody(
     upstream_req: *std.http.Client.Request,
     method: std.http.Method,
-    body: []const u8,
+    body: BodySource,
     bufs: *ThreadBufs,
 ) !void {
     if (method.requestHasBody()) {
-        upstream_req.transfer_encoding = .{ .content_length = body.len };
-        var body_writer = try upstream_req.sendBodyUnflushed(bufs.upstream);
-        try body_writer.writer.writeAll(body);
+        const len = switch (body) {
+            .bytes => |b| b.len,
+            .stream => |st| st.len,
+        };
+        upstream_req.transfer_encoding = .{ .content_length = len };
+        const write_buf = switch (body) {
+            .bytes => bufs.upstream,
+            // Sized by exchange() before the send; see ensurePump.
+            .stream => bufs.pump,
+        };
+        std.debug.assert(write_buf.len > 0);
+        var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
+        switch (body) {
+            .bytes => |b| try body_writer.writer.writeAll(b),
+            // Client socket to upstream socket through the 20 KiB write
+            // buffer; nothing body-sized is ever resident.
+            .stream => |st| try st.reader.streamExact(&body_writer.writer, st.len),
+        }
         try body_writer.end();
         try upstream_req.connection.?.flush();
     } else {
@@ -981,4 +1245,19 @@ test "collectForwardHeaders drops hop-by-hop headers" {
     try testing.expectEqualStrings("dd-api-key", headers[0].name);
     try testing.expectEqualStrings("secret", headers[0].value);
     try testing.expectEqualStrings("x-keep", headers[1].name);
+}
+
+test "only write-side failures are probed for an early upstream response" {
+    // These mean the peer's read side went away mid-body, the one situation
+    // where a response can already be sitting in our socket.
+    try testing.expect(isSendSideFailure(error.WriteFailed));
+    try testing.expect(isSendSideFailure(error.BrokenPipe));
+    try testing.expect(isSendSideFailure(error.ConnectionResetByPeer));
+    // Anything else and the peer may never answer; probing would block the
+    // handler on a read until the upstream watchdog fires.
+    try testing.expect(!isSendSideFailure(error.ConnectionRefused));
+    try testing.expect(!isSendSideFailure(error.HostUnreachable));
+    try testing.expect(!isSendSideFailure(error.ReadFailed));
+    try testing.expect(!isSendSideFailure(error.UnexpectedEndOfStream));
+    try testing.expect(!isSendSideFailure(error.HttpConnectionClosing));
 }
