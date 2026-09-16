@@ -34,6 +34,12 @@ pub const TapState = struct {
 
     pub const Stage = enum { pre, post };
 
+    /// True while a tap session is armed. Same unlocked acquire-load as
+    /// `capture`, so it costs one load on the request path.
+    pub fn isArmed(self: *TapState) bool {
+        return @atomicLoad(?*std.Io.Writer, &self.sink, .acquire) != null;
+    }
+
     /// Hot path. Called from every onRecord on every data-plane thread. When
     /// no tap is armed this is one acquire-load + a not-taken branch.
     pub fn capture(

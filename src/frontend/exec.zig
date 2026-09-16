@@ -441,7 +441,10 @@ pub const RecordSink = struct {
             self.ctx.registry,
             self.ctx.bus,
             bytes,
-            self.ctx.extension_sink,
+            // A probe is a dry run: the real pass that follows dispatches
+            // these actions, and a sink that saw both would record every
+            // record before the first change twice.
+            if (self.probe) null else self.ctx.extension_sink,
         );
         switch (verdict) {
             .keep => return .keep,
