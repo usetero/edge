@@ -31,13 +31,15 @@ pub fn processBatchScalar(
 }
 
 /// Stable per-file key for isolating framer state across a multi-file batch.
-/// Uses the watcher's file handle pointer, which is unique and stable per
-/// tracked path entry for the lifetime of the open file. Using the physical
-/// file identity (dev+ino hash) instead would assign the same key to two
-/// hard-linked paths tracked as separate watcher entries, causing their
-/// framer states to collide and cross-contaminate each other.
+/// Uses the OS file descriptor number, which is unique per open file within
+/// the process and does not change when the watcher's `files` ArrayList moves
+/// entries during a `swapRemove`. Using a pointer into the ArrayList instead
+/// would produce a stale key for the moved entry on every subsequent batch
+/// after a file removal. Using the physical file identity (dev+ino hash)
+/// instead would assign the same key to two hard-linked paths tracked as
+/// separate watcher entries, causing their framer states to collide.
 pub fn eventKey(evt: watch_mod.Event) u64 {
-    return @intFromPtr(evt.file);
+    return @as(u64, @bitCast(@as(i64, evt.file.handle)));
 }
 
 pub fn readTailScalar(
