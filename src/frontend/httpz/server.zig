@@ -117,10 +117,6 @@ const ThreadBufs = struct {
     /// though only `thread_pool_count` bodies are ever live at once. Sized to
     /// max_body_size, so it is bounded by threads alone.
     body: []u8 = &.{},
-    /// Taken once in `handle`; `trackUpstream` derives its deadline from it
-    /// instead of reading the clock again. The attempt timeout is 30 s, so
-    /// anchoring it a few hundred microseconds early is immaterial.
-    request_start_ns: i128 = 0,
     timed_out: std.atomic.Value(bool) = .init(false),
 
     /// Lazily sized on first streamed body; retained for the thread like the
@@ -177,7 +173,11 @@ fn trackUpstream(io: std.Io, bufs: *ThreadBufs, connection: ?*std.http.Client.Co
     defer bufs.deadline_lock.unlock(io);
     bufs.connection = connection;
     if (connection) |_| {
-        bufs.deadline_ns = bufs.request_start_ns + upstream_attempt_timeout_ns;
+        // From now, not from when the inbound request arrived. A slow client
+        // that took most of the request timeout to deliver its body would
+        // otherwise leave the upstream almost no budget, and a healthy
+        // upstream would be cut off and reported as a 504.
+        bufs.deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() + upstream_attempt_timeout_ns;
         bufs.timed_out.store(false, .release);
     }
 }
@@ -338,8 +338,53 @@ const InboundBody = union(enum) {
 /// Chunk size for pumping a streamed body client socket -> upstream socket.
 const pump_buffer_bytes: usize = 512 * 1024;
 
-/// Read timeout for pulling a lazy body off the client socket.
+/// Per-read timeout for pulling a lazy body off the client socket. This is
+/// SO_RCVTIMEO, so it bounds one read, not the transfer; `DeadlineReader`
+/// bounds the transfer.
 const lazy_read_timeout_ms: usize = limits_mod.REQUEST_TIMEOUT_SECONDS * 1000;
+
+/// Whole-body deadline for a lazy inbound body.
+const inbound_body_timeout_ns: i128 = @as(i128, limits_mod.REQUEST_TIMEOUT_SECONDS) * std.time.ns_per_s;
+
+/// Absolute deadline over a lazy body read.
+///
+/// `req.reader(ms)` sets SO_RCVTIMEO, which restarts on every read, so a
+/// client that sends one byte just inside the timeout holds its handler
+/// thread for as long as it likes. A few dozen such clients take the whole
+/// pool and the server stops answering, health checks included. This wraps
+/// the httpz reader and fails the transfer once the deadline passes.
+const DeadlineReader = struct {
+    interface: std.Io.Reader,
+    inner: *std.Io.Reader,
+    io: std.Io,
+    deadline_ns: i128,
+    /// Set when the deadline fired, so the handler can close the connection
+    /// instead of leaving an undrained body on it.
+    expired: bool = false,
+
+    fn init(io: std.Io, inner: *std.Io.Reader) DeadlineReader {
+        return .{
+            .interface = .{
+                .end = 0,
+                .seek = 0,
+                .buffer = &.{},
+                .vtable = &.{ .stream = DeadlineReader.stream },
+            },
+            .inner = inner,
+            .io = io,
+            .deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() + inbound_body_timeout_ns,
+        };
+    }
+
+    fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *DeadlineReader = @alignCast(@fieldParentPtr("interface", io_r));
+        if (std.Io.Timestamp.now(self.io, .awake).toNanoseconds() > self.deadline_ns) {
+            self.expired = true;
+            return error.ReadFailed;
+        }
+        return self.inner.stream(w, limit);
+    }
+};
 
 /// Classify the inbound body and enforce the cap httpz skips for lazy reads
 /// (request.zig: the max_body_size check is bypassed when lazy_read_size is
@@ -354,13 +399,17 @@ fn inboundBody(req: *httpz.Request, limits: limits_mod.Limits) !InboundBody {
 /// read the body twice (the policy probe, the buffered transforms); the
 /// result is what `req.body()` would have held had httpz buffered it, at the
 /// same one-exact-copy cost.
-fn bufferLazyBody(req: *httpz.Request, dst: []u8, len: usize) ![]const u8 {
+fn bufferLazyBody(io: std.Io, req: *httpz.Request, dst: []u8, len: usize) ![]const u8 {
     // `len` was checked against max_body_size by inboundBody, and `dst` is
     // sized to max_body_size, so this cannot overrun.
     std.debug.assert(len <= dst.len);
     var reader = try req.reader(lazy_read_timeout_ms);
+    var bounded = DeadlineReader.init(io, &reader.interface);
     var sink: std.Io.Writer = .fixed(dst[0..len]);
-    try reader.interface.streamExact(&sink, len);
+    bounded.interface.streamExact(&sink, len) catch |err| {
+        if (bounded.expired) return error.InboundBodyTimeout;
+        return err;
+    };
     return dst[0..len];
 }
 
@@ -378,7 +427,6 @@ pub const Handler = struct {
         }
         const ctx = self.ctx;
         const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
-        if (threadBufs(ctx.io, ctx.gpa, ctx.limits)) |bufs| bufs.request_start_ns = start_ns else |_| {}
         const method = serviceMethod(req.method);
         const known_path = exec.classifyKnownPath(req.url.path, method);
         if (ctx.metrics) |metrics| {
@@ -398,6 +446,10 @@ pub const Handler = struct {
             res.headers.reset();
             res.status = errorStatus(err);
             res.body = "";
+            // The body is part-read, so the connection cannot be reused: httpz
+            // would drain the remainder, which is the same unbounded wait we
+            // just escaped.
+            if (err == error.InboundBodyTimeout) res.keepalive = false;
             if (ctx.metrics) |metrics| {
                 metrics.recordRequestError(known_path, .uncaught);
             }
@@ -570,8 +622,12 @@ pub const Handler = struct {
             .bytes => |b| return self.exchange(req, res, fwd.upstream, .{ .bytes = b }, fwd.replayable),
             .lazy => |len| {
                 var reader = try req.reader(lazy_read_timeout_ms);
-                const body: BodySource = .{ .stream = .{ .reader = &reader.interface, .len = len } };
-                return self.exchange(req, res, fwd.upstream, body, false);
+                var bounded = DeadlineReader.init(self.ctx.io, &reader.interface);
+                const body: BodySource = .{ .stream = .{ .reader = &bounded.interface, .len = len } };
+                self.exchange(req, res, fwd.upstream, body, false) catch |err| {
+                    if (bounded.expired) return error.InboundBodyTimeout;
+                    return err;
+                };
             },
         }
     }
@@ -726,8 +782,13 @@ pub const Handler = struct {
                 .bytes => |b| return self.exchange(req, res, pipe.upstream, .{ .bytes = b }, pipe.signal == .log),
                 .lazy => |len| {
                     var reader = try req.reader(lazy_read_timeout_ms);
-                    const body: BodySource = .{ .stream = .{ .reader = &reader.interface, .len = len } };
-                    return self.exchange(req, res, pipe.upstream, body, false);
+                    var bounded = DeadlineReader.init(ctx.io, &reader.interface);
+                    const body: BodySource = .{ .stream = .{ .reader = &bounded.interface, .len = len } };
+                    self.exchange(req, res, pipe.upstream, body, false) catch |err| {
+                        if (bounded.expired) return error.InboundBodyTimeout;
+                        return err;
+                    };
+                    return;
                 },
             }
         }
@@ -744,6 +805,7 @@ pub const Handler = struct {
         const raw_body = switch (inbound) {
             .bytes => |b| b,
             .lazy => |len| try bufferLazyBody(
+                ctx.io,
                 req,
                 try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size),
                 len,
@@ -832,6 +894,7 @@ pub const Handler = struct {
             .lazy => |len| blk: {
                 const bufs = try threadBufs(ctx.io, ctx.gpa, ctx.limits);
                 break :blk try bufferLazyBody(
+                    ctx.io,
                     req,
                     try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size),
                     len,
@@ -920,6 +983,7 @@ pub const Handler = struct {
 fn errorStatus(err: anyerror) u16 {
     return switch (err) {
         error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
+        error.InboundBodyTimeout => 408,
         error.InvalidRequestBody => 400,
         error.UpstreamTimeout => 504,
         error.OutOfMemory, error.WriteFailed => 503,
