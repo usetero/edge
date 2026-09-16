@@ -17,7 +17,13 @@ pub fn processBatchScalar(
         // events for multiple different files through this one framer, so
         // without switching a partial line left in scratch by one file is
         // completed with the next file's bytes.
-        try framer.selectStream(eventKey(evt));
+        const key = eventKey(evt);
+        // A start_offset of 0 means the watcher reset the read position —
+        // truncation-and-rewrite or rotation to a new file at the same path.
+        // Discard any saved partial for this key so stale pre-rewrite bytes
+        // are not concatenated onto the new file contents.
+        if (evt.start_offset == 0) framer.resetStream(key);
+        try framer.selectStream(key);
         try framer.readRange(io, evt.file, evt.start_offset, evt.end_offset, writer, filter_ctx, filter_fn);
         processed += 1;
     }
@@ -25,11 +31,12 @@ pub fn processBatchScalar(
 }
 
 /// Stable per-file key for isolating framer state across a multi-file batch.
-/// Uses the watcher's file identity when available (set for every tracked,
-/// stat-able file); falls back to the file handle pointer so un-identifiable
-/// files are still isolated from each other within a batch.
+/// Uses the watcher's file handle pointer, which is unique and stable per
+/// tracked path entry for the lifetime of the open file. Using the physical
+/// file identity (dev+ino hash) instead would assign the same key to two
+/// hard-linked paths tracked as separate watcher entries, causing their
+/// framer states to collide and cross-contaminate each other.
 pub fn eventKey(evt: watch_mod.Event) u64 {
-    if (evt.identity) |id| return types.identityHash(id);
     return @intFromPtr(evt.file);
 }
 
