@@ -292,7 +292,10 @@ pub const Runtime = struct {
         };
         lifecycle.shutdown(self.io);
 
-        if (signal_waiter) |waiter| teardownSignalWaiter(waiter, &shutdown_waiter);
+        if (signal_waiter) |waiter| {
+            teardownSignalWaiter(waiter, &shutdown_waiter);
+            signal_waiter = null;
+        }
 
         // The canceled tasks can't reliably do final file IO; drain and
         // flush on this (uncanceled) thread. See drainFramer for why the
