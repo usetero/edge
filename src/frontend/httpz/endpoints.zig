@@ -1,45 +1,47 @@
 //! Internal observability endpoints under `/_edge/`: Prometheus scrape, the
 //! loaded policy snapshot, and the config-gated record tap. Not the data
-//! plane; nothing here touches an upstream.
+//! plane; nothing here touches an upstream. Frontend-neutral: responses go
+//! through a `sink` (contract in exchange.zig); the frontend parses the query.
 const std = @import("std");
-const httpz = @import("httpz");
 const exec = @import("../exec.zig");
 
-pub fn metrics(ctx: *exec.SharedCtx, res: *httpz.Response) !void {
-    res.header("content-type", "text/plain; version=0.0.4");
+/// `write_frontend_metrics` appends the HTTP server's own counters (httpz has
+/// them; std.http.Server does not).
+pub fn metrics(
+    ctx: *exec.SharedCtx,
+    sink: anytype,
+    write_frontend_metrics: ?*const fn (*std.Io.Writer) anyerror!void,
+) !void {
     exec.refreshPolicyGauge(ctx);
-    if (ctx.metrics) |m| try m.writePrometheus(res.writer());
-    // httpz's own counters. httpz_connections going flat while httpz_requests
-    // keeps climbing is the signature of the connection cap being reached.
-    try httpz.writeMetrics(res.writer());
+    const out = try sink.begin(200, &.{.{ .name = "content-type", .value = "text/plain; version=0.0.4" }});
+    if (ctx.metrics) |m| try m.writePrometheus(out);
+    if (write_frontend_metrics) |f| try f(out);
+    try sink.end();
 }
 
-pub fn policies(ctx: *exec.SharedCtx, req: *httpz.Request, res: *httpz.Response) !void {
-    const json = std.mem.eql(u8, (try req.query()).get("format") orelse "", "json");
-    res.header("content-type", if (json) "application/json" else "text/plain; charset=utf-8");
-    try exec.writePolicies(ctx.registry, res.writer(), json);
+pub fn policies(ctx: *exec.SharedCtx, sink: anytype, json: bool) !void {
+    const ct = if (json) "application/json" else "text/plain; charset=utf-8";
+    const out = try sink.begin(200, &.{.{ .name = "content-type", .value = ct }});
+    try exec.writePolicies(ctx.registry, out, json);
+    try sink.end();
 }
 
-pub fn recordTap(ctx: *exec.SharedCtx, req: *httpz.Request, res: *httpz.Response, stage: exec.TapState.Stage) !void {
+pub fn recordTap(ctx: *exec.SharedCtx, sink: anytype, stage: exec.TapState.Stage, requested: u32) !void {
     const tap = ctx.tap orelse {
-        res.status = 404;
-        res.body = "tap disabled (set tap_enabled in config)\n";
-        return;
+        const out = try sink.begin(404, &.{});
+        try out.writeAll("tap disabled (set tap_enabled in config)\n");
+        return sink.end();
     };
 
-    var n: u32 = 50;
-    if ((try req.query()).get("n")) |raw| {
-        n = std.fmt.parseInt(u32, raw, 10) catch 50;
-    }
-    n = std.math.clamp(n, 1, 1000);
+    const n = std.math.clamp(requested, 1, 1000);
 
     var buf: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer buf.deinit();
 
     if (!tap.arm(stage, n, &buf.writer)) {
-        res.status = 409;
-        res.body = "a tap is already active\n";
-        return;
+        const out = try sink.begin(409, &.{});
+        try out.writeAll("a tap is already active\n");
+        return sink.end();
     }
     errdefer tap.disarm();
 
@@ -50,6 +52,7 @@ pub fn recordTap(ctx: *exec.SharedCtx, req: *httpz.Request, res: *httpz.Response
     }
     tap.disarm(); // stop producers before we read `buf`
 
-    res.header("content-type", "application/octet-stream");
-    try res.writer().writeAll(buf.written());
+    const out = try sink.begin(200, &.{.{ .name = "content-type", .value = "application/octet-stream" }});
+    try out.writeAll(buf.written());
+    try sink.end();
 }

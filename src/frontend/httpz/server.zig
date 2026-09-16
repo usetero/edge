@@ -21,11 +21,54 @@ const httpz = @import("httpz");
 const exec = @import("../exec.zig");
 const runtime_metrics = @import("../../runtime/runtime_metrics.zig");
 const limits_mod = @import("../../core/limits.zig");
+const service_mod = @import("../../service/service.zig");
 const lifecycle_mod = @import("../../core/lifecycle.zig");
 const exchange = @import("exchange.zig");
 const paths = @import("paths.zig");
 const endpoints = @import("endpoints.zig");
 const thread_bufs = @import("thread_bufs.zig");
+
+const Inbound = exchange.Inbound;
+const InboundBody = paths.InboundBody;
+
+/// Read timeout for pulling a lazy body off the client socket.
+const lazy_read_timeout_ms: usize = limits_mod.REQUEST_TIMEOUT_SECONDS * 1000;
+
+/// The response side of the sink contract (exchange.zig) over an httpz
+/// response. httpz commits status and headers when the handler returns, so
+/// `end` has nothing to do.
+pub const Sink = struct {
+    res: *httpz.Response,
+    pub fn begin(self: Sink, status: u16, headers: []const std.http.Header) !*std.Io.Writer {
+        self.res.status = status;
+        for (headers) |h| self.res.header(h.name, h.value);
+        return self.res.writer();
+    }
+    pub fn end(_: Sink) !void {}
+};
+
+/// Lift the request into the frontend-neutral shape.
+fn inboundOf(req: *httpz.Request, arena: std.mem.Allocator) !Inbound {
+    return .{
+        .method = stdMethod(req.method) orelse return error.UnsupportedMethod,
+        .target = req.url.raw,
+        .path = req.url.path,
+        .headers = try exchange.collectForwardHeaders(arena, req.headers.iterator()),
+        .arena = arena,
+    };
+}
+
+/// Classify the body and enforce the cap httpz skips for lazy reads: with
+/// lazy_read_size set, httpz does not check max_body_size (request.zig), and
+/// `req.body()` on a lazy request holds only the prefix that arrived with the
+/// headers. `lazy_reader` must outlive the returned body; it is only
+/// initialized when the body is lazy.
+fn inboundBodyOf(req: *httpz.Request, limits: limits_mod.Limits, lazy_reader: *httpz.Request.Reader) !InboundBody {
+    if (req.unread_body == 0) return .{ .bytes = req.body() orelse "" };
+    if (req.body_len > limits.max_body_size) return error.BodyTooLarge;
+    lazy_reader.* = try req.reader(lazy_read_timeout_ms);
+    return .{ .lazy = .{ .reader = &lazy_reader.interface, .len = req.body_len } };
+}
 
 const log = std.log.scoped(.httpz_server);
 
@@ -145,7 +188,7 @@ pub const Handler = struct {
         }
         const ctx = self.ctx;
         const start_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
-        const method = exchange.serviceMethod(req.method);
+        const method = serviceMethod(req.method);
         const known_path = exec.classifyKnownPath(req.url.path, method);
         if (ctx.metrics) |metrics| {
             metrics.recordRequest(exec.methodLabel(method), known_path);
@@ -188,12 +231,17 @@ pub const Handler = struct {
 
     fn dispatch(self: *Handler, req: *httpz.Request, res: *httpz.Response) !void {
         const ctx = self.ctx;
-        const method = exchange.serviceMethod(req.method);
+        const method = serviceMethod(req.method);
         const path = req.url.path;
 
-        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) return endpoints.metrics(ctx, res);
-
-        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) return endpoints.policies(ctx, req, res);
+        var sink: Sink = .{ .res = res };
+        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
+            return endpoints.metrics(ctx, &sink, &httpz.writeMetrics);
+        }
+        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) {
+            const json = std.mem.eql(u8, (try req.query()).get("format") orelse "", "json");
+            return endpoints.policies(ctx, &sink, json);
+        }
 
         if (req.method == .GET and std.mem.startsWith(u8, path, "/_edge/tap/")) {
             const stage: exec.TapState.Stage = if (std.mem.eql(u8, path, "/_edge/tap/pre"))
@@ -204,7 +252,8 @@ pub const Handler = struct {
                 res.status = 404;
                 return;
             };
-            return endpoints.recordTap(ctx, req, res, stage);
+            const n: u32 = if ((try req.query()).get("n")) |raw| std.fmt.parseInt(u32, raw, 10) catch 50 else 50;
+            return endpoints.recordTap(ctx, &sink, stage, n);
         }
 
         const outcome = exec.planRequest(
@@ -218,19 +267,52 @@ pub const Handler = struct {
             res.body = "";
             return;
         };
+        if (outcome == .respond) {
+            const static = outcome.respond;
+            res.status = static.status;
+            res.header("content-type", static.content_type);
+            res.body = static.body;
+            return;
+        }
+        const in = try inboundOf(req, res.arena);
+        var lazy_reader: httpz.Request.Reader = undefined;
+        const body = try inboundBodyOf(req, ctx.limits, &lazy_reader);
         switch (outcome) {
-            .respond => |static| {
-                res.status = static.status;
-                res.header("content-type", static.content_type);
-                res.body = static.body;
-            },
-            .forward_raw => |fwd| try paths.execForwardRaw(ctx, req, res, fwd),
-            .pipe_stream => |pipe| try paths.execPipeStream(ctx, req, res, pipe),
-            .pipe_buffered => |pipe| try paths.execPipeBuffered(ctx, req, res, pipe),
-            .fetch_filtered => |fetch| try paths.execFetchFiltered(ctx, req, res, fetch),
+            .respond => unreachable,
+            .forward_raw => |fwd| try paths.execForwardRaw(ctx, in, &sink, body, fwd),
+            .pipe_stream => |pipe| try paths.execPipeStream(ctx, in, &sink, body, pipe),
+            .pipe_buffered => |pipe| try paths.execPipeBuffered(ctx, in, &sink, body, pipe),
+            .fetch_filtered => |fetch| try paths.execFetchFiltered(ctx, in, &sink, body, fetch),
         }
     }
 };
+
+pub fn serviceMethod(method: httpz.Method) service_mod.HttpMethod {
+    return switch (method) {
+        .GET => .GET,
+        .POST => .POST,
+        .PUT => .PUT,
+        .DELETE => .DELETE,
+        .PATCH => .PATCH,
+        .HEAD => .HEAD,
+        .OPTIONS => .OPTIONS,
+        .CONNECT, .OTHER => .OTHER,
+    };
+}
+
+fn stdMethod(method: httpz.Method) ?std.http.Method {
+    return switch (method) {
+        .GET => .GET,
+        .POST => .POST,
+        .PUT => .PUT,
+        .DELETE => .DELETE,
+        .PATCH => .PATCH,
+        .HEAD => .HEAD,
+        .OPTIONS => .OPTIONS,
+        .CONNECT => .CONNECT,
+        .OTHER => null,
+    };
+}
 
 fn errorStatus(err: anyerror) u16 {
     return switch (err) {
@@ -298,4 +380,11 @@ test "more workers than connections cannot over-admit" {
 
     const config = configFromLimits(limits, .{ 127, 0, 0, 1 }, 8080);
     try testing.expectEqual(@as(usize, 1), (config.workers.max_conn orelse 0) * config.workerCount());
+}
+
+test "httpz method maps onto service and std methods" {
+    try testing.expectEqual(service_mod.HttpMethod.POST, serviceMethod(.POST));
+    try testing.expectEqual(service_mod.HttpMethod.OTHER, serviceMethod(.CONNECT));
+    try testing.expectEqual(@as(?std.http.Method, .GET), stdMethod(.GET));
+    try testing.expectEqual(@as(?std.http.Method, null), stdMethod(.OTHER));
 }

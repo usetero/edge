@@ -1,8 +1,9 @@
-//! The upstream leg of an httpz request: open a connection, send the body,
-//! receive the head, relay the response. Free functions on `SharedCtx` with
-//! no dependency on the httpz `Handler`, so another frontend can adopt them.
+//! The upstream leg of a request: open a connection, send the body, receive
+//! the head, relay the response. Frontend-neutral: the request arrives as an
+//! `Inbound` and the response leaves through a `sink` (contract below), so
+//! the httpz and stdio frontends share every retry, eviction and early-
+//! response rule here.
 const std = @import("std");
-const httpz = @import("httpz");
 const exec = @import("../exec.zig");
 const service_mod = @import("../../service/service.zig");
 const upstream_mod = @import("../upstream.zig");
@@ -19,8 +20,31 @@ const UpstreamConnectionEvicted = struct { path: []const u8, err: []const u8 };
 /// the send failed but a real status was already on the wire.
 const UpstreamEarlyResponse = struct { path: []const u8, status: u16, err: []const u8 };
 
-/// What goes upstream: a slice httpz already buffered, or a body still on
-/// the inbound socket with its declared length. A stream is consumed by the
+/// The parts of an inbound request the upstream leg needs, already lifted
+/// out of whatever HTTP server produced it.
+pub const Inbound = struct {
+    method: std.http.Method,
+    /// Path plus query, forwarded to the upstream verbatim.
+    target: []const u8,
+    /// Path only, for logs and metrics.
+    path: []const u8,
+    /// Forwardable request headers (hop-by-hop already dropped).
+    headers: []const std.http.Header,
+    /// Per-request arena; freed by the frontend after the response.
+    arena: std.mem.Allocator,
+};
+
+// Response sink contract. Duck-typed: any `sink` passed to functions here
+// must provide
+//
+//     fn begin(self, status: u16, headers: []const std.http.Header) !*std.Io.Writer
+//     fn end(self) !void
+//
+// `begin` commits status and headers and returns the body writer; `end`
+// finishes the body. Each frontend has a small adapter.
+
+/// What goes upstream: a slice the frontend already buffered, or a body still
+/// on the inbound socket with its declared length. A stream is consumed by the
 /// first send and is never retried.
 pub const BodySource = union(enum) {
     bytes: []const u8,
@@ -33,7 +57,7 @@ const max_forward_headers = 64;
 
 /// Forwardable request headers into an arena-owned array. `iter` is any
 /// iterator whose `next()` yields `.{ .key, .value }`.
-fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.http.Header {
+pub fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.http.Header {
     const out = try arena.alloc(std.http.Header, max_forward_headers);
     var it = iter;
     var count: usize = 0;
@@ -46,43 +70,13 @@ fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.http.He
     return out[0..count];
 }
 
-pub fn serviceMethod(method: httpz.Method) service_mod.HttpMethod {
-    return switch (method) {
-        .GET => .GET,
-        .POST => .POST,
-        .PUT => .PUT,
-        .DELETE => .DELETE,
-        .PATCH => .PATCH,
-        .HEAD => .HEAD,
-        .OPTIONS => .OPTIONS,
-        .CONNECT, .OTHER => .OTHER,
-    };
-}
-
-fn stdMethod(method: httpz.Method) ?std.http.Method {
-    return switch (method) {
-        .GET => .GET,
-        .POST => .POST,
-        .PUT => .PUT,
-        .DELETE => .DELETE,
-        .PATCH => .PATCH,
-        .HEAD => .HEAD,
-        .OPTIONS => .OPTIONS,
-        .CONNECT => .CONNECT,
-        .OTHER => null,
-    };
-}
-
 /// Single-attempt open on the pooled client; the scrape path uses this.
 pub fn openUpstream(
     ctx: *exec.SharedCtx,
-    req: *httpz.Request,
-    arena: std.mem.Allocator,
+    in: Inbound,
     choice: service_mod.UpstreamChoice,
 ) !std.http.Client.Request {
-    const method = stdMethod(req.method) orelse return error.UnsupportedMethod;
-    const headers = try collectForwardHeaders(arena, req.headers.iterator());
-    return exec.openUpstream(ctx, arena, method, req.url.raw, headers, choice);
+    return exec.openUpstream(ctx, in.arena, in.method, in.target, in.headers, choice);
 }
 
 /// Open the upstream request, dialing a second time if the first dial fails.
@@ -91,17 +85,14 @@ pub fn openUpstream(
 /// startup when every handler dials at once; std hides the errno.)
 fn dialUpstream(
     ctx: *exec.SharedCtx,
-    req: *httpz.Request,
-    res: *httpz.Response,
-    method: std.http.Method,
-    headers: []const std.http.Header,
+    in: Inbound,
     choice: service_mod.UpstreamChoice,
     client: *std.http.Client,
 ) !std.http.Client.Request {
-    return exec.openUpstreamWithClient(ctx, res.arena, method, req.url.raw, headers, choice, client) catch |err| {
+    return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.info(UpstreamRetried{ .path = req.url.path, .err = @errorName(err) });
-        return exec.openUpstreamWithClient(ctx, res.arena, method, req.url.raw, headers, choice, client);
+        ctx.bus.info(UpstreamRetried{ .path = in.path, .err = @errorName(err) });
+        return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client);
     };
 }
 
@@ -112,27 +103,25 @@ fn dialUpstream(
 /// be replayed and never retries.
 pub fn exchange(
     ctx: *exec.SharedCtx,
-    req: *httpz.Request,
-    res: *httpz.Response,
+    in: Inbound,
+    sink: anytype,
     choice: service_mod.UpstreamChoice,
     body: BodySource,
     replayable: bool,
 ) !void {
     const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
-    const headers = try collectForwardHeaders(res.arena, req.headers.iterator());
-    const method = stdMethod(req.method) orelse return error.UnsupportedMethod;
     if (body == .stream) _ = try bufs.ensurePump(ctx.gpa);
-    const retry = body == .bytes and (replayable or method == .GET or method == .HEAD);
+    const retry = body == .bytes and (replayable or in.method == .GET or in.method == .HEAD);
     const attempts: usize = if (retry) 2 else 1;
     for (0..attempts) |attempt| {
         const client = if (attempt == 0) ctx.upstreams.getHttpClient() else &ctx.upstreams.retry_client;
         if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(attempt > 0);
-        var upstream_req = try dialUpstream(ctx, req, res, method, headers, choice, client);
+        var upstream_req = try dialUpstream(ctx, in, choice, client);
         defer upstream_req.deinit();
         thread_bufs.trackUpstream(ctx.io, bufs, upstream_req.connection);
         defer thread_bufs.trackUpstream(ctx.io, bufs, null);
 
-        var upstream_res = sendAndReceiveHead(&upstream_req, method, body, bufs) catch |err| blk: {
+        var upstream_res = sendAndReceiveHead(&upstream_req, in.method, body, bufs) catch |err| blk: {
             // An intake that rejects a request answers as soon as it has seen
             // the headers and stops reading, so our write fails while its
             // response is already in our socket. Relay that instead of a 502.
@@ -143,34 +132,34 @@ pub fn exchange(
                     markUpstreamClosing(&upstream_req); // peer stopped reading mid-body
                     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
                     ctx.bus.info(UpstreamEarlyResponse{
-                        .path = req.url.path,
+                        .path = in.path,
                         .status = @intFromEnum(early.head.status),
                         .err = @errorName(err),
                     });
                     break :blk early;
                 } else |_| {}
             }
-            evictUpstream(ctx, &upstream_req, req.url.path, err);
+            evictUpstream(ctx, &upstream_req, in.path, err);
             if (bufs.timed_out.load(.acquire)) return error.UpstreamTimeout;
             if (!retryableTransportError(err)) return err;
             if (attempt + 1 == attempts) return error.UpstreamTransportFailed;
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            ctx.bus.info(UpstreamRetried{ .path = req.url.path, .err = @errorName(err) });
+            ctx.bus.info(UpstreamRetried{ .path = in.path, .err = @errorName(err) });
             continue;
         };
 
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(choice));
-        relayResponse(res, &upstream_res, max_response, bufs) catch |err| {
+        relayResponse(sink, in.arena, &upstream_res, max_response, bufs) catch |err| {
             if (bufs.timed_out.load(.acquire)) {
-                evictUpstream(ctx, &upstream_req, req.url.path, err);
+                evictUpstream(ctx, &upstream_req, in.path, err);
                 return error.UpstreamTimeout;
             }
             switch (err) {
                 error.BodyTooLarge => {
-                    evictUpstream(ctx, &upstream_req, req.url.path, err);
+                    evictUpstream(ctx, &upstream_req, in.path, err);
                     return error.UpstreamResponseTooLarge;
                 },
-                error.ReadFailed => evictUpstream(ctx, &upstream_req, req.url.path, err),
+                error.ReadFailed => evictUpstream(ctx, &upstream_req, in.path, err),
                 else => {},
             }
             return err;
@@ -181,17 +170,18 @@ pub fn exchange(
 }
 
 fn relayResponse(
-    res: *httpz.Response,
+    sink: anytype,
+    arena: std.mem.Allocator,
     upstream_res: *std.http.Client.Response,
     max_response_body: usize,
     bufs: *ThreadBufs,
 ) !void {
     var extra_headers: [64]std.http.Header = undefined;
-    const relayed = try exec.collectUpstreamResponseHeaders(upstream_res, res.arena, &extra_headers);
-    res.status = @intFromEnum(upstream_res.head.status);
-    for (relayed) |header| res.header(header.name, header.value);
+    const relayed = try exec.collectUpstreamResponseHeaders(upstream_res, arena, &extra_headers);
+    const out = try sink.begin(@intFromEnum(upstream_res.head.status), relayed);
     const upstream_body = upstream_res.reader(bufs.upstream);
-    _ = try pipeline_mod.streamReaderToWriter(upstream_body, res.writer(), max_response_body);
+    _ = try pipeline_mod.streamReaderToWriter(upstream_body, out, max_response_body);
+    try sink.end();
 }
 
 /// Destroy a failed pooled connection and record it, so the next request
@@ -317,13 +307,6 @@ test "head-phase protocol failures are not replayable" {
     // A pooled connection the peer already closed carries no response bytes,
     // so it is the one head-phase failure worth replaying.
     try testing.expect(retryableTransportError(error.HttpConnectionClosing));
-}
-
-test "httpz method maps onto service and std methods" {
-    try testing.expectEqual(service_mod.HttpMethod.POST, serviceMethod(.POST));
-    try testing.expectEqual(service_mod.HttpMethod.OTHER, serviceMethod(.CONNECT));
-    try testing.expectEqual(@as(?std.http.Method, .GET), stdMethod(.GET));
-    try testing.expectEqual(@as(?std.http.Method, null), stdMethod(.OTHER));
 }
 
 test "only transport failures are replayable" {
