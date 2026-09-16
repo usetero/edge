@@ -540,7 +540,12 @@ pub const DatadogLog = struct {
                         .object => |*obj| {
                             if (obj.getPtr(path[path.len - 1])) |entry| switch (entry.*) {
                                 .string => |s| return s,
-                                else => return null,
+                                // Non-string leaf (array, object, number, …): the tree
+                                // value is not a scalar string, but `flattenValue` may
+                                // have stored a string from inside it (e.g. array
+                                // containing a string).  Fall through to `message_flat`
+                                // so those entries are not silently dropped.
+                                else => {},
                             } else return null;
                         },
                         // Parent isn't an object (e.g. an array the flattener
