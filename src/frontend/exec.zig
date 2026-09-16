@@ -289,8 +289,16 @@ pub fn processBuffered(
     raw_body: []const u8,
 ) !BufferedResult {
     if (!policiesActiveFor(ctx.registry, pipe.signal)) {
+        if (ctx.metrics) |metrics| metrics.recordPrefilterDecision(
+            bufferedRouteKindLabel(pipe.kind),
+            .fast_path,
+        );
         return .{ .body = raw_body, .all_dropped = false };
     }
+    if (ctx.metrics) |metrics| metrics.recordPrefilterDecision(
+        bufferedRouteKindLabel(pipe.kind),
+        .policy_path,
+    );
     var raw_reader = std.Io.Reader.fixed(raw_body);
     const decode_buf = try arena.alloc(u8, pipe.codec.decoderBufferLen(ctx.limits.zstd_window_len));
     var decoder: encoding_mod.Decoder = .init(pipe.codec, &raw_reader, decode_buf, ctx.limits.zstd_window_len);
@@ -532,6 +540,40 @@ pub fn bufferedRouteLabel(kind: service_mod.BufferedKind) runtime_metrics_mod.Po
     };
 }
 
+/// Maps a streamed pipe's `(signal, format)` to the `RouteKindLabel` exposed by
+/// `edge_prefilter_decisions_total`. Streamed pipes carry the four telemetry
+/// route kinds reachable through the framer (datadog logs via `json_array` and
+/// the three otlp kinds via `otlp_protobuf`); `.health`, `.passthrough`, and
+/// `.none` are never produced at this fork (see `RuntimeMetrics.initializeStaticSeries`).
+pub fn routeKindLabel(
+    signal: service_mod.Signal,
+    format: framer_mod.WireFormat,
+) runtime_metrics_mod.RouteKindLabel {
+    return switch (routeLabel(signal, format)) {
+        .datadog_logs => .datadog_logs,
+        .datadog_metrics => .datadog_metrics,
+        .otlp_logs => .otlp_logs,
+        .otlp_metrics => .otlp_metrics,
+        .otlp_traces => .otlp_traces,
+        .prometheus_metrics => .prometheus_metrics,
+    };
+}
+
+/// Maps a buffered pipe's `BufferedKind` to the `RouteKindLabel` exposed by
+/// `edge_prefilter_decisions_total`. Buffered pipes carry the four whole-body
+/// batch kinds (datadog metrics JSON + the three otlp JSON kinds); the
+/// remaining route kinds are not reachable from a buffered pipe, so the two
+/// streaming/fetch-only telemetry labels are unreachable here.
+pub fn bufferedRouteKindLabel(kind: service_mod.BufferedKind) runtime_metrics_mod.RouteKindLabel {
+    return switch (bufferedRouteLabel(kind)) {
+        .datadog_metrics => .datadog_metrics,
+        .otlp_logs => .otlp_logs,
+        .otlp_metrics => .otlp_metrics,
+        .otlp_traces => .otlp_traces,
+        else => unreachable,
+    };
+}
+
 // ============================== Tests ==============================
 
 const testing = std.testing;
@@ -596,4 +638,170 @@ test "contentEncodingName round-trips through the codec layer" {
         @as(?encoding_mod.ContentEncoding, null),
         encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.deflate)),
     );
+}
+
+test "routeKindLabel maps streamed pipe routes onto RouteKindLabel" {
+    const Rk = runtime_metrics_mod.RouteKindLabel;
+    // json_array is the Datadog log wire format regardless of the carried signal.
+    try testing.expectEqual(Rk.datadog_logs, routeKindLabel(.log, .json_array));
+    try testing.expectEqual(Rk.datadog_logs, routeKindLabel(.metric, .json_array));
+    // otlp_protobuf selects the signal's otlp route kind.
+    try testing.expectEqual(Rk.otlp_logs, routeKindLabel(.log, .otlp_protobuf));
+    try testing.expectEqual(Rk.otlp_metrics, routeKindLabel(.metric, .otlp_protobuf));
+    try testing.expectEqual(Rk.otlp_traces, routeKindLabel(.trace, .otlp_protobuf));
+}
+
+test "bufferedRouteKindLabel maps buffered pipe kinds onto RouteKindLabel" {
+    const Rk = runtime_metrics_mod.RouteKindLabel;
+    try testing.expectEqual(Rk.datadog_metrics, bufferedRouteKindLabel(.datadog_metrics_json));
+    try testing.expectEqual(Rk.otlp_logs, bufferedRouteKindLabel(.otlp_logs_json));
+    try testing.expectEqual(Rk.otlp_metrics, bufferedRouteKindLabel(.otlp_metrics_json));
+    try testing.expectEqual(Rk.otlp_traces, bufferedRouteKindLabel(.otlp_traces_json));
+}
+
+/// Minimal `SharedCtx` for the buffered-pipe wiring tests. `processBuffered`
+/// reads only `registry`, `metrics`, `limits`, and `bus`; the
+/// router/upstream/services fields are left `undefined` (poison-filled in Debug
+/// builds, so any accidental read fails loudly rather than silently passing).
+fn bufferedPipeCtx(
+    bus: *EventBus,
+    registry: *policy.Registry,
+    metrics: *runtime_metrics_mod.RuntimeMetrics,
+) SharedCtx {
+    return .{
+        .io = undefined,
+        .gpa = testing.allocator,
+        .router = undefined,
+        .services = &[_]service_mod.Service{},
+        .upstreams = undefined,
+        .upstream_ids = undefined,
+        .registry = registry,
+        .bus = bus,
+        .metrics = metrics,
+        .limits = limits_mod.Limits.resolve(.{ .max_body_size = 1024 * 1024 }),
+    };
+}
+
+/// A datadog metrics series body the buffered pipe decodes + re-encodes for a
+/// keep-all metric policy without dropping anything (so `all_dropped` stays
+/// false and the full policy path runs to completion).
+const datadog_metrics_body =
+    \\{"series": [{"metric": "system.load.1", "type": 3, "points": [{"timestamp": 1636629071, "value": 0.7}]}]}
+;
+
+// Regression guard for the #187 bug, which left recordPrefilterDecision with no
+// caller. Drives a real request through `processBuffered` (the shared buffered
+// pipe path both frontends' `execPipeBuffered` call) and asserts the prefilter
+// decision counter increments on the fast path. Fails on an unwired HEAD (the
+// counter stays at its seeded 0) and passes once the fork records the decision.
+test "processBuffered records a fast_path prefilter decision when no policy targets the signal" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var metrics = try runtime_metrics_mod.RuntimeMetrics.init(testing.allocator, io, .edge);
+    defer metrics.deinit();
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = policy.Registry.init(testing.allocator, noop_bus.eventBus());
+    defer registry.deinit();
+    // No snapshot loaded: policiesActiveFor(.metric) is false -> fast path.
+
+    var ctx = bufferedPipeCtx(noop_bus.eventBus(), &registry, &metrics);
+    const pipe: service_mod.PipeBuffered = .{
+        .kind = .datadog_metrics_json,
+        .signal = .metric,
+        .upstream = .default,
+        .codec = .identity,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try processBuffered(&ctx, pipe, arena.allocator(), datadog_metrics_body);
+    // Fast path forwards the raw body verbatim.
+    try testing.expectEqualStrings(datadog_metrics_body, result.body);
+    try testing.expect(!result.all_dropped);
+
+    var scrape: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer scrape.deinit();
+    try metrics.writePrometheus(&scrape.writer);
+    const out = scrape.written();
+    const fast_path_1 = "edge_prefilter_decisions_total{route_kind=\"datadog_metrics\",decision=\"fast_path\"} 1";
+    const policy_path_0 = "edge_prefilter_decisions_total{route_kind=\"datadog_metrics\",decision=\"policy_path\"} 0";
+    try testing.expect(std.mem.indexOf(u8, out, fast_path_1) != null);
+    // The policy-path series for this route kind must stay at its seeded 0.
+    try testing.expect(std.mem.indexOf(u8, out, policy_path_0) != null);
+}
+
+// Companion to the fast_path test: with a metric policy loaded, the buffered
+// pipe takes the policy path and must record a policy_path decision. Also
+// fails on an unwired HEAD. Loads the policy via the same JSON parser the
+// runtime uses (`policy.parser.parsePoliciesBytes`), exercising the real
+// snapshot-install path that `policiesActiveFor` reads.
+test "processBuffered records a policy_path prefilter decision when a policy targets the signal" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var metrics = try runtime_metrics_mod.RuntimeMetrics.init(testing.allocator, io, .edge);
+    defer metrics.deinit();
+
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = policy.Registry.init(testing.allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // keep-all metric policy: every metric matches ".*" and is kept, so the
+    // pipe runs the full decode -> evaluate -> re-encode path without dropping.
+    const policy_json =
+        \\{
+        \\  "policies": [
+        \\    { "id": "keep-metrics", "name": "keep-metrics",
+        \\      "metric": { "match": [{ "metric_field": "name", "regex": ".*" }], "keep": true } }
+        \\  ]
+        \\}
+    ;
+    const policies = try policy.parser.parsePoliciesBytes(testing.allocator, policy_json);
+    defer {
+        for (policies) |*p| p.deinit(testing.allocator);
+        testing.allocator.free(policies);
+    }
+    try registry.updatePolicies(policies, "prefilter-test", .file);
+    // A metric policy is loaded, so the metric signal is now active.
+    try testing.expect(policiesActiveFor(&registry, .metric));
+
+    var ctx = bufferedPipeCtx(noop_bus.eventBus(), &registry, &metrics);
+    const pipe: service_mod.PipeBuffered = .{
+        .kind = .datadog_metrics_json,
+        .signal = .metric,
+        .upstream = .default,
+        .codec = .identity,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try processBuffered(&ctx, pipe, arena.allocator(), datadog_metrics_body);
+    try testing.expect(!result.all_dropped);
+
+    var scrape: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer scrape.deinit();
+    try metrics.writePrometheus(&scrape.writer);
+    const out = scrape.written();
+    const policy_path_1 = "edge_prefilter_decisions_total{route_kind=\"datadog_metrics\",decision=\"policy_path\"} 1";
+    const fast_path_0 = "edge_prefilter_decisions_total{route_kind=\"datadog_metrics\",decision=\"fast_path\"} 0";
+    try testing.expect(std.mem.indexOf(u8, out, policy_path_1) != null);
+    // The fast-path series for this route kind must stay at its seeded 0.
+    try testing.expect(std.mem.indexOf(u8, out, fast_path_0) != null);
+    // The policy-path decision is recorded exactly once (no double counting
+    // from both the fork and the existing recordPolicyBatch emit).
+    var policy_path_ones: usize = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "edge_prefilter_decisions_total")) continue;
+        if (line[0] == '#') continue;
+        if (std.mem.indexOf(u8, line, "decision=\"policy_path\"") == null) continue;
+        if (std.mem.indexOf(u8, line, " 1") != null) policy_path_ones += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), policy_path_ones);
 }
