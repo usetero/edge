@@ -216,20 +216,6 @@ pub const Runtime = struct {
         // loop — run as concurrent tasks in one lifecycle group; shutdown is
         // a single structured cancel (PLAN.md §9 Phase 6).
         var lifecycle: lifecycle_mod.Lifecycle = .init;
-        try checkpoint.start(&lifecycle);
-
-        var loop: PollLoop = .{
-            .runtime = self,
-            .framer = &framer,
-            .evaluator = &evaluator,
-            .scheduler = &scheduler,
-            .watcher = &watcher,
-            .checkpoint = &checkpoint,
-            .checkpoint_lane = checkpoint_lane,
-            .output = output,
-            .lifecycle = &lifecycle,
-        };
-        try lifecycle.spawn(self.io, PollLoop.run, .{&loop});
 
         var signal_count = std.atomic.Value(u32).init(0);
         var shutdown_waiter = std.atomic.Value(bool).init(false);
@@ -244,6 +230,21 @@ pub const Runtime = struct {
                 return err;
             },
         }
+
+        try checkpoint.start(&lifecycle);
+
+        var loop: PollLoop = .{
+            .runtime = self,
+            .framer = &framer,
+            .evaluator = &evaluator,
+            .scheduler = &scheduler,
+            .watcher = &watcher,
+            .checkpoint = &checkpoint,
+            .checkpoint_lane = checkpoint_lane,
+            .output = output,
+            .lifecycle = &lifecycle,
+        };
+        try lifecycle.spawn(self.io, PollLoop.run, .{&loop});
 
         lifecycle.awaitShutdown(self.io) catch |err| switch (err) {
             error.Canceled => {},
