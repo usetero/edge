@@ -494,13 +494,21 @@ pub const PolicyStreamingFilter = struct {
 
     /// Evaluate whether to keep a metric sample based on policy
     fn shouldKeepMetric(self: *PolicyStreamingFilter, sample: Sample, line: []const u8) bool {
-        // Build the field context with metadata from HELP/TYPE lines
+        // Only attach HELP/TYPE metadata when the sample belongs to the current
+        // metric family. A metadata-less sample (no preceding # HELP / # TYPE of
+        // its own) must be evaluated with null description/type rather than
+        // inheriting the most-recent prior typed family's metadata, mirroring the
+        // guard used by maybeWriteMetadata when emitting metadata. Histograms and
+        // summaries emit suffixed sample names (_bucket/_sum/_count), so we use
+        // the same startsWith family-membership rule as the emission path.
+        const meta_matches = self.current_metric_name.len > 0 and
+            std.mem.startsWith(u8, sample.metric_name, self.current_metric_name);
         var ctx: PrometheusFieldContext = .{
             .parsed = .{ .sample = sample },
             .line_buffer = line,
             .labels_cache = null,
-            .description = if (self.current_description.len > 0) self.current_description else null,
-            .metric_type = if (self.current_type_str.len > 0) self.current_type_str else null,
+            .description = if (meta_matches and self.current_description.len > 0) self.current_description else null,
+            .metric_type = if (meta_matches and self.current_type_str.len > 0) self.current_type_str else null,
         };
 
         // Build labels cache for pattern matching (if needed)
@@ -2503,4 +2511,115 @@ test "FilteringWriter - max_input_bytes limit" {
     // With limit 25, we get 2 complete lines (22 bytes) then stop partway through 3rd
     try std.testing.expect(stats.scrape_truncated);
     try std.testing.expect(stats.bytes_processed <= 25);
+}
+
+test "PolicyStreamingFilter - metadata-less sample does not inherit prior family's type (DROP)" {
+    // A sample with no preceding # HELP / # TYPE of its own must be evaluated
+    // with null metric_type, not the most-recent prior typed family's type.
+    // Here a DROP-on-counter rule must drop `a 1` (typed counter) but keep
+    // `b 2` (metadata-less, must NOT inherit a's "counter").
+    const allocator = std.testing.allocator;
+    const MetricType = proto.policy.MetricType;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-counters"),
+        .name = try allocator.dupe(u8, "drop-counters"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_type = MetricType.METRIC_TYPE_UNSPECIFIED },
+        .match = .{ .exact = try allocator.dupe(u8, "counter") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP a A metric
+        \\# TYPE a counter
+        \\a 1
+        \\b 2
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "a 1") == null); // counter dropped
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "b 2") != null); // metadata-less kept
+    try std.testing.expectEqual(@as(usize, 1), result.stats.lines_dropped);
+}
+
+test "PolicyStreamingFilter - suffixed sample keeps family metadata for policy" {
+    // Histograms/summaries emit suffixed sample names (_bucket/_sum/_count) that
+    // share the family's TYPE. The startsWith family rule must still attach the
+    // family's type to suffixed samples so type-based policies apply correctly.
+    const allocator = std.testing.allocator;
+    const MetricType = proto.policy.MetricType;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-histograms"),
+        .name = try allocator.dupe(u8, "drop-histograms"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_type = MetricType.METRIC_TYPE_UNSPECIFIED },
+        .match = .{ .exact = try allocator.dupe(u8, "histogram") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [8192]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# TYPE http_request_duration_seconds histogram
+        \\http_request_duration_seconds_bucket{le="0.1"} 100
+        \\http_request_duration_seconds_sum 12.5
+        \\http_request_duration_seconds_count 1000
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // All suffixed samples inherit the family's "histogram" type and get dropped.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "http_request_duration_seconds_bucket") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "http_request_duration_seconds_sum") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "http_request_duration_seconds_count") == null);
+    try std.testing.expectEqual(@as(usize, 3), result.stats.lines_dropped);
 }
