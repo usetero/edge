@@ -346,7 +346,8 @@ pub fn shouldSkipRequestHeader(name: []const u8) bool {
 
 pub fn shouldSkipResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "content-length") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding");
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "connection");
 }
 
 test "header skip helpers" {
@@ -375,6 +376,11 @@ test "shouldSkipResponseHeader" {
     try std.testing.expect(shouldSkipResponseHeader("Content-Length"));
     try std.testing.expect(shouldSkipResponseHeader("transfer-encoding"));
     try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
+    try std.testing.expect(shouldSkipResponseHeader("connection"));
+    try std.testing.expect(shouldSkipResponseHeader("Connection"));
+    try std.testing.expect(shouldSkipResponseHeader("CONNECTION"));
     try std.testing.expect(!shouldSkipResponseHeader("content-type"));
     try std.testing.expect(!shouldSkipResponseHeader("x-custom-header"));
+    try std.testing.expect(!shouldSkipResponseHeader("connection-info"));
+    try std.testing.expect(!shouldSkipResponseHeader("x-connection"));
 }
