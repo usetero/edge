@@ -19,6 +19,19 @@ const UpstreamConnectionEvicted = struct { path: []const u8, err: []const u8 };
 /// The upstream answered before the body was fully sent and stopped reading;
 /// the send failed but a real status was already on the wire.
 const UpstreamEarlyResponse = struct { path: []const u8, status: u16, err: []const u8 };
+/// The watchdog cut this attempt off at its deadline. Without this line the
+/// request reports a generic transport failure, and nothing names the stalled
+/// intake as the cause.
+const UpstreamTimedOut = struct { path: []const u8, phase: []const u8 };
+/// A dial slow enough to matter. `std.http.Client` takes no connect timeout,
+/// so a stalled dial holds its handler thread and the watchdog has no socket
+/// to interrupt; this line is the only way to see one.
+const UpstreamDialSlow = struct { path: []const u8, ms: f64 };
+
+/// Dial warn threshold. A pooled connection dials in microseconds and a cold
+/// TCP plus TLS handshake to a public intake costs tens of milliseconds, so a
+/// whole second means the dial is stalling.
+const dial_slow_ns: i128 = std.time.ns_per_s;
 
 /// The parts of an inbound request the upstream leg needs, already lifted
 /// out of whatever HTTP server produced it.
@@ -102,11 +115,31 @@ fn dialUpstream(
     choice: service_mod.UpstreamChoice,
     client: *std.http.Client,
 ) !std.http.Client.Request {
+    const started_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+    defer {
+        const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - started_ns;
+        if (elapsed_ns >= dial_slow_ns) {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            ctx.bus.warn(UpstreamDialSlow{
+                .path = in.path,
+                .ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms,
+            });
+        }
+    }
     return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.info(UpstreamRetried{ .path = in.path, .err = @errorName(err) });
         return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client);
     };
+}
+
+/// Record a watchdog timeout: the warn line names the phase and the path, the
+/// counter makes the rate alertable.
+fn timedOut(ctx: *exec.SharedCtx, path: []const u8, phase: []const u8) error{UpstreamTimeout} {
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    ctx.bus.warn(UpstreamTimedOut{ .path = path, .phase = phase });
+    if (ctx.metrics) |metrics| metrics.recordUpstreamTimeout();
+    return error.UpstreamTimeout;
 }
 
 /// Send `body` upstream and relay the response into `res`.
@@ -153,7 +186,7 @@ pub fn exchange(
                 } else |_| {}
             }
             evictUpstream(ctx, &upstream_req, in.path, err);
-            if (bufs.timed_out.load(.acquire)) return error.UpstreamTimeout;
+            if (bufs.timed_out.load(.acquire)) return timedOut(ctx, in.path, "head");
             if (!retryableTransportError(err)) return err;
             if (attempt + 1 == attempts) return error.UpstreamTransportFailed;
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
@@ -165,7 +198,7 @@ pub fn exchange(
         relayResponse(sink, in.arena, &upstream_res, max_response, bufs) catch |err| {
             if (bufs.timed_out.load(.acquire)) {
                 evictUpstream(ctx, &upstream_req, in.path, err);
-                return error.UpstreamTimeout;
+                return timedOut(ctx, in.path, "relay");
             }
             switch (err) {
                 error.BodyTooLarge => {

@@ -1,8 +1,16 @@
 const std = @import("std");
 const m = @import("metrics_zig");
 const ext = @import("extensions");
+const build_options = @import("build_options");
 
 const log = std.log.scoped(.runtime_metrics);
+
+/// Connection-level series need a hook at accept and at slot release. The
+/// stdio frontend owns both; httpz owns neither (it exports its own
+/// `httpz_connections` and `httpz_invalid_request` through endpoints.zig
+/// instead). Registering them on an httpz build would publish a flat zero,
+/// which reads as "no connections" rather than "not measured".
+const conn_metrics_enabled = build_options.frontend == .stdio;
 
 pub const DistributionLabel = enum {
     edge,
@@ -66,6 +74,30 @@ pub const ErrorClassLabel = enum {
     module,
 };
 
+/// Why a connection was refused before it ever carried a request.
+pub const ShedReasonLabel = enum {
+    /// No free connection slab slot: the process is at `max_connections`.
+    slab_full,
+    /// The Io implementation refused another concurrent task.
+    concurrency,
+};
+
+const ShedLabels = struct {
+    reason: ShedReasonLabel,
+};
+
+/// Which inbound deadline expired. `idle` is a keep-alive wait with no
+/// request in flight; `request` means a partial request stalled and was
+/// answered with 408.
+pub const InboundPhaseLabel = enum {
+    idle,
+    request,
+};
+
+const InboundTimeoutLabels = struct {
+    phase: InboundPhaseLabel,
+};
+
 pub const PolicyTelemetryLabel = enum {
     datadog_logs,
     datadog_metrics,
@@ -121,6 +153,50 @@ const InternalMetrics = struct {
         .{ .help = "Fresh-connection transport retries." },
         .{},
     ),
+    edge_upstream_timeouts_total: m.Counter(u64) = .init(
+        "edge_upstream_timeouts_total",
+        .{ .help = "Upstream attempts the watchdog cut off at its deadline." },
+        .{},
+    ),
+    /// Connections accepted, and the count currently holding a slab slot.
+    /// stdio only: see `conn_metrics_enabled`.
+    edge_connections_total: m.Counter(u64) = if (conn_metrics_enabled) .init(
+        "edge_connections_total",
+        .{ .help = "Inbound connections accepted." },
+        .{},
+    ) else .{ .noop = {} },
+    edge_connections_active: m.Gauge(i64) = if (conn_metrics_enabled) .init(
+        "edge_connections_active",
+        .{ .help = "Inbound connections currently holding a connection slot." },
+        .{},
+    ) else .{ .noop = {} },
+    /// Connections refused before a request: the exhaustion signal. Read it
+    /// against `edge_connections_max`.
+    edge_connections_shed_total: ConnectionsShedTotal,
+    /// Inbound reads cut off by their deadline. The `request` phase counts
+    /// dropped requests; the `idle` phase counts reclaimed keep-alive slots.
+    edge_inbound_timeouts_total: InboundTimeoutsTotal,
+    /// Heads that failed to parse, answered with 400 and a close. stdio only.
+    edge_requests_invalid_total: m.Counter(u64) = if (conn_metrics_enabled) .init(
+        "edge_requests_invalid_total",
+        .{ .help = "Requests rejected before routing because the head failed to parse." },
+        .{},
+    ) else .{ .noop = {} },
+    /// The configured connection ceiling. Both frontends report it, so an
+    /// alert can compare use against capacity without knowing the frontend.
+    edge_connections_max: m.Gauge(i64) = .init(
+        "edge_connections_max",
+        .{ .help = "Configured maximum concurrent inbound connections." },
+        .{},
+    ),
+    /// Handler threads currently holding a request. Against the configured
+    /// thread pool count this is the saturation signal: at the ceiling, a new
+    /// request (a health probe included) waits for a thread to come free.
+    edge_requests_in_flight: m.Gauge(i64) = .init(
+        "edge_requests_in_flight",
+        .{ .help = "Requests currently held by a handler thread." },
+        .{},
+    ),
     edge_requests_total: RequestsTotal,
     edge_request_duration_seconds: RequestDurationSeconds,
     edge_responses_total: ResponsesTotal,
@@ -146,11 +222,13 @@ const InternalMetrics = struct {
     const RequestDurationSeconds = m.HistogramVec(
         f64,
         DurationLabels,
-        &.{ 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 },
+        &.{ 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60 },
     );
     const ResponsesTotal = m.CounterVec(u64, ResponseLabels);
     const PrefilterDecisionsTotal = m.CounterVec(u64, PrefilterLabels);
     const RequestErrorsTotal = m.CounterVec(u64, ErrorLabels);
+    const ConnectionsShedTotal = m.CounterVec(u64, ShedLabels);
+    const InboundTimeoutsTotal = m.CounterVec(u64, InboundTimeoutLabels);
     const PolicyRecordsEvaluatedTotal = m.CounterVec(u64, PolicyLabels);
     const PolicyRecordsKeptTotal = m.CounterVec(u64, PolicyLabels);
     const PolicyRecordsDroppedTotal = m.CounterVec(u64, PolicyLabels);
@@ -206,6 +284,20 @@ pub const RuntimeMetrics = struct {
                     io,
                     "edge_request_errors_total",
                     .{ .help = "Total number of request-level errors." },
+                    .{},
+                ),
+                .edge_connections_shed_total = try InternalMetrics.ConnectionsShedTotal.init(
+                    allocator,
+                    io,
+                    "edge_connections_shed_total",
+                    .{ .help = "Connections refused before carrying a request." },
+                    .{},
+                ),
+                .edge_inbound_timeouts_total = try InternalMetrics.InboundTimeoutsTotal.init(
+                    allocator,
+                    io,
+                    "edge_inbound_timeouts_total",
+                    .{ .help = "Inbound reads cut off by the idle or request deadline." },
                     .{},
                 ),
                 .edge_policy_records_evaluated_total = try InternalMetrics.PolicyRecordsEvaluatedTotal.init(
@@ -383,6 +475,44 @@ pub const RuntimeMetrics = struct {
         if (retry) self.internal.edge_upstream_retries_total.incr();
     }
 
+    pub fn recordUpstreamTimeout(self: *RuntimeMetrics) void {
+        self.internal.edge_upstream_timeouts_total.incr();
+    }
+
+    /// `delta` is +1 when a handler takes a request and -1 when it returns it.
+    pub fn recordInFlight(self: *RuntimeMetrics, delta: i64) void {
+        self.internal.edge_requests_in_flight.incrBy(delta);
+    }
+
+    pub fn recordConnectionAccepted(self: *RuntimeMetrics) void {
+        self.internal.edge_connections_total.incr();
+    }
+
+    /// `delta` is +1 when a connection claims a slot and -1 when it frees it.
+    pub fn recordConnectionsActive(self: *RuntimeMetrics, delta: i64) void {
+        self.internal.edge_connections_active.incrBy(delta);
+    }
+
+    pub fn recordConnectionShed(self: *RuntimeMetrics, reason: ShedReasonLabel) void {
+        self.internal.edge_connections_shed_total.incr(.{
+            .reason = reason,
+        }) catch |err| log.debug("failed to record shed metric: {}", .{err});
+    }
+
+    pub fn recordInboundTimeout(self: *RuntimeMetrics, phase: InboundPhaseLabel) void {
+        self.internal.edge_inbound_timeouts_total.incr(.{
+            .phase = phase,
+        }) catch |err| log.debug("failed to record inbound timeout metric: {}", .{err});
+    }
+
+    pub fn recordInvalidRequest(self: *RuntimeMetrics) void {
+        self.internal.edge_requests_invalid_total.incr();
+    }
+
+    pub fn setMaxConnections(self: *RuntimeMetrics, max_connections: usize) void {
+        self.internal.edge_connections_max.set(@intCast(max_connections));
+    }
+
     pub fn recordResponse(
         self: *RuntimeMetrics,
         known_path: KnownPathLabel,
@@ -454,4 +584,47 @@ pub fn statusClass(status: u16) StatusClassLabel {
     if (status >= 400 and status < 500) return .s4xx;
     if (status >= 500 and status < 600) return .s5xx;
     return .other;
+}
+
+// ============================== Tests ==============================
+
+const testing = std.testing;
+
+test "connection and saturation series reach the scrape" {
+    var metrics: RuntimeMetrics = try .init(testing.allocator, testing.io, .datadog);
+    defer metrics.deinit();
+
+    metrics.setMaxConnections(256);
+    metrics.recordConnectionAccepted();
+    metrics.recordConnectionsActive(1);
+    metrics.recordConnectionsActive(1);
+    metrics.recordConnectionsActive(-1);
+    metrics.recordConnectionShed(.slab_full);
+    metrics.recordConnectionShed(.concurrency);
+    metrics.recordInvalidRequest();
+    metrics.recordInFlight(3);
+    metrics.recordInFlight(-1);
+    metrics.recordUpstreamTimeout();
+    metrics.recordInboundTimeout(.idle);
+    metrics.recordInboundTimeout(.request);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try metrics.writePrometheus(&out.writer);
+    const text = out.written();
+
+    // Frontend-neutral series: present on every build.
+    try testing.expect(std.mem.indexOf(u8, text, "edge_connections_max 256") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "edge_requests_in_flight 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "edge_upstream_timeouts_total 1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "edge_connections_shed_total{reason=\"slab_full\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "edge_connections_shed_total{reason=\"concurrency\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "edge_inbound_timeouts_total{phase=\"idle\"} 1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "edge_inbound_timeouts_total{phase=\"request\"} 1") != null);
+
+    // Accept-time series exist only where a frontend can feed them.
+    const has_conn_series = std.mem.indexOf(u8, text, "edge_connections_active 1") != null;
+    try testing.expectEqual(conn_metrics_enabled, has_conn_series);
+    const has_invalid = std.mem.indexOf(u8, text, "edge_requests_invalid_total 1") != null;
+    try testing.expectEqual(conn_metrics_enabled, has_invalid);
 }

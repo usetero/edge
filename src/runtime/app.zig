@@ -517,6 +517,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         });
     }
 
+    runtime_metrics.setMaxConnections(engine.limits.max_connections);
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(DataPlaneBudget{
         .frontend = @tagName(build_options.frontend),
