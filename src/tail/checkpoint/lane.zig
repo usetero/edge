@@ -120,6 +120,23 @@ pub const Lane = struct {
         return self.store.getOffset(identity);
     }
 
+    /// Synchronously update the in-memory store so that `getOffset` for
+    /// `identity` returns `offset` immediately, without waiting for the async
+    /// checkpoint worker to drain the queue.  This is needed when a truncation
+    /// forces an in-memory offset reset: without it, `applyCheckpointOffsetOne`
+    /// can resurrect the stale (higher) checkpoint value on the very next
+    /// `collect` call, duplicating the re-emitted range.  The update is NOT
+    /// persisted to the WAL here; the normal async enqueue path handles
+    /// durability once the consumer acknowledges the re-emitted range.
+    pub fn resetOffset(self: *Lane, identity: tail_types.FileIdentity, offset: u64) void {
+        const now_ns: i64 = @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
+        self.store.upsert(.{
+            .identity = identity,
+            .offset = offset,
+            .last_seen_ns = now_ns,
+        }) catch {};
+    }
+
     fn recover(self: *Lane) !void {
         var snapshot_values = try self.snapshot.load(self.allocator);
         defer snapshot_values.deinit(self.allocator);
