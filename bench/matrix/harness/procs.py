@@ -8,6 +8,7 @@ half the assertions are about what we logged, not only what we answered.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -45,6 +46,7 @@ class EchoIntake:
         env["ECHO_LATENCY_MS"] = str(latency_ms)
         self._log = open(self.log_path, "wb")
         self._last_seen = 0
+        self._capture_name = "capture"
         self.proc = subprocess.Popen(
             [self.BINARY, str(self.port), tempfile.gettempdir()],
             stdout=self._log,
@@ -79,6 +81,22 @@ class EchoIntake:
         if count is not None:
             query += "&count=%d" % count
         urllib.request.urlopen("%s/fault?%s" % (self.url, query), data=b"", timeout=5).read()
+
+    def capture_start(self, name: str) -> None:
+        """Records every body the intake receives, so a case can compare bytes."""
+        self._capture_name = name
+        urllib.request.urlopen("%s/capture/start?name=%s" % (self.url, name), data=b"", timeout=5).read()
+
+    def capture_stop(self) -> list[bytes]:
+        """Stops the capture and returns the bodies, in arrival order."""
+        urllib.request.urlopen("%s/capture/stop" % self.url, data=b"", timeout=10).read()
+        path = os.path.join(tempfile.gettempdir(), "%s.jsonl" % self._capture_name)
+        bodies = []
+        with open(path, "r") as handle:
+            for line in handle:
+                if line.strip():
+                    bodies.append(base64.b64decode(json.loads(line)["data_base64"]))
+        return bodies
 
     def faults_applied(self) -> int:
         return int(self.stats().get("fault_applied", 0))
