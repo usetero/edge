@@ -78,6 +78,15 @@ pub const SharedCtx = struct {
     /// Last reported count of policies the matcher refused, so the warning
     /// fires on a change rather than on every scrape.
     rejected_policies: std.atomic.Value(u32) = .init(0),
+    /// One bit per `head_repair.Reason` already reported. A sender spells an
+    /// encoding the same way on every request, so the warning is worth one
+    /// line for the deployment, not one per request.
+    head_repairs_seen: std.atomic.Value(u8) = .init(0),
+    /// Whether a whole batch has already been reported as dropped by policy.
+    /// Same reasoning as above: the rate belongs to
+    /// `edge_policy_records_dropped_total`, and the operator needs the fact
+    /// once.
+    batch_dropped_seen: std.atomic.Value(bool) = .init(false),
 };
 
 /// Routes and plans a request from transport-neutral parts. Returns null
@@ -587,23 +596,6 @@ pub fn routeLabel(signal: service_mod.Signal, format: framer_mod.WireFormat) run
         },
         // raw/ndjson/prom_text outcomes never run the record pipeline.
         else => unreachable,
-    };
-}
-
-/// Same routes as `routeLabel`, in the label set `edge_prefilter_decisions_total`
-/// uses. The two enums overlap but are distinct types.
-pub fn prefilterRouteLabel(
-    signal: service_mod.Signal,
-    format: framer_mod.WireFormat,
-) runtime_metrics_mod.RouteKindLabel {
-    return switch (format) {
-        .json_array => .datadog_logs,
-        .otlp_protobuf => switch (signal) {
-            .log => .otlp_logs,
-            .metric => .otlp_metrics,
-            .trace => .otlp_traces,
-        },
-        else => .passthrough,
     };
 }
 

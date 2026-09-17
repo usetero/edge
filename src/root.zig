@@ -32,6 +32,7 @@ pub const frontend_select = @import("frontend/select.zig");
 pub const frontend_stdio_server = @import("frontend/stdio/server.zig");
 pub const frontend_stdio_conn = @import("frontend/stdio/conn.zig");
 pub const frontend_stdio_deadline_reader = @import("frontend/stdio/deadline_reader.zig");
+pub const frontend_stdio_head_repair = @import("frontend/stdio/head_repair.zig");
 pub const frontend_httpz_server = @import("frontend/httpz/server.zig");
 pub const frontend_exchange = @import("frontend/exchange.zig");
 pub const frontend_paths = @import("frontend/paths.zig");
@@ -101,8 +102,9 @@ test {
     _ = @import("frontend/exec.zig");
     _ = @import("frontend/stdio/conn.zig");
     _ = @import("frontend/stdio/deadline_reader.zig");
+    _ = @import("frontend/stdio/head_repair.zig");
     // Both frontends compile in every test build regardless of -Dfrontend,
-    // so the unselected one can't rot (PLAN-FRONTEND-SWAP.md §6).
+    // so the unselected one can't rot.
     _ = @import("frontend/stdio/server.zig");
     _ = @import("frontend/httpz/server.zig");
     _ = @import("frontend/exchange.zig");

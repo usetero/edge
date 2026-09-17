@@ -112,7 +112,7 @@ with its note.
 | a08 | Body above `max_body_size` (16 KiB here) | 413, and nothing is forwarded | |
 | a09 | Corrupt gzip, no policies loaded | Forwarded; the intake's answer is relayed | |
 | a09 | Corrupt gzip, policies loaded | Fails open and forwards, with `policy.failed.open` | |
-| a10 | `content-encoding: br` | Forwarded raw, per the router's documented intent | xfail stdio: std refuses the head. Skipped on httpz: our std-based intake refuses brotli too |
+| a10 | `content-encoding: br` | Forwarded raw, and the intake receives `br` | the head is repaired; the fake intake repairs too |
 | a11 | Sender vanishes mid-body, five times | Slots return, and nothing blames the intake | |
 | a12 | Two requests written in one packet | Both are served | xfail httpz: answers 400 |
 | a13 | 50 requests on one keep-alive connection | All 202, and the connection count stays at one | |
@@ -125,6 +125,7 @@ with its note.
 | a22 | `GET http://example.com/_health` | Not forwarded as a mangled target | xfail stdio |
 | a30 | 60 KiB batch, intake closes mid-request | Replayed, 202 | the resident side of the threshold |
 | a30 | 300 KiB batch, intake closes mid-request | Replayed, 202 | xfail both, by design: a streamed batch cannot be replayed, and the agent retries the 502 |
+| a34 | `gzip`, `GZIP`, `x-gzip`, `gzip ` | Every spelling reaches the intake | codings are case-insensitive (RFC 9110 §8.4.1) |
 | a35 | Small gzip that expands past the decoded cap, policies loaded | Bounded, and the batch is not lost | fails open; the raw cap still answers 413 |
 | a35 | The same body with no policies loaded | Forwarded untouched, 202 | nothing reads it |
 
@@ -145,7 +146,7 @@ with its note.
 | b11 | Intake declares more body than it sends | Never 202; `UpstreamResponseTruncated` | |
 | b11b | Intake truncates *before* reading the body | The batch never arrived, so a retry repairs it | settles the b11 challenge |
 | b11b | Intake reads the batch, *then* truncates | The batch is in, so our 502 costs a duplicate | settles the b11 challenge |
-| b12 | Dial into a full accept queue, so SYNs are dropped | An answer inside 35 s | slow, xfail both: the dial has no deadline |
+| b12 | Dial `198.51.100.1`, which swallows the SYN | An answer inside 35 s | slow, xfail both: the dial has no deadline. Skips where the route is refused |
 | b23 | Intake reads the whole batch, then closes with no answer | Exactly two copies at the intake | pins at-least-once |
 | b24 | Every request fails the same way, 100 of them | At most two attempts each, health unaffected | |
 

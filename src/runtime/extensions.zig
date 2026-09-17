@@ -13,11 +13,30 @@
 
 const std = @import("std");
 const ext = @import("extensions");
+const o11y = @import("o11y");
 const proto = @import("proto");
 const dd_logs = @import("../signals/datadog/logs.zig");
 const datadog_log = @import("../signals/datadog/log.zig");
 const config = @import("../config/types.zig");
 const runtime_metrics = @import("runtime_metrics.zig");
+
+const EventBus = o11y.EventBus;
+
+// Named event payloads: the type name is the telemetry event name.
+/// A flush lost records for good. Either the backlog cap refused to requeue a
+/// failed batch, or the batch could not be encoded at delivery time. This is
+/// the only line that says data left the process undelivered, so it is a
+/// warning even though the flush itself continues.
+const S3DumpRecordsDropped = struct { records: u64, backlog_bytes: u64 };
+/// A flush failed to upload objects that were requeued for the next attempt.
+/// No data is lost yet; a backlog that keeps growing turns into the event
+/// above.
+const S3DumpUploadFailed = struct {
+    objects_failed: u32,
+    objects_requeued: u32,
+    bytes_failed: u64,
+    backlog_bytes: u64,
+};
 
 pub const Extensions = ext.Extensions;
 
@@ -133,12 +152,40 @@ pub fn flushLoop(
     io: std.Io,
     interval_ms: u64,
     metrics: ?*runtime_metrics.RuntimeMetrics,
+    bus: *EventBus,
 ) void {
     const interval: std.Io.Duration = .fromMilliseconds(@intCast(interval_ms));
     while (true) {
         std.Io.sleep(io, interval, .awake) catch return; // canceled at shutdown
-        const result = exts.flush(io, .{});
-        if (metrics) |mx| mx.recordS3DumpFlush(result);
+        reportFlush(exts.flush(io, .{}), metrics, bus);
+    }
+}
+
+/// Counts every flush, and explains the ones that did not deliver. The
+/// counters give an operator the rate; without these two lines a dropped
+/// record has no explanation anywhere. A flush runs on an interval, not per
+/// request, so one line per failing flush is a bounded volume.
+pub fn reportFlush(
+    result: ext.S3Dump.FlushResult,
+    metrics: ?*runtime_metrics.RuntimeMetrics,
+    bus: *EventBus,
+) void {
+    if (metrics) |mx| mx.recordS3DumpFlush(result);
+    if (result.records_dropped > 0) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        bus.warn(S3DumpRecordsDropped{
+            .records = result.records_dropped,
+            .backlog_bytes = result.backlog_bytes,
+        });
+    }
+    if (result.objects_failed > 0) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        bus.warn(S3DumpUploadFailed{
+            .objects_failed = result.objects_failed,
+            .objects_requeued = result.objects_requeued,
+            .bytes_failed = result.bytes_failed,
+            .backlog_bytes = result.backlog_bytes,
+        });
     }
 }
 

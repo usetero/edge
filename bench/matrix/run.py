@@ -27,8 +27,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+#: One prefix per frontend, and each build names its frontend. Neither
+#: binary comes from the default, so a change of default cannot make the suite
+#: test one frontend twice — which it silently did once.
 BINARIES = {
-    "httpz": os.path.join(REPO_ROOT, "zig-out", "bin", "edge"),
+    "httpz": os.path.join(REPO_ROOT, "zig-out-httpz", "bin", "edge"),
     "stdio": os.path.join(REPO_ROOT, "zig-out-stdio", "bin", "edge"),
 }
 
@@ -37,13 +40,11 @@ def build(frontends: list[str]) -> None:
     zig = os.path.join(REPO_ROOT, "bin", "zig")
     print("building: echo server with fault injection")
     subprocess.run([zig, "build", "echo-server", "-Doptimize=ReleaseFast"], cwd=REPO_ROOT, check=True)
-    if "httpz" in frontends:
-        print("building: httpz frontend")
-        subprocess.run([zig, "build", "-Doptimize=ReleaseFast"], cwd=REPO_ROOT, check=True)
-    if "stdio" in frontends:
-        print("building: stdio frontend")
+    for frontend in frontends:
+        print("building: %s frontend" % frontend)
         subprocess.run(
-            [zig, "build", "-Dfrontend=stdio", "-Doptimize=ReleaseFast", "--prefix", "zig-out-stdio"],
+            [zig, "build", "-Dfrontend=%s" % frontend, "-Doptimize=ReleaseFast",
+             "--prefix", "zig-out-%s" % frontend],
             cwd=REPO_ROOT,
             check=True,
         )

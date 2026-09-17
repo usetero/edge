@@ -25,6 +25,13 @@ const Inbound = exchange.Inbound;
 /// untouched. The edge must never be the reason data disappears: only the
 /// intake can accept or reject a payload.
 const PolicyFailedOpen = struct { path: []const u8, stage: []const u8, err: []const u8 };
+/// Policy kept nothing in the batch. Intended behaviour, and the first thing
+/// to look at when an operator asks where their data went. `forwarded` says
+/// what the intake saw: the record path sends the empty batch on, and the
+/// buffered path answers success and sends nothing. Warned once for the
+/// process, then a line per batch at debug: at full rate a line per batch is
+/// its own outage, and `edge_policy_records_dropped_total` carries the rate.
+const BatchDropped = struct { path: []const u8, signal: []const u8, forwarded: bool };
 
 pub const InboundBody = union(enum) {
     /// Fully buffered by the frontend. Zero-copy slice.
@@ -157,13 +164,8 @@ pub fn execPipeStream(
     if (!changed and !tap_armed) {
         if (ctx.metrics) |metrics| {
             metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), probe.records, 0);
-            metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .fast_path);
         }
         return exchange.exchange(ctx, in, sink, pipe.upstream, .{ .bytes = raw_body }, pipe.signal == .log);
-    }
-
-    if (ctx.metrics) |metrics| {
-        metrics.recordPrefilterDecision(exec.prefilterRouteLabel(pipe.signal, pipe.format), .policy_path);
     }
     body_reader = .fixed(raw_body);
     var output: std.Io.Writer.Allocating = try .initCapacity(in.arena, initial_capacity);
@@ -178,6 +180,9 @@ pub fn execPipeStream(
     };
     if (ctx.metrics) |metrics| {
         metrics.recordPolicyBatch(exec.routeLabel(pipe.signal, pipe.format), stats.records, stats.dropped);
+    }
+    if (stats.records > 0 and stats.dropped == stats.records) {
+        reportBatchDropped(ctx, in.path, pipe.signal, true);
     }
     try exchange.exchange(ctx, in, sink, pipe.upstream, .{ .bytes = output.written() }, pipe.signal == .log);
 }
@@ -211,12 +216,29 @@ pub fn execPipeBuffered(
     };
 
     if (processed.all_dropped) {
+        reportBatchDropped(ctx, in.path, pipe.signal, false);
         const out = try sink.begin(200, &.{.{ .name = "content-type", .value = "application/json" }});
         try out.writeAll("{}");
         return sink.end();
     }
 
     try exchange.exchange(ctx, in, sink, pipe.upstream, .{ .bytes = processed.body }, pipe.signal == .log);
+}
+
+/// Reports a batch that policy emptied. Warn once, then debug per batch.
+fn reportBatchDropped(
+    ctx: *exec.SharedCtx,
+    path: []const u8,
+    signal: service_mod.Signal,
+    forwarded: bool,
+) void {
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    const event: BatchDropped = .{ .path = path, .signal = @tagName(signal), .forwarded = forwarded };
+    if (ctx.batch_dropped_seen.swap(true, .monotonic)) {
+        ctx.bus.debug(event);
+    } else {
+        ctx.bus.warn(event);
+    }
 }
 
 pub fn execFetchFiltered(

@@ -132,6 +132,12 @@ const RequestFailed = struct { method: []const u8, path: []const u8, err: []cons
 const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 /// Same shape at warn level, for a request that held its handler thread.
 const RequestSlow = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
+/// The listener stopped with an error. Nothing reaches the edge after this,
+/// so it is the one line that explains a process that is up and deaf.
+const ListenFailed = struct { err: []const u8 };
+/// The upstream deadline watchdog could not start, so nothing would ever cut
+/// off a hung upstream. The process shuts down instead of serving blind.
+const WatchdogSpawnFailed = struct { err: []const u8 };
 
 /// Warn past this. `RequestCompleted` is debug level, which production turns
 /// off, so without this line a handler that sat on a stalled upstream for
@@ -220,13 +226,16 @@ pub const HttpServer = struct {
     }
 
     pub fn run(self: *HttpServer) std.Io.Cancelable!void {
-        self.lifecycle.spawn(self.ctx.io, watchUpstreamDeadlines, .{self}) catch {
+        self.lifecycle.spawn(self.ctx.io, watchUpstreamDeadlines, .{self}) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            self.ctx.bus.err(WatchdogSpawnFailed{ .err = @errorName(err) });
             self.listen_done.set(self.ctx.io);
             self.lifecycle.requestShutdown(self.ctx.io);
             return;
         };
         self.server.listen() catch |err| {
-            log.err("httpz listen failed: {s}", .{@errorName(err)});
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            self.ctx.bus.err(ListenFailed{ .err = @errorName(err) });
         };
         const stopped = self.handler.stopping.load(.acquire);
         self.listen_done.set(self.ctx.io);

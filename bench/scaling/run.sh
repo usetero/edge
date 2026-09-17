@@ -327,6 +327,10 @@ cleanup() {
     sleep 0.5
 }
 
+#: hermit's toolchain, so a benchmark does not depend on the machine's python.
+UV="$PROJECT_ROOT/bin/uv"
+HERMIT_PYTHON="$PROJECT_ROOT/bin/python3"
+
 trap cleanup EXIT INT TERM
 
 usage() {
@@ -343,6 +347,14 @@ check_dependencies() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Missing dependencies: ${missing[*]}"
         echo "Install with: brew install oha jq"
+        exit 1
+    fi
+
+    # python and uv come from hermit, so the payload generators do not depend
+    # on what happens to be installed on the machine.
+    if [[ ! -x "$UV" ]] || [[ ! -x "$HERMIT_PYTHON" ]]; then
+        log_error "hermit's uv and python3 are required: $UV, $HERMIT_PYTHON"
+        echo "Run 'source bin/activate-hermit' in the repository root first."
         exit 1
     fi
 
@@ -437,6 +449,87 @@ reset_echo_stats() {
     log_warn "Could not reset echo stats after 60s (port exhaustion?), continuing"
 }
 
+# The edge's own counters, read before the process is stopped. The echo count
+# alone cannot say whether a shortfall is ours or the load generator's, and a
+# `kill -9` takes the evidence with it.
+# True while anything holds the port. `reuse_address` on the listener sets
+# SO_REUSEPORT (std/Io/net.zig), so a second process binds the same port
+# happily and macOS hands new connections to the newest listener. Two edges on
+# one port split the traffic, and a scrape then reports the wrong process: one
+# run here reported 70,757 requests for a 50,000-request scenario. So every
+# start waits for the port to be free rather than sleeping and hoping.
+port_in_use() {
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+wait_for_port_free() {
+    local port=$1
+    local seconds=${2:-15}
+    local waited=0
+    while port_in_use "$port"; do
+        if (( $(echo "$waited >= $seconds" | bc -l) )); then
+            return 1
+        fi
+        sleep 0.2
+        waited=$(echo "$waited + 0.2" | bc)
+    done
+    return 0
+}
+
+# Clears the fixed ports before the first scenario. A leftover edge from an
+# earlier run points at an intake that is gone, so every request it serves
+# evicts a dead pooled connection and fails.
+free_fixed_ports() {
+    local port
+    for port in "$ECHO_SERVER_PORT" "$DATADOG_PORT" "$OTLP_PORT"; do
+        port_in_use "$port" || continue
+        log_warn "port $port is already in use; stopping what holds it"
+        lsof -tnP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null || true
+        if ! wait_for_port_free "$port" 10; then
+            lsof -tnP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+            wait_for_port_free "$port" 5 || { log_error "port $port stays busy"; exit 1; }
+        fi
+    done
+}
+
+get_edge_metrics() {
+    local port=$1
+    local label=$2
+    local text
+    text=$(curl -s --max-time 5 "http://127.0.0.1:$port/_edge/metrics") || return 0
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        printf '%s\n' "$text" > "$DEBUG_DIR/metrics-${label}.prom"
+    fi
+    printf '%s' "$text"
+}
+
+# Names what became of the requests the intake never saw. Both sides matter:
+# `edge_requests_total` below the expected count means the load generator never
+# delivered them, and the rest say what the edge did with the ones it read.
+report_shortfall() {
+    local metrics=$1
+    local expected=$2
+    local seen=$3
+    local name=$4
+
+    local missing=$((expected - seen))
+    [[ $missing -le 0 ]] && return 0
+    if [[ -z "$metrics" ]]; then
+        log_warn "$name: $missing of $expected never reached the intake, and the metrics scrape failed"
+        return 0
+    fi
+
+    local requests non2xx shed invalid timeouts
+    requests=$(awk '/^edge_requests_total\{/ { s += $NF } END { printf "%d", s + 0 }' <<< "$metrics")
+    non2xx=$(awk '/^edge_responses_total\{.*status_class="s[345]xx"/ { s += $NF } END { printf "%d", s + 0 }' <<< "$metrics")
+    shed=$(awk '/^edge_connections_shed_total\{/ { s += $NF } END { printf "%d", s + 0 }' <<< "$metrics")
+    invalid=$(awk '/^edge_requests_invalid_total/ { s += $NF } END { printf "%d", s + 0 }' <<< "$metrics")
+    timeouts=$(awk '/^edge_inbound_timeouts_total\{phase="request"\}/ { s += $NF } END { printf "%d", s + 0 }' <<< "$metrics")
+
+    log_warn "$name: $missing of $expected never reached the intake"
+    log_warn "  edge read $requests request(s), answered $non2xx non-2xx, shed $shed connection(s), refused $invalid head(s), cut off $timeouts inbound read(s)"
+}
+
 get_echo_stats() {
     local attempt=0
     while [[ $attempt -lt 60 ]]; do
@@ -455,9 +548,25 @@ start_edge_proxy() {
     local port=$3
     local scenario_name=$4
 
-    # Kill existing if running
-    [[ -n "$EDGE_PID" ]] && kill "$EDGE_PID" 2>/dev/null && sleep 0.3 || true
+    # Stop the previous edge and wait for it, rather than sleeping: while both
+    # processes hold the port the kernel splits connections between them.
+    if [[ -n "$EDGE_PID" ]]; then
+        kill "$EDGE_PID" 2>/dev/null || true
+        local waited=0
+        while kill -0 "$EDGE_PID" 2>/dev/null; do
+            if (( waited > 100 )); then
+                kill -9 "$EDGE_PID" 2>/dev/null || true
+                break
+            fi
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+    fi
     EDGE_PID=""
+    if ! wait_for_port_free "$port" 15; then
+        log_error "port $port is still held; refusing to start a second listener on it"
+        exit 1
+    fi
 
     log_info "Starting $binary..."
 
@@ -508,7 +617,7 @@ start_resource_monitor() {
     MONITORED_PID="$target_pid"
     RESOURCE_FILE=$(mktemp /tmp/bench_mem_XXXXXX)
     CPU_START_TIME=$(get_cpu_seconds "$target_pid")
-    BENCH_START_WALL=$(python3 -c 'import time; print(time.monotonic())')
+    BENCH_START_WALL=$("$HERMIT_PYTHON" -c 'import time; print(time.monotonic())')
 
     (
         trap 'exit 0' TERM INT
@@ -524,7 +633,7 @@ start_resource_monitor() {
 stop_resource_monitor() {
     local target_pid="$MONITORED_PID"
     local cpu_end_time=$(get_cpu_seconds "$target_pid")
-    local wall_end=$(python3 -c 'import time; print(time.monotonic())')
+    local wall_end=$("$HERMIT_PYTHON" -c 'import time; print(time.monotonic())')
 
     [[ -n "$MONITOR_PID" ]] && kill "$MONITOR_PID" 2>/dev/null || true
     wait "$MONITOR_PID" 2>/dev/null || true
@@ -613,7 +722,7 @@ create_edge_config() {
   "listen_address": "127.0.0.1",
   "listen_port": $port,
   "upstream_url": "http://127.0.0.1:$ECHO_SERVER_PORT",
-  "log_level": "err",
+  "log_level": "warn",
   "max_body_size": 2097152,
   "max_decoded_bytes": 5242880,
   "thread_pool_count": $THREAD_POOL_COUNT,
@@ -691,20 +800,31 @@ main() {
     cd "$PROJECT_ROOT"
 
     check_dependencies
+    free_fixed_ports
+    # 256 inbound connections plus an upstream pool do not fit in macOS's
+    # default 256 descriptors, and the failures then look like the edge's.
+    ulimit -n 8192 2>/dev/null || log_warn "could not raise the descriptor limit; $(ulimit -n) may be too low"
     mkdir -p "$OUTPUT_DIR" "$CONFIGS_DIR/generated"
     [[ "$DEBUG_MODE" == "true" ]] && mkdir -p "$DEBUG_DIR"
 
     # Build if needed
     if [[ "$SKIP_BUILD" == "false" ]]; then
         log_info "Building release binaries..."
-        zig build echo-server datadog otlp -Doptimize=ReleaseFast
+        # hermit's zig by path, so the build does not depend on the shell
+        # having been activated.
+        "$PROJECT_ROOT/bin/zig" build echo-server datadog otlp -Doptimize=ReleaseFast
         log_success "Build complete"
     fi
 
     # Generate protobuf payloads for OTLP tests
     if [[ "$RUN_EDGE" == "true" ]] || [[ "$RUN_OTELCOL" == "true" ]] || [[ "$RUN_VECTOR" == "true" ]] || [[ "$RUN_TERO_VECTOR" == "true" ]] || [[ "$RUN_TERO_COLLECTOR" == "true" ]]; then
         log_info "Generating protobuf OTLP payloads..."
-        python3 "$SCRIPT_DIR/generate-protobuf-payloads.py"
+        # `bench/scaling/proto_gen` is gitignored, so a fresh checkout has no
+        # generated protobuf modules. uv supplies the published package
+        # instead, which carries the same `opentelemetry.proto.*` paths, so
+        # nothing has to be generated or copied between machines.
+        "$UV" run --python "$HERMIT_PYTHON" --with opentelemetry-proto \
+            "$SCRIPT_DIR/generate-protobuf-payloads.py"
         log_success "Protobuf payloads generated"
     fi
 
@@ -775,10 +895,15 @@ main() {
                 # Stop monitoring
                 local resource_metrics=$(stop_resource_monitor)
 
+                # The edge is still alive here, so read its counters first.
+                local edge_metrics
+                edge_metrics=$(get_edge_metrics "$port" "${binary}-${name// /-}-${count}")
+
                 # Get echo server stats
                 local echo_stats=$(get_echo_stats)
                 local echo_requests=$(echo "$echo_stats" | jq -r '.total_requests')
                 local echo_bytes=$(echo "$echo_stats" | jq -r '.total_bytes')
+                report_shortfall "$edge_metrics" "$REQUESTS" "${echo_requests:-0}" "$name"
 
                 # Extract benchmark metrics
                 local metrics=$(extract_metrics "$output_json")

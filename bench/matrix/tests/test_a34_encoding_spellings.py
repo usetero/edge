@@ -14,16 +14,20 @@ BATCH = json.dumps([{"message": "spelling", "ddsource": "matrix"}]).encode()
 
 
 class EncodingSpellings(MatrixCase):
-    # Content codings are case-insensitive (RFC 9110 §8.4.1), but
-    # `std.http.Server` matches them case-sensitively, so stdio refuses
-    # `GZIP` with a 400 — which the agent discards for good.
-    DEFECTS = {"stdio": "refuses an uppercase content-encoding with 400"}
+    # One line per cause for the whole process, not one per request: the
+    # spelling does not change between requests.
+    EXPECT_LOGS_FOR = {"stdio": ["head.repaired"]}
+    # Content codings are case-insensitive (RFC 9110 §8.4.1) and
+    # `std.http.Server` matches them case-sensitively, so stdio used to refuse
+    # `GZIP` with a 400, which the agent discards for good. The frontend now
+    # rewrites the value and parses the head again
+    # (src/frontend/stdio/head_repair.zig).
     EDGE_POLICIES = {
         "policies": [
             {
                 "id": "keep-all",
                 "name": "keep-all",
-                "log": {"match": [{"log_field": "body", "regex": ".*"}], "keep": "all"},
+                "log": {"match": [{"log_field": "body", "regex": ".+"}], "keep": "all"},
             }
         ]
     }

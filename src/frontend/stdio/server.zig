@@ -21,6 +21,12 @@ const log = std.log.scoped(.http_server);
 // Named event payloads: the type name is the telemetry event name.
 /// A connection refused before it carried a request, with the status sent.
 const ConnectionShed = struct { reason: []const u8, answered: u16 };
+/// `accept` failed. One inbound connection is gone before it carried a
+/// request, and the loop continues.
+const AcceptFailed = struct { err: []const u8 };
+/// The upstream deadline watchdog could not start, so nothing would ever cut
+/// off a hung upstream. The process shuts down instead of serving blind.
+const WatchdogSpawnFailed = struct { err: []const u8 };
 
 pub const HttpServer = struct {
     listener: std.Io.net.Server,
@@ -86,7 +92,9 @@ pub const HttpServer = struct {
     /// cancellation lands here as error.Canceled out of accept().
     pub fn run(self: *HttpServer) std.Io.Cancelable!void {
         const io = self.ctx.io;
-        self.lifecycle.spawn(io, watchUpstreamDeadlines, .{ self.ctx, self.lifecycle }) catch {
+        self.lifecycle.spawn(io, watchUpstreamDeadlines, .{ self.ctx, self.lifecycle }) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            self.ctx.bus.err(WatchdogSpawnFailed{ .err = @errorName(err) });
             self.lifecycle.requestShutdown(io);
             return;
         };
@@ -96,7 +104,8 @@ pub const HttpServer = struct {
                 else => {
                     // Transient accept failures (fd exhaustion, aborted
                     // handshake) shouldn't kill the server.
-                    log.warn("accept failed: {s}", .{@errorName(err)});
+                    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                    self.ctx.bus.warn(AcceptFailed{ .err = @errorName(err) });
                     continue;
                 },
             };

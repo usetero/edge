@@ -18,14 +18,19 @@ pub fn build(b: *std.Build) void {
     const profiling = b.option(bool, "profiling", "Keep frame pointers and symbols for profilers") orelse false;
     const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
     const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
-    // httpz is the default until std.Io has an evented implementation that
-    // serves sockets (PLAN-FRONTEND-SWAP.md §6 swap-back criteria). CI must
-    // keep building both.
+    // stdio is the default. httpz hands a batch of up to 16 requests to one
+    // pool thread, so one slow intake response parks the rest of that batch,
+    // and a health probe behind them times out — the ECS incident this suite
+    // reproduces (bench/matrix: c02, c05). stdio runs a task per connection,
+    // and measures 2 to 2.8 times the throughput of httpz once the intake is
+    // slow, with a p99.9 within 50 ms of its p50 instead of ten times it.
+    // httpz stays buildable and tested: bench/matrix runs every case against
+    // both.
     const frontend = b.option(
         Frontend,
         "frontend",
-        "Inbound HTTP frontend (httpz = event loop + worker pool, stdio = std.Io-native)",
-    ) orelse .httpz;
+        "Inbound HTTP frontend (stdio = std.Io-native, httpz = event loop + worker pool)",
+    ) orelse .stdio;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
@@ -214,6 +219,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    // The echo server is its own module (src/bench is outside the src
+    // package), so its tests need their own artifact or they never run. The
+    // matrix trusts this binary to behave like an intake, which makes its
+    // parsing and its `/stats` output worth a check.
+    const echo_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/echo_server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    echo_tests.root_module.addImport("head_repair", b.createModule(.{
+        .root_source_file = b.path("src/frontend/stdio/head_repair.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    test_step.dependOn(&b.addRunArtifact(echo_tests).step);
+
     // Real-storage smoke test for the s3-dump extension, filtered to the MinIO
     // e2e test. Excluded from `test` (it needs a live backend); driven by
     // `task test:s3-e2e`, which starts MinIO, creates the bucket, and sets the
@@ -246,6 +269,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The fake intake must take the heads a real intake takes, so it shares
+    // the frontend's head repair rather than keeping its own copy.
+    echo_server.root_module.addImport("head_repair", b.createModule(.{
+        .root_source_file = b.path("src/frontend/stdio/head_repair.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
 
     const echo_step = b.step("echo-server", "Build the echo server for benchmarking");
     echo_step.dependOn(&b.addInstallArtifact(echo_server, .{}).step);

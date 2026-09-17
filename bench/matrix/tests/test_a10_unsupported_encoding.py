@@ -4,28 +4,40 @@
 unsupported content encoding plans `forward_raw`, so no policy reads the body
 and the batch still goes to the intake.
 
-httpz does exactly that. Verified against a lenient intake: a brotli batch
-comes back 200, relayed from upstream. It cannot be asserted here, because our
-own intake is `std.http.Server` based and refuses the head for the same reason
-stdio does.
+httpz always did that, because it passes the raw header string to the router.
+stdio could not accept the request at all: `std.http.Server` maps
+`content-encoding` through `ContentEncoding.fromString` (std/http.zig:283) and
+`Request.Head.parse` fails the whole head for anything outside its table
+(std/http/Server.zig:164), so the sender got 400 and the agent discarded the
+batch for good.
 
-stdio cannot accept the request at all. `std.http.Server` maps
-`content-encoding` through `ContentEncoding.fromString`, and anything outside
-its five known values fails the whole head with `HttpHeadersInvalid`. There is
-no distinct error, so we cannot tell an unknown encoding from a malformed
-head, and the sender gets 400. An agent using brotli would retry it forever.
+The frontend now repairs such a head. `Head.parse` reports the cause
+distinctly, as `HttpTransferEncodingUnsupported`, and `Server.receiveHead`
+flattens it to `HttpHeadersInvalid` on one line (std/http/Server.zig:53), so
+the frontend re-parses the head bytes to find out what really happened and
+rewrites the value (src/frontend/stdio/head_repair.zig).
+
+The fake intake shares that repair, because a real intake takes a coding it
+cannot decode and this one is `std.http.Server` based too. Without it the case
+would measure our test double instead of the edge.
 """
 
 from harness import MatrixCase
 
 
 class UnsupportedEncoding(MatrixCase):
-    DEFECTS = {"stdio": "std.http.Server refuses the head, so the batch is dropped with 400"}
     FORBID_LOGS = ["upstream.timed.out"]
 
     def test_unknown_encoding_forwards_raw(self):
-        if self.frontend == "httpz":
-            self.skipTest("our std-based intake refuses brotli; httpz verified against a lenient one")
         response = self.post_raw_body(b'[{"message":"brotli"}]', headers={"Content-Encoding": "br"})
         self.assert_status(response, 202, "an unsupported encoding must forward, not drop")
         self.assertGreaterEqual(self.intake_saw(1), 1, "the batch never reached the intake")
+
+    def test_the_intake_receives_the_encoding_the_sender_sent(self):
+        """The body is untouched, so the header must still describe it."""
+        self.post_raw_body(b'[{"message":"brotli"}]', headers={"Content-Encoding": "br"})
+        self.assertEqual(
+            "br",
+            self.intake.stats().get("last_content_encoding", ""),
+            "a forwarded body must keep the sender's content-encoding",
+        )

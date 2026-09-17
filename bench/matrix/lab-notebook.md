@@ -267,6 +267,236 @@ So the header is the whole improvement. A sender that honours `Retry-After`
 waits the stated interval instead of retrying at once. `SHED_RETRY_AFTER_SECONDS`
 sets both the header and the fixed shed response, so the two cannot disagree.
 
+## The default frontend is stdio
+
+`-Dfrontend` now defaults to `stdio`, so the release binaries and the container
+image carry it. httpz stays buildable, and every case in this suite still runs
+against both.
+
+The reason is the incident this suite was written for. httpz hands a batch of
+up to 16 requests to one pool thread, so one slow intake response parks the
+rest of that batch, and a health probe behind them times out (c02, c05).
+stdio runs a task per connection and answers the probe (c05 passes on stdio,
+and reproduces as a declared defect on httpz).
+
+A sweep on the Mac Studio, 12 s per row, both frontends, `bench/perf/sweep.py`:
+
+| intake | httpz rps | stdio rps | httpz p99.9 | stdio p99.9 |
+| ------ | --------- | --------- | ----------- | ----------- |
+| immediate | 87,733 | 87,344 | 1.9 ms | 1.0 ms |
+| slow, stage 1 | 741 | 2,089 | 469.6 ms | 50.6 ms |
+| slow, stage 2 | 183 | 444 | 2083.1 ms | 203.4 ms |
+| slow, stage 3 | 105 | 221 | 4600.7 ms | 351.8 ms |
+
+Read the stages as "the intake gets slower", not as a number: the host
+stretches short sleeps, so the axis label understates the real delay. Both
+frontends met the same intake. Throughput with an immediate intake is equal,
+stdio serves 2 to 2.8 times as many requests once the intake is slow, and its
+p99.9 stays within 50 ms of its own p50 while httpz's runs to ten times its
+p50. The `threads` and `maxconn` axes are flat for both.
+
+### What the swap costs
+
+Two things get worse. A third, the pair of encoding defects, is fixed below.
+
+1. **An invalid chunk waits for the request deadline** instead of a fast 400
+   (a07). The sender still gets an answer, just late.
+2. **Memory grows with the connection count.** `Io.Threaded` gives each
+   connection a task, so 256 concurrent senders cost 229 MB against httpz's
+   129 MB. Below 64 connections stdio is the cheaper of the two (21 MB at 16
+   connections, 65 MB at 64), and it does not grow with `thread_pool_count`,
+   which httpz does: 20.7 MB at 8 threads against 119.9 MB at 128.
+
+httpz keeps five declared defects of its own (a02, a03, a12, c02, c05), two of
+them the incident.
+
+## Repairing a head std refuses over one header
+
+std's head parser maps `content-encoding` through an exact-match table of seven
+spellings (std/http.zig:283) and fails the whole head for anything else
+(std/http/Server.zig:164). Two real senders hit that, and both lost data,
+because 400 is one of the four statuses the Datadog agent treats as permanent:
+
+* `Content-Encoding: GZIP`. RFC 9110 §8.4.1 makes codings case-insensitive,
+  and the table is keyed on lowercase bytes (a34).
+* `Content-Encoding: br`, or any codec we do not decode. The router plans
+  `forward_raw` for those, so the batch should reach the intake untouched
+  (a10).
+
+`src/frontend/stdio/head_repair.zig` rewrites the value in a copy of the head
+and parses it again: a known coding gets the spelling std takes, and an unknown
+one becomes `identity`, which leaves the body unread. The router decides on
+what the sender sent, and the relay forwards it, so a coding we cannot decode
+reaches the intake exactly as it arrived. Both cases now pass on both
+frontends, and a10 asserts the header the intake received, not only the status.
+
+Three details make it work:
+
+1. **The bytes are still there.** `http.Reader.receiveHead` ends with `toss`,
+   which only moves the read cursor, so the head sits in the receive buffer we
+   own. The frontend records the cursor before the call and reads the head back
+   after the failure.
+2. **std reports the cause, one layer down.** `Head.parse` returns
+   `HttpTransferEncodingUnsupported`; `receiveHead` flattens it to
+   `HttpHeadersInvalid` on one line (std/http/Server.zig:53). Re-parsing the
+   bytes recovers the distinction, which is what makes the repair safe: any
+   other fault still answers 400.
+3. **`Server.Request` is a public struct.** The repaired request is built from
+   the rewritten head, and `reader.state` is already `received_head`, so the
+   rest of the connection path runs unchanged.
+
+There is no metric. A sender spells an encoding the same way on every request,
+so the signal is one warn line per cause for the process (`head.repaired`), not
+a counter that only ever says "this deployment has that sender".
+
+The fake intake shares the repair, because a real intake accepts a coding it
+cannot decode and ours is `std.http.Server` based too. Without that, a10 would
+measure the test double.
+
+## Two cases that tested less than they claimed
+
+Both came out of the full run after the repair landed, and neither was a
+product defect.
+
+**d05 ran the machine out of ports.** The reload case sends from four threads
+for six seconds with no keep-alive, which is a connection per request. That
+exhausts the ephemeral range in seconds, and the sender then fails with
+`EADDRNOTAVAIL`: its own local address, not anything the edge did. Each thread
+now keeps one connection, which is also what an agent does. `post_logs` takes
+a `session` for that.
+
+**Four cases ran with no policy in force.** They asked for `"regex": ".*"`,
+which the matcher refuses because the pattern can match an empty buffer, so
+a09, a34, a35 and d05 claimed to exercise the decode path while nothing
+decoded. They now say `.+`.
+
+One invariant closes that class for good: a case that declares `EDGE_POLICIES`
+must end with `edge_policies_rejected` at zero. a41 is the only case that opts
+out, with `EXPECT_REJECTED_POLICIES`, because a41 is the case about the
+refusal.
+
+## A case that passed for the wrong reason
+
+b12 points the edge at a blackhole and asserts the sender is not held for the
+kernel's connect timeout. It started passing on both frontends, which would
+have read as "the dial is bounded now". It is not. The blackhole was a loopback
+listener with a filled accept queue, and loopback accepted the connection
+anyway, so the case measured the request deadline instead of the dial.
+
+It now dials `198.51.100.1`, reserved for documentation by RFC 5737, which
+swallows the SYN. Both frontends hold the sender for the full 120 s client
+timeout, so the defect is declared again and the case proves it. Where a host
+refuses the route instead of dropping it, the case skips rather than claim a
+bound it did not test.
+
+## Observability review
+
+An audit of every metric and every log site, for gaps on one side and noise on
+the other.
+
+### Logs added
+
+Five places could lose or fail something with no line at all:
+
+1. **A batch policy empties.** Both paths now report it: the record path
+   forwards the empty batch, and the buffered path answers success and
+   forwards nothing. `batch.dropped` carries `forwarded`, so the line says
+   which happened. This is the first thing to read when an operator asks where
+   their data went. a41 asserts it.
+2. **An s3-dump flush that did not deliver.** `s3.dump.records.dropped` is
+   data lost for good, from a full backlog or an encode failure.
+   `s3.dump.upload.failed` is a failed upload that was requeued, which is the
+   leading indicator of the first. The counters gave the rate; nothing gave
+   the reason. Both the flush loop and the shutdown drain report through one
+   helper.
+3. **An `accept` that failed.** `accept.failed`. One inbound connection is
+   gone before it carried a request.
+4. **A watchdog that could not start.** `watchdog.spawn.failed`, on both
+   frontends. The spawn error was dropped on the floor, and the process shut
+   down with no reason given.
+5. **A listener that stopped.** `listen.failed` on httpz. It explains a
+   process that is up and deaf.
+
+Three of those were `std.log` free text before. A named type gives the event a
+stable telemetry name, so an alert can match it and this suite can assert it.
+
+Two events are warn-once-per-process, then debug: `batch.dropped` and
+`head.repaired`. The fact is what an operator needs, and it does not change
+between requests; the rate belongs to the counter. A warn per request at 87k
+rps is its own outage.
+
+### Metrics removed and trimmed
+
+- `edge_prefilter_decisions_total{route_kind,decision}` is gone. It answered
+  whether the prefilter took the fast path, which is tuning work, not
+  operation. That is 24 series, and no case or dashboard read it. The
+  `RouteKindLabel` enum and `prefilterRouteLabel` went with it.
+- `edge_request_duration_seconds` drops from 18 buckets to 11 boundaries, 100
+  us to 30 s. At 18 it was half the whole series budget (18 x 9 paths), finer
+  than any alert reads.
+
+The series budget goes from about 380 to about 240, and the README now lists
+every series with its labels.
+
+### Cardinality
+
+No unbounded label anywhere. Every label is a bounded enum, and the only
+string labels are `version` and `commit` on `edge_build_info`, one series per
+process. No path, status code, policy id or client value reaches a label, so
+the series count cannot grow with traffic.
+
+httpz keeps three events against stdio's twelve, and its connection metrics
+are compiled out (`conn_metrics_enabled`). That is left as it is: stdio is the
+default, and the comment that claimed httpz exports its own connection series
+through `endpoints.zig` was wrong, because no such series exists.
+
+## What the scaling benchmark taught us
+
+A run of `bench/scaling/run.sh` on the Mac Studio reported 99% success while
+the edge answered 49,889 of 49,927 requests with a 5xx. Four causes, none of
+them the frontend swap: the same shape passes on both frontends locally, and
+the same command on that host with clean ports and a raised descriptor limit
+was 100% on every scenario.
+
+1. **The benchmark asked for `log_level: err`,** so every warning was thrown
+   away. The edge reset the bus level from the config right after loading it,
+   which is why those logs held exactly two lines. It asks for `warn` now.
+2. **The benchmark never read the counters.** `edge_requests_total`,
+   `edge_responses_total`, `edge_connections_shed_total` and the rest answer
+   "where did the missing requests go" directly, and a `kill -9` took them
+   with it. The script now scrapes `/_edge/metrics` before it stops each edge,
+   saves it under `debug/`, and prints one line naming what became of the
+   requests the intake never saw.
+3. **Two processes shared a port.** `reuse_address` sets SO_REUSEADDR *and*
+   SO_REUSEPORT (std/Io/net.zig:229), so a second edge binds the same port
+   happily, and macOS hands new connections to the newest listener. Proved
+   with two processes on one port: the newest served 600 of 600, the older
+   none. The script slept 0.3 s after SIGTERM and never checked the port, so a
+   slow shutdown or a leftover process from an earlier run split the traffic:
+   one scenario reported 70,757 requests for 50,000 sent, and a scrape
+   labelled `v1_logs` for a traces run. It now clears the fixed ports, waits
+   for the previous process to exit, and refuses to start a second listener.
+4. **`ulimit -n`.** macOS defaults to 256 descriptors, which cannot hold 256
+   inbound connections plus an upstream pool. The script raises it to 8192.
+
+Two of our own problems surfaced with it:
+
+* `arena_pool` warned once per release, 19,306 times in one run, that the
+  connection arena had grown past its reserve. It now warns on a new
+  high-water mark, so a repeat is silent and a worse leak still gets a line.
+  Worth noting on its own: the Datadog metrics path does exceed the 16 KiB
+  reserve.
+* The echo server printed `/stats` strings raw, so one request with control
+  bytes in its target made the whole document unparseable and hid every number
+  in it. `std.http.Server` accepts such a target, and the edge forwards it.
+  The strings are escaped now, and `src/bench` finally has a test artifact in
+  `build.zig`: its tests never ran, because it is outside the `src` package.
+
+The payload generator also needed `bench/scaling/proto_gen`, which is
+gitignored, so a fresh checkout could not run the benchmark at all. It now
+takes the published `opentelemetry-proto` package through uv, and hermit's zig
+and python by path, so nothing depends on an activated shell.
+
 ## Findings
 
 ### Fixed

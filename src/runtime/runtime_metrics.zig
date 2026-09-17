@@ -6,10 +6,10 @@ const build_options = @import("build_options");
 const log = std.log.scoped(.runtime_metrics);
 
 /// Connection-level series need a hook at accept and at slot release. The
-/// stdio frontend owns both; httpz owns neither (it exports its own
-/// `httpz_connections` and `httpz_invalid_request` through endpoints.zig
-/// instead). Registering them on an httpz build would publish a flat zero,
-/// which reads as "no connections" rather than "not measured".
+/// stdio frontend owns both; httpz owns neither, and it publishes nothing in
+/// their place. Registering them on an httpz build would report a flat zero,
+/// which reads as "no connections" rather than "not measured". stdio is the
+/// default frontend, so this gates the fallback build only.
 const conn_metrics_enabled = build_options.frontend == .stdio;
 
 pub const DistributionLabel = enum {
@@ -32,17 +32,6 @@ pub const MethodLabel = enum {
     other,
 };
 
-pub const RouteKindLabel = enum {
-    datadog_logs,
-    datadog_metrics,
-    otlp_logs,
-    otlp_metrics,
-    otlp_traces,
-    prometheus_metrics,
-    health,
-    passthrough,
-};
-
 pub const KnownPathLabel = enum {
     api_v2_logs,
     api_v2_series,
@@ -53,12 +42,6 @@ pub const KnownPathLabel = enum {
     health,
     edge_metrics,
     other,
-};
-
-pub const PrefilterDecisionLabel = enum {
-    policy_path,
-    fast_path,
-    none,
 };
 
 pub const StatusClassLabel = enum {
@@ -115,11 +98,6 @@ const RequestLabels = struct {
 const DurationLabels = struct { known_path: KnownPathLabel };
 
 const ResponseLabels = struct { known_path: KnownPathLabel, status_class: StatusClassLabel };
-
-const PrefilterLabels = struct {
-    route_kind: RouteKindLabel,
-    decision: PrefilterDecisionLabel,
-};
 
 const ErrorLabels = struct {
     known_path: KnownPathLabel,
@@ -200,7 +178,6 @@ const InternalMetrics = struct {
     edge_requests_total: RequestsTotal,
     edge_request_duration_seconds: RequestDurationSeconds,
     edge_responses_total: ResponsesTotal,
-    edge_prefilter_decisions_total: PrefilterDecisionsTotal,
     edge_request_errors_total: RequestErrorsTotal,
     edge_policy_records_evaluated_total: PolicyRecordsEvaluatedTotal,
     edge_policy_records_kept_total: PolicyRecordsKeptTotal,
@@ -230,10 +207,12 @@ const InternalMetrics = struct {
     const RequestDurationSeconds = m.HistogramVec(
         f64,
         DurationLabels,
-        &.{ 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60 },
+        // Eleven boundaries, a decade-ish step from 100 us to 30 s. Eighteen
+        // made this metric half of the whole series budget (18 buckets x 9
+        // paths), and no alert or dashboard reads a finer grade.
+        &.{ 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30 },
     );
     const ResponsesTotal = m.CounterVec(u64, ResponseLabels);
-    const PrefilterDecisionsTotal = m.CounterVec(u64, PrefilterLabels);
     const RequestErrorsTotal = m.CounterVec(u64, ErrorLabels);
     const ConnectionsShedTotal = m.CounterVec(u64, ShedLabels);
     const InboundTimeoutsTotal = m.CounterVec(u64, InboundTimeoutLabels);
@@ -278,13 +257,6 @@ pub const RuntimeMetrics = struct {
                     io,
                     "edge_responses_total",
                     .{ .help = "Total number of HTTP responses produced by edge." },
-                    .{},
-                ),
-                .edge_prefilter_decisions_total = try InternalMetrics.PrefilterDecisionsTotal.init(
-                    allocator,
-                    io,
-                    "edge_prefilter_decisions_total",
-                    .{ .help = "Total number of prefilter routing decisions." },
                     .{},
                 ),
                 .edge_request_errors_total = try InternalMetrics.RequestErrorsTotal.init(
@@ -409,15 +381,6 @@ pub const RuntimeMetrics = struct {
             }
         }
 
-        inline for (std.meta.tags(RouteKindLabel)) |route_kind| {
-            inline for (std.meta.tags(PrefilterDecisionLabel)) |decision| {
-                try self.internal.edge_prefilter_decisions_total.incrBy(.{
-                    .route_kind = route_kind,
-                    .decision = decision,
-                }, 0);
-            }
-        }
-
         inline for (std.meta.tags(PolicyTelemetryLabel)) |telemetry| {
             try self.internal.edge_policy_records_evaluated_total.incrBy(.{ .telemetry = telemetry }, 0);
             try self.internal.edge_policy_records_kept_total.incrBy(.{ .telemetry = telemetry }, 0);
@@ -530,17 +493,6 @@ pub const RuntimeMetrics = struct {
             .known_path = known_path,
             .status_class = status_class,
         }) catch |err| log.debug("failed to record response metric: {}", .{err});
-    }
-
-    pub fn recordPrefilterDecision(
-        self: *RuntimeMetrics,
-        route_kind: RouteKindLabel,
-        decision: PrefilterDecisionLabel,
-    ) void {
-        self.internal.edge_prefilter_decisions_total.incr(.{
-            .route_kind = route_kind,
-            .decision = decision,
-        }) catch |err| log.debug("failed to record prefilter decision metric: {}", .{err});
     }
 
     pub fn recordRequestError(
