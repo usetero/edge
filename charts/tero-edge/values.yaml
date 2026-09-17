@@ -28,9 +28,10 @@ resources:
   limits:
     cpu: 200m
     # Sized for the default threadPoolCount of 128 at the maxBodySize below:
-    # ~540 MiB of retained per-thread workspace once every handler has seen
-    # compressed traffic. See the sizing formula under proxy.maxConnections.
-    # Set proxy.threadPoolCount lower to trade throughput for a smaller
+    # ~607 MiB of retained per-thread workspace once every handler has seen
+    # compressed traffic (the 16 MiB decoded cap keys a 2 MiB zstd decode
+    # window; see the sizing formula under proxy.maxConnections). Set
+    # proxy.threadPoolCount lower to trade throughput for a smaller
     # footprint: 32 threads need about 140 MiB.
     memory: 768Mi
 
@@ -112,13 +113,17 @@ config:
   # A connection costs 20 KiB (the receive buffer), NOT maxBodySize. Sizing:
   #
   #   memory ~= maxConnections x 20 KiB
-  #           + threadPoolCount x (2 x maxBodySize + 1.2 MiB)
+  #           + threadPoolCount x (zstdWindow + maxBodySize + 1.2 MiB)
   #
-  # The second term is the per-handler workspace: the zstd window, record
-  # scratch and encoder, plus a resident body buffer and a streaming pump.
-  # It is allocated on demand and then retained for the life of the thread,
-  # so memory tracks the number of threads that have served a compressed
-  # body, not the number in flight now. Worked example at maxBodySize 2 MiB:
+  # The second term is the per-handler workspace: the post-decompression zstd
+  # decode window (limits.zig ZSTD_WINDOW_BUDGET_MAX, bounded at 2 MiB - it
+  # tracks maxDecodedBytes, not maxBodySize, so a decoded cap above 2 MiB does
+  # not grow per-thread scratch), record scratch and encoder, plus a resident
+  # body buffer and a streaming pump. It is allocated on demand and then
+  # retained for the life of the thread, so memory tracks the number of
+  # threads that have served a compressed body, not the number in flight now.
+  # At maxBodySize <= 2 MiB the window equals maxBodySize and the term collapses
+  # to 2 x maxBodySize. Worked example at maxBodySize 2 MiB:
   #
   #   maxConnections | threadPoolCount | approx memory | suggested request
   #   ---------------|-----------------|---------------|------------------
@@ -129,9 +134,9 @@ config:
   #
   # threadPoolCount is the dominant term. Lower it before you raise the
   # memory limit if throughput allows: it is the only knob that bounds
-  # retained workspace. At this chart's own maxBodySize of 1.5 MiB the
-  # default 256/128 shape works out at about 540 MiB, which is what the
-  # resources block above is sized for.
+  # retained workspace. At this chart's own maxBodySize of 1.5 MiB (and the
+  # default 16 MiB decoded cap -> 2 MiB window) the default 256/128 shape works
+  # out at about 607 MiB, which the resources block above is sized for.
   #
   # Raise maxConnections and threadPoolCount together: connections admitted
   # beyond what the handler pool can serve just queue until requestTimeout.

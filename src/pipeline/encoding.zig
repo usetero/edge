@@ -291,6 +291,7 @@ pub const ZstdCompressor = struct {
 
 const testing = std.testing;
 const buffered = @import("compress_buffered.zig");
+const limits = @import("../core/limits.zig");
 
 const TEST_ZSTD_WINDOW: usize = 256 * 1024;
 
@@ -448,7 +449,6 @@ test "identity passes bytes through untouched" {
 test "limits regions satisfy codec buffer requirements" {
     // core/limits.zig can't import pipeline (layering), so the contract is
     // enforced here: the slab regions must fit every codec's needs.
-    const limits = @import("../core/limits.zig");
     inline for (@typeInfo(ContentEncoding).@"enum".fields) |field| {
         const enc: ContentEncoding = @enumFromInt(field.value);
         try testing.expect(limits.ENCODE_BUF_BYTES >= enc.encoderBufferLen());
@@ -456,6 +456,75 @@ test "limits regions satisfy codec buffer requirements" {
         // flate's whole requirement and zstd's block.
         try testing.expect(limits.DECODE_SLACK_BYTES >= enc.decoderBufferLen(0));
     }
+}
+
+test "default-config zstd decoder admits a frame the decoded cap admits" {
+    // Regression for the OTLP-zstd window-cap bug (e75cfca, #263): the resolver
+    // raised max_decoded_bytes to 16 MiB but left zstd_window_len keyed to
+    // max_body_size (1.5 MiB). A one-shot libzstd/default frame declares
+    // window = min(content, 2 MiB), so any frame decoding past 1.5 MiB declared
+    // a 2 MiB window and was rejected by the window cap (error.WindowOversize
+    // -> error.ReadFailed) at frame init, before the 16 MiB decoded cap was
+    // consulted. The fix keys zstd_window_len to max_decoded_bytes (bounded to
+    // 2 MiB), so the 2 MiB window passes and the decoded cap is the real gate.
+    const L = limits.Limits.resolve(.{ .max_body_size = limits.DEFAULT_MAX_BODY_BYTES });
+    try testing.expectEqual(@as(usize, 16 * 1024 * 1024), L.max_decoded_bytes);
+    try testing.expectEqual(limits.ZSTD_WINDOW_BUDGET_MAX, L.zstd_window_len);
+    try testing.expect(L.zstd_window_len < L.max_decoded_bytes);
+
+    // Highly-compressible payload decoding to 3 MiB (between max_body_size and
+    // max_decoded_bytes). Random bytes would not compress and would blow the
+    // raw cap; a repeating structured line stays well under 1.5 MiB compressed.
+    const line =
+        "{\"ddsource\":\"nginx\",\"message\":\"2019-11-19T14:37:58 INFO process hello world\",\"service\":\"payment\"}";
+    const payload = try testing.allocator.alloc(u8, 3 * 1024 * 1024);
+    defer testing.allocator.free(payload);
+    var off: usize = 0;
+    while (off + line.len <= payload.len) : (off += line.len) {
+        @memcpy(payload[off..][0..line.len], line);
+    }
+    @memset(payload[off..], ' ');
+
+    const compressed = try buffered.compressZstd(testing.allocator, payload);
+    defer testing.allocator.free(compressed);
+    // Admissible on the wire: well under the raw cap.
+    try testing.expect(compressed.len <= L.max_body_size);
+
+    // The frame declares a 2 MiB window: at/under the configured window cap and
+    // under the decoded cap -- the over-cap/under-decoded-cap shape the old
+    // 1.5 MiB window cap rejected.
+    var hdr_in: std.Io.Reader = .fixed(compressed[4..]); // skip 4-byte magic
+    const hdr = try zstd.Decompress.Frame.Zstandard.Header.decode(&hdr_in);
+    const declared_window = hdr.windowSize().?;
+    try testing.expect(declared_window > limits.DEFAULT_MAX_BODY_BYTES);
+    try testing.expect(declared_window <= L.zstd_window_len);
+    try testing.expect(declared_window <= L.max_decoded_bytes);
+
+    // Contrast -- the pre-fix window cap (keyed to max_body_size, 1.5 MiB) was
+    // below the declared 2 MiB window, so a decoder sized to it rejects the
+    // frame with error.ReadFailed: the bug.
+    const old_window = limits.DEFAULT_MAX_BODY_BYTES;
+    const old_buf = try testing.allocator.alloc(u8, ContentEncoding.zstd.decoderBufferLen(old_window));
+    defer testing.allocator.free(old_buf);
+    var old_in: std.Io.Reader = .fixed(compressed);
+    var old_dec: Decoder = .init(.zstd, &old_in, old_buf, old_window);
+    var old_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer old_out.deinit();
+    try testing.expectError(error.ReadFailed, old_dec.reader().streamRemaining(&old_out.writer));
+
+    // The configured decoder (window = L.zstd_window_len) round-trips it
+    // byte-identically: the decoded cap, not the window cap, gates admission.
+    const cap_buf = try testing.allocator.alloc(
+        u8,
+        ContentEncoding.zstd.decoderBufferLen(L.zstd_window_len),
+    );
+    defer testing.allocator.free(cap_buf);
+    var in: std.Io.Reader = .fixed(compressed);
+    var dec: Decoder = .init(.zstd, &in, cap_buf, L.zstd_window_len);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    _ = try dec.reader().streamRemaining(&out.writer);
+    try testing.expectEqualStrings(payload, out.written());
 }
 
 test "ContentEncoding.fromHeader" {

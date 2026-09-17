@@ -136,10 +136,15 @@ have served a compressed body:
 
 ```
 memory ~= maxConnections x 20 KiB
-        + threadPoolCount x (2 x maxBodySize + 1.2 MiB)
+        + threadPoolCount x (zstdWindow + maxBodySize + 1.2 MiB)
 ```
 
 A connection itself costs 20 KiB, the receive buffer — not `maxBodySize`.
+`zstdWindow` is the post-decompression zstd decode window cap
+(`limits.zig` `ZSTD_WINDOW_BUDGET_MAX`, bounded at 2 MiB): it tracks
+`maxDecodedBytes`, not `maxBodySize`, so a decoded cap above 2 MiB does not grow
+per-thread scratch. At `maxBodySize <= 2 MiB` the window equals `maxBodySize`
+and the per-handler term collapses to `2 x maxBodySize + 1.2 MiB`.
 
 Worked example at `maxBodySize` 2 MiB:
 
@@ -150,10 +155,11 @@ Worked example at `maxBodySize` 2 MiB:
 | 2048           | 16              | 123 MiB       | 192Mi             |
 | 4096           | 32              | 246 MiB       | 320Mi             |
 
-At this chart's own `maxBodySize` of 1.5 MiB the default 256/128 shape works
-out at about 540 MiB, which is what the shipped `resources` block is sized
-for. `threadPoolCount` rose from 32 to 128 in v1.30.2, so a chart pinned to
-the old resource values will not hold the current default.
+At this chart's own `maxBodySize` of 1.5 MiB (and the default 16 MiB decoded
+cap, which keys a 2 MiB `zstdWindow`) the default 256/128 shape works out at
+about 607 MiB, which is what the shipped `resources` block is sized for.
+`threadPoolCount` rose from 32 to 128 in v1.30.2, so a chart pinned to the old
+resource values will not hold the current default.
 
 To cut the footprint, lower `threadPoolCount` before you raise the memory
 limit: it is the only knob that bounds retained workspace. 32 threads need
