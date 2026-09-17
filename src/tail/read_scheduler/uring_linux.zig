@@ -73,7 +73,35 @@ pub const Scheduler = struct {
         try self.cqes.ensureTotalCapacity(self.allocator, events.len);
         try self.prepareFixedResources(framer.read_buf.len);
         const use_fixed = self.fixed_enabled and self.fixed_buffers_registered and self.fixed_files_registered;
-        if (!use_fixed) self.scratch.clearRetainingCapacity();
+        if (!use_fixed) {
+            self.scratch.clearRetainingCapacity();
+            // Size `scratch` once for the whole batch BEFORE preparing any
+            // SQEs. `self.ring.read` below pins each event's slot pointer into
+            // `sqe.addr`, but the kernel does not run those reads until
+            // `submit_and_wait` fires after this loop. Growing `scratch` per
+            // event could relocate (and free) the backing buffer that earlier
+            // SQEs already captured, dangling their `sqe.addr` so the kernel
+            // reads file bytes into freed memory while the completion handler
+            // slices the relocated `scratch` — silent wrong output (regressed
+            // in a32652c). Reserve capacity for the sum of every dispatched
+            // event's read up front so the `addManyAsSliceAssumeCapacity`
+            // slots below never move. The preview must mirror the dispatch
+            // loop's skip/cap logic exactly (both bounded by
+            // `fixed_slot_count`); `addManyAsSliceAssumeCapacity` asserts the
+            // capacity in Debug, guarding that agreement.
+            var scratch_total: usize = 0;
+            var preview_idx: usize = 0;
+            for (events) |evt| {
+                if (evt.end_offset <= evt.start_offset) continue;
+                if (preview_idx >= fixed_slot_count) break;
+                const max_bytes: u64 = evt.end_offset - evt.start_offset;
+                const to_read: usize = @intCast(@min(max_bytes, framer.read_buf.len));
+                if (to_read == 0) continue;
+                scratch_total += to_read;
+                preview_idx += 1;
+            }
+            try self.scratch.ensureTotalCapacity(self.allocator, scratch_total);
+        }
 
         var op_idx: usize = 0;
         for (events) |evt| {
@@ -102,9 +130,11 @@ pub const Scheduler = struct {
                 };
                 sqe.flags |= std.os.linux.IOSQE_FIXED_FILE;
             } else {
+                // Capacity was reserved above; this advances `items.len`
+                // without reallocating, so `slot.ptr` stays live and stable
+                // until the CQE is reaped (assert-backed in Debug builds).
                 const off = self.scratch.items.len;
-                try self.scratch.resize(self.allocator, off + to_read);
-                const slot = self.scratch.items[off .. off + to_read];
+                const slot = self.scratch.addManyAsSliceAssumeCapacity(to_read);
                 _ = self.ring.read(user_data, evt.file.handle, .{ .buffer = slot }, evt.start_offset) catch {
                     return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
                 };
