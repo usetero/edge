@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.32.0](https://github.com/usetero/edge/compare/v1.31.0...v1.32.0) (2026-09-17)
+
+
+### Features
+
+* **frontend:** bound stdio inbound reads and report every drop path ([#322](https://github.com/usetero/edge/issues/322)) ([4943f1a](https://github.com/usetero/edge/commit/4943f1a2fcac1b471d03075c04af3b1e7b5ef722))
+* make stdio the default frontend, and accept the heads std refuses ([#331](https://github.com/usetero/edge/issues/331)) ([0ee512b](https://github.com/usetero/edge/commit/0ee512b9a78aa0e29a3e8e0681ac8f7b02c50781))
+
+
+### Performance Improvements
+
+* look up the wrapped body directly instead of flattening it ([#280](https://github.com/usetero/edge/issues/280)) ([08938c4](https://github.com/usetero/edge/commit/08938c476e5c937e262dce62e168ba5bb396970d))
+* skip the re-encode when no policy changed the batch ([#274](https://github.com/usetero/edge/issues/274)) ([3e38bf1](https://github.com/usetero/edge/commit/3e38bf1ae4c8b2b7d28523dd9dc80e04d892f2d9))
+* stream passthrough bodies, relay early upstream responses, retry dials ([#317](https://github.com/usetero/edge/issues/317)) ([c6c0cbd](https://github.com/usetero/edge/commit/c6c0cbdbc26bdc98c9b77bafe4260b109c2795a1))
+
 ## [1.31.0](https://github.com/usetero/edge/compare/v1.30.2...v1.31.0) (2026-09-15)
 
 
