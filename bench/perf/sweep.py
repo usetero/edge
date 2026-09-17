@@ -117,6 +117,32 @@ def policy_document(count: int) -> dict:
     return {"policies": policies}
 
 
+#: How much a short sleep may overshoot before the latency axis is measuring
+#: the host instead of the edge. A millisecond or two is ordinary scheduling;
+#: tens of milliseconds swamp a 5 ms intake.
+TIMER_OVERSHOOT_BUDGET_MS = 3.0
+
+
+def timer_overshoot_ms() -> float:
+    """How far a short sleep overshoots on this host, in milliseconds.
+
+    The latency axis simulates intake latency with a sleep, so a host whose
+    timers are stretched measures its own scheduler rather than the edge. One
+    machine here reported 33.5 ms for `sleep(5 ms)` while a busy-wait of the
+    same length measured 5.0 ms exactly: the CPU was fine and only
+    timer-driven wakeups were late. That run produced a table showing a 100x
+    throughput collapse that had nothing to do with either frontend, so the
+    axis now refuses to run on a host like that.
+    """
+    want = 0.005
+    rounds = 20
+    started = time.monotonic()
+    for _ in range(rounds):
+        time.sleep(want)
+    measured = (time.monotonic() - started) / rounds
+    return (measured - want) * 1000
+
+
 def peak_rss_mb(pid: int, stop_after: float) -> float:
     peak = 0.0
     deadline = time.monotonic() + stop_after
@@ -227,6 +253,8 @@ def main() -> int:
     parser.add_argument("--frontend", choices=("stdio", "httpz", "both"), default="both")
     parser.add_argument("--axes", default=",".join(AXES))
     parser.add_argument("--out", default="/tmp/edge-perf-sweep.json")
+    parser.add_argument("--force-latency", action="store_true",
+                        help="run the latency axis even where the host's timers are stretched")
     args = parser.parse_args()
 
     if not shutil.which("oha"):
@@ -235,7 +263,17 @@ def main() -> int:
     frontends = ["httpz", "stdio"] if args.frontend == "both" else [args.frontend]
     results = []
 
-    for axis in args.axes.split(","):
+    axes = args.axes.split(",")
+    if "latency" in axes:
+        overshoot = timer_overshoot_ms()
+        print("timer check: sleep(5 ms) overshoots by %.1f ms on this host" % overshoot)
+        if overshoot > TIMER_OVERSHOOT_BUDGET_MS and not args.force_latency:
+            axes = [a for a in axes if a != "latency"]
+            print("skipping the latency axis: a %.0f ms overshoot would be the "
+                  "intake's delay, not the intake. Pass --force-latency to run "
+                  "it anyway." % overshoot)
+
+    for axis in axes:
         if axis not in AXES:
             raise SystemExit("unknown axis %r; choose from %s" % (axis, ",".join(AXES)))
         print("\n== %s (everything else at the baseline) ==" % axis)
