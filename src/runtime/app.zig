@@ -505,6 +505,10 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     }
 
     try engine.start();
+    errdefer {
+        engine.requestShutdown();
+        engine.stop();
+    }
 
     // Single background flush task, torn down with the rest of the group on
     // shutdown; the final force-flush runs on the main path below.
