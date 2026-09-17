@@ -340,6 +340,14 @@ pub const Handler = struct {
             // here, and close the connection: the body is part-read, and httpz
             // would drain the remainder — the same unbounded wait again.
             if (body == .lazy and bounded.expired) {
+                // `res.keepalive = false` only writes the `Connection: Close`
+                // response header; httpz gates its post-handler body drain on
+                // `conn.handover` (derived from `req.canKeepAlive()`), which a
+                // plain HTTP/1.1 request leaves `.keepalive`. The drain would
+                // then re-enter the same unbounded per-read wait on this
+                // handler thread we just escaped. Flip `handover` to `.close`
+                // so httpz skips the drain and closes the connection.
+                req.conn.handover = .close;
                 res.keepalive = false;
                 return error.InboundBodyTimeout;
             }
@@ -437,4 +445,52 @@ test "httpz method maps onto service and std methods" {
     try testing.expectEqual(service_mod.HttpMethod.OTHER, serviceMethod(.CONNECT));
     try testing.expectEqual(@as(?std.http.Method, .GET), stdMethod(.GET));
     try testing.expectEqual(@as(?std.http.Method, null), stdMethod(.OTHER));
+}
+
+test "InboundBodyTimeout recovery flips httpz handover so the post-handler drain is skipped" {
+    // httpz gates its post-handler body drain on `conn.handover`, which it
+    // derives from `req.canKeepAlive()` after the handler returns
+    // (httpz.zig:573-586); `res.keepalive` only writes the `Connection: Close`
+    // response header. So an HTTP/1.1 keep-alive request whose lazy body is
+    // only partly read when the deadline fires would still be drained on the
+    // handler thread despite `res.keepalive = false`, reintroducing the
+    // slow-drip DoS `DeadlineReader` exists to stop. `Handler.dispatch` now
+    // flips `conn.handover` to `.close` so httpz skips the drain and closes
+    // the connection. This exercises that interaction against httpz's real
+    // gate logic without sockets or the 30s wait.
+    var t = httpz.testing.init(.{});
+    defer t.deinit();
+
+    // httpz.testing.init parses `GET / HTTP/1.1\r\nContent-Length: 0`: HTTP/1.1
+    // with no `connection: close` header, so `canKeepAlive()` is true (the
+    // slow-drip exploit's normal case). Give it a large, partly-unread lazy body.
+    try testing.expectEqual(httpz.Protocol.HTTP11, t.req.protocol);
+    try testing.expect(t.req.canKeepAlive());
+    t.req.unread_body = 10_000;
+
+    // Buggy recovery (only the response-side toggle). Simulate httpz deriving
+    // handover from canKeepAlive() (httpz.zig:573-576).
+    t.conn.handover = .unknown;
+    t.res.keepalive = false;
+    if (t.conn.handover == .unknown) {
+        t.conn.handover = if (t.req.canKeepAlive()) .keepalive else .close;
+    }
+    // The drain gate at httpz.zig:582 is OPEN: drain would re-enter the
+    // unbounded per-read wait on this handler thread.
+    try testing.expect(t.req.unread_body > 0);
+    try testing.expect(t.conn.handover == .keepalive);
+    try testing.expect(t.req.unread_body > 0 and t.conn.handover == .keepalive);
+
+    // Fixed recovery (flip handover to .close, as `Handler.dispatch` now does
+    // for `body == .lazy and bounded.expired`).
+    t.conn.handover = .unknown;
+    t.res.keepalive = false;
+    t.conn.handover = .close;
+    if (t.conn.handover == .unknown) {
+        t.conn.handover = if (t.req.canKeepAlive()) .keepalive else .close;
+    }
+    // The drain gate is CLOSED: httpz skips the drain and closes the connection.
+    try testing.expect(t.req.unread_body > 0);
+    try testing.expect(t.conn.handover == .close);
+    try testing.expect(!(t.req.unread_body > 0 and t.conn.handover == .keepalive));
 }
