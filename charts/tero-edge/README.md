@@ -173,8 +173,9 @@ kernel gives the process no chance to log.
   4.8k requests/sec per pod. Raise `threadPoolCount` and `resources.limits.memory`
   together — see Sizing below.
 - Log intake routes replay once on a fresh upstream connection when the first
-  attempt fails before a response. A replay can duplicate log lines if the
-  upstream accepted the first attempt but its acknowledgement was lost.
+  attempt fails before a response, if the body was buffered. A streamed
+  passthrough body has nothing to replay. A replay can duplicate log lines if
+  the upstream accepted the first attempt but its acknowledgement was lost.
 - `workspace_id` is not required in `config.json`.
 - If `tero.url` is set, chart requires either `tero.apiKey` or
   `tero.existingSecret.name`.
