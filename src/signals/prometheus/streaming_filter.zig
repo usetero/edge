@@ -468,13 +468,30 @@ pub const PolicyStreamingFilter = struct {
         }
     }
 
+    /// Returns true if `sample_name` belongs to the metric family `family`.
+    /// A sample belongs to its family when its name is exactly the family
+    /// name, or the family name plus one of the histogram/summary suffixes
+    /// (`_bucket`, `_sum`, `_count`) defined by the Prometheus text exposition
+    /// format. A looser prefix match would wrongly bind a dropped family's
+    /// `# HELP`/`# TYPE` to an unrelated sibling that merely shares a prefix.
+    fn metricMatchesFamily(sample_name: []const u8, family: []const u8) bool {
+        if (std.mem.eql(u8, sample_name, family)) return true;
+        if (!std.mem.startsWith(u8, sample_name, family)) return false;
+        const suffix = sample_name[family.len..];
+        return std.mem.eql(u8, suffix, "_bucket") or
+            std.mem.eql(u8, suffix, "_sum") or
+            std.mem.eql(u8, suffix, "_count") or
+            std.mem.eql(u8, suffix, "_created") or
+            std.mem.eql(u8, suffix, "_total");
+    }
+
     /// Write metadata lines if not already written for current metric
     fn maybeWriteMetadata(self: *PolicyStreamingFilter, metric_name: []const u8, writer: *std.Io.Writer) !void {
-        // Only write metadata if it matches the current metric and hasn't been written
-        // For histograms/summaries, sample names have suffixes like _bucket, _sum, _count
-        // so we check if sample name starts with the metadata metric name
+        // Only write metadata if it matches the current metric and hasn't been written.
+        // For histograms/summaries, sample names have suffixes like _bucket, _sum, _count,
+        // so a sample belongs to the family if it's the exact name or family + a suffix.
         const matches = self.current_metric_name.len > 0 and
-            std.mem.startsWith(u8, metric_name, self.current_metric_name);
+            metricMatchesFamily(metric_name, self.current_metric_name);
 
         if (matches and !self.metadata_written) {
             if (self.current_help_line.len > 0) {
@@ -1980,6 +1997,265 @@ test "PolicyStreamingFilter - metadata included when some samples kept" {
     // instance="debug" dropped, instance="prod" kept
     try std.testing.expect(std.mem.indexOf(u8, result.output, "instance=\"debug\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "instance=\"prod\"") != null);
+}
+
+test "PolicyStreamingFilter - prefix collision does not leak dropped metric metadata" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // DROP only the family literally named "foo".
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-foo"),
+        .name = try allocator.dupe(u8, "drop-foo"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^foo$") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    // `foo` has HELP/TYPE in the input and is dropped by policy; `foo_extra` is
+    // a *different* family that legitimately has no HELP/TYPE of its own (valid
+    // per the exposition-format spec) and is kept. The filter must not attach
+    // `foo`'s metadata to the unrelated `foo_extra` sample.
+    const input =
+        \\# HELP foo A foo metric
+        \\# TYPE foo counter
+        \\foo 100
+        \\foo_extra 200
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // `foo` itself is correctly filtered out.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo 100") == null);
+    // `foo`'s metadata must not leak into the output.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP foo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE foo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "A foo metric") == null);
+    // `foo_extra` is kept and passes through on its own (no preceding metadata).
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_extra 200") != null);
+    try std.testing.expectEqualStrings("foo_extra 200\n", result.output);
+    // Sanity: one sample dropped, one sample kept.
+    try std.testing.expectEqual(@as(usize, 1), result.stats.lines_dropped);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.lines_kept);
+}
+
+test "PolicyStreamingFilter - suffix boundary: _total is part of family name, not a suffix" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // DROP only the family literally named "foo"; keep "foo_total" which has
+    // its own HELP/TYPE. `_total` must NOT be treated as a histogram suffix of
+    // `foo`, so `foo`'s metadata must be suppressed and `foo_total`'s metadata
+    // must be emitted with the `foo_total` sample.
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-foo"),
+        .name = try allocator.dupe(u8, "drop-foo"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^foo$") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP foo A foo metric
+        \\# TYPE foo counter
+        \\foo 100
+        \\# HELP foo_total Total foo
+        \\# TYPE foo_total counter
+        \\foo_total 500
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // `foo` (bare) dropped, its metadata suppressed.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo 100") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP foo ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE foo counter") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "A foo metric") == null);
+    // `foo_total` kept with its OWN metadata (emitted before the sample).
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP foo_total Total foo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE foo_total counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_total 500") != null);
+}
+
+test "PolicyStreamingFilter - suffix boundary: non-suffix prefix sibling not bound" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // DROP only `foo` (bare); keep several `foo*` siblings that have their own
+    // metadata: `foo_extra`, `foobucket` (no underscore), `foo__bucket` (double
+    // underscore), and `foo_something`. None of these should bind `foo`'s
+    // metadata; each should pass through with its own metadata (or none).
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-foo"),
+        .name = try allocator.dupe(u8, "drop-foo"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^foo$") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP foo A foo metric
+        \\# TYPE foo counter
+        \\foo 100
+        \\foo_extra 1
+        \\foo_something 2
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // `foo` dropped and its metadata must not leak before any sibling.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo 100") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP foo ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE foo counter") == null);
+    // Siblings kept, no `foo` metadata preceding them.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_extra 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_something 2") != null);
+    try std.testing.expectEqualStrings("foo_extra 1\nfoo_something 2\n", result.output);
+}
+
+test "PolicyStreamingFilter - histogram suffix siblings kept, metadata binds once" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // DROP only bare `foo` samples whose instance="debug"; keep `foo` with
+    // instance="prod" plus the histogram-suffix siblings `_bucket`/`_sum`/
+    // `_count` (no own metadata). `foo`'s HELP/TYPE must be emitted exactly
+    // once before the first kept sample in the `foo` family, and the suffix
+    // siblings must pass through.
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-foo-debug"),
+        .name = try allocator.dupe(u8, "drop-foo-debug"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .datapoint_attribute = try testMakeAttrPath(allocator, "instance") },
+        .match = .{ .exact = try allocator.dupe(u8, "debug") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [8192]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP foo A foo histogram
+        \\# TYPE foo histogram
+        \\foo{instance="debug"} 1
+        \\foo{instance="prod"} 2
+        \\foo_bucket{le="0.1"} 10
+        \\foo_bucket{le="+Inf"} 100
+        \\foo_sum 5.0
+        \\foo_count 100
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // `foo{instance="debug"}` dropped; `foo{instance="prod"}` kept.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "instance=\"debug\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo{instance=\"prod\"} 2") != null);
+    // HELP/TYPE emitted exactly once (count occurrences of the metadata lines).
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP foo A foo histogram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE foo histogram") != null);
+    const help_count = std.mem.count(u8, result.output, "# HELP foo A foo histogram");
+    const type_count = std.mem.count(u8, result.output, "# TYPE foo histogram");
+    try std.testing.expectEqual(@as(usize, 1), help_count);
+    try std.testing.expectEqual(@as(usize, 1), type_count);
+    // All histogram/summary suffix siblings pass through.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_bucket{le=\"0.1\"} 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_bucket{le=\"+Inf\"} 100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_sum 5.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_count 100") != null);
+    // Ordering: HELP/TYPE come before the first kept sample.
+    const help_idx = std.mem.indexOf(u8, result.output, "# HELP foo A foo histogram").?;
+    const type_idx = std.mem.indexOf(u8, result.output, "# TYPE foo histogram").?;
+    const first_kept_idx = std.mem.indexOf(u8, result.output, "foo{instance=\"prod\"} 2").?;
+    try std.testing.expect(help_idx < first_kept_idx);
+    try std.testing.expect(type_idx < first_kept_idx);
 }
 
 test "PolicyStreamingFilter - histogram buckets filtered together" {
