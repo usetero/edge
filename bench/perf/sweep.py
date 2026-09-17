@@ -32,6 +32,8 @@ import sys
 import tempfile
 import time
 
+sys.stdout.reconfigure(line_buffering=True)  # a long sweep must show progress
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, os.path.join(REPO_ROOT, "bench", "matrix"))
