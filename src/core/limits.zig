@@ -185,14 +185,22 @@ pub const Limits = struct {
     /// config-proportional state (router tables, policy snapshots) and
     /// libzstd contexts, which are bounded separately and logged by their
     /// owners.
+    /// Slots the frontend actually allocates: the operator's connection cap
+    /// plus the control reserve. The reserve sits on top of `max_connections`
+    /// rather than inside it, so a deployment that sizes the cap to its sender
+    /// count is not shedding two of them.
+    pub fn connectionSlots(self: Limits) usize {
+        return self.max_connections + CONTROL_RESERVE_SLOTS;
+    }
+
     pub fn steadyStateBytes(self: Limits) usize {
-        return self.max_connections * (self.perConnBytes() + self.conn_arena_reserve);
+        return self.connectionSlots() * (self.perConnBytes() + self.conn_arena_reserve);
     }
 
     pub fn logStartup(self: Limits) void {
         log.info("steady-state data-plane budget: {d} bytes ({d} conns x {d} per-conn)", .{
             self.steadyStateBytes(),
-            self.max_connections,
+            self.connectionSlots(),
             self.perConnBytes() + self.conn_arena_reserve,
         });
     }
@@ -204,14 +212,18 @@ test "Limits budget formula is locked" {
     // Hand-computed with the default 1 MiB max_body_size:
     //   zstd window = clamp(1M, 256K, 8M)        = 1024 KiB
     //   per conn = 20K+20K (socket bufs) + 8K (body staging) = 48 KiB
-    //   steady state = 256 x (48K + 16K arena)  = 16 MiB reserved
+    //   slots = 256 cap + 2 control reserve      = 258
+    //   steady state = 258 x (48K + 16K arena)  = 16.1 MiB reserved
     // Codec, record and upstream scratch are per thread, not per connection
     // (frontend/thread_bufs.zig), so they are outside this budget.
     // Any change to a buffer constant must show up as a diff in this test.
     try std.testing.expectEqual(@as(usize, 256), limits.max_connections);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.zstd_window_len);
     try std.testing.expectEqual(@as(usize, 48 * 1024), limits.perConnBytes());
-    try std.testing.expectEqual(@as(usize, 256 * 64 * 1024), limits.steadyStateBytes());
+    // The reserve is capacity on top of the cap, so a deployment sized to its
+    // sender count does not shed the last two senders. It costs two slots.
+    try std.testing.expectEqual(@as(usize, 258), limits.connectionSlots());
+    try std.testing.expectEqual(@as(usize, 258 * 64 * 1024), limits.steadyStateBytes());
     try std.testing.expectEqual(@as(u32, 1024 * 1024), limits.max_body_size);
     // max_decoded_bytes is decoupled from max_body_size: agents compress, so a
     // 1 MiB raw body routinely decodes to several MiB.

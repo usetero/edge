@@ -84,8 +84,11 @@ pub const ConnSlab = struct {
         // u16 slot indexes bound the slab; 65k concurrent connections is far
         // beyond this proxy's design envelope.
         std.debug.assert(limits.max_connections > 0);
-        std.debug.assert(limits.max_connections < std.math.maxInt(u16));
-        const n = limits.max_connections;
+        std.debug.assert(limits.connectionSlots() < std.math.maxInt(u16));
+        // The control reserve is extra capacity, not a slice of the operator's
+        // cap: `claim` must still yield `max_connections` ordinary slots, or a
+        // deployment sized to its sender count sheds the last few senders.
+        const n = limits.connectionSlots();
 
         var hot: std.MultiArrayList(ConnHot) = .empty;
         errdefer hot.deinit(gpa);
@@ -121,9 +124,7 @@ pub const ConnSlab = struct {
             .free_count = n,
             .mutex = .init,
             .limits = limits,
-            // Never the whole slab, and never nothing: a two-slot slab keeps
-            // one back.
-            .reserve = @max(1, @min(limits_mod.CONTROL_RESERVE_SLOTS, n / 4)),
+            .reserve = limits_mod.CONTROL_RESERVE_SLOTS,
         };
     }
 
@@ -354,7 +355,10 @@ test "the reserve is reachable only through claimReserved" {
     const io = testing.io;
 
     try testing.expect(slab.reserve > 0);
+    // The promise: `claim` yields exactly `max_connections` slots, and the
+    // reserve is extra.
     const ordinary = slab.free_list.len - slab.reserve;
+    try testing.expectEqual(testLimits().max_connections, ordinary);
 
     var ids: [8]ConnId = undefined;
     for (ids[0..ordinary]) |*id| id.* = slab.claim(io).?;
