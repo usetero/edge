@@ -59,7 +59,8 @@ pub const Store = struct {
             if (!checkpoint_types.isExpired(value, self.ttl_ns, now)) return value.offset;
         }
         if (self.by_inode.get(keys.inode)) |value| {
-            if (!checkpoint_types.isExpired(value, self.ttl_ns, now)) return value.offset;
+            if (value.identity.fingerprint == identity.fingerprint and
+                !checkpoint_types.isExpired(value, self.ttl_ns, now)) return value.offset;
         }
         return null;
     }
@@ -139,3 +140,52 @@ pub const Store = struct {
         }
     }
 };
+
+const testing = std.testing;
+
+fn freshStore(ttl_ns: i128) Store {
+    return Store.init(testing.allocator, testing.io, 256, ttl_ns);
+}
+
+test "store: by_inode fallback returns null when stored fingerprint differs" {
+    var store = freshStore(72 * 60 * 60 * std.time.ns_per_s);
+    defer store.deinit();
+
+    const id_a: tail_types.FileIdentity = .{ .dev = 1, .inode = 2, .fingerprint = 100 };
+    const id_b: tail_types.FileIdentity = .{ .dev = 1, .inode = 2, .fingerprint = 999 };
+    const now = std.Io.Timestamp.now(testing.io, .awake).toNanoseconds();
+    try store.upsert(.{ .identity = id_a, .offset = 4096, .last_seen_ns = @intCast(now) });
+
+    // by_identity misses (different fingerprint key).
+    try testing.expect(store.by_identity.get(checkpoint_types.keysFor(id_b).identity) == null);
+    // by_inode gate must reject the cross-version offset.
+    try testing.expect(store.getOffset(id_b) == null);
+}
+
+test "store: by_inode fallback returns offset when fingerprint matches and by_identity misses" {
+    var store = freshStore(72 * 60 * 60 * std.time.ns_per_s);
+    defer store.deinit();
+
+    // Two entries sharing the same (dev, inode) but different fingerprints.
+    const id_a: tail_types.FileIdentity = .{ .dev = 1, .inode = 5, .fingerprint = 10 };
+    const id_b: tail_types.FileIdentity = .{ .dev = 1, .inode = 5, .fingerprint = 20 };
+    const now = std.Io.Timestamp.now(testing.io, .awake).toNanoseconds();
+    try store.upsert(.{ .identity = id_a, .offset = 111, .last_seen_ns = @intCast(now) });
+    try store.upsert(.{ .identity = id_b, .offset = 222, .last_seen_ns = @intCast(now) });
+
+    // by_identity hits directly for each fingerprint.
+    try testing.expectEqual(@as(?u64, 111), store.getOffset(id_a));
+    try testing.expectEqual(@as(?u64, 222), store.getOffset(id_b));
+}
+
+test "store: by_inode fallback returns null for expired entry with matching fingerprint" {
+    const ttl_ns: i128 = 1 * std.time.ns_per_s;
+    var store = freshStore(ttl_ns);
+    defer store.deinit();
+
+    const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 2, .fingerprint = 100 };
+    // last seen far in the past so it is expired relative to ttl.
+    try store.upsert(.{ .identity = id, .offset = 4096, .last_seen_ns = -1_000_000_000 });
+
+    try testing.expect(store.getOffset(id) == null);
+}
