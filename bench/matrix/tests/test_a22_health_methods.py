@@ -13,10 +13,6 @@ from harness import MatrixCase
 
 
 class HealthMethods(MatrixCase):
-    DEFECTS = {
-        "stdio": "HEAD and POST /_health fall through to the passthrough and are forwarded",
-        "httpz": "HEAD and POST /_health fall through to the passthrough and are forwarded",
-    }
 
     def test_head_health_is_answered_locally(self):
         before = self.intake.requests_seen()
@@ -33,10 +29,6 @@ class HealthMethods(MatrixCase):
 
 
 class HealthMethodsPost(MatrixCase):
-    DEFECTS = {
-        "stdio": "POST /_health is forwarded to the intake",
-        "httpz": "POST /_health is forwarded to the intake",
-    }
 
     def test_post_health_does_not_reach_the_intake(self):
         before = self.intake.requests_seen()

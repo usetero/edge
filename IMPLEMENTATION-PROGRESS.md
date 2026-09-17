@@ -151,21 +151,42 @@ descriptors back to baseline.
    `UpstreamResponseTruncated`. See the challenge above for the nuance.
 6. **httpz dropped headers above its own cap in silence.** Caught by a14.
 
-### New, from the backlog cases
+### From the backlog cases: fixed
 
-7. **`/_health` is GET-only, so any other method is forwarded to Datadog.**
-   An ALB or ECS check configured for HEAD tests the intake, not the edge, and
-   fails whenever the intake is unreachable. Both frontends. (a22)
-8. **stdio takes 30 s to shut down with idle keep-alive connections**, against
-   httpz's 2 s, because shutdown waits out the idle deadline. Every deployment
-   stalls one task at a time against the orchestrator's kill timeout. (d03)
-9. **A batch above the 64 KiB streaming threshold cannot be replayed**, so an
-   intake blip mid-exchange loses it. Agent batches routinely exceed it. Both
-   frontends. (a30)
-10. **A body that expands past the decoded cap answers 413**, which the agent
-    discards permanently, rather than forwarding what we cannot decode. (a35)
-11. **stdio forwards an absolute-form target upstream** as a path. (a22)
-12. **Health is shed at capacity** rather than reserved, which restarts the
+7. **`/_health` was GET-only, so every other method reached Datadog.** An ALB
+   or ECS check configured for HEAD tested the intake, not the edge, and
+   failed whenever the intake was unreachable. The route claims every method
+   now: 200 for GET and HEAD, 405 for the rest. `/_edge/*` had the same hole
+   and got the same treatment. Both frontends. (a22)
+8. **stdio took 30 s to shut down with idle keep-alive connections**, against
+   httpz's 2 s, because cancellation does not reach a task parked in a poll,
+   so each connection waited out its own idle deadline. The slab now records
+   the socket per slot and `stopAccepting` interrupts them all, the same way
+   the upstream watchdog already did. Exit is under 2 s. (d03)
+9. **A body that expanded past the decoded cap answered 413**, which the agent
+   discards for good. The two size limits are split now: the raw cap stays
+   413, because the sender can act on it, and a decoded-size overrun fails
+   open, because the sender cannot see our decode budget. (a35)
+10. **Control paths were labelled by method, so a HEAD health probe counted as
+    data traffic** in `edge_responses_total`. Found by the phantom-success
+    invariant while checking the fix for 7. `/_health` and `/_edge/*` are
+    labelled by path now.
+
+### From the backlog cases: documented, not fixed
+
+11. **A batch above the streaming threshold cannot be replayed**, so an intake
+    blip mid-exchange ends it with a 502. Deliberate: the agent retries a 5xx
+    with backoff, so the cost is a delay and a duplicate risk, not loss.
+    Making every batch replayable costs one `max_body_size` buffer per
+    concurrent request, which policy deployments already pay and passthrough
+    deployments do not. Recorded at the decision in `stdio/conn.zig` and in
+    the a30 case. Exposing the threshold as configuration is the follow-up.
+
+### From the backlog cases: still open
+
+12. **stdio forwards an absolute-form target upstream** as a path; httpz
+    refuses it with 400. (a22)
+13. **Health is shed at capacity** rather than reserved, which restarts the
     sidecar during the spike that filled it. (c05)
 
 ### Open: needs a change in a dependency

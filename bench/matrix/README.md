@@ -117,11 +117,11 @@ with its note.
 | a15 | Incomplete garbage, no head terminator | Bounded by the deadline | slow |
 | a16 | zstd batch, what a current agent sends | 202, and the intake receives it | |
 | a19 | `Content-Length` with chunked, two lengths, a length that is not a number | A 4xx, and nothing reaches the intake | the smuggling surface |
-| a22 | `HEAD /_health`, `POST /_health` | Answered by the edge, never forwarded | xfail both: GET-only route, so other methods fall through to the passthrough |
+| a22 | `HEAD /_health`, `POST /_health` | Answered by the edge, never forwarded | |
 | a22 | `GET http://example.com/_health` | Not forwarded as a mangled target | xfail stdio |
 | a30 | 60 KiB batch, intake closes mid-request | Replayed, 202 | the resident side of the threshold |
-| a30 | 300 KiB batch, intake closes mid-request | Replayed, 202 | xfail both: a streamed batch cannot be replayed |
-| a35 | Small gzip that expands past the decoded cap, policies loaded | Bounded, and the batch is not lost | xfail both: 413, which the agent discards for good |
+| a30 | 300 KiB batch, intake closes mid-request | Replayed, 202 | xfail both, by design: a streamed batch cannot be replayed, and the agent retries the 502 |
+| a35 | Small gzip that expands past the decoded cap, policies loaded | Bounded, and the batch is not lost | fails open; the raw cap still answers 413 |
 | a35 | The same body with no policies loaded | Forwarded untouched, 202 | nothing reads it |
 
 ### `b*` — the edge to the intake
@@ -162,7 +162,7 @@ with its note.
 |---|---|---|---|
 | d01 | SIGTERM with four exchanges open against a 4 s intake | Exit inside 35 s, and no 202 for a batch never forwarded | slow |
 | d02 | SIGTERM while the intake is hung | Exit inside 20 s | slow |
-| d03 | SIGTERM with eight idle keep-alive connections | Exit inside 10 s | xfail stdio: waits out the 30 s idle deadline |
+| d03 | SIGTERM with eight idle keep-alive connections | Exit inside 10 s | |
 
 Every case also asserts its telemetry, and the base class asserts that a
 counter which moved is explainable from the log.

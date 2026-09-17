@@ -2,8 +2,13 @@
 
 A body at or below the threshold stays resident and can be replayed after a
 transport failure. A larger one streams, is consumed by its first send, and
-cannot be retried, so an intake blip mid-exchange becomes a 502. Agent batches
-routinely exceed the threshold, so the unprotected size is the common one.
+cannot be retried, so an intake blip mid-exchange becomes a 502.
+
+Deliberate, and documented rather than fixed. The agent retries a 5xx with
+backoff (harness/agent.py), so the cost is a delayed batch and a duplicate
+risk, not lost data. Making every batch replayable means holding up to
+`max_body_size` per concurrent request, which is the memory a policy
+deployment already pays and a passthrough deployment does not.
 """
 
 import json

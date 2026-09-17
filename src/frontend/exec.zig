@@ -103,8 +103,12 @@ pub fn classifyKnownPath(path: []const u8, method: service_mod.HttpMethod) runti
     if (method == .POST and std.mem.endsWith(u8, path, "/v1/traces")) return .v1_traces;
     if (method == .GET and
         (std.mem.eql(u8, path, "/metrics") or std.mem.startsWith(u8, path, "/metrics/"))) return .metrics;
-    if (method == .GET and std.mem.eql(u8, path, "/_health")) return .health;
-    if (method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) return .edge_metrics;
+    // The control paths are labelled by path, not by method. A HEAD probe is
+    // a health check, and a rejected POST to an observability endpoint is not
+    // customer data: labelling either as `other` puts control traffic in the
+    // data-path series and hides it from the ones that matter.
+    if (std.mem.eql(u8, path, "/_health")) return .health;
+    if (std.mem.startsWith(u8, path, "/_edge/")) return .edge_metrics;
     return .other;
 }
 

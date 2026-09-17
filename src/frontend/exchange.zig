@@ -88,7 +88,11 @@ pub fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.htt
 /// frontend answers with this when nothing has reached the wire yet.
 pub fn errorStatus(err: anyerror) u16 {
     return switch (err) {
-        error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
+        // The raw cap is actionable: the sender can split the batch. A
+        // decoded-size overrun fails open in paths.zig instead, because the
+        // sender cannot see our decode budget and the agent discards a 413
+        // permanently.
+        error.BodyTooLarge, error.DecodedBodyTooLarge => 413,
         error.InboundBodyTimeout => 408,
         error.InvalidRequestBody => 400,
         // Our cap, and the sender can act on it. A 5xx would send an agent

@@ -15,13 +15,8 @@ BOMB = gzip.compress(b"[" + b'{"message":"' + b"a" * (40 * 1024 * 1024) + b'"}' 
 
 class DecompressionBombWithPolicies(MatrixCase):
     # The agent discards a payload for good on 413 (harness/agent.py), so a
-    # batch that merely expands a lot — repetitive logs compress hard — is
-    # lost rather than delayed. Forwarding what we cannot decode would keep
-    # it, as the fail-open paths do elsewhere.
-    DEFECTS = {
-        "stdio": "answers 413, which the agent drops permanently",
-        "httpz": "answers 413, which the agent drops permanently",
-    }
+    # decode budget the sender cannot see must not end the batch. The policy
+    # paths fail open instead, and this case holds that line.
     EDGE_CONFIG = {"max_body_size": 1048576, "max_decoded_bytes": 1048576}
     EDGE_POLICIES = {
         "policies": [

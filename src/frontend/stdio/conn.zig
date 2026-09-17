@@ -131,6 +131,7 @@ pub fn serveConnection(
     const arena_slot = arenas.claim(io);
     defer arenas.release(io, arena_slot);
 
+    slab.trackSocket(io, conn_id, stream);
     var inbound: deadline_reader_mod.DeadlineReader = .init(io, stream, slab.recvBuf(conn_id));
     env = .{ .shared = shared, .slab = slab, .arenas = arenas, .inbound = &inbound };
     var net_writer = std.Io.net.Stream.Writer.init(stream, io, slab.sendBuf(conn_id));
@@ -269,6 +270,13 @@ fn dispatch(
     const path = pathOf(target);
     const method = service_mod.HttpMethod.fromStd(request.head.method);
 
+    // Claim the whole namespace whatever the method. Matching only GET let
+    // `POST /_edge/metrics` fall through to the wildcard passthrough and
+    // travel to the intake, the same way `POST /_health` did.
+    if (std.mem.startsWith(u8, path, "/_edge/") and request.head.method != .GET) {
+        sink.status = 405;
+        return request.respond("", .{ .status = .method_not_allowed });
+    }
     if (request.head.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
         // std.http.Server keeps no counters of its own.
         return endpoints.metrics(ctx, sink, null);
@@ -288,6 +296,10 @@ fn dispatch(
         };
         const n: u32 = if (queryParam(target, "n")) |raw| std.fmt.parseInt(u32, raw, 10) catch 50 else 50;
         return endpoints.recordTap(ctx, sink, stage, n);
+    }
+    if (std.mem.startsWith(u8, path, "/_edge/")) {
+        sink.status = 404;
+        return request.respond("", .{ .status = .not_found });
     }
 
     const outcome = exec.planRequest(
@@ -369,10 +381,17 @@ fn inboundBodyOf(
     if (len > limits.max_body_size) return error.BodyTooLarge;
     const reader = try request.readerExpectContinue(buffer);
     // A streamed body is consumed by its first send and can never be
-    // replayed, and log intake clients do not retry. Streaming every body
-    // therefore turned one stale pooled connection into lost logs. Keep
-    // bodies below the streaming threshold resident so the upstream leg can
-    // dial again; httpz draws the same line at `lazy_read_size`.
+    // replayed, so a transport failure mid-exchange ends the batch with a
+    // 502. Bodies below the streaming threshold stay resident and can be
+    // dialed again; httpz draws the same line at `lazy_read_size`.
+    //
+    // Above the threshold the batch is not replayable, which is deliberate.
+    // The Datadog agent retries a 5xx with exponential backoff, so the cost
+    // is a delayed batch and a duplicate risk rather than lost data. Raising
+    // the line to `max_body_size` would make every batch replayable, at the
+    // price of one `max_body_size` buffer per concurrent request: the memory
+    // a policy deployment already pays through `residentBody`, and a
+    // passthrough deployment does not. See bench/matrix a30.
     if (len <= limits.large_body_buffer_size) {
         var capture: std.Io.Writer.Allocating = .init(arena);
         _ = try pipeline_mod.streamReaderToWriter(reader, &capture.writer, limits.max_body_size);

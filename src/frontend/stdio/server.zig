@@ -75,6 +75,11 @@ pub const HttpServer = struct {
     /// listen loop is NOT Io-cancelable, does more here.
     pub fn stopAccepting(self: *HttpServer) void {
         thread_bufs.expireTrackedUpstreams(self.ctx, true);
+        // Cancellation does not reach a connection task parked in a poll, so
+        // without this a SIGTERM waited out the 30 s idle deadline while the
+        // orchestrator counted down its kill timer.
+        const interrupted = self.slab.shutdownAll(self.ctx.io);
+        if (interrupted > 0) log.info("interrupted {d} inbound connection(s)", .{interrupted});
     }
 
     /// The accept loop; itself spawned into the lifecycle group, so

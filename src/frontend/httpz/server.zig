@@ -309,6 +309,12 @@ pub const Handler = struct {
         const path = req.url.path;
 
         var sink: Sink = .{ .res = res };
+        // Claim the whole namespace whatever the method; see the stdio note.
+        if (std.mem.startsWith(u8, path, "/_edge/") and req.method != .GET) {
+            res.status = 405;
+            res.body = "";
+            return;
+        }
         if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
             return endpoints.metrics(ctx, &sink, &httpz.writeMetrics);
         }
@@ -328,6 +334,11 @@ pub const Handler = struct {
             };
             const n: u32 = if ((try req.query()).get("n")) |raw| std.fmt.parseInt(u32, raw, 10) catch 50 else 50;
             return endpoints.recordTap(ctx, &sink, stage, n);
+        }
+        if (std.mem.startsWith(u8, path, "/_edge/")) {
+            res.status = 404;
+            res.body = "";
+            return;
         }
 
         const outcome = exec.planRequest(

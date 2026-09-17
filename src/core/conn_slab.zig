@@ -68,6 +68,11 @@ pub const ConnSlab = struct {
     buffers: []align(std.heap.page_size_min) u8,
     /// Stack of free slot indexes; claim pops, release pushes.
     free_list: []u16,
+    /// The socket each claimed slot is serving, so shutdown can interrupt a
+    /// read that is waiting on its deadline. Cancellation does not reach a
+    /// task parked in a poll, so without this a SIGTERM waited out the idle
+    /// deadline: 30 s per deployment, against the orchestrator's kill timer.
+    sockets: []?std.Io.net.Stream,
     free_count: usize,
     mutex: std.Io.Mutex,
     limits: limits_mod.Limits,
@@ -97,6 +102,10 @@ pub const ConnSlab = struct {
 
         const free_list = try gpa.alloc(u16, n);
         errdefer gpa.free(free_list);
+
+        const sockets = try gpa.alloc(?std.Io.net.Stream, n);
+        errdefer gpa.free(sockets);
+        @memset(sockets, null);
         // Pop order is LIFO: slot 0 first, keeping low slots (and their warm
         // cache lines) in rotation under light load.
         for (free_list, 0..) |*slot, i| slot.* = @intCast(n - 1 - i);
@@ -105,6 +114,7 @@ pub const ConnSlab = struct {
             .hot = hot,
             .buffers = buffers,
             .free_list = free_list,
+            .sockets = sockets,
             .free_count = n,
             .mutex = .init,
             .limits = limits,
@@ -115,6 +125,7 @@ pub const ConnSlab = struct {
         self.hot.deinit(gpa);
         std.heap.page_allocator.free(self.buffers);
         gpa.free(self.free_list);
+        gpa.free(self.sockets);
         self.* = undefined;
     }
 
@@ -131,6 +142,7 @@ pub const ConnSlab = struct {
         const entry = self.hot.get(slot);
         std.debug.assert(entry.state == .free);
         self.hot.set(slot, .{ .state = .accepted, .generation = entry.generation });
+        self.sockets[slot] = null;
         return ConnId.pack(slot, entry.generation);
     }
 
@@ -147,6 +159,7 @@ pub const ConnSlab = struct {
             const entry = self.hot.get(s);
             std.debug.assert(entry.state != .free);
             self.hot.set(s, .{ .state = .free, .generation = entry.generation +% 1 });
+            self.sockets[s] = null;
 
             std.debug.assert(self.free_count < self.free_list.len);
             self.free_list[self.free_count] = s;
@@ -190,6 +203,33 @@ pub const ConnSlab = struct {
         const entry = self.hot.get(slot);
         std.debug.assert(entry.state.legalNext(next));
         self.hot.set(slot, .{ .state = next, .generation = entry.generation });
+    }
+
+    /// Records the socket a claimed slot is serving. Call once the stream is
+    /// known, so `shutdownAll` can reach it.
+    pub fn trackSocket(self: *ConnSlab, io: std.Io, id: ConnId, stream: std.Io.net.Stream) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.sockets[self.checkedIndex(id)] = stream;
+    }
+
+    /// Interrupts every connection the slab is serving. A reader parked on
+    /// its deadline returns at once, so shutdown does not wait out the idle
+    /// timeout. Safe to call from another task: shutdown only, and the worst
+    /// case is a read that was about to fail anyway.
+    pub fn shutdownAll(self: *ConnSlab, io: std.Io) usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var count: usize = 0;
+        for (self.sockets) |maybe_stream| {
+            const stream = maybe_stream orelse continue;
+            stream.shutdown(io, .both) catch |err| {
+                log.debug("failed to interrupt inbound socket: {s}", .{@errorName(err)});
+                continue;
+            };
+            count += 1;
+        }
+        return count;
     }
 
     pub fn recvBuf(self: *ConnSlab, id: ConnId) []u8 {

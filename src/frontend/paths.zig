@@ -149,7 +149,8 @@ pub fn execPipeStream(
         error.BatchChanged => true,
         // A body we cannot read is still the customer's data. Forward it and
         // let the intake judge it, exactly as execPipeBuffered does.
-        error.ReadFailed => return failOpen(ctx, in, sink, pipe, raw_body, "probe", err),
+        // A decode budget the sender cannot see must not destroy the batch.
+        error.ReadFailed, error.DecodedBodyTooLarge => return failOpen(ctx, in, sink, pipe, raw_body, "probe", err),
         else => return err,
     };
 
@@ -172,7 +173,7 @@ pub fn execPipeStream(
     encode_spec.encode = pipe.codec;
     const encoded = pipeline_mod.run(encode_spec, &body_reader, &output.writer, buffers, &record_sink);
     const stats = encoded catch |err| switch (err) {
-        error.ReadFailed => return failOpen(ctx, in, sink, pipe, raw_body, "encode", err),
+        error.ReadFailed, error.DecodedBodyTooLarge => return failOpen(ctx, in, sink, pipe, raw_body, "encode", err),
         else => return err,
     };
     if (ctx.metrics) |metrics| {
@@ -191,7 +192,12 @@ pub fn execPipeBuffered(
     const raw_body = try residentBody(ctx, body);
 
     const processed: exec.BufferedResult = exec.processBuffered(ctx, pipe, in.arena, raw_body) catch |err| blk: {
-        if (err == error.BodyTooLarge or err == error.DecodedBodyTooLarge) return err;
+        // `BodyTooLarge` is the raw cap: the sender framed a batch we will not
+        // carry, and it can split it. `DecodedBodyTooLarge` is our decode
+        // budget, which the sender cannot see, so refusing it destroys data
+        // the intake would have taken — the agent discards a 413 for good.
+        // Fail open on that one and let the intake judge the payload.
+        if (err == error.BodyTooLarge) return err;
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.warn(PolicyFailedOpen{
             .path = in.path,
