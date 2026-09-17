@@ -132,6 +132,30 @@ pub const Runtime = struct {
         return evaluator.evalLine(line);
     }
 
+    /// File-tail shutdown drain: emit any trailing partial line the framer is
+    /// holding in scratch, then flush output. The watcher sizes events to raw
+    /// stat size (not a newline boundary), so a trailing record without a `\n`
+    /// is buffered in scratch; without this `finish()` it would be freed by
+    /// `deinit` and silently dropped. Scoped to `.tail`/`.checkpoint`: `.head`
+    /// re-reads the whole file from 0 on restart, so emitting at shutdown would
+    /// duplicate it on the next run (status quo for `.head` is unchanged).
+    /// Parse errors (malformed JSON/logfmt half-record) are swallowed so
+    /// `output.flush()` still runs; allocation and writer errors propagate.
+    fn drainFramer(
+        read_from: types.ReadFrom,
+        framer: *framer_mod.LineFramer,
+        output: *io_mod.Output,
+        evaluator: *eval_stream.StreamEvaluator,
+    ) !void {
+        if (read_from != .head) {
+            framer.finish(output.writer(), evaluator, Runtime.evalLineFilter) catch |err| switch (err) {
+                error.OutOfMemory, error.WriteFailed => return err,
+                else => {}, // swallow half-record parse errors so flush still runs
+            };
+        }
+        try output.flush();
+    }
+
     pub fn runStream(self: *Runtime, input: *io_mod.Input, output: *io_mod.Output) !void {
         var stdio_bus = initEventBus(self.io, self.environ_map);
         var evaluator = try eval_stream.StreamEvaluator.init(
@@ -216,6 +240,38 @@ pub const Runtime = struct {
         // loop — run as concurrent tasks in one lifecycle group; shutdown is
         // a single structured cancel (PLAN.md §9 Phase 6).
         var lifecycle: lifecycle_mod.Lifecycle = .init;
+
+        // Block SIGINT/SIGTERM/SIGUSR1 (and start the sigwait waiter) on this
+        // thread BEFORE spawning the checkpoint worker and poll loop tasks.
+        // Spawned threads inherit this thread's signal mask, so they block
+        // these signals too; only the sigwait thread catches them and requests
+        // a structured shutdown. If the mask is set only after the workers are
+        // spawned (as it was here previously), a worker thread that did not
+        // inherit the block receives SIGTERM by default action and terminates
+        // the process before the sigwait thread can drive the clean shutdown —
+        // so the shutdown drain below never runs and any trailing partial line
+        // held in the framer's scratch is lost anyway, defeating the drain's
+        // finish().
+        var signal_count = std.atomic.Value(u32).init(0);
+        var shutdown_waiter = std.atomic.Value(bool).init(false);
+        var signal_waiter: ?SignalWaiterHandle = null;
+        if (installSignalWaiter(self.io, &lifecycle, &signal_count, &shutdown_waiter)) |waiter| {
+            signal_waiter = waiter;
+        } else |err| switch (err) {
+            error.UnsupportedPlatform => {},
+            else => {
+                lifecycle.requestShutdown(self.io);
+                lifecycle.shutdown(self.io);
+                return err;
+            },
+        }
+
+        errdefer {
+            lifecycle.requestShutdown(self.io);
+            lifecycle.shutdown(self.io);
+            if (signal_waiter) |waiter| teardownSignalWaiter(waiter, &shutdown_waiter);
+        }
+
         try checkpoint.start(&lifecycle);
 
         var loop: PollLoop = .{
@@ -231,31 +287,23 @@ pub const Runtime = struct {
         };
         try lifecycle.spawn(self.io, PollLoop.run, .{&loop});
 
-        var signal_count = std.atomic.Value(u32).init(0);
-        var shutdown_waiter = std.atomic.Value(bool).init(false);
-        var signal_waiter: ?SignalWaiterHandle = null;
-        if (installSignalWaiter(self.io, &lifecycle, &signal_count, &shutdown_waiter)) |waiter| {
-            signal_waiter = waiter;
-        } else |err| switch (err) {
-            error.UnsupportedPlatform => {},
-            else => {
-                lifecycle.requestShutdown(self.io);
-                lifecycle.shutdown(self.io);
-                return err;
-            },
-        }
-
         lifecycle.awaitShutdown(self.io) catch |err| switch (err) {
             error.Canceled => {},
         };
         lifecycle.shutdown(self.io);
 
-        if (signal_waiter) |waiter| teardownSignalWaiter(waiter, &shutdown_waiter);
+        if (signal_waiter) |waiter| {
+            teardownSignalWaiter(waiter, &shutdown_waiter);
+            signal_waiter = null;
+        }
 
         // The canceled tasks can't reliably do final file IO; drain and
-        // flush on this (uncanceled) thread.
+        // flush on this (uncanceled) thread. See drainFramer for why the
+        // trailing partial is finished only in .tail/.checkpoint.
+        // Drain and flush before finalizing the checkpoint so that an output
+        // failure does not advance persisted offsets past an unwritten record.
+        try Runtime.drainFramer(self.cfg.read_from, &framer, output, &evaluator);
         checkpoint.finalize();
-        try output.flush();
         if (loop.failure) |err| return err;
     }
 };
@@ -485,4 +533,314 @@ test "runtime public API: runStream applies policy drops" {
     const got = try tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("ok\nnext\n", got);
+}
+
+// =============================================================================
+// File-tail shutdown drain: the framer buffers a trailing non-newline-terminated
+// record in scratch (the watcher sizes events to raw stat size, not a newline
+// boundary). `runFilesLoopBackend` used to flush output without `finish()`-ing
+// the framer, so `defer framer.deinit()` freed and silently dropped that
+// partial. In the default `.tail` and `.checkpoint` modes the offset/checkpoint
+// advances to the raw size, so the dropped bytes were never re-read on restart
+// — permanently lost. `Runtime.drainFramer` is the fix; these tests exercise
+// it directly (and, for .tail/.checkpoint, through the real Watcher +
+// EngineScheduler that produce the mid-line event in the first place).
+// =============================================================================
+
+// Returns a StreamEvaluator backed by `bus`, which the caller owns and must
+// keep alive for the lifetime of the returned evaluator (an active evaluator
+// stores the event-bus pointer). Mirrors eval_stream's testBus pattern but lets
+// the bus live in the caller so the retained pointer stays valid.
+fn initEvaluator(
+    io: std.Io,
+    bus: *o11y.StdioEventBus,
+    format: types.InputFormat,
+    policy_path: ?[]const u8,
+) !eval_stream.StreamEvaluator {
+    bus.init(io);
+    bus.eventBus().setLevel(.err);
+    return eval_stream.StreamEvaluator.init(testing.allocator, format, policy_path, bus.eventBus());
+}
+
+test "runtime public API: .tail drain finishes trailing partial and restart does not re-read it" {
+    // Reproduces the bug's permanent-loss scenario in the DEFAULT mode and
+    // verifies the fix end-to-end through the real watcher/scheduler/drain:
+    //   run 1 : .tail opens at size 5 (no event), append "part" (no \n) -> event
+    //           [5..9), processBatch buffers "part" in scratch, drainFramer
+    //           finish()es it -> out1 = "part" (was 0 bytes before the fix).
+    //   restart: fresh .tail watcher re-opens at size 9 -> size<=offset -> no
+    //           event -> out2 = 0 bytes. The partial is NOT re-read, but it was
+    //           already emitted on run 1, so there is no loss AND no duplication.
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const in_path = "tail.log";
+    const out1_path = "out1.log";
+    const out2_path = "out2.log";
+
+    // Pre-seed "done\n" (5 bytes, newline-aligned prefix).
+    {
+        const f = try tmp.dir.createFile(io, in_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "done\n");
+    }
+
+    const abs_in = try tmp.dir.realPathFileAlloc(io, in_path, testing.allocator);
+    defer testing.allocator.free(abs_in);
+    const cwd_abs = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(cwd_abs);
+    const abs_out1 = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out1_path });
+    defer testing.allocator.free(abs_out1);
+    const abs_out2 = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out2_path });
+    defer testing.allocator.free(abs_out2);
+
+    // ---- Run 1: .tail default mode. ----
+    {
+        var stdio_bus: o11y.StdioEventBus = undefined;
+        var evaluator = try initEvaluator(io, &stdio_bus, .raw, null);
+        defer evaluator.deinit();
+        var framer = try framer_mod.LineFramer.init(testing.allocator, 16, 1024);
+        defer framer.deinit();
+        var scheduler = try read_scheduler.EngineScheduler.init(testing.allocator, io, .poll);
+        defer scheduler.deinit();
+        var watcher = try watch_mod.Watcher.init(
+            testing.allocator,
+            io,
+            .poll,
+            &.{abs_in},
+            abs_out1,
+            .tail,
+            1000,
+            50,
+            1000,
+        );
+        defer watcher.deinit();
+        var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out1 }, 16);
+        defer output.deinit();
+
+        var events: std.ArrayList(watch_mod.Event) = .empty;
+        defer events.deinit(testing.allocator);
+
+        // .tail opens at size 5 -> size <= offset -> no event for the prefix.
+        try watcher.collect(&events, .tail, null);
+        try testing.expectEqual(@as(usize, 0), events.items.len);
+
+        // Append "part" (no trailing newline) -> file is 9 bytes.
+        {
+            const f = try tmp.dir.openFile(io, in_path, .{ .mode = .read_write });
+            defer f.close(io);
+            const size = (try f.stat(io)).size;
+            try f.writePositionalAll(io, "part", size);
+        }
+
+        // Second collect: event [5..9) covering the trailing partial, sized to
+        // raw stat size (mid-line) — the root cause.
+        try watcher.collect(&events, .tail, null);
+        try testing.expectEqual(@as(usize, 1), events.items.len);
+        try testing.expectEqual(@as(u64, 5), events.items[0].start_offset);
+        try testing.expectEqual(@as(u64, 9), events.items[0].end_offset);
+
+        // processBatch: "part" enters scratch (no newline -> not emitted yet).
+        _ = try scheduler.processBatch(&framer, output.writer(), events.items, &evaluator, Runtime.evalLineFilter);
+        try testing.expectEqual(@as(usize, 4), framer.inner.scratch_len);
+
+        // Production shutdown drain (the fix): finish() emits "part".
+        try Runtime.drainFramer(.tail, &framer, &output, &evaluator);
+        try testing.expectEqual(@as(usize, 0), framer.inner.scratch_len);
+    }
+
+    const got1 = try tmp.dir.readFileAlloc(io, out1_path, testing.allocator, .limited(1024));
+    defer testing.allocator.free(got1);
+    try testing.expectEqualStrings("part", got1); // before the fix: 0 bytes (dropped)
+
+    // ---- Simulated restart: fresh Watcher + framer in .tail mode. ----
+    {
+        var stdio_bus: o11y.StdioEventBus = undefined;
+        var evaluator = try initEvaluator(io, &stdio_bus, .raw, null);
+        defer evaluator.deinit();
+        var framer = try framer_mod.LineFramer.init(testing.allocator, 16, 1024);
+        defer framer.deinit();
+        var scheduler = try read_scheduler.EngineScheduler.init(testing.allocator, io, .poll);
+        defer scheduler.deinit();
+        var watcher = try watch_mod.Watcher.init(
+            testing.allocator,
+            io,
+            .poll,
+            &.{abs_in},
+            abs_out2,
+            .tail,
+            1000,
+            50,
+            1000,
+        );
+        defer watcher.deinit();
+        var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out2 }, 16);
+        defer output.deinit();
+
+        var events: std.ArrayList(watch_mod.Event) = .empty;
+        defer events.deinit(testing.allocator);
+
+        // .tail re-opens at the current size (9) -> size <= offset -> no event:
+        // the partial is not re-read (it was already emitted on run 1).
+        try watcher.collect(&events, .tail, null);
+        try testing.expectEqual(@as(usize, 0), events.items.len);
+        _ = try scheduler.processBatch(&framer, output.writer(), events.items, &evaluator, Runtime.evalLineFilter);
+        try testing.expectEqual(@as(usize, 0), framer.inner.scratch_len);
+        try Runtime.drainFramer(.tail, &framer, &output, &evaluator);
+    }
+
+    const got2 = try tmp.dir.readFileAlloc(io, out2_path, testing.allocator, .limited(1024));
+    defer testing.allocator.free(got2);
+    try testing.expectEqual(@as(usize, 0), got2.len); // no re-read, no duplication
+}
+
+test "runtime public API: file-tail drain finishes trailing partial in .checkpoint mode" {
+    // .checkpoint advances to the stored raw size on restart, so (like .tail)
+    // a trailing partial is never re-read; the drain must finish() it out.
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const in_path = "tail.log";
+    const out_path = "out.log";
+    {
+        const f = try tmp.dir.createFile(io, in_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "done\npart"); // 9 bytes, non-newline-aligned
+    }
+
+    const abs_in = try tmp.dir.realPathFileAlloc(io, in_path, testing.allocator);
+    defer testing.allocator.free(abs_in);
+    const cwd_abs = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(cwd_abs);
+    const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
+    defer testing.allocator.free(abs_out);
+
+    var stdio_bus: o11y.StdioEventBus = undefined;
+    var evaluator = try initEvaluator(io, &stdio_bus, .raw, null);
+    defer evaluator.deinit();
+    var framer = try framer_mod.LineFramer.init(testing.allocator, 16, 1024);
+    defer framer.deinit();
+    var scheduler = try read_scheduler.EngineScheduler.init(testing.allocator, io, .poll);
+    defer scheduler.deinit();
+    var watcher = try watch_mod.Watcher.init(
+        testing.allocator,
+        io,
+        .poll,
+        &.{abs_in},
+        abs_out,
+        .checkpoint,
+        1000,
+        50,
+        1000,
+    );
+    defer watcher.deinit();
+    var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out }, 16);
+    defer output.deinit();
+
+    var events: std.ArrayList(watch_mod.Event) = .empty;
+    defer events.deinit(testing.allocator);
+
+    // No checkpoint lane -> .checkpoint opens at 0 -> reads [0..9), the whole
+    // file. "done\n" is emitted; "part" buffers in scratch.
+    try watcher.collect(&events, .checkpoint, null);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 9), events.items[0].end_offset); // raw st.size, mid-line
+
+    _ = try scheduler.processBatch(&framer, output.writer(), events.items, &evaluator, Runtime.evalLineFilter);
+    try testing.expectEqual(@as(usize, 4), framer.inner.scratch_len);
+
+    try Runtime.drainFramer(.checkpoint, &framer, &output, &evaluator);
+    try testing.expectEqual(@as(usize, 0), framer.inner.scratch_len);
+
+    const got = try tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("done\npart", got); // before the fix: "done\n" only
+}
+
+test "runtime public API: file-tail drain skips finish() in .head mode (recovered on restart)" {
+    // .head re-reads the whole file from 0 on restart, so emitting the trailing
+    // partial at shutdown would duplicate it on the next run. The drain guard
+    // (read_from != .head) leaves the partial buffered; a fresh .head watcher
+    // re-reads it from 0 on the next run. Status quo for .head is unchanged.
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out_path = "out.log";
+    const cwd_abs = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(cwd_abs);
+    const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
+    defer testing.allocator.free(abs_out);
+
+    var stdio_bus: o11y.StdioEventBus = undefined;
+    var evaluator = try initEvaluator(io, &stdio_bus, .raw, null);
+    defer evaluator.deinit();
+    var framer = try framer_mod.LineFramer.init(testing.allocator, 16, 1024);
+    defer framer.deinit();
+    var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out }, 16);
+    defer output.deinit();
+
+    // Ingest "done\npart": "done\n" is emitted during ingest, "part" buffers.
+    try framer.ingestChunk("done\npart", output.writer(), &evaluator, Runtime.evalLineFilter);
+    try testing.expectEqual(@as(usize, 4), framer.inner.scratch_len);
+
+    // drainFramer(.head) must NOT finish(): the partial stays in scratch.
+    try Runtime.drainFramer(.head, &framer, &output, &evaluator);
+    try testing.expectEqual(@as(usize, 4), framer.inner.scratch_len);
+
+    const got = try tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("done\n", got); // "part" intentionally not emitted in .head
+}
+
+test "runtime public API: file-tail drain swallows half-record parse error (.json policy)" {
+    // Under .json with an active policy, finish() runs the trailing partial
+    // through evalLine -> parseJsonAttrs -> std.json.parseFromSliceLeaky, which
+    // errors on a half-record. drainFramer catches parse errors (letting
+    // allocation and writer errors propagate) so output.flush() still runs and
+    // the already-emitted complete record is not lost (at-worst-neutral for
+    // .json/.logfmt; a valid trailing record still emits normally).
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Keep-all policy: every parsed line matches and is kept. Required so the
+    // parser actually runs (a disabled evaluator never parses and would keep a
+    // half-record without erroring, hiding the catch {} path).
+    const policy_path = "policies.json";
+    {
+        const f = try tmp.dir.createFile(io, policy_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            // ziglint-ignore: Z024 (single-line JSON policy record)
+            \\{"policies":[{"id":"keep-all","name":"keep-all","log":{"match":[{"log_field":"body","regex":"."}],"keep":"all"}}]}
+        );
+    }
+    const abs_policy = try tmp.dir.realPathFileAlloc(io, policy_path, testing.allocator);
+    defer testing.allocator.free(abs_policy);
+    const out_path = "out.log";
+    const cwd_abs = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(cwd_abs);
+    const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
+    defer testing.allocator.free(abs_out);
+
+    var stdio_bus: o11y.StdioEventBus = undefined;
+    var evaluator = try initEvaluator(io, &stdio_bus, .json, abs_policy);
+    defer evaluator.deinit();
+    var framer = try framer_mod.LineFramer.init(testing.allocator, 16, 1024);
+    defer framer.deinit();
+    var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out }, 64);
+    defer output.deinit();
+
+    // A complete JSON record then a half-record (no newline): the complete
+    // record emits during ingest; the half-record buffers in scratch.
+    try framer.ingestChunk("{\"message\":\"x\"}\n{\"ms", output.writer(), &evaluator, Runtime.evalLineFilter);
+    try testing.expectEqual(@as(usize, 4), framer.inner.scratch_len); // "{\"ms" buffered
+
+    // drainFramer(.tail): finish() tries to eval "{\"ms" -> JSON parse error,
+    // parse error swallowed -> output.flush() still runs. drainFramer must NOT return error.
+    try Runtime.drainFramer(.tail, &framer, &output, &evaluator);
+
+    const got = try tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("{\"message\":\"x\"}\n", got); // complete record kept; half-record not emitted
 }
