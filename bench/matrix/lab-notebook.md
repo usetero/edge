@@ -297,25 +297,97 @@ p50. The `threads` and `maxconn` axes are flat for both.
 
 ### What the swap costs
 
-Three things get worse, and none is hidden:
+Two things get worse. A third, the pair of encoding defects, is fixed below.
 
-1. **An encoding stdio cannot name is refused with 400.** `std.http.Server`
-   maps `content-encoding` through a five-value enum and fails the whole head
-   for anything else, so brotli is dropped rather than forwarded raw (a10), and
-   an uppercase `GZIP` is dropped although RFC 9110 §8.4.1 makes codings
-   case-insensitive (a34). 400 is one of the four statuses the Datadog agent
-   treats as permanent, so this is lost data, not a retry. httpz forwards both.
-   These are the two defects to fix before a customer meets them.
-2. **An invalid chunk waits for the request deadline** instead of a fast 400
+1. **An invalid chunk waits for the request deadline** instead of a fast 400
    (a07). The sender still gets an answer, just late.
-3. **Memory grows with the connection count.** `Io.Threaded` gives each
+2. **Memory grows with the connection count.** `Io.Threaded` gives each
    connection a task, so 256 concurrent senders cost 229 MB against httpz's
    129 MB. Below 64 connections stdio is the cheaper of the two (21 MB at 16
    connections, 65 MB at 64), and it does not grow with `thread_pool_count`,
    which httpz does: 20.7 MB at 8 threads against 119.9 MB at 128.
 
-httpz keeps five declared defects of its own (a02, a03, a12, c02, c05), so the
-swap trades four std-shaped problems for those.
+httpz keeps five declared defects of its own (a02, a03, a12, c02, c05), two of
+them the incident.
+
+## Repairing a head std refuses over one header
+
+std's head parser maps `content-encoding` through an exact-match table of seven
+spellings (std/http.zig:283) and fails the whole head for anything else
+(std/http/Server.zig:164). Two real senders hit that, and both lost data,
+because 400 is one of the four statuses the Datadog agent treats as permanent:
+
+* `Content-Encoding: GZIP`. RFC 9110 §8.4.1 makes codings case-insensitive,
+  and the table is keyed on lowercase bytes (a34).
+* `Content-Encoding: br`, or any codec we do not decode. The router plans
+  `forward_raw` for those, so the batch should reach the intake untouched
+  (a10).
+
+`src/frontend/stdio/head_repair.zig` rewrites the value in a copy of the head
+and parses it again: a known coding gets the spelling std takes, and an unknown
+one becomes `identity`, which leaves the body unread. The router decides on
+what the sender sent, and the relay forwards it, so a coding we cannot decode
+reaches the intake exactly as it arrived. Both cases now pass on both
+frontends, and a10 asserts the header the intake received, not only the status.
+
+Three details make it work:
+
+1. **The bytes are still there.** `http.Reader.receiveHead` ends with `toss`,
+   which only moves the read cursor, so the head sits in the receive buffer we
+   own. The frontend records the cursor before the call and reads the head back
+   after the failure.
+2. **std reports the cause, one layer down.** `Head.parse` returns
+   `HttpTransferEncodingUnsupported`; `receiveHead` flattens it to
+   `HttpHeadersInvalid` on one line (std/http/Server.zig:53). Re-parsing the
+   bytes recovers the distinction, which is what makes the repair safe: any
+   other fault still answers 400.
+3. **`Server.Request` is a public struct.** The repaired request is built from
+   the rewritten head, and `reader.state` is already `received_head`, so the
+   rest of the connection path runs unchanged.
+
+There is no metric. A sender spells an encoding the same way on every request,
+so the signal is one warn line per cause for the process (`head.repaired`), not
+a counter that only ever says "this deployment has that sender".
+
+The fake intake shares the repair, because a real intake accepts a coding it
+cannot decode and ours is `std.http.Server` based too. Without that, a10 would
+measure the test double.
+
+## Two cases that tested less than they claimed
+
+Both came out of the full run after the repair landed, and neither was a
+product defect.
+
+**d05 ran the machine out of ports.** The reload case sends from four threads
+for six seconds with no keep-alive, which is a connection per request. That
+exhausts the ephemeral range in seconds, and the sender then fails with
+`EADDRNOTAVAIL`: its own local address, not anything the edge did. Each thread
+now keeps one connection, which is also what an agent does. `post_logs` takes
+a `session` for that.
+
+**Four cases ran with no policy in force.** They asked for `"regex": ".*"`,
+which the matcher refuses because the pattern can match an empty buffer, so
+a09, a34, a35 and d05 claimed to exercise the decode path while nothing
+decoded. They now say `.+`.
+
+One invariant closes that class for good: a case that declares `EDGE_POLICIES`
+must end with `edge_policies_rejected` at zero. a41 is the only case that opts
+out, with `EXPECT_REJECTED_POLICIES`, because a41 is the case about the
+refusal.
+
+## A case that passed for the wrong reason
+
+b12 points the edge at a blackhole and asserts the sender is not held for the
+kernel's connect timeout. It started passing on both frontends, which would
+have read as "the dial is bounded now". It is not. The blackhole was a loopback
+listener with a filled accept queue, and loopback accepted the connection
+anyway, so the case measured the request deadline instead of the dial.
+
+It now dials `198.51.100.1`, reserved for documentation by RFC 5737, which
+swallows the SYN. Both frontends hold the sender for the full 120 s client
+timeout, so the defect is declared again and the case proves it. Where a host
+refuses the route instead of dropping it, the case skips rather than claim a
+bound it did not test.
 
 ## Findings
 

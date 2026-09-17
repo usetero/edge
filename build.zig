@@ -251,6 +251,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The fake intake must take the heads a real intake takes, so it shares
+    // the frontend's head repair rather than keeping its own copy.
+    echo_server.root_module.addImport("head_repair", b.createModule(.{
+        .root_source_file = b.path("src/frontend/stdio/head_repair.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
 
     const echo_step = b.step("echo-server", "Build the echo server for benchmarking");
     echo_step.dependOn(&b.addInstallArtifact(echo_server, .{}).step);

@@ -78,6 +78,10 @@ pub const SharedCtx = struct {
     /// Last reported count of policies the matcher refused, so the warning
     /// fires on a change rather than on every scrape.
     rejected_policies: std.atomic.Value(u32) = .init(0),
+    /// One bit per `head_repair.Reason` already reported. A sender spells an
+    /// encoding the same way on every request, so the warning is worth one
+    /// line for the deployment, not one per request.
+    head_repairs_seen: std.atomic.Value(u8) = .init(0),
 };
 
 /// Routes and plans a request from transport-neutral parts. Returns null

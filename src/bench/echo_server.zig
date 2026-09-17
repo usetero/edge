@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const head_repair = @import("head_repair");
+
 const EndpointStats = struct {
     requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -79,6 +81,11 @@ pub const ServerContext = struct {
     /// and a query survive the trip byte for byte.
     last_target: [512]u8 = undefined,
     last_target_len: usize = 0,
+
+    /// The most recent `content-encoding`, so a test can assert that a body
+    /// the edge forwards untouched still arrives described correctly.
+    last_encoding: [64]u8 = undefined,
+    last_encoding_len: usize = 0,
 
     // Fault injection state
     fault_mutex: std.Io.Mutex = .init,
@@ -271,6 +278,14 @@ pub const ServerContext = struct {
         self.last_target_len = len;
     }
 
+    pub fn recordEncoding(self: *ServerContext, encoding: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const len = @min(encoding.len, self.last_encoding.len);
+        @memcpy(self.last_encoding[0..len], encoding[0..len]);
+        self.last_encoding_len = len;
+    }
+
     pub fn reset(self: *ServerContext) void {
         self.total_requests.store(0, .monotonic);
         self.total_bytes.store(0, .monotonic);
@@ -319,6 +334,7 @@ pub const ServerContext = struct {
         defer self.fault_mutex.unlock(self.io);
 
         try writer.print("}},\"last_target\":\"{s}\",", .{self.last_target[0..self.last_target_len]});
+        try writer.print("\"last_content_encoding\":\"{s}\",", .{self.last_encoding[0..self.last_encoding_len]});
         try writer.print("\"total_requests\":{d},\"total_bytes\":{d}," ++
             "\"capture_enabled\":{},\"captured_count\":{d}," ++
             "\"fault\":\"{s}\",\"fault_arg\":{d},\"fault_applied\":{d}}}", .{
@@ -384,6 +400,10 @@ fn handleRequest(
     request: *std.http.Server.Request,
     gpa: std.mem.Allocator,
     stream: std.Io.net.Stream,
+    /// The `content-encoding` the sender sent, when the head needed a repair
+    /// to parse. The repaired head says `identity` instead, and a test asserts
+    /// on what arrived.
+    sent_encoding: ?[]const u8,
 ) !void {
     const target = request.head.target;
     const query_start = std.mem.findScalar(u8, target, '?');
@@ -513,6 +533,9 @@ fn handleRequest(
     else
         null;
     defer if (content_type_copy) |ct| gpa.free(ct);
+    // Same reason as the two copies above: the head bytes go away with the
+    // body read, so record the encoding while it is still there.
+    ctx.recordEncoding(sent_encoding orelse encodingOf(request));
 
     var body_buf: [16 * 1024]u8 = undefined;
     var captured: std.Io.Writer.Allocating = .init(gpa);
@@ -648,12 +671,63 @@ fn serveConnection(ctx: *ServerContext, gpa: std.mem.Allocator, stream: std.Io.n
     var net_writer = std.Io.net.Stream.Writer.init(stream, ctx.io, &send_buf);
     var server = std.http.Server.init(&net_reader.interface, &net_writer.interface);
 
+    // Heads live as long as their request; one arena, reset per request.
+    var head_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer head_arena.deinit();
+
     while (server.reader.state == .ready) {
-        var request = server.receiveHead() catch return;
+        const head_start = net_reader.interface.seek;
+        var sent_encoding: ?[]const u8 = null;
+        var request = server.receiveHead() catch |err| repaired: {
+            // The real intake accepts a coding it cannot decode, and a
+            // spelling like `GZIP`; `std.http.Server` refuses both, which
+            // would make this intake reject what the edge correctly forwarded
+            // (bench/matrix a10, a34). Same repair the stdio frontend uses.
+            if (err == error.HttpHeadersInvalid) {
+                if (repairHead(&server, &net_reader, head_start, head_arena.allocator())) |result| {
+                    sent_encoding = result.encoding;
+                    break :repaired result.request;
+                }
+            }
+            return;
+        };
         // A fault that closes the connection surfaces as an error, and the
         // defer above closes the stream.
-        handleRequest(ctx, &request, gpa, stream) catch return;
+        handleRequest(ctx, &request, gpa, stream, sent_encoding) catch return;
+        _ = head_arena.reset(.retain_capacity);
     }
+}
+
+/// The request's `content-encoding`, read from the head bytes rather than the
+/// parsed enum: a repaired head carries `identity` where the sender named a
+/// coding we do not decode, and the test asserts on what the sender said.
+fn encodingOf(request: *std.http.Server.Request) []const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-encoding")) return header.value;
+    }
+    return "";
+}
+
+/// Parses a head std refused over its `content-encoding` value. Null leaves
+/// the connection to close, as before.
+fn repairHead(
+    server: *std.http.Server,
+    net_reader: *std.Io.net.Stream.Reader,
+    head_start: usize,
+    arena: std.mem.Allocator,
+) ?struct { request: std.http.Server.Request, encoding: []const u8 } {
+    const head_end = net_reader.interface.seek;
+    if (head_start >= head_end or head_end > net_reader.interface.buffer.len) return null;
+    const fixed = head_repair.repair(net_reader.interface.buffer[head_start..head_end], arena) catch return null;
+    return .{
+        .request = .{
+            .server = server,
+            .head = fixed.head,
+            .head_buffer = fixed.head_buffer,
+        },
+        .encoding = fixed.encoding,
+    };
 }
 
 /// Simulated upstream round trip, from ECHO_LATENCY_MS. Read once at startup.

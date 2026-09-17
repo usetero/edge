@@ -29,6 +29,7 @@ const exchange = @import("../exchange.zig");
 const paths = @import("../paths.zig");
 const endpoints = @import("../endpoints.zig");
 const deadline_reader_mod = @import("deadline_reader.zig");
+const head_repair_mod = @import("head_repair.zig");
 
 const Inbound = exchange.Inbound;
 const InboundBody = paths.InboundBody;
@@ -48,6 +49,11 @@ const ConnectionShed = struct { reason: []const u8, answered: u16 };
 /// request in flight; `request` means a partial request stalled, which drops
 /// that request, so it answers 408 first.
 const InboundTimeout = struct { phase: []const u8, answered: u16 };
+/// A head std refused only over its `content-encoding` value, which we
+/// rewrote and parsed again rather than answer 400 and lose the batch. Warned
+/// once per cause: `reason` is the `head_repair.Reason` tag, and `encoding` is
+/// what the sender sent.
+const HeadRepaired = struct { encoding: []const u8, reason: []const u8 };
 /// A head that failed to parse. Answered 400, then closed.
 const RequestRejected = struct { reason: []const u8, answered: u16 };
 /// The response was already on the wire when the request failed. The body
@@ -71,6 +77,10 @@ const Env = struct {
     /// as the client stall it is (408) instead of a generic read failure
     /// (502), which would point at the upstream.
     inbound: *deadline_reader_mod.DeadlineReader,
+    /// Set for a request whose head we repaired: the `content-encoding` to
+    /// decide and forward on, where the parsed head says something else.
+    /// See `head_repair.Repaired.forward`.
+    encoding_override: ?[]const u8 = null,
 };
 
 /// The response side of the sink contract (exchange.zig) over a
@@ -165,23 +175,37 @@ pub fn serveConnection(
     var server = std.http.Server.init(&inbound.interface, &net_writer.interface);
 
     while (server.reader.state == .ready) {
-        var request = server.receiveHead() catch |err| switch (err) {
-            // Cancellation surfaces as ReadFailed through the reader, as does
-            // a deadline; `inbound` says which.
-            error.HttpConnectionClosing, error.ReadFailed => {
-                reportReadEnd(shared, io, stream, &inbound, err);
-                return;
-            },
-            else => {
-                // Malformed head (incl. unsupported content-encoding, see
-                // wiring-notes): answer 400 on the raw writer and close.
-                if (shared.metrics) |metrics| metrics.recordInvalidRequest();
-                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-                shared.bus.warn(RequestRejected{ .reason = @errorName(err), .answered = 400 });
-                const reject = "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                writeRawResponse(shared, io, stream, reject, 400);
-                return;
-            },
+        env.encoding_override = null;
+        // Where this head starts in the receive buffer. `receiveHead` tosses
+        // the head on success, which only moves `seek`, so on failure the
+        // bytes are still there and `repairHead` can look at them.
+        const head_start = inbound.interface.seek;
+        var request = server.receiveHead() catch |err| repaired: {
+            switch (err) {
+                // Cancellation surfaces as ReadFailed through the reader, as
+                // does a deadline; `inbound` says which.
+                error.HttpConnectionClosing, error.ReadFailed => {
+                    reportReadEnd(shared, io, stream, &inbound, err);
+                    return;
+                },
+                // std refuses a whole head over one `content-encoding` value
+                // it cannot name, and 400 makes the agent discard the batch.
+                // Rewrite the value and parse again where that is the only
+                // fault.
+                error.HttpHeadersInvalid => {
+                    if (repairHead(&env, &server, arena_slot, head_start)) |request_again| {
+                        break :repaired request_again;
+                    }
+                },
+                else => {},
+            }
+            // Malformed head: answer 400 on the raw writer and close.
+            if (shared.metrics) |metrics| metrics.recordInvalidRequest();
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            shared.bus.warn(RequestRejected{ .reason = @errorName(err), .answered = 400 });
+            const reject = "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            writeRawResponse(shared, io, stream, reject, 400);
+            return;
         };
         if (reserved and !isControlPath(pathOf(request.head.target))) {
             // The reserve exists for the control paths. Everything else is
@@ -351,7 +375,7 @@ fn dispatch(
         method,
         path,
         request.head.content_type orelse "",
-        exec.contentEncodingName(request.head.transfer_compression),
+        env.encoding_override orelse exec.contentEncodingName(request.head.transfer_compression),
     ) orelse {
         sink.status = 404;
         return request.respond("", .{ .status = .not_found });
@@ -372,7 +396,7 @@ fn dispatch(
         .method = request.head.method,
         .target = target,
         .path = path,
-        .headers = try collectRequestHeaders(request, arena, headers_buf),
+        .headers = try collectRequestHeaders(request, arena, headers_buf, env.encoding_override),
         .arena = arena,
     };
     const body = try inboundBodyOf(request, ctx.limits, env.slab.bodyBuf(conn_id), arena);
@@ -484,23 +508,73 @@ fn inboundBodyOf(
 
 /// Collected, arena-duped request headers. Must run BEFORE the body reader
 /// is created: readerExpectNone invalidates the head strings.
+/// Copies the headers to forward out of the head, which the body read
+/// overwrites. `encoding` replaces the `content-encoding` value where the head
+/// was repaired and carries `identity` instead of what the sender sent.
 fn collectRequestHeaders(
     request: *std.http.Server.Request,
     arena: std.mem.Allocator,
     buffer: []std.http.Header,
+    encoding: ?[]const u8,
 ) ![]std.http.Header {
     var count: usize = 0;
     var it = request.iterateHeaders();
     while (it.next()) |header| {
         if (upstream_mod.shouldSkipRequestHeader(header.name)) continue;
         if (count >= buffer.len) return error.TooManyHeaders;
+        const repaired = encoding != null and std.ascii.eqlIgnoreCase(header.name, "content-encoding");
         buffer[count] = .{
             .name = try arena.dupe(u8, header.name),
-            .value = try arena.dupe(u8, header.value),
+            // The repaired value is already in the arena; the rest of the head
+            // is not, so it is duped here.
+            .value = if (repaired) encoding.? else try arena.dupe(u8, header.value),
         };
         count += 1;
     }
     return buffer[0..count];
+}
+
+/// Parses a head std refused over its `content-encoding` value, and reports
+/// it. Returns null when the head has any other fault, which leaves the
+/// caller's 400 to answer.
+///
+/// The bytes are still in the receive buffer: `http.Reader.receiveHead` ends
+/// with `toss`, which only moves the read cursor.
+fn repairHead(
+    env: *Env,
+    server: *std.http.Server,
+    arena_slot: u16,
+    head_start: usize,
+) ?std.http.Server.Request {
+    const buffer = env.inbound.interface.buffer;
+    const head_end = env.inbound.interface.seek;
+    // `fillMore` may rebase the buffer while the head arrives, which leaves
+    // the snapshot pointing at bytes that moved. `repair` checks that the
+    // slice ends like a head and parses, so a stale span reads as
+    // unrepairable and gets the 400.
+    if (head_start >= head_end or head_end > buffer.len) return null;
+
+    const fixed = head_repair_mod.repair(
+        buffer[head_start..head_end],
+        env.arenas.allocator(arena_slot),
+    ) catch return null;
+
+    // Warn once per cause for the whole process. The sender's spelling does
+    // not change between requests, so the second line tells an operator
+    // nothing the first did not, and a line per request at full rate is its
+    // own outage.
+    const shared = env.shared;
+    const bit = @as(u8, 1) << @intFromEnum(fixed.reason);
+    if (shared.head_repairs_seen.fetchOr(bit, .monotonic) & bit == 0) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        shared.bus.warn(HeadRepaired{ .encoding = fixed.encoding, .reason = @tagName(fixed.reason) });
+    }
+    env.encoding_override = fixed.forward;
+    return .{
+        .server = server,
+        .head = fixed.head,
+        .head_buffer = fixed.head_buffer,
+    };
 }
 
 /// Reports why the read side ended, and answers when a request was in flight.

@@ -23,7 +23,7 @@ class DecompressionBombWithPolicies(MatrixCase):
             {
                 "id": "keep-all",
                 "name": "keep-all",
-                "log": {"match": [{"log_field": "body", "regex": ".*"}], "keep": "all"},
+                "log": {"match": [{"log_field": "body", "regex": ".+"}], "keep": "all"},
             }
         ]
     }

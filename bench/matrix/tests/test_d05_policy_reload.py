@@ -9,6 +9,8 @@ import json
 import threading
 import time
 
+import requests
+
 from harness import MatrixCase
 
 KEEP_ALL = {
@@ -16,7 +18,7 @@ KEEP_ALL = {
         {
             "id": "keep-all",
             "name": "keep-all",
-            "log": {"match": [{"log_field": "body", "regex": ".*"}], "keep": "all"},
+            "log": {"match": [{"log_field": "body", "regex": ".+"}], "keep": "all"},
         }
     ]
 }
@@ -31,12 +33,17 @@ class PolicyReloadUnderLoad(MatrixCase):
         stop = threading.Event()
 
         def sender():
-            while not stop.is_set():
-                try:
-                    if self.post_logs(timeout=20).status_code != 202:
-                        failures.append("status")
-                except Exception:
-                    failures.append("error")
+            # One connection per thread, as an agent keeps one. A connection
+            # per request runs the machine out of ephemeral ports in seconds
+            # at this rate, and the case then fails on the sender's local
+            # address instead of on the reload.
+            with requests.Session() as session:
+                while not stop.is_set():
+                    try:
+                        if self.post_logs(timeout=20, session=session).status_code != 202:
+                            failures.append("status")
+                    except Exception as err:
+                        failures.append(repr(err))
 
         traffic = [threading.Thread(target=sender, daemon=True) for _ in range(4)]
         for thread in traffic:
@@ -55,5 +62,7 @@ class PolicyReloadUnderLoad(MatrixCase):
             for thread in traffic:
                 thread.join(timeout=30)
 
-        self.assertEqual(failures, [], "%d requests failed across the reload" % len(failures))
+        self.assertEqual(
+            failures[:3], [], "%d of the requests failed across the reload" % len(failures)
+        )
         self.assertEqual(self.health().status_code, 200)

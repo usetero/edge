@@ -75,6 +75,9 @@ class MatrixCase(unittest.TestCase):
     #: The case answers a status the agent drops on purpose, and the batch is
     #: genuinely unforwardable (too large, ambiguous framing).
     EXPECT_PERMANENT_DROP: bool = False
+    #: The case loads a policy the matcher is meant to refuse, so the
+    #: rejected-policy invariant does not apply to it.
+    EXPECT_REJECTED_POLICIES: bool = False
     #: Data paths only: health and the scrape answer 2xx without an upstream.
     DATA_PATHS = ("api_v2_logs", "api_v2_series", "v1_logs", "v1_metrics", "v1_traces", "other")
     EXPECT_METRICS: dict = {}
@@ -175,13 +178,29 @@ class MatrixCase(unittest.TestCase):
 
     # ---------------------------------------------------------------- senders
 
-    def post_logs(self, body=None, path: str = "/api/v2/logs", headers=None, timeout: float = 60.0, **kwargs):
-        """A well-formed request, the way an agent sends one."""
+    def post_logs(
+        self,
+        body=None,
+        path: str = "/api/v2/logs",
+        headers=None,
+        timeout: float = 60.0,
+        session=None,
+        **kwargs,
+    ):
+        """A well-formed request, the way an agent sends one.
+
+        `session` reuses one connection across calls, which is what an agent
+        does and what a case must do when it sends thousands of requests: a
+        connection per request exhausts the machine's ephemeral ports, and the
+        sender then fails on its own local address rather than on anything the
+        edge did.
+        """
         self.assertIsNotNone(requests, "run through bench/matrix/run.py, which supplies requests")
         payload = json.dumps(LOG_PAYLOAD if body is None else body).encode()
         merged = {"Content-Type": "application/json"}
         merged.update(headers or {})
-        return requests.post(
+        sender = session or requests
+        return sender.post(
             self.edge.url + path, data=payload, headers=merged, timeout=timeout, **kwargs
         )
 
@@ -360,6 +379,20 @@ class MatrixCase(unittest.TestCase):
                 0,
                 "answered %d status(es) the agent drops permanently, for a batch "
                 "the intake never received" % dropped,
+            )
+
+        # A case that loads policies must have policies that work. A pattern
+        # the matcher refuses leaves the rule in the snapshot doing nothing,
+        # and the case then proves whatever it proves with no policy running
+        # at all: four cases here claimed to exercise the decode path while
+        # `.*` was refused for being able to match an empty buffer.
+        if self.EDGE_POLICIES and not self.EXPECT_REJECTED_POLICIES:
+            rejected = self.edge.metric("edge_policies_rejected")
+            self.assertEqual(
+                rejected,
+                0,
+                "%s policy pattern(s) were refused, so the case ran with no "
+                "policy in force" % rejected,
             )
 
         # In-flight returns to zero: the scrape itself is the only request

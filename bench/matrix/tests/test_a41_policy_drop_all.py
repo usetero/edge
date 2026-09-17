@@ -46,6 +46,7 @@ class RejectedPatternIsVisible(MatrixCase):
     # The rejection is settled before the case body runs, so these are
     # absolute checks rather than deltas.
     ALLOW_PHANTOM_SUCCESS = True
+    EXPECT_REJECTED_POLICIES = True
     EDGE_POLICIES = {
         "policies": [
             {
