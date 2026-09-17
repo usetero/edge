@@ -216,20 +216,6 @@ pub const Runtime = struct {
         // loop — run as concurrent tasks in one lifecycle group; shutdown is
         // a single structured cancel (PLAN.md §9 Phase 6).
         var lifecycle: lifecycle_mod.Lifecycle = .init;
-        try checkpoint.start(&lifecycle);
-
-        var loop: PollLoop = .{
-            .runtime = self,
-            .framer = &framer,
-            .evaluator = &evaluator,
-            .scheduler = &scheduler,
-            .watcher = &watcher,
-            .checkpoint = &checkpoint,
-            .checkpoint_lane = checkpoint_lane,
-            .output = output,
-            .lifecycle = &lifecycle,
-        };
-        try lifecycle.spawn(self.io, PollLoop.run, .{&loop});
 
         var signal_count = std.atomic.Value(u32).init(0);
         var shutdown_waiter = std.atomic.Value(bool).init(false);
@@ -244,6 +230,34 @@ pub const Runtime = struct {
                 return err;
             },
         }
+
+        // If startup fails after the signal waiter is installed (i.e. before
+        // the lifecycle tasks are running and awaited), shut down the lifecycle
+        // and tear down the waiter before propagating the error so that no
+        // background threads are left pointing at stack-local state and the
+        // signal mask is restored.
+        var startup_done = false;
+        errdefer if (!startup_done) {
+            lifecycle.requestShutdown(self.io);
+            lifecycle.shutdown(self.io);
+            if (signal_waiter) |waiter| teardownSignalWaiter(waiter, &shutdown_waiter);
+        };
+
+        try checkpoint.start(&lifecycle);
+
+        var loop: PollLoop = .{
+            .runtime = self,
+            .framer = &framer,
+            .evaluator = &evaluator,
+            .scheduler = &scheduler,
+            .watcher = &watcher,
+            .checkpoint = &checkpoint,
+            .checkpoint_lane = checkpoint_lane,
+            .output = output,
+            .lifecycle = &lifecycle,
+        };
+        try lifecycle.spawn(self.io, PollLoop.run, .{&loop});
+        startup_done = true;
 
         lifecycle.awaitShutdown(self.io) catch |err| switch (err) {
             error.Canceled => {},
