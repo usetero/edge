@@ -95,3 +95,48 @@ test "read scheduler public API: processes event batch" {
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a\n", out.written());
 }
+
+test "read scheduler public API: isolates partial lines across files in one batch" {
+    // Exercises the real scheduler (io_uring fast path on Linux, poll
+    // elsewhere) with two files in one batch where file A has no trailing
+    // newline. The bug: A's partial line was completed with B's first line,
+    // emitting one corrupted cross-file record through the shared framer.
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile(io, "a.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "line1\npartial");
+    }
+    {
+        const f = try tmp.dir.createFile(io, "b.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hello\nworld\n");
+    }
+    const abs_a = try tmp.dir.realPathFileAlloc(io, "a.log", testing.allocator);
+    defer testing.allocator.free(abs_a);
+    const abs_b = try tmp.dir.realPathFileAlloc(io, "b.log", testing.allocator);
+    defer testing.allocator.free(abs_b);
+    const file_a = try std.Io.Dir.cwd().openFile(io, abs_a, .{ .mode = .read_only });
+    defer file_a.close(io);
+    const file_b = try std.Io.Dir.cwd().openFile(io, abs_b, .{ .mode = .read_only });
+    defer file_b.close(io);
+
+    var framer = try framer_mod.LineFramer.init(testing.allocator, 16, 1024);
+    defer framer.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var scheduler = try EngineScheduler.init(testing.allocator, io, .auto);
+    defer scheduler.deinit();
+
+    const n = try scheduler.processBatch(&framer, &out.writer, &.{
+        .{ .file = &file_a, .start_offset = 0, .end_offset = 13, .identity = null },
+        .{ .file = &file_b, .start_offset = 0, .end_offset = 12, .identity = null },
+    }, &framer, keepAll);
+
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("line1\nhello\nworld\n", out.written());
+    try testing.expect(std.mem.indexOf(u8, out.written(), "partialhello") == null);
+}

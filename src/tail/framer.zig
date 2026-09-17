@@ -21,9 +21,43 @@ pub const LineFramer = struct {
     /// (they size positional reads off `read_buf.len`).
     read_buf: []u8,
     /// Scratch for chunk-spanning lines, sized to the eval bound: a line must
-    /// fit here to be evaluated, otherwise it fails open.
+    /// fit here to be evaluated, otherwise it fails open. Shared by every
+    /// stream: only the *active* stream's partial line lives here at a time;
+    /// `selectStream` swaps partials in/out when switching files.
     scratch: []u8,
     inner: frame_ndjson.NdjsonFramer,
+    /// Saved partial-line state for the streams that are not currently active,
+    /// keyed by file identity hash (see `eventKey`). The tail read schedulers
+    /// feed one framer with events for *multiple different files* in a single
+    /// batch (`watch.zig:collect` appends one Event per dirty file); without
+    /// per-stream isolation, a partial line left in `NdjsonFramer.scratch` by
+    /// file A is concatenated onto file B's first bytes and emitted as one
+    /// corrupted cross-file record. The map persists across batches (the
+    /// runtime reuses one framer for the whole loop), so a file's partial line
+    /// is also preserved across batch boundaries — not flushed early, which
+    /// would split a logical line into two records.
+    streams: std.AutoHashMapUnmanaged(u64, StreamState) = .{},
+    /// Identity hash of the stream whose partial line currently lives in
+    /// `inner.scratch`, or `null` before the first `selectStream` call.
+    /// Single-stream callers that never switch files (`pump`/`runStream` and
+    /// the unit tests) leave this `null` and pay no isolation overhead.
+    active_key: ?u64 = null,
+
+    /// Saved partial-line state for one inactive stream.
+    const StreamState = struct {
+        /// Owned buffer holding `bytes[0..len]`. Grown only when a larger
+        /// partial arrives; freed when the state is loaded back into `inner`,
+        /// evicted (the file completed its line), or on `deinit`.
+        bytes: ?[]u8 = null,
+        /// Number of valid partial bytes in `bytes`. Always `<= scratch.len`
+        /// because `NdjsonFramer` never buffers more than the scratch bound.
+        len: usize = 0,
+        /// True when the stream is mid-record in fail-open streaming. No bytes
+        /// are held then (`len == 0`) but the flag must survive switching files
+        /// so the file's next chunk continues verbatim until its closing
+        /// newline instead of being evaluated as a fresh record.
+        overflowed: bool = false,
+    };
 
     pub fn init(allocator: std.mem.Allocator, read_buf_size: usize, max_line: usize) !LineFramer {
         const read_buf = try allocator.alloc(u8, read_buf_size);
@@ -40,7 +74,87 @@ pub const LineFramer = struct {
     pub fn deinit(self: *LineFramer) void {
         self.allocator.free(self.read_buf);
         self.allocator.free(self.scratch);
+        var it = self.streams.iterator();
+        while (it.next()) |entry| if (entry.value_ptr.bytes) |b| self.allocator.free(b);
+        self.streams.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Switches the active stream so a partial line buffered for one file is
+    /// never completed with bytes from another. Saves the currently active
+    /// stream's partial (if any) under its key, then loads the named stream's
+    /// saved partial (if any) into `inner`. Idempotent when `key` is already
+    /// active. Callers that feed the framer from one stream at a time
+    /// (`pump`/`readRange` for a single file) need not call this.
+    pub fn selectStream(self: *LineFramer, key: u64) !void {
+        if (self.active_key) |old_key| {
+            if (old_key == key) return;
+            try self.saveStream(old_key);
+        }
+        try self.loadStream(key);
+        self.active_key = key;
+    }
+
+    /// Discards any saved (parked) partial-line state for `key` without loading
+    /// it. Use cases:
+    /// - **Truncation/rewrite**: call before `selectStream` when the watcher
+    ///   resets a file's read offset to zero, so stale pre-rewrite bytes are
+    ///   not concatenated onto the new contents.
+    /// - **Rotation/removal**: call when the watcher evicts a tracked path so
+    ///   the `streams` map does not hold the file's partial buffer indefinitely.
+    ///   Without this, repeated log rotation grows the map without bound.
+    pub fn resetStream(self: *LineFramer, key: u64) void {
+        if (self.streams.fetchRemove(key)) |kv| if (kv.value.bytes) |b| self.allocator.free(b);
+        // If this key is currently active, clear inner state too.
+        if (self.active_key) |ak| {
+            if (ak == key) {
+                self.inner.scratch_len = 0;
+                self.inner.overflowed = false;
+                self.active_key = null;
+            }
+        }
+    }
+
+    /// Parks the active stream's partial state in `streams[key]`.
+    fn saveStream(self: *LineFramer, key: u64) !void {
+        const len = self.inner.scratch_len;
+        const overflowed = self.inner.overflowed;
+        // The stream completed cleanly: drop any stale entry so the file's
+        // next event starts fresh rather than reviving an obsolete partial.
+        if (len == 0 and !overflowed) {
+            if (self.streams.fetchRemove(key)) |kv| if (kv.value.bytes) |b| self.allocator.free(b);
+            return;
+        }
+        const gop = try self.streams.getOrPut(self.allocator, key);
+        if (!gop.found_existing) gop.value_ptr.* = .{}; // getOrPut leaves new slots undefined
+        const cap = if (gop.value_ptr.bytes) |b| b.len else 0;
+        if (cap < len) {
+            const new_bytes = try self.allocator.alloc(u8, len);
+            if (gop.value_ptr.bytes) |b| self.allocator.free(b);
+            gop.value_ptr.bytes = new_bytes;
+        }
+        if (len > 0) @memcpy(gop.value_ptr.bytes.?[0..len], self.inner.scratch[0..len]);
+        gop.value_ptr.len = len;
+        gop.value_ptr.overflowed = overflowed;
+    }
+
+    /// Loads `streams[key]` into `inner` and frees its owned buffer (the state
+    /// now lives in the shared scratch). Resets `inner` when the stream has no
+    /// saved state, which is the common case for a file seen for the first
+    /// time in this run.
+    fn loadStream(self: *LineFramer, key: u64) !void {
+        self.inner.scratch_len = 0;
+        self.inner.overflowed = false;
+        if (self.streams.fetchRemove(key)) |kv| {
+            if (kv.value.bytes) |b| {
+                if (kv.value.len > 0) {
+                    @memcpy(self.inner.scratch[0..kv.value.len], b[0..kv.value.len]);
+                    self.inner.scratch_len = kv.value.len;
+                }
+                self.allocator.free(b);
+            }
+            self.inner.overflowed = kv.value.overflowed;
+        }
     }
 
     pub const LineFilterFn = fn (ctx: *anyopaque, line: []const u8, meta: types.LineMeta) anyerror!bool;
@@ -70,6 +184,11 @@ pub const LineFramer = struct {
         try self.inner.ingest(chunk, writer, &sink);
     }
 
+    /// Flushes all streams — the active one and every parked stream — emitting
+    /// any unterminated trailing line from each file. When a multi-file batch
+    /// ends, the active stream holds the last file's partial, while earlier
+    /// files' partials are parked in `streams`; both must be drained here so
+    /// no unterminated final line is silently dropped.
     pub fn finish(
         self: *LineFramer,
         writer: *std.Io.Writer,
@@ -77,7 +196,21 @@ pub const LineFramer = struct {
         filter_fn: *const LineFilterFn,
     ) !void {
         const sink: FilterSink = .{ .filter_ctx = filter_ctx, .filter_fn = filter_fn };
+        // Flush the active stream first.
         try self.inner.finish(writer, &sink);
+        // Drain every parked stream: load it into `inner`, flush, then discard.
+        // We collect the keys up front because draining empties the map.
+        var keys: std.ArrayListUnmanaged(u64) = .empty;
+        defer keys.deinit(self.allocator);
+        {
+            var it = self.streams.iterator();
+            while (it.next()) |entry| try keys.append(self.allocator, entry.key_ptr.*);
+        }
+        for (keys.items) |k| {
+            try self.loadStream(k);
+            try self.inner.finish(writer, &sink);
+        }
+        self.active_key = null;
     }
 
     /// Pumps from any Reader endpoint into this framer with no per-iteration
@@ -227,4 +360,88 @@ test "framer public API: trailing line without newline is preserved byte-exactly
     try framer.finish(&out.writer, &ctx, keepAll);
 
     try testing.expectEqualStrings("done\npart", out.written());
+}
+
+test "framer public API: selectStream isolates per-file partial lines" {
+    // A single framer fed by multiple files must keep each file's partial
+    // line isolated: file A's trailing "partial" cannot be completed with
+    // file B's first bytes. Switching back to A restores its buffered partial
+    // so the logical line is still emitted as one record.
+    var framer = try LineFramer.init(testing.allocator, 8, 64);
+    defer framer.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    var ctx: u8 = 0;
+    try framer.selectStream(111);
+    try framer.ingestChunk("line1\npartial", &out.writer, &ctx, keepAll);
+    try framer.selectStream(222);
+    try framer.ingestChunk("hello\nworld\n", &out.writer, &ctx, keepAll);
+    try framer.selectStream(111);
+    try framer.ingestChunk("rest\n", &out.writer, &ctx, keepAll);
+
+    try testing.expectEqualStrings("line1\nhello\nworld\npartialrest\n", out.written());
+    try testing.expect(std.mem.indexOf(u8, out.written(), "partialhello") == null);
+}
+
+test "framer public API: selectStream no-ops for the active key" {
+    // Re-selecting the active key must not save/drop the buffered partial —
+    // single-file continuation works exactly as before isolation was added.
+    var framer = try LineFramer.init(testing.allocator, 8, 64);
+    defer framer.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    var ctx: u8 = 0;
+    try framer.selectStream(111);
+    try framer.ingestChunk("foo\nbar", &out.writer, &ctx, keepAll);
+    try framer.selectStream(111);
+    try framer.ingestChunk("baz\n", &out.writer, &ctx, keepAll);
+
+    try testing.expectEqualStrings("foo\nbarbaz\n", out.written());
+}
+
+test "framer public API: selectStream isolates fail-open overflow per file" {
+    // File A's oversized, non-newline-terminated record enters fail-open
+    // streaming (overflowed=true, no scratch bytes). File B's in-bound record
+    // must still be evaluated as its own record — the overflowed flag cannot
+    // carry across files. A recording filter distinguishes the fixed path
+    // (filter sees B's record) from the buggy path (B is copied through
+    // fail-open and never evaluated).
+    const Seen = struct {
+        const Self = @This();
+        seen: std.ArrayList([]u8) = .empty,
+        allocator: std.mem.Allocator,
+        fn deinit(self: *Self) void {
+            for (self.seen.items) |s| self.allocator.free(s);
+            self.seen.deinit(self.allocator);
+            self.* = undefined;
+        }
+        fn filter(ctx: *anyopaque, line: []const u8, _: types.LineMeta) !bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            try self.seen.append(self.allocator, try self.allocator.dupe(u8, line));
+            return true;
+        }
+    };
+
+    var framer = try LineFramer.init(testing.allocator, 64, 32);
+    defer framer.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    var seen: Seen = .{ .allocator = testing.allocator };
+    defer seen.deinit();
+
+    const partial_a = "Q" ** 40 ++ "PARTIAL"; // 47 bytes, no newline, > max_line
+    try framer.selectStream(111);
+    try framer.ingestChunk(partial_a, &out.writer, &seen, Seen.filter);
+    try framer.selectStream(222);
+    try framer.ingestChunk("hello\n", &out.writer, &seen, Seen.filter);
+
+    try testing.expectEqual(@as(usize, 1), seen.seen.items.len);
+    try testing.expectEqualStrings("hello", seen.seen.items[0]);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "PARTIAL") != null);
 }
