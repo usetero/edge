@@ -247,6 +247,7 @@ fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8,
         .pos = 0,
     };
 
+    var frame_complete = false;
     while (in_buffer.pos < in_buffer.size) {
         // Check if we need more output space
         if (out_buffer.pos == out_buffer.size) {
@@ -277,8 +278,18 @@ fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8,
             if (out_buffer.pos > max_decompressed) {
                 return error.DecompressedSizeTooLarge;
             }
+            frame_complete = true;
             break;
         }
+    }
+
+    // Input ran out before the frame closed: truncated input. Mirrors the
+    // sibling gzip path's Z_BUF_ERROR branch — ZSTD_decompressStream returns
+    // a positive non-error hint (>0) here instead of synthesizing an error,
+    // so without this guard a byte-exact plaintext prefix would be returned
+    // on the success path (silent data corruption).
+    if (!frame_complete) {
+        return error.DecompressionFailed;
     }
 
     // Resize to actual size
@@ -456,4 +467,46 @@ test "decompressZstd rejects data exceeding max size" {
     // ZSTD stores the decompressed size in the header, so it checks upfront
     const result = decompressZstd(allocator, compressed, 500);
     try std.testing.expectError(error.DecompressedSizeTooLarge, result);
+}
+
+test "decompressZstd rejects truncated frame with known content size" {
+    const allocator = std.testing.allocator;
+
+    // The one-shot compressZstd embeds the content size in the frame header, so
+    // decompressZstd routes through the known-size branch (ZSTD_decompress),
+    // not decompressZstdStreaming. That branch already rejected truncated
+    // input from day one — this test documents the safe subpath the streaming
+    // branch is contrasted against. It truncates the frame to an *incomplete
+    // header* (fewer than the minimum 6-byte zstd1 frame header), which makes
+    // ZSTD_getFrameContentSize return ZSTD_CONTENTSIZE_ERROR, surfaced as
+    // error.InvalidCompressedData before any ZSTD_decompress call. (Body
+    // truncation of a known-size frame reaches the one-shot ZSTD_decompress
+    // error path and would also be rejected, but that path logs via
+    // std.log.err; the header-truncated subpath is the log-free rejection
+    // this test exercises.)
+    const payload_len: usize = 300_000;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    const compressed = try compressZstd(allocator, payload);
+    defer allocator.free(compressed);
+
+    // Known content size => the non-streaming branch.
+    try std.testing.expect(c.ZSTD_getFrameContentSize(compressed.ptr, compressed.len) == @as(u64, payload_len));
+
+    // Sanity: a complete frame round-trips.
+    {
+        const decoded = try decompressZstd(allocator, compressed, 0);
+        defer allocator.free(decoded);
+        try std.testing.expectEqualSlices(u8, payload, decoded);
+    }
+
+    // Truncate to an incomplete header at several lengths (keep < the minimum
+    // 6-byte zstd1 frame header); each must be rejected with
+    // error.InvalidCompressedData, never a silent partial plaintext.
+    for ([_]usize{ 0, 3, 4 }) |keep| {
+        const truncated = compressed[0..@min(keep, compressed.len)];
+        try std.testing.expectError(error.InvalidCompressedData, decompressZstd(allocator, truncated, 0));
+    }
 }
