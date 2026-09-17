@@ -379,6 +379,19 @@ pub const PolicyStreamingFilter = struct {
                 });
             },
             .sample => |s| {
+                // If this sample is not a member of the currently tracked
+                // family, the current family has ended (its samples were all
+                // kept and emitted, or all dropped). Invalidate the stored
+                // metadata so it cannot leak into policy evaluation or be
+                // emitted as orphan HELP/TYPE lines for this unrelated,
+                // metadata-less sample. This is required because a fully
+                // dropped family leaves `metadata_written == false` with its
+                // `current_*` still populated; without invalidation, a later
+                // prefix-extending sample (e.g. `foo_extra` after `foo`) would
+                // borrow the dropped family's metadata.
+                if (self.current_metric_name.len > 0 and !self.belongsToCurrentFamily(s.metric_name)) {
+                    self.clearCurrentMetadata();
+                }
                 // Evaluate sample against policy engine
                 if (self.shouldKeepMetric(s, line)) {
                     // Output metadata if this is first sample for this metric
@@ -468,15 +481,75 @@ pub const PolicyStreamingFilter = struct {
         }
     }
 
+    /// Returns true if the given sample metric name is a member of the
+    /// currently tracked metric family.
+    ///
+    /// This is stricter than a bare `std.mem.startsWith`: a sample whose name
+    /// merely extends the family name (e.g. `foo_extra` for family `foo`) is
+    /// NOT a member. The only samples that legitimately share a family name
+    /// with a different string are histogram/summary suffix samples
+    /// (`_bucket`/`_sum`/`_count`) declared via `# TYPE <family> histogram` or
+    /// `# TYPE <family> summary`. Summary quantile samples share the family
+    /// name exactly. Counters/gauges (and families with no `# TYPE`) require
+    /// an exact name match — `_total` is part of the family name in this
+    /// repo's exposition convention, not a suffix, so a metadata-less
+    /// `foo_total` is treated as its own family following a dropped `foo`.
+    fn belongsToCurrentFamily(self: *PolicyStreamingFilter, metric_name: []const u8) bool {
+        if (self.current_metric_name.len == 0) return false;
+
+        // Exact match: counter/gauge base sample, summary quantile sample, or
+        // any non-histogram/summary family.
+        if (std.mem.eql(u8, metric_name, self.current_metric_name)) return true;
+
+        // Suffix samples only exist for histograms and summaries. The type
+        // string comes from the parsed `# TYPE` line (e.g. "histogram",
+        // "summary"). No `# TYPE` means we cannot confirm a suffix sample, so
+        // we require an exact name match above.
+        const t = self.current_type_str;
+        const is_hist = std.mem.eql(u8, t, "histogram");
+        const is_summary = std.mem.eql(u8, t, "summary");
+        if (!is_hist and !is_summary) return false;
+
+        const prefix = self.current_metric_name;
+        if (!std.mem.startsWith(u8, metric_name, prefix)) return false;
+        const suffix = metric_name[prefix.len..];
+
+        if (is_hist) {
+            return std.mem.eql(u8, suffix, "_bucket") or
+                std.mem.eql(u8, suffix, "_sum") or
+                std.mem.eql(u8, suffix, "_count");
+        }
+
+        // summary
+        return std.mem.eql(u8, suffix, "_sum") or
+            std.mem.eql(u8, suffix, "_count");
+    }
+
+    /// Clear all stored family metadata.
+    ///
+    /// Called when a sample arrives that is not a member of the current
+    /// family: the current family has ended (with all samples kept or all
+    /// dropped), so its metadata must not survive to be borrowed by, or
+    /// policy-evaluated against, a later unrelated sample.
+    fn clearCurrentMetadata(self: *PolicyStreamingFilter) void {
+        self.current_metric_name = "";
+        self.current_help_line = "";
+        self.current_type_line = "";
+        self.current_description = "";
+        self.current_type_str = "";
+        self.metadata_written = false;
+    }
+
     /// Write metadata lines if not already written for current metric
     fn maybeWriteMetadata(self: *PolicyStreamingFilter, metric_name: []const u8, writer: *std.Io.Writer) !void {
-        // Only write metadata if it matches the current metric and hasn't been written
-        // For histograms/summaries, sample names have suffixes like _bucket, _sum, _count
-        // so we check if sample name starts with the metadata metric name
-        const matches = self.current_metric_name.len > 0 and
-            std.mem.startsWith(u8, metric_name, self.current_metric_name);
-
-        if (matches and !self.metadata_written) {
+        // Only write metadata if this sample is actually a member of the
+        // stored family and the metadata has not yet been written. The
+        // membership check (rather than a bare prefix test) prevents emitting
+        // a dropped family's HELP/TYPE in front of an unrelated, prefix-
+        // extending sample (e.g. `foo_extra` after a fully-dropped `foo`).
+        // For histograms/summaries, sample names have suffixes like _bucket,
+        // _sum, _count which `belongsToCurrentFamily` recognizes.
+        if (self.belongsToCurrentFamily(metric_name) and !self.metadata_written) {
             if (self.current_help_line.len > 0) {
                 try self.writeLine(self.current_help_line, writer);
                 self.base.lines_kept += 1;
@@ -494,13 +567,20 @@ pub const PolicyStreamingFilter = struct {
 
     /// Evaluate whether to keep a metric sample based on policy
     fn shouldKeepMetric(self: *PolicyStreamingFilter, sample: Sample, line: []const u8) bool {
-        // Build the field context with metadata from HELP/TYPE lines
+        // Only borrow the stored family's description/type for policy
+        // evaluation if this sample is actually a member of that family.
+        // Without the membership guard, a fully-dropped family's stored
+        // description/type would leak into the evaluation of a later, prefix-
+        // extending but unrelated and metadata-less sample (e.g. evaluating
+        // `foo_extra` against `foo`'s "A counter" description), producing
+        // false drops (or, for KEEP policies, false keeps).
+        const is_member = self.belongsToCurrentFamily(sample.metric_name);
         var ctx: PrometheusFieldContext = .{
             .parsed = .{ .sample = sample },
             .line_buffer = line,
             .labels_cache = null,
-            .description = if (self.current_description.len > 0) self.current_description else null,
-            .metric_type = if (self.current_type_str.len > 0) self.current_type_str else null,
+            .description = if (is_member and self.current_description.len > 0) self.current_description else null,
+            .metric_type = if (is_member and self.current_type_str.len > 0) self.current_type_str else null,
         };
 
         // Build labels cache for pattern matching (if needed)
@@ -2503,4 +2583,423 @@ test "FilteringWriter - max_input_bytes limit" {
     // With limit 25, we get 2 complete lines (22 bytes) then stop partway through 3rd
     try std.testing.expect(stats.scrape_truncated);
     try std.testing.expect(stats.bytes_processed <= 25);
+}
+
+// =============================================================================
+// Prefix-collision / stale-metadata regression tests
+// =============================================================================
+// These guard against the bug where a fully-dropped family's stored
+// HELP/TYPE/description/type metadata leaked into a later, metadata-less
+// sample whose metric name merely extended the dropped family's name
+// (e.g. `foo_extra` after a fully-dropped `foo`). The fix uses a type-aware
+// membership predicate (`belongsToCurrentFamily`) instead of a bare prefix
+// test, falls back to `null` description/type for non-members in
+// `shouldKeepMetric`, and invalidates stored metadata on a family boundary.
+
+test "BUG_REPRO_PREFIXCOLLISION_METADATA" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-foo"),
+        .name = try allocator.dupe(u8, "drop-foo"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^foo$") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP foo A counter
+        \\# TYPE foo counter
+        \\foo 1
+        \\foo_extra 2
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // foo is fully dropped; foo_extra is unrelated. No foo metadata should appear.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP foo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE foo") == null);
+}
+
+test "BUG_REPRO_PREFIXCOLLISION_DESC_POLICY" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-desc"),
+        .name = try allocator.dupe(u8, "drop-desc"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_DESCRIPTION },
+        .match = .{ .regex = try allocator.dupe(u8, "A counter") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    // foo has description "A counter"; foo_extra has NO HELP so its description
+    // should be empty and must NOT match the drop policy.
+    const input =
+        \\# HELP foo A counter
+        \\# TYPE foo counter
+        \\foo 1
+        \\foo_extra 2
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // foo_extra should be kept -- it has no description matching "A counter".
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_extra 2") != null);
+}
+
+test "PolicyStreamingFilter - _total is not a histogram/summary suffix: name-DROP" {
+    // In this repo's exposition convention `_total` is part of the family
+    // name (declared via `# TYPE foo_total counter`), not a suffix appended to
+    // a base family. A metadata-less `foo_total` following a fully-dropped
+    // `foo` (counter) must be treated as its own family, not a `foo` suffix
+    // sample, so it must not inherit `foo`'s metadata.
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-foo"),
+        .name = try allocator.dupe(u8, "drop-foo"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^foo$") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP foo A counter
+        \\# TYPE foo counter
+        \\foo 1
+        \\foo_total 2
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo 1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP foo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE foo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "A counter") == null);
+}
+
+test "PolicyStreamingFilter - _total is not a histogram/summary suffix: description-DROP" {
+    // The realistic go_memstats case: a gauge `go_memstats_alloc_bytes` is a
+    // string-prefix of a counter `go_memstats_alloc_bytes_total`. Dropping the
+    // gauge by its description must not also drop the unrelated, metadata-less
+    // `_total` family, nor emit the gauge's HELP/TYPE in front of it.
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-alloc"),
+        .name = try allocator.dupe(u8, "drop-alloc"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_DESCRIPTION },
+        .match = .{ .regex = try allocator.dupe(u8, "Allocated bytes") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP go_memstats_alloc_bytes Allocated bytes
+        \\# TYPE go_memstats_alloc_bytes gauge
+        \\go_memstats_alloc_bytes 1.234e+07
+        \\go_memstats_alloc_bytes_total 9.87654321e+09
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // gauge dropped by description; metadata-less _total counter kept, no leak.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "go_memstats_alloc_bytes 1.234e+07") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "go_memstats_alloc_bytes_total 9.87654321e+09") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP go_memstats_alloc_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE go_memstats_alloc_bytes") == null);
+}
+
+test "PolicyStreamingFilter - histogram metadata emitted when first bucket sample is dropped" {
+    // Regression guard for the type-aware membership predicate: a histogram's
+    // _bucket/_sum/_count samples are members of the family. When the first
+    // bucket sample is policy-dropped but a later one is kept, the stored
+    // HELP/TYPE must still be emitted in front of the first kept sample.
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-le-0.1"),
+        .name = try allocator.dupe(u8, "drop-le-0.1"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .datapoint_attribute = try testMakeAttrPath(allocator, "le") },
+        .match = .{ .exact = try allocator.dupe(u8, "0.1") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [8192]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP http_request_duration_seconds Request duration histogram.
+        \\# TYPE http_request_duration_seconds histogram
+        \\http_request_duration_seconds_bucket{le="0.1"} 10
+        \\http_request_duration_seconds_bucket{le="1"} 50
+        \\http_request_duration_seconds_bucket{le="+Inf"} 100
+        \\http_request_duration_seconds_sum 123.45
+        \\http_request_duration_seconds_count 100
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // The le="0.1" bucket is dropped; the rest of the family is kept, and the
+    // family metadata must be emitted in front of the first kept sample.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP http_request_duration_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE http_request_duration_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "le=\"0.1\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "le=\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "le=\"+Inf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "http_request_duration_seconds_sum 123.45") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "http_request_duration_seconds_count 100") != null);
+    // Metadata must appear exactly once (in front of the first kept sample):
+    // the dropped first bucket must not cause a duplicate or orphan emission.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE http_request_duration_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE http_request_duration_seconds") ==
+        std.mem.lastIndexOf(u8, result.output, "# TYPE http_request_duration_seconds"));
+    // 1 dropped bucket; rest kept.
+    try std.testing.expectEqual(@as(usize, 1), result.stats.lines_dropped);
+}
+
+test "PolicyStreamingFilter - summary metadata emitted when first quantile sample is dropped" {
+    // Regression guard for summaries: the base quantile sample shares the
+    // family name exactly, and _sum/_count are suffix members. Dropping the
+    // first quantile must not prevent metadata emission for the kept samples.
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-q05"),
+        .name = try allocator.dupe(u8, "drop-q05"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .datapoint_attribute = try testMakeAttrPath(allocator, "quantile") },
+        .match = .{ .exact = try allocator.dupe(u8, "0.5") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP rpc_duration_seconds RPC latency distributions.
+        \\# TYPE rpc_duration_seconds summary
+        \\rpc_duration_seconds{quantile="0.5"} 0.000473
+        \\rpc_duration_seconds{quantile="0.9"} 0.00102
+        \\rpc_duration_seconds_sum 17560473
+        \\rpc_duration_seconds_count 2693
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP rpc_duration_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE rpc_duration_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "quantile=\"0.5\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "quantile=\"0.9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "rpc_duration_seconds_sum 17560473") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "rpc_duration_seconds_count 2693") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.stats.lines_dropped);
+}
+
+test "PolicyStreamingFilter - prefix collision: metadata-less family followed by its own metadata is handled" {
+    // A metadata-less family B (foosuffix) that happens to extend a dropped
+    // family A's name must not borrow A's metadata. A subsequent family C
+    // that carries its own metadata must still emit its own metadata
+    // correctly (the invalidation of A must not corrupt C's metadata path).
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-foo"),
+        .name = try allocator.dupe(u8, "drop-foo"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^foo$") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELP foo A counter
+        \\# TYPE foo counter
+        \\foo 1
+        \\foo_extra 2
+        \\# HELP bar A gauge
+        \\# TYPE bar gauge
+        \\bar 3
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // foo is dropped; foo_extra is kept without foo metadata; bar carries its
+    // own metadata and must be emitted correctly in front of its sample.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo 1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "foo_extra 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP foo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE foo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP bar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE bar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "bar 3") != null);
+    // foo_extra and bar kept; foo dropped.
+    try std.testing.expectEqual(@as(usize, 1), result.stats.lines_dropped);
 }
