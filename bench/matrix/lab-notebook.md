@@ -1,4 +1,8 @@
-# Implementation progress
+# Lab notebook
+
+What the fault matrix found, what we changed because of it, and what is still
+open. Kept next to the suite, because every entry here points at a case in
+`tests/`. `README.md` lists the cases; this file records the reasoning.
 
 ## Fault matrix suite for both frontends (`bench/matrix/`)
 

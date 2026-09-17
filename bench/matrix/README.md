@@ -15,6 +15,10 @@ $UV bench/matrix/run.py --frontend stdio -k b05
 `--fast` skips the cases that wait for a 30 s deadline. `--skip-build` reuses
 the binaries already in `zig-out/` and `zig-out-stdio/`.
 
+`task test:matrix` (aliases `tm`, `matrix`) and `task test:matrix:fast` (`tmf`)
+run the same thing through hermit. `lab-notebook.md` records what the suite
+found and what we changed because of it.
+
 ## How a case is written
 
 One case per file, one class per case, inheriting `MatrixCase`:
