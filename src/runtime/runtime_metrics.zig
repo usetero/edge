@@ -206,6 +206,14 @@ const InternalMetrics = struct {
     edge_policy_records_kept_total: PolicyRecordsKeptTotal,
     edge_policy_records_dropped_total: PolicyRecordsDroppedTotal,
     edge_policies_loaded: PoliciesLoaded,
+    /// Policies present in the snapshot whose pattern the matcher refused.
+    /// They evaluate nothing, so a non-zero value means a rule an operator
+    /// believes is live is doing nothing at all.
+    edge_policies_rejected: m.Gauge(i64) = .init(
+        "edge_policies_rejected",
+        .{ .help = "Loaded policies the matcher could not compile." },
+        .{},
+    ),
     edge_build_info: BuildInfo,
 
     // s3-dump extension flush stats (aggregate across targets; the FlushResult
@@ -567,6 +575,10 @@ pub const RuntimeMetrics = struct {
     pub fn setPoliciesLoaded(self: *RuntimeMetrics, signal: SignalLabel, count: u64) void {
         self.internal.edge_policies_loaded.set(.{ .signal = signal }, count) catch |err|
             log.warn("failed to set policies loaded metric: {}", .{err});
+    }
+
+    pub fn setPoliciesRejected(self: *RuntimeMetrics, count: usize) void {
+        self.internal.edge_policies_rejected.set(@intCast(count));
     }
 
     pub fn setBuildInfo(self: *RuntimeMetrics, version: []const u8, commit: []const u8) void {

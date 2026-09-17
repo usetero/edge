@@ -55,6 +55,10 @@ pub const TapState = tap_mod.TapState;
 /// Shared, read-only state for every connection, regardless of frontend.
 /// Frontend-specific state (the stdio conn slab and arena pool) lives in the
 /// frontend's own server struct, NOT here — see PLAN-FRONTEND-SWAP.md §2.
+/// Policies in the snapshot that the matcher refused to compile. Named type,
+/// so the event carries the name `policies.rejected`.
+const PoliciesRejected = struct { count: usize };
+
 pub const SharedCtx = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -71,6 +75,9 @@ pub const SharedCtx = struct {
     /// Extension dispatch sink (s3-dump), or null when extensions are off.
     /// Threaded into per-record policy evaluation on the Datadog log path.
     extension_sink: ?policy.ExtensionSink = null,
+    /// Last reported count of policies the matcher refused, so the warning
+    /// fires on a change rather than on every scrape.
+    rejected_policies: std.atomic.Value(u32) = .init(0),
 };
 
 /// Routes and plans a request from transport-neutral parts. Returns null
@@ -228,6 +235,45 @@ pub fn refreshPolicyGauge(ctx: *SharedCtx) void {
     metrics.setPoliciesLoaded(.log, if (snapshot) |s| @intCast(s.getLogTargetIndices().len) else 0);
     metrics.setPoliciesLoaded(.metric, if (snapshot) |s| @intCast(s.getMetricTargetIndices().len) else 0);
     metrics.setPoliciesLoaded(.trace, if (snapshot) |s| @intCast(s.trace_target_indices.len) else 0);
+
+    // A policy whose pattern the engine refused is in the snapshot and does
+    // nothing. Without this it reads as a live rule: the loader counts it as
+    // loaded, and the debug endpoint lists it as enabled.
+    const rejected = rejectedPolicyCount(ctx);
+    metrics.setPoliciesRejected(rejected);
+    const previous = ctx.rejected_policies.swap(@intCast(rejected), .monotonic);
+    if (rejected > 0 and previous != @as(u32, @intCast(rejected))) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.warn(PoliciesRejected{ .count = rejected });
+    }
+}
+
+/// Policies the matcher could not compile. `collectStats` copies into the
+/// arena, so this pays one small allocation per scrape and frees it here.
+pub fn rejectedPolicyCount(ctx: *SharedCtx) usize {
+    var arena = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena.deinit();
+    const stats = ctx.registry.collectStats(arena.allocator()) catch return 0;
+    var count: usize = 0;
+    for (stats) |entry| {
+        if (entry.errors.len > 0) count += 1;
+    }
+    return count;
+}
+
+/// Names the policies the matcher refused, with the reason, at the top of the
+/// dump. A rule that cannot compile is in the snapshot and evaluates nothing,
+/// so listing it as enabled without this is misleading.
+fn writeRejectedPolicies(registry: *policy.Registry, w: *std.Io.Writer) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const stats = registry.collectStats(arena.allocator()) catch return;
+    for (stats) |entry| {
+        if (entry.errors.len == 0) continue;
+        for (entry.errors) |message| {
+            try w.print("# REJECTED id={s}: {s}\n", .{ entry.id, message });
+        }
+    }
 }
 
 /// Dump the loaded policies in the active snapshot, for the `/_edge/policies`
@@ -249,6 +295,7 @@ pub fn writePolicies(registry: *policy.Registry, w: *std.Io.Writer, json: bool) 
         try w.writeAll("# no policy snapshot loaded (0 policies)\n");
         return;
     };
+    try writeRejectedPolicies(registry, w);
     try w.print("# snapshot version={d} policies={d} (log={d} metric={d} trace={d})\n", .{
         s.version,
         s.policies.len,

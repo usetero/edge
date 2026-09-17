@@ -9,7 +9,6 @@ from harness import MatrixCase
 
 class BodilessStatus(MatrixCase):
     ALLOW_PHANTOM_SUCCESS = True
-    DEFECTS = {"stdio": "re-frames a bodiless 204 as chunked, which some clients reject"}
 
     def test_a_204_stays_bodiless(self):
         self.intake.arm("bodiless", count=1)

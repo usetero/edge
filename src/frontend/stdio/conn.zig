@@ -83,10 +83,29 @@ pub const Sink = struct {
     /// consumed before `begin`, so its slab region is reused here.
     buffer: []u8,
     body: ?std.http.BodyWriter = null,
+    /// Sink for a bodiless status, which is answered before the relay runs.
+    discard: std.Io.Writer.Discarding = .init(&.{}),
     status: u16 = 0,
+
+    /// 204 and 304 carry no body, and 1xx is interim. Streaming them frames
+    /// a chunked body onto a status that must not have one, which some
+    /// clients reject outright.
+    fn isBodiless(status: u16) bool {
+        return status == 204 or status == 304 or (status >= 100 and status < 200);
+    }
 
     pub fn begin(self: *Sink, status: u16, headers: []const std.http.Header) !*std.Io.Writer {
         self.status = status;
+        if (isBodiless(status)) {
+            try self.request.respond("", .{
+                .status = @enumFromInt(status),
+                .extra_headers = headers,
+            });
+            // Nothing to write, and `end` has nothing to finish. The relay
+            // still writes into this, so hand it a discard.
+            self.discard = .init(&.{});
+            return &self.discard.writer;
+        }
         self.body = try self.request.respondStreaming(self.buffer, .{
             .respond_options = .{ .status = @enumFromInt(status), .extra_headers = headers },
         });

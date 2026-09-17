@@ -38,16 +38,13 @@ class RejectedPatternIsVisible(MatrixCase):
 
     Hyperscan refuses a pattern that can match an empty buffer, so `.*` is
     invalid and `.+` or `^.*$` is the way to say "everything". That part is
-    correct. What is not correct is what an operator sees: the matcher builds
-    nothing (`matcher.index.build.completed ... policy_count=0`), while the
-    loader reports `loaded_count=1 failed_count=0` and `/_edge/policies` lists
-    the policy as enabled. A rule that silently does nothing looks live.
+    correct. What was wrong is what an operator saw: the matcher built nothing
+    while the snapshot listed the policy as enabled, so a rule that does
+    nothing looked live. The rejection is now named in three places.
     """
 
-    DEFECTS = {
-        "stdio": "a rejected pattern still reports loaded_count=1, failed_count=0 and enabled",
-        "httpz": "a rejected pattern still reports loaded_count=1, failed_count=0 and enabled",
-    }
+    # The rejection is settled before the case body runs, so these are
+    # absolute checks rather than deltas.
     ALLOW_PHANTOM_SUCCESS = True
     EDGE_POLICIES = {
         "policies": [
@@ -59,18 +56,26 @@ class RejectedPatternIsVisible(MatrixCase):
         ]
     }
 
-    def test_a_pattern_the_engine_rejects_is_reported(self):
+    def test_a_pattern_the_engine_rejects_is_named(self):
         import requests
 
-        logs = self.edge.logs()
+        # The scrape is what refreshes the gauge and emits the warning.
+        self.edge.metrics()
         snapshot = requests.get(self.edge.url + "/_edge/policies", timeout=10).text
-
-        built_nothing = "policy_count=0" in logs
-        self.assertTrue(built_nothing, "the pattern compiled after all; update this case")
-
-        reported = ("failed_count=0" not in logs) or ("enabled=true" not in snapshot)
-        self.assertTrue(
-            reported,
-            "the matcher built nothing, yet the loader reports failed_count=0 "
-            "and the snapshot lists the policy as enabled:\n%s" % snapshot,
+        self.assertIn("REJECTED", snapshot, "the dump does not name the rejected policy")
+        self.assertIn("drop-all-star", snapshot)
+        self.assertIn(
+            "invalid regex",
+            snapshot,
+            "the dump names the policy but not the reason:\n%s" % snapshot,
+        )
+        self.assertGreaterEqual(
+            self.edge.metric("edge_policies_rejected"),
+            1,
+            "the rejected policy is not counted",
+        )
+        self.assertIn(
+            "policies.rejected",
+            self.edge.logs(),
+            "nothing warned that a policy was refused",
         )

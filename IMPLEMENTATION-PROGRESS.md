@@ -229,6 +229,20 @@ request target in `/stats`.
 - **b16 is stdio only.** httpz keeps a 204 bodiless; stdio re-frames it as
   chunked.
 
+## Latest round: the two defects that were ours
+
+- **A rejected pattern is now named.** policy-zig already recorded the reason;
+  the edge never read it. `/_edge/policies` leads with
+  `# REJECTED id=<policy>: log: match[0]: invalid regex ".*"`, the gauge
+  `edge_policies_rejected` counts them, and `policies.rejected` warns when the
+  count changes. A rule that cannot compile no longer reads as live. (a41)
+- **stdio keeps a bodiless status bodiless.** 204, 304 and 1xx answer directly
+  instead of opening a streamed body, so the relay no longer frames a chunked
+  body onto a status that must not have one. (b16)
+
+Everything else on the ledger needs a change in `std`, in httpz, or a product
+decision about the streaming threshold.
+
 ## Findings
 
 ### Fixed
