@@ -142,10 +142,23 @@ pub const ProxyConfig = struct {
 
     /// Post-load validation hook (called by zonfig).
     pub fn validate(self: *ProxyConfig) !void {
-        if (self.max_connections == 0 or self.max_connections > std.math.maxInt(u16) or
+        if (self.max_connections == 0 or
             self.max_body_size == 0 or (self.max_decoded_bytes orelse 1) == 0 or
             (self.worker_count orelse 1) == 0 or (self.thread_pool_count orelse 1) == 0)
             return error.InvalidLimits;
+        // The connection slab and arena pool assert 0 < max_connections <
+        // 65535 (conn_slab.zig, arena_pool.zig): their free-list slot indexes
+        // are u16, so 65535 fails the strict upper bound. The stdio frontend
+        // instantiates both, and under the shipped ReleaseSafe build a failed
+        // std.debug.assert hard-aborts instead of producing a clean config
+        // error. Mirror LambdaConfig.validate's [1,65534] clamp so an
+        // over-large override degrades (a running server at 65534 + a warning)
+        // rather than panicking the stdio frontend at startup.
+        const clamped = std.math.clamp(self.max_connections, 1, 65534);
+        if (clamped != self.max_connections) {
+            log.warn("max_connections={d} out of range [1,65534]; clamping to {d}", .{ self.max_connections, clamped });
+            self.max_connections = clamped;
+        }
         try self.s3_dump.validate();
     }
 };
@@ -169,16 +182,31 @@ test "ProxyConfig.validate rejects zero s3_dump knobs when enabled" {
 }
 
 test "ProxyConfig.validate rejects invalid data-plane limits" {
+    // 0 connections is degenerate (no data plane) and stays a hard reject.
     var zero_connections: ProxyConfig = .{ .max_connections = 0 };
     try std.testing.expectError(error.InvalidLimits, zero_connections.validate());
-    var too_many_connections: ProxyConfig = .{ .max_connections = std.math.maxInt(u16) + 1 };
-    try std.testing.expectError(error.InvalidLimits, too_many_connections.validate());
     var zero_body: ProxyConfig = .{ .max_body_size = 0 };
     try std.testing.expectError(error.InvalidLimits, zero_body.validate());
     var zero_decoded: ProxyConfig = .{ .max_decoded_bytes = 0 };
     try std.testing.expectError(error.InvalidLimits, zero_decoded.validate());
     var zero_workers: ProxyConfig = .{ .worker_count = 0 };
     try std.testing.expectError(error.InvalidLimits, zero_workers.validate());
+}
+
+test "ProxyConfig.validate clamps max_connections into the slab/arena range" {
+    // 65534 — the slab/arena strict upper bound (assert max_connections <
+    // 65535) — is admissible and passes through unchanged.
+    var at_bound: ProxyConfig = .{ .max_connections = std.math.maxInt(u16) - 1 };
+    try at_bound.validate();
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u16) - 1), at_bound.max_connections);
+
+    // 65535 — the off-by-one window e75cfca admitted (it only rejected
+    // > 65535, so 65535 passed validate and panicked ConnSlab.init) — is now
+    // clamped to 65534. The prior test pinned maxInt(u16)+1 (65536) and never
+    // exercised this boundary, which is how the bug slipped in.
+    var over_by_one: ProxyConfig = .{ .max_connections = std.math.maxInt(u16) };
+    try over_by_one.validate();
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u16) - 1), over_by_one.max_connections);
 }
 
 test "s3_dump targets_json parses into S3TargetConfig (Lambda env-only path)" {
