@@ -10,10 +10,15 @@ own intake is `std.http.Server` based and refuses the head for the same reason
 stdio does.
 
 stdio cannot accept the request at all. `std.http.Server` maps
-`content-encoding` through `ContentEncoding.fromString`, and anything outside
-its five known values fails the whole head with `HttpHeadersInvalid`. There is
-no distinct error, so we cannot tell an unknown encoding from a malformed
-head, and the sender gets 400. An agent using brotli would retry it forever.
+`content-encoding` through `ContentEncoding.fromString` (std/http.zig:283) and
+`Request.Head.parse` fails the whole head for anything outside its table
+(std/http/Server.zig:164), so the sender gets 400 and the agent discards the
+batch for good.
+
+The cause is distinct: `Head.parse` returns `HttpTransferEncodingUnsupported`.
+`Server.receiveHead` flattens it to `HttpHeadersInvalid` on one line
+(std/http/Server.zig:53), which is why the frontend has to re-parse the head
+bytes to learn what really happened.
 """
 
 from harness import MatrixCase

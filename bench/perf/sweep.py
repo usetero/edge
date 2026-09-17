@@ -50,8 +50,10 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "bench", "matrix"))
 
 from harness import Edge, EchoIntake  # noqa: E402
 
+#: The prefixes `bench/matrix/run.py` builds into. Each one is built with its
+#: frontend named, so neither depends on which frontend is the default.
 BINARIES = {
-    "httpz": os.path.join(REPO_ROOT, "zig-out", "bin", "edge"),
+    "httpz": os.path.join(REPO_ROOT, "zig-out-httpz", "bin", "edge"),
     "stdio": os.path.join(REPO_ROOT, "zig-out-stdio", "bin", "edge"),
 }
 
@@ -198,7 +200,7 @@ def measure(frontend: str, settings: dict, seconds: int) -> dict:
     edge = Edge(intake.url, config)
     running = edge.frontend()
     if running is not None and running != frontend:
-        raise SystemExit("%s carries the %s frontend; rebuild with --prefix" % (BINARIES[frontend], running))
+        raise SystemExit("%s carries the %s frontend; rebuild with -Dfrontend and --prefix" % (BINARIES[frontend], running))
     try:
         rss = {"peak": 0.0}
         watcher = threading.Thread(

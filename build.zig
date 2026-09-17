@@ -18,14 +18,19 @@ pub fn build(b: *std.Build) void {
     const profiling = b.option(bool, "profiling", "Keep frame pointers and symbols for profilers") orelse false;
     const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
     const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
-    // httpz is the default until std.Io has an evented implementation that
-    // serves sockets (PLAN-FRONTEND-SWAP.md §6 swap-back criteria). CI must
-    // keep building both.
+    // stdio is the default. httpz hands a batch of up to 16 requests to one
+    // pool thread, so one slow intake response parks the rest of that batch,
+    // and a health probe behind them times out — the ECS incident this suite
+    // reproduces (bench/matrix: c02, c05). stdio runs a task per connection,
+    // and measures 2 to 2.8 times the throughput of httpz once the intake is
+    // slow, with a p99.9 within 50 ms of its p50 instead of ten times it.
+    // httpz stays buildable and tested: bench/matrix runs every case against
+    // both.
     const frontend = b.option(
         Frontend,
         "frontend",
-        "Inbound HTTP frontend (httpz = event loop + worker pool, stdio = std.Io-native)",
-    ) orelse .httpz;
+        "Inbound HTTP frontend (stdio = std.Io-native, httpz = event loop + worker pool)",
+    ) orelse .stdio;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);

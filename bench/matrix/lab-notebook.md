@@ -267,6 +267,56 @@ So the header is the whole improvement. A sender that honours `Retry-After`
 waits the stated interval instead of retrying at once. `SHED_RETRY_AFTER_SECONDS`
 sets both the header and the fixed shed response, so the two cannot disagree.
 
+## The default frontend is stdio
+
+`-Dfrontend` now defaults to `stdio`, so the release binaries and the container
+image carry it. httpz stays buildable, and every case in this suite still runs
+against both.
+
+The reason is the incident this suite was written for. httpz hands a batch of
+up to 16 requests to one pool thread, so one slow intake response parks the
+rest of that batch, and a health probe behind them times out (c02, c05).
+stdio runs a task per connection and answers the probe (c05 passes on stdio,
+and reproduces as a declared defect on httpz).
+
+A sweep on the Mac Studio, 12 s per row, both frontends, `bench/perf/sweep.py`:
+
+| intake | httpz rps | stdio rps | httpz p99.9 | stdio p99.9 |
+| ------ | --------- | --------- | ----------- | ----------- |
+| immediate | 87,733 | 87,344 | 1.9 ms | 1.0 ms |
+| slow, stage 1 | 741 | 2,089 | 469.6 ms | 50.6 ms |
+| slow, stage 2 | 183 | 444 | 2083.1 ms | 203.4 ms |
+| slow, stage 3 | 105 | 221 | 4600.7 ms | 351.8 ms |
+
+Read the stages as "the intake gets slower", not as a number: the host
+stretches short sleeps, so the axis label understates the real delay. Both
+frontends met the same intake. Throughput with an immediate intake is equal,
+stdio serves 2 to 2.8 times as many requests once the intake is slow, and its
+p99.9 stays within 50 ms of its own p50 while httpz's runs to ten times its
+p50. The `threads` and `maxconn` axes are flat for both.
+
+### What the swap costs
+
+Three things get worse, and none is hidden:
+
+1. **An encoding stdio cannot name is refused with 400.** `std.http.Server`
+   maps `content-encoding` through a five-value enum and fails the whole head
+   for anything else, so brotli is dropped rather than forwarded raw (a10), and
+   an uppercase `GZIP` is dropped although RFC 9110 §8.4.1 makes codings
+   case-insensitive (a34). 400 is one of the four statuses the Datadog agent
+   treats as permanent, so this is lost data, not a retry. httpz forwards both.
+   These are the two defects to fix before a customer meets them.
+2. **An invalid chunk waits for the request deadline** instead of a fast 400
+   (a07). The sender still gets an answer, just late.
+3. **Memory grows with the connection count.** `Io.Threaded` gives each
+   connection a task, so 256 concurrent senders cost 229 MB against httpz's
+   129 MB. Below 64 connections stdio is the cheaper of the two (21 MB at 16
+   connections, 65 MB at 64), and it does not grow with `thread_pool_count`,
+   which httpz does: 20.7 MB at 8 threads against 119.9 MB at 128.
+
+httpz keeps five declared defects of its own (a02, a03, a12, c02, c05), so the
+swap trades four std-shaped problems for those.
+
 ## Findings
 
 ### Fixed

@@ -13,8 +13,10 @@
 .zig-cache-global/
 *.pyc
 zig-out/
-# The stdio frontend builds to its own prefix for the frontend comparison.
+# Each frontend builds to its own prefix, so the fault matrix never depends on
+# which one is the default.
 zig-out-stdio/
+zig-out-httpz/
 zig-pkg/
 /release/
 /debug/
