@@ -320,8 +320,8 @@ pub const ServerContext = struct {
             if (!first) try writer.writeAll(",");
             first = false;
 
-            try writer.print("\"{s}\":{{\"requests\":{d},\"bytes\":{d}}}", .{
-                entry.key_ptr.*,
+            try writer.print("\"{f}\":{{\"requests\":{d},\"bytes\":{d}}}", .{
+                jsonString(entry.key_ptr.*),
                 entry.value_ptr.requests.load(.monotonic),
                 entry.value_ptr.bytes.load(.monotonic),
             });
@@ -333,8 +333,10 @@ pub const ServerContext = struct {
         self.fault_mutex.lockUncancelable(self.io);
         defer self.fault_mutex.unlock(self.io);
 
-        try writer.print("}},\"last_target\":\"{s}\",", .{self.last_target[0..self.last_target_len]});
-        try writer.print("\"last_content_encoding\":\"{s}\",", .{self.last_encoding[0..self.last_encoding_len]});
+        try writer.print("}},\"last_target\":\"{f}\",", .{jsonString(self.last_target[0..self.last_target_len])});
+        try writer.print("\"last_content_encoding\":\"{f}\",", .{
+            jsonString(self.last_encoding[0..self.last_encoding_len]),
+        });
         try writer.print("\"total_requests\":{d},\"total_bytes\":{d}," ++
             "\"capture_enabled\":{},\"captured_count\":{d}," ++
             "\"fault\":\"{s}\",\"fault_arg\":{d},\"fault_applied\":{d}}}", .{
@@ -696,6 +698,44 @@ fn serveConnection(ctx: *ServerContext, gpa: std.mem.Allocator, stream: std.Io.n
         handleRequest(ctx, &request, gpa, stream, sent_encoding) catch return;
         _ = head_arena.reset(.retain_capacity);
     }
+}
+
+/// A request target arrives from the wire, so it can hold any byte. Printed
+/// raw it breaks the JSON of `/stats`, and `jq` then refuses the whole
+/// document: one odd request hides every number in it. A control character is
+/// escaped as `\uXXXX`, which is also how the odd target stays readable.
+fn jsonString(bytes: []const u8) JsonString {
+    return .{ .bytes = bytes };
+}
+
+pub const JsonString = struct {
+    bytes: []const u8,
+
+    pub fn format(self: JsonString, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (self.bytes) |c| switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => try writer.print("\\u{x:0>4}", .{c}),
+            else => try writer.writeByte(c),
+        };
+    }
+};
+
+test "stats strings survive a target from the wire" {
+    var buf: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    // A quote, a backslash and two control bytes: `std.http.Server` accepts
+    // all four in a target, and a raw print makes `/stats` unparseable.
+    try writer.print("{f}", .{jsonString("/a\"b\\c\x01\x1f")});
+    try std.testing.expectEqualStrings("/a\\\"b\\\\c\\u0001\\u001f", writer.buffered());
+
+    var plain: [32]u8 = undefined;
+    var plain_writer = std.Io.Writer.fixed(&plain);
+    try plain_writer.print("{f}", .{jsonString("/api/v2/logs")});
+    try std.testing.expectEqualStrings("/api/v2/logs", plain_writer.buffered());
 }
 
 /// The request's `content-encoding`, read from the head bytes rather than the

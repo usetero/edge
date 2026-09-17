@@ -70,13 +70,21 @@ pub const ArenaPool = struct {
         }
     }
 
+    /// The largest over-reserve capacity already reported. The condition is a
+    /// property of the deployment's cold paths, not of one request, so a line
+    /// per release buries the log: one benchmark produced 19,306 copies of it.
+    /// A high-water mark instead of a flag, because a worse leak later still
+    /// deserves its line, and an arena grows geometrically, so the lines stay
+    /// few. Static, so it counts once for the process rather than per pool.
+    var reported_capacity: std.atomic.Value(usize) = .init(0);
+
     /// Reset-don't-free: retained capacity makes steady-state claims
     /// allocation-free. A connection that out-grows the reserve is a cold-path
     /// budget leak — warn so it shows up in logs before it shows up in RSS.
     pub fn release(self: *ArenaPool, io: std.Io, slot: u16) void {
         std.debug.assert(slot < self.arenas.len);
         const capacity = self.arenas[slot].queryCapacity();
-        if (capacity > self.reserve) {
+        if (capacity > self.reserve and reported_capacity.fetchMax(capacity, .monotonic) < capacity) {
             log.warn("conn arena grew to {d} bytes (reserve {d}); check cold paths", .{
                 capacity, self.reserve,
             });

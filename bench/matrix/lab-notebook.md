@@ -450,6 +450,53 @@ are compiled out (`conn_metrics_enabled`). That is left as it is: stdio is the
 default, and the comment that claimed httpz exports its own connection series
 through `endpoints.zig` was wrong, because no such series exists.
 
+## What the scaling benchmark taught us
+
+A run of `bench/scaling/run.sh` on the Mac Studio reported 99% success while
+the edge answered 49,889 of 49,927 requests with a 5xx. Four causes, none of
+them the frontend swap: the same shape passes on both frontends locally, and
+the same command on that host with clean ports and a raised descriptor limit
+was 100% on every scenario.
+
+1. **The benchmark asked for `log_level: err`,** so every warning was thrown
+   away. The edge reset the bus level from the config right after loading it,
+   which is why those logs held exactly two lines. It asks for `warn` now.
+2. **The benchmark never read the counters.** `edge_requests_total`,
+   `edge_responses_total`, `edge_connections_shed_total` and the rest answer
+   "where did the missing requests go" directly, and a `kill -9` took them
+   with it. The script now scrapes `/_edge/metrics` before it stops each edge,
+   saves it under `debug/`, and prints one line naming what became of the
+   requests the intake never saw.
+3. **Two processes shared a port.** `reuse_address` sets SO_REUSEADDR *and*
+   SO_REUSEPORT (std/Io/net.zig:229), so a second edge binds the same port
+   happily, and macOS hands new connections to the newest listener. Proved
+   with two processes on one port: the newest served 600 of 600, the older
+   none. The script slept 0.3 s after SIGTERM and never checked the port, so a
+   slow shutdown or a leftover process from an earlier run split the traffic:
+   one scenario reported 70,757 requests for 50,000 sent, and a scrape
+   labelled `v1_logs` for a traces run. It now clears the fixed ports, waits
+   for the previous process to exit, and refuses to start a second listener.
+4. **`ulimit -n`.** macOS defaults to 256 descriptors, which cannot hold 256
+   inbound connections plus an upstream pool. The script raises it to 8192.
+
+Two of our own problems surfaced with it:
+
+* `arena_pool` warned once per release, 19,306 times in one run, that the
+  connection arena had grown past its reserve. It now warns on a new
+  high-water mark, so a repeat is silent and a worse leak still gets a line.
+  Worth noting on its own: the Datadog metrics path does exceed the 16 KiB
+  reserve.
+* The echo server printed `/stats` strings raw, so one request with control
+  bytes in its target made the whole document unparseable and hid every number
+  in it. `std.http.Server` accepts such a target, and the edge forwards it.
+  The strings are escaped now, and `src/bench` finally has a test artifact in
+  `build.zig`: its tests never ran, because it is outside the `src` package.
+
+The payload generator also needed `bench/scaling/proto_gen`, which is
+gitignored, so a fresh checkout could not run the benchmark at all. It now
+takes the published `opentelemetry-proto` package through uv, and hermit's zig
+and python by path, so nothing depends on an activated shell.
+
 ## Findings
 
 ### Fixed

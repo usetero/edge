@@ -219,6 +219,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    // The echo server is its own module (src/bench is outside the src
+    // package), so its tests need their own artifact or they never run. The
+    // matrix trusts this binary to behave like an intake, which makes its
+    // parsing and its `/stats` output worth a check.
+    const echo_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/echo_server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    echo_tests.root_module.addImport("head_repair", b.createModule(.{
+        .root_source_file = b.path("src/frontend/stdio/head_repair.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    test_step.dependOn(&b.addRunArtifact(echo_tests).step);
+
     // Real-storage smoke test for the s3-dump extension, filtered to the MinIO
     // e2e test. Excluded from `test` (it needs a live backend); driven by
     // `task test:s3-e2e`, which starts MinIO, creates the bucket, and sets the
