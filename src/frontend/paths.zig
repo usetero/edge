@@ -39,6 +39,12 @@ pub const InboundBody = union(enum) {
     /// Still on the client socket. `len` is the declared Content-Length,
     /// already checked against max_body_size by the frontend.
     lazy: struct { reader: *std.Io.Reader, len: usize },
+    /// Still on the client socket with no declared length (chunked). The
+    /// frontend stamped `max_bytes` (its `max_body_size`) so the cap is
+    /// enforced during the pump. `forward_raw` streams this socket->upstream
+    /// with no body-sized buffering; the policy paths drain it resident via
+    /// `residentBody` (they read the body twice). Never replayable.
+    streamed: struct { reader: *std.Io.Reader, max_bytes: usize },
 };
 
 fn bufferLazyBody(reader: *std.Io.Reader, dst: []u8, len: usize) ![]const u8 {
@@ -53,7 +59,9 @@ fn bufferLazyBody(reader: *std.Io.Reader, dst: []u8, len: usize) ![]const u8 {
 }
 
 /// Forward an inbound body as-is: buffered bytes go with the route's replay
-/// policy; a lazy body streams socket to socket and cannot be replayed.
+/// policy; a lazy or streamed body streams socket to socket and cannot be
+/// replayed (a chunked body is forwarded upstream as chunked, preserving its
+/// unknown-length framing instead of buffering it resident).
 fn forwardInbound(
     ctx: *exec.SharedCtx,
     in: Inbound,
@@ -68,11 +76,18 @@ fn forwardInbound(
             const body: BodySource = .{ .stream = .{ .reader = l.reader, .len = l.len } };
             return exchange.exchange(ctx, in, sink, upstream, body, false);
         },
+        .streamed => |s| {
+            const body: BodySource = .{ .chunked = .{ .reader = s.reader, .max_bytes = s.max_bytes } };
+            return exchange.exchange(ctx, in, sink, upstream, body, false);
+        },
     }
 }
 
 /// Drain a lazy body into this thread's body buffer; the policy paths read
-/// the body twice (probe, then encode), so it must be resident.
+/// the body twice (probe, then encode), so it must be resident. A streamed
+/// (chunked) body has no length to pre-check, so it is drained here through
+/// the bounded pump instead of being captured arena-resident by the
+/// frontend — keeping body-sized retention per thread, not per connection.
 fn residentBody(ctx: *exec.SharedCtx, inbound: InboundBody) ![]const u8 {
     return switch (inbound) {
         .bytes => |b| b,
@@ -80,6 +95,13 @@ fn residentBody(ctx: *exec.SharedCtx, inbound: InboundBody) ![]const u8 {
             const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
             const dst = try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size);
             break :blk try bufferLazyBody(l.reader, dst, l.len);
+        },
+        .streamed => |s| blk: {
+            const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
+            const dst = try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size);
+            var fixed: std.Io.Writer = .fixed(dst);
+            const n = try pipeline_mod.streamReaderToWriter(s.reader, &fixed, s.max_bytes);
+            break :blk dst[0..n];
         },
     };
 }
