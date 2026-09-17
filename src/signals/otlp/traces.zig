@@ -383,6 +383,13 @@ fn mergeOtTracestate(allocator: std.mem.Allocator, tracestate: []const u8, th_va
     var other_vendors: std.ArrayList(u8) = .empty;
     defer other_vendors.deinit(allocator);
 
+    // The W3C Trace Context spec (section 3.3.1.1/3.3.1.2) caps a `tracestate`
+    // list at 32 list-members. The `ot=...` member we always emit counts as 1,
+    // so at most 31 other-vendor members may be carried through. Non-th `ot=`
+    // sub-keys (rv:, p:, ...) live inside the single `ot=` member and do not
+    // add list-members, so they are preserved without counting against the cap.
+    var entry_count: usize = 1;
+
     if (tracestate.len > 0) {
         var vendors = std.mem.splitScalar(u8, tracestate, ',');
         while (vendors.next()) |vendor_raw| {
@@ -400,8 +407,12 @@ fn mergeOtTracestate(allocator: std.mem.Allocator, tracestate: []const u8, th_va
                     try ot_parts.appendSlice(allocator, part);
                 }
             } else {
+                // Enforce the W3C 32-member cap, dropping the least-recent
+                // (rightmost) vendor entries once it is reached.
+                if (entry_count >= 32) break;
                 if (other_vendors.items.len > 0) try other_vendors.appendSlice(allocator, ",");
                 try other_vendors.appendSlice(allocator, vendor);
+                entry_count += 1;
             }
         }
     }
@@ -814,6 +825,87 @@ test "mergeOtTracestate - ot entry with only th" {
     );
 }
 
+// =============================================================================
+// mergeOtTracestate W3C 32-member limit (see bug in full_report)
+// =============================================================================
+
+// Build a `count`-member vendor-only tracestate ("v0=x,v1=x,...") into `buf`.
+fn buildVendorTracestate(buf: []u8, count: usize) ![]const u8 {
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (pos > 0) {
+            buf[pos] = ',';
+            pos += 1;
+        }
+        const tag = try std.fmt.bufPrint(buf[pos..], "v{d}=x", .{i});
+        pos += tag.len;
+    }
+    return buf[0..pos];
+}
+
+// Count W3C tracestate list-members (comma-separated). Empty == 0.
+fn listMemberCount(tracestate: []const u8) usize {
+    if (tracestate.len == 0) return 0;
+    return std.mem.count(u8, tracestate, ",") + 1;
+}
+
+// A W3C-compliant 32-member vendor-only tracestate (the maximum allowed by
+// section 3.3.1.1/3.3.1.2) must NOT grow to 33 members after the `ot=th:` member
+// is prepended. The least-recent (rightmost) vendor is dropped to stay at 32.
+test "mergeOtTracestate - 32 vendors capped at W3C 32-member limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ts_buf: [4096]u8 = undefined;
+    const trace_state = try buildVendorTracestate(&ts_buf, 32);
+    try std.testing.expectEqual(@as(usize, 32), listMemberCount(trace_state));
+
+    const out = try mergeOtTracestate(arena.allocator(), trace_state, "0");
+    try std.testing.expectEqual(@as(usize, 32), listMemberCount(out));
+    try std.testing.expect(std.mem.startsWith(u8, out, "ot=th:0,"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "v0=x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "v30=x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "v31=x") == null);
+}
+
+// The W3C boundary at exactly 31 other vendors: ot= + 31 = 32 members, all
+// preserved (no truncation because the cap is reached only by the next append).
+test "mergeOtTracestate - 31 vendors stays within cap, all preserved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ts_buf: [4096]u8 = undefined;
+    const trace_state = try buildVendorTracestate(&ts_buf, 31);
+
+    const out = try mergeOtTracestate(arena.allocator(), trace_state, "0");
+    try std.testing.expectEqual(@as(usize, 32), listMemberCount(out));
+    try std.testing.expect(std.mem.startsWith(u8, out, "ot=th:0,"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "v0=x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "v30=x") != null);
+}
+
+// The cap must NOT wholesale-drop `ot=` sub-keys (unlike the vendored helper):
+// an `ot=` entry with a non-th sub-key (rv:) plus an over-long vendor list keeps
+// the rv: sub-key while still clamping the total to 32 members.
+test "mergeOtTracestate - ot sub-keys preserved when vendor cap reached" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ts_buf: [4096]u8 = undefined;
+    const vendors = try buildVendorTracestate(&ts_buf, 32); // over the cap once ot= counts
+    var ts_full_buf: [8192]u8 = undefined;
+    const trace_state = try std.fmt.bufPrint(&ts_full_buf, "ot=rv:abc,{s}", .{vendors});
+    try std.testing.expectEqual(@as(usize, 33), listMemberCount(trace_state));
+
+    const out = try mergeOtTracestate(arena.allocator(), trace_state, "8");
+    try std.testing.expectEqual(@as(usize, 32), listMemberCount(out));
+    // rv: survived (NOT wholesale-dropped like the vendored helper would do).
+    try std.testing.expect(std.mem.indexOf(u8, out, "ot=rv:abc;th:8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "v30=x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "v31=x") == null);
+}
+
 test "processTraces - parses and re-serializes JSON" {
     const allocator = std.testing.allocator;
 
@@ -968,4 +1060,83 @@ test "processTraces - unknown content type returns unchanged" {
     defer allocator.free(result.data);
 
     try std.testing.expectEqualStrings(data, result.data);
+}
+
+// =============================================================================
+// processTracesStream: tracestate writeback W3C 32-member limit (E2E)
+// =============================================================================
+
+// Drives a W3C-compliant 32-member vendor-only `traceState` through the full
+// public path (JSON decode -> filterSpansInPlace -> engine.evaluate -> sample
+// -> traceSet -> mergeOtTracestate -> JSON re-encode) under a 100%-keep
+// probabilistic trace policy, which still triggers writeback (threshold "0").
+// Before the fix, the prepended `ot=th:0` made the serialized output 33 members,
+// violating W3C Trace Context 3.3.1.1/3.3.1.2. After the fix, the output is
+// clamped to 32 members.
+test "processTraces - 100%-keep writeback keeps traceState within W3C 32-member limit" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(a, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var pol: proto.policy.Policy = .{
+        .id = try a.dupe(u8, "trace-keep-100"),
+        .name = try a.dupe(u8, "keep-100"),
+        .enabled = true,
+        .target = .{ .trace = .{ .keep = .{ .percentage = 100.0 } } },
+    };
+    try pol.target.?.trace.match.append(a, .{
+        .field = .{ .trace_field = .TRACE_FIELD_NAME },
+        .match = .{ .regex = try a.dupe(u8, ".+") },
+    });
+    try registry.updatePolicies(&.{pol}, "test", .file);
+
+    // 32 vendor entries (W3C max), no `ot=` entry.
+    var ts_buf: [4096]u8 = undefined;
+    const trace_state_in = try buildVendorTracestate(&ts_buf, 32);
+    try std.testing.expectEqual(@as(usize, 32), listMemberCount(trace_state_in));
+
+    var traces_buf: [8192]u8 = undefined;
+    const prefix = "{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[" ++
+        "{\"traceId\":\"0123456789abcdef0123456789abcdef\"," ++
+        "\"spanId\":\"0123456789abcdef\",\"name\":\"test-span\",\"kind\":1," ++
+        "\"startTimeUnixNano\":\"1000000000\",\"endTimeUnixNano\":\"2000000000\"," ++
+        "\"traceState\":\"";
+    const suffix = "\"}]}]}]}";
+    @memcpy(traces_buf[0..prefix.len], prefix);
+    @memcpy(traces_buf[prefix.len..][0..trace_state_in.len], trace_state_in);
+    @memcpy(traces_buf[prefix.len + trace_state_in.len ..][0..suffix.len], suffix);
+    const traces = traces_buf[0 .. prefix.len + trace_state_in.len + suffix.len];
+
+    // Route the stream through an arena: the JSON writeback path's merged
+    // trace_state is a standalone allocation that the JSON encoder stores as a
+    // view, so it is reclaimed by the arena (the protobuf path uses the same
+    // arena technique). The arena is parented at std.testing.allocator, so any
+    // true escape is still caught.
+    var in_reader = std.Io.Reader.fixed(traces);
+    var out_writer: std.Io.Writer.Allocating = .init(a);
+    const stream_result = try processTracesStream(
+        a,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const out = try out_writer.toOwnedSlice();
+
+    const ts_key = "\"traceState\":\"";
+    const ts_start = std.mem.indexOf(u8, out, ts_key).? + ts_key.len;
+    const ts_end = std.mem.indexOfScalarPos(u8, out, ts_start, '"').?;
+    const trace_state_out = out[ts_start..ts_end];
+
+    try std.testing.expect(stream_result.was_transformed); // writeback fired
+    try std.testing.expectEqual(@as(usize, 32), listMemberCount(trace_state_out)); // W3C cap honored
+    try std.testing.expect(std.mem.startsWith(u8, trace_state_out, "ot=th:0,"));
+    try std.testing.expect(std.mem.indexOf(u8, trace_state_out, "v31=x") == null);
 }
