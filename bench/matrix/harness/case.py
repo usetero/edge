@@ -175,13 +175,15 @@ class MatrixCase(unittest.TestCase):
 
     # ---------------------------------------------------------------- senders
 
-    def post_logs(self, body=None, path: str = "/api/v2/logs", headers=None, timeout: float = 60.0):
+    def post_logs(self, body=None, path: str = "/api/v2/logs", headers=None, timeout: float = 60.0, **kwargs):
         """A well-formed request, the way an agent sends one."""
         self.assertIsNotNone(requests, "run through bench/matrix/run.py, which supplies requests")
         payload = json.dumps(LOG_PAYLOAD if body is None else body).encode()
         merged = {"Content-Type": "application/json"}
         merged.update(headers or {})
-        return requests.post(self.edge.url + path, data=payload, headers=merged, timeout=timeout)
+        return requests.post(
+            self.edge.url + path, data=payload, headers=merged, timeout=timeout, **kwargs
+        )
 
     def post_raw_body(self, body: bytes, path: str = "/api/v2/logs", headers=None, timeout: float = 60.0):
         self.assertIsNotNone(requests, "run through bench/matrix/run.py, which supplies requests")

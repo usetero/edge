@@ -135,6 +135,100 @@ descriptors back to baseline.
    second copy, measured at exactly two. The fix worth making is to relay the
    2xx when we know the body was fully sent, and count the truncation.
 
+## Scope: remaining matrix cases and stdio fixes
+
+### Fixes we can make ourselves
+
+| Item | What | Effort |
+|---|---|---|
+| a22 absolute-form | Accept `GET http://host/path` and route on the path, per RFC 9112 §3.2.2, instead of forwarding the whole URL upstream as a path. stdio only | S |
+| c05 health at capacity | Reserve a small number of slab slots that are handed out only after a normal claim fails, and serve those connections without keep-alive. A probe then answers during the spike that filled the slab, instead of being shed and restarting the sidecar | M |
+
+### Fixes that need a change outside our tree
+
+| Item | Why it is blocked | What the fix looks like |
+|---|---|---|
+| b12 dial deadline (both frontends) | `std.http.Client.ConnectTcpOptions` **declares** `timeout` and never passes it to `host.connect`, and `Connection.Plain.create` is private, so we cannot build a connection with our own bounded dial | One line in std to forward the timeout, plus a `timeout` on `RequestOptions`. Worth an upstream patch; we carry a circuit breaker only if that stalls |
+| a10 unknown content encoding (stdio) | `std.http.Server` maps `content-encoding` through `ContentEncoding.fromString` and fails the whole head with `HttpHeadersInvalid`, with no distinct error to match on | std should carry an unknown encoding as opaque. Byte-rewriting the header in our own buffer is not worth it for an encoding no agent sends |
+| a07 broken chunk (stdio) | std's chunked reader waits for a valid size line rather than erroring, so only the request deadline bounds it | std should reject an invalid chunk size |
+| a30 streaming threshold | Deliberate. Documented at the decision | Expose the threshold as configuration |
+| httpz dispatch, pipelining, stalled-sender status | Inside httpz | The fork series already scoped |
+
+### Cases still to write
+
+Ingress: a17 oversize head, a18 chunked above the cap, a20 Expect 100-continue,
+a23 resync after a local error, a25 half-close, a26 RST mid-body, a27 vanish
+after forward, a34 encoding spellings (reduced), a36 gzip with two members,
+a37 record above the scratch cap, a39 unframeable JSON, a41 policy drop-all.
+
+Egress: b14 keep-alive off, b15 HTTP/1.0 read-until-close, b16 bodiless
+statuses, b17 response header flood, b18 slow-drip response, b19 slow-reading
+intake, b20 accept then silence, b21 early rejection of a streamed body,
+b22 intake restart, b25 redirect, b26 base path and query fidelity, b28 slow
+dial warning, b29 scrape path faults.
+
+Capacity and lifecycle: c06 memory budget under saturation, c07 connection
+churn, d04 startup with the intake down, d05 policy hot reload under load.
+
+New echo modes they need: `keep_alive_off`, `slow_read`, `accept_silence`,
+`slow_body`, `header_flood`, `redirect`, `bodiless`, `http10_no_length`, and
+the last request target reported in `/stats` for b26.
+
+Left out on purpose: anything that needs a particular platform or container
+shape (the Linux run, the constrained-CPU profile, c10 descriptor exhaustion),
+the framer and OTLP torture cases (unit tests), a29 (nondeterministic), a21
+(h2 cannot work against an HTTP/1 edge), c08 and c13 (runner modes).
+
+## This round: cases added and fixes made
+
+### Cases added (28, taking the suite to 81)
+
+Ingress: a17 oversize head, a20 Expect 100-continue, a23 resync after a local
+error, a25 half-close, a26 RST mid-body, a27 vanish after forward, a34 encoding
+spellings, a41 policy drop-all plus the rejected-pattern case.
+
+Egress: b14 keep-alive off, b15 HTTP/1.0 read-until-close, b16 bodiless
+statuses, b17 response header flood, b18 slow-drip response, b19 slow-reading
+intake, b20 accept then silence, b21 early rejection of a streamed body,
+b22 intake restart, b25 redirect, b26 target fidelity, b29 scrape path faults.
+
+Capacity and lifecycle: c06 memory budget, c07 connection churn, d04 startup
+with the intake down, d05 policy reload under load.
+
+New intake fault modes: `keep_alive_off`, `bodiless`, `redirect`,
+`header_flood`, `http10_no_length`, `slow_body`, `slow_read`,
+`accept_silence`, `read_then_close`, `truncate_after_read`, plus the last
+request target in `/stats`.
+
+### Fixes made this round
+
+- **`/_health` and `/_edge/*` claim every method.** A HEAD probe is answered,
+  everything else gets 405, and neither reaches the intake. (a22)
+- **Control paths are labelled by path, not by method**, so a HEAD probe is no
+  longer counted as data traffic.
+- **stdio accepts an absolute-form target** and routes on its path, per
+  RFC 9112 §3.2.2, instead of forwarding the whole URL upstream. (a22)
+- **stdio interrupts its inbound sockets on shutdown.** 30 s to under 2 s. (d03)
+- **A decoded-size overrun fails open**; only the raw cap answers 413. (a35)
+- **stdio keeps a control reserve.** Two slots are held back, and a connection
+  taken from the reserve serves one control request and closes. A health probe
+  now answers while the slab is full, instead of being shed and restarting the
+  sidecar during the spike. (c05)
+- **httpz relays response headers up to our own cap.** Its default of 16
+  silently truncated an intake answer, so a `Retry-After` on a 429 vanished
+  while the request still reported 202. (b17)
+
+### Corrections to earlier claims
+
+- **`.*` is not a policy bug.** Hyperscan refuses a pattern that can match an
+  empty buffer, so `.*` never compiles and `.+` or `^.*$` is the correct way to
+  say "everything". The real finding is narrower: the matcher builds nothing
+  (`policy_count=0`), while the loader reports `loaded_count=1 failed_count=0`
+  and `/_edge/policies` lists the policy as enabled. A rule that cannot compile
+  looks live. (a41)
+- **b16 is stdio only.** httpz keeps a 204 bodiless; stdio re-frames it as
+  chunked.
+
 ## Findings
 
 ### Fixed

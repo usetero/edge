@@ -11,10 +11,7 @@ from harness import MatrixCase
 class HealthAtCapacity(MatrixCase):
     EDGE_CONFIG = {"max_connections": 8}
     EXPECT_SHED = True
-    DEFECTS = {
-        "stdio": "health is shed with the rest once the slab is full",
-        "httpz": "health waits behind the full connection table",
-    }
+    DEFECTS = {"httpz": "health waits behind the full connection table"}
 
     def test_health_answers_at_capacity(self):
         held = []

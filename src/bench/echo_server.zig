@@ -47,6 +47,24 @@ pub const Fault = enum {
     /// fulfil. Unlike `truncate`, the batch was accepted before the answer
     /// broke, which is the case where a retry duplicates rather than repairs.
     truncate_after_read,
+    /// Answer 202 with `Connection: close`. The client must not pool it.
+    keep_alive_off,
+    /// Answer 204, which carries no body. A relay that re-frames it as
+    /// chunked violates the protocol and some clients reject it.
+    bodiless,
+    /// Answer 308 with a Location. Redirects are unhandled by design, so this
+    /// checks the sender is told rather than left guessing.
+    redirect,
+    /// Answer with `arg` extra headers, the mirror of a header flood inbound.
+    header_flood,
+    /// Answer HTTP/1.0 with no content-length, so the body ends at the close.
+    http10_no_length,
+    /// Dribble the answer body, one chunk per `arg` milliseconds.
+    slow_body,
+    /// Read the request body a few bytes at a time, so a large send blocks.
+    slow_read,
+    /// Accept the connection and never read or write it.
+    accept_silence,
 };
 
 pub const ServerContext = struct {
@@ -56,6 +74,11 @@ pub const ServerContext = struct {
     endpoint_stats: std.StringHashMap(EndpointStats),
     total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// The most recent request target, so a test can assert that a base path
+    /// and a query survive the trip byte for byte.
+    last_target: [512]u8 = undefined,
+    last_target_len: usize = 0,
 
     // Fault injection state
     fault_mutex: std.Io.Mutex = .init,
@@ -230,6 +253,24 @@ pub const ServerContext = struct {
         self.armFault(.none, 0, null);
     }
 
+    /// The armed fault without spending the counter.
+    pub fn peekFault(self: *ServerContext) Fault {
+        self.fault_mutex.lockUncancelable(self.io);
+        defer self.fault_mutex.unlock(self.io);
+        if (self.fault_remaining) |left| {
+            if (left == 0) return .none;
+        }
+        return self.fault;
+    }
+
+    pub fn recordTarget(self: *ServerContext, target: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const len = @min(target.len, self.last_target.len);
+        @memcpy(self.last_target[0..len], target[0..len]);
+        self.last_target_len = len;
+    }
+
     pub fn reset(self: *ServerContext) void {
         self.total_requests.store(0, .monotonic);
         self.total_bytes.store(0, .monotonic);
@@ -277,7 +318,8 @@ pub const ServerContext = struct {
         self.fault_mutex.lockUncancelable(self.io);
         defer self.fault_mutex.unlock(self.io);
 
-        try writer.print("}},\"total_requests\":{d},\"total_bytes\":{d}," ++
+        try writer.print("}},\"last_target\":\"{s}\",", .{self.last_target[0..self.last_target_len]});
+        try writer.print("\"total_requests\":{d},\"total_bytes\":{d}," ++
             "\"capture_enabled\":{},\"captured_count\":{d}," ++
             "\"fault\":\"{s}\",\"fault_arg\":{d},\"fault_applied\":{d}}}", .{
             self.total_requests.load(.monotonic),
@@ -477,16 +519,21 @@ fn handleRequest(
     defer captured.deinit();
     if (!unframed_body) {
         const body_reader = try request.readerExpectContinue(&body_buf);
+        // `slow_read` trickles the body off the socket, so a sender with a
+        // body larger than the socket buffer blocks in its send.
+        const slice: usize = if (fault == .slow_read) 64 else 5 * 1024 * 1024;
         while (true) {
-            const n = body_reader.stream(&captured.writer, .limited(5 * 1024 * 1024)) catch |err| switch (err) {
+            const n = body_reader.stream(&captured.writer, .limited(slice)) catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return err,
             };
             if (n == 0) break;
+            if (fault == .slow_read) try ctx.io.sleep(.fromMilliseconds(@max(fault_arg, 1)), .awake);
         }
     }
     const body = captured.written();
 
+    ctx.recordTarget(target);
     ctx.recordRequest(path_copy, body.len);
     if (body.len > 0) {
         ctx.capturePayload(path_copy, content_type_copy orelse "application/octet-stream", body);
@@ -531,6 +578,50 @@ fn handleRequest(
             try request.respond(filler, .{ .keep_alive = keep_alive, .status = .accepted });
             return;
         },
+        .keep_alive_off => {
+            try request.respond("{}", .{ .keep_alive = false, .status = .accepted, .extra_headers = &json_headers });
+            return;
+        },
+        .bodiless => {
+            try request.respond("", .{ .keep_alive = keep_alive, .status = .no_content });
+            return;
+        },
+        .redirect => {
+            try request.respond("", .{
+                .keep_alive = keep_alive,
+                .status = .permanent_redirect,
+                .extra_headers = &.{.{ .name = "location", .value = "http://127.0.0.1:1/moved" }},
+            });
+            return;
+        },
+        .header_flood => {
+            const count = @min(fault_arg, 96);
+            var names: [96][16]u8 = undefined;
+            var headers: [96]std.http.Header = undefined;
+            for (0..count) |i| {
+                _ = std.fmt.bufPrint(&names[i], "x-flood-{d:0>3}", .{i}) catch unreachable;
+                headers[i] = .{ .name = names[i][0..11], .value = "v" };
+            }
+            try request.respond("{}", .{
+                .keep_alive = keep_alive,
+                .status = .accepted,
+                .extra_headers = headers[0..count],
+            });
+            return;
+        },
+        .http10_no_length => {
+            writeRaw(ctx, stream, "HTTP/1.0 202 Accepted\r\n\r\n{\"read\":\"until close\"}");
+            return error.FaultHttp10;
+        },
+        .slow_body => {
+            writeRaw(ctx, stream, "HTTP/1.1 202 Accepted\r\ncontent-length: 64\r\n\r\n");
+            var sent: usize = 0;
+            while (sent < 64) : (sent += 8) {
+                writeRaw(ctx, stream, "xxxxxxxx");
+                try ctx.io.sleep(.fromMilliseconds(@max(fault_arg, 1)), .awake);
+            }
+            return error.FaultSlowBody;
+        },
         .stale_keepalive => {
             // Answer, then drop the connection the client just pooled.
             try request.respond("{}", .{ .keep_alive = true, .status = .accepted, .extra_headers = &json_headers });
@@ -543,6 +634,13 @@ fn handleRequest(
 
 fn serveConnection(ctx: *ServerContext, gpa: std.mem.Allocator, stream: std.Io.net.Stream) std.Io.Cancelable!void {
     defer stream.close(ctx.io);
+
+    // Accepted and then ignored: no read, no write, no answer.
+    if (ctx.peekFault() == .accept_silence) {
+        _ = ctx.takeFault();
+        try ctx.io.sleep(.fromMilliseconds(600_000), .awake);
+        return;
+    }
 
     var recv_buf: [32 * 1024]u8 = undefined;
     var send_buf: [32 * 1024]u8 = undefined;

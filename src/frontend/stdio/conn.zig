@@ -114,8 +114,17 @@ pub fn serveConnection(
     // `inbound` is filled once the slab slot provides its receive buffer.
     var env: Env = undefined;
 
-    const conn_id = slab.claim(io) orelse {
-        // Load shed: no slab slot. One fixed write, then close.
+    // A full slab still keeps a couple of slots back, so a health probe can
+    // be read and answered during the spike that filled it. A connection
+    // served from the reserve gets exactly one request, and only a control
+    // path: anything else is shed after the head, not before it.
+    var reserved = false;
+    const conn_id = slab.claim(io) orelse claim_reserved: {
+        if (slab.claimReserved(io)) |id| {
+            reserved = true;
+            break :claim_reserved id;
+        }
+        // Load shed: no slab slot at all. One fixed write, then close.
         if (shared.metrics) |metrics| metrics.recordConnectionShed(.slab_full);
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         shared.bus.warn(ConnectionShed{ .reason = "connection_slab_full", .answered = 503 });
@@ -156,6 +165,17 @@ pub fn serveConnection(
                 return;
             },
         };
+        if (reserved and !isControlPath(pathOf(request.head.target))) {
+            // The reserve exists for the control paths. Everything else is
+            // shed here, one step later than usual, with the same status.
+            if (shared.metrics) |metrics| metrics.recordConnectionShed(.slab_full);
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            shared.bus.warn(ConnectionShed{ .reason = "connection_slab_full", .answered = 503 });
+            request.respond("", .{ .status = .service_unavailable, .keep_alive = false }) catch |err| {
+                undeliverable(shared, 503, err);
+            };
+            return;
+        }
         handleRequest(&env, conn_id, arena_slot, &request) catch |err| {
             // handleRequest already reported and answered what it could; this
             // only decides the connection's fate.
@@ -164,6 +184,8 @@ pub fn serveConnection(
         };
         inbound.endRequest();
         arenas.reset(arena_slot);
+        // A reserved slot serves one request, so the next probe finds it free.
+        if (reserved) return;
     }
 }
 
@@ -184,7 +206,7 @@ fn handleRequest(
 
     // Head strings die when the body reader is created; the target must
     // outlive that for the upstream leg, logs and metrics.
-    const target = try arena.dupe(u8, request.head.target);
+    const target = try arena.dupe(u8, originForm(request.head.target));
     const path = pathOf(target);
     const method = service_mod.HttpMethod.fromStd(request.head.method);
     const known_path = exec.classifyKnownPath(path, method);
@@ -342,8 +364,32 @@ fn dispatch(
 }
 
 fn pathOf(target: []const u8) []const u8 {
-    const query_start = std.mem.findScalar(u8, target, '?');
-    return if (query_start) |i| target[0..i] else target;
+    const relative = originForm(target);
+    const query_start = std.mem.findScalar(u8, relative, '?');
+    return if (query_start) |i| relative[0..i] else relative;
+}
+
+/// The paths the edge answers itself. They never reach an upstream, so they
+/// are the ones worth keeping a connection slot for.
+fn isControlPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/_health") or std.mem.startsWith(u8, path, "/_edge/");
+}
+
+/// The origin-form of a request target.
+///
+/// A sender configured with a proxy sends the absolute-form
+/// (`GET http://host/path HTTP/1.1`), which RFC 9112 §3.2.2 requires a server
+/// to accept. Treating the whole URL as a path routed it to the wildcard
+/// passthrough and shipped a mangled target upstream, so `/_health` behind a
+/// proxy setting became intake traffic.
+fn originForm(target: []const u8) []const u8 {
+    for ([_][]const u8{ "http://", "https://" }) |scheme| {
+        if (!std.ascii.startsWithIgnoreCase(target, scheme)) continue;
+        const after_scheme = target[scheme.len..];
+        const slash = std.mem.findScalar(u8, after_scheme, '/') orelse return "/";
+        return after_scheme[slash..];
+    }
+    return target;
 }
 
 /// Value of `name` in the target's query string, undecoded.

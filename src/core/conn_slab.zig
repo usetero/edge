@@ -76,6 +76,9 @@ pub const ConnSlab = struct {
     free_count: usize,
     mutex: std.Io.Mutex,
     limits: limits_mod.Limits,
+    /// Slots an ordinary connection may not take, so a health probe can still
+    /// be read while the slab is full. See limits.CONTROL_RESERVE_SLOTS.
+    reserve: usize,
 
     pub fn init(gpa: std.mem.Allocator, limits: limits_mod.Limits) !ConnSlab {
         // u16 slot indexes bound the slab; 65k concurrent connections is far
@@ -118,6 +121,9 @@ pub const ConnSlab = struct {
             .free_count = n,
             .mutex = .init,
             .limits = limits,
+            // Never the whole slab, and never nothing: a two-slot slab keeps
+            // one back.
+            .reserve = @max(1, @min(limits_mod.CONTROL_RESERVE_SLOTS, n / 4)),
         };
     }
 
@@ -131,11 +137,27 @@ pub const ConnSlab = struct {
 
     /// Claims a slot, or null when the slab is exhausted (caller load-sheds
     /// with 503). Never blocks beyond the mutex, never allocates.
+    ///
+    /// Leaves `reserve` slots untouched; `claimReserved` reaches those, and
+    /// the caller must close such a connection after one request so the
+    /// reserve recycles.
     pub fn claim(self: *ConnSlab, io: std.Io) ?ConnId {
+        return self.claimInner(io, false);
+    }
+
+    /// Claims from the reserve. Only for a connection that will be answered
+    /// and closed at once, so a control path can be served while the rest of
+    /// the slab is full.
+    pub fn claimReserved(self: *ConnSlab, io: std.Io) ?ConnId {
+        return self.claimInner(io, true);
+    }
+
+    fn claimInner(self: *ConnSlab, io: std.Io, reserved: bool) ?ConnId {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
-        if (self.free_count == 0) return null;
+        const floor = if (reserved) 0 else self.reserve;
+        if (self.free_count <= floor) return null;
         self.free_count -= 1;
         const slot = self.free_list[self.free_count];
 
@@ -310,8 +332,10 @@ test "exhausted slab returns null, recovers after release" {
     defer slab.deinit(testing.allocator);
     const io = testing.io;
 
+    // An ordinary claim stops at the reserve, not at zero.
+    const ordinary = slab.free_list.len - slab.reserve;
     var ids: [4]ConnId = undefined;
-    for (&ids) |*id| id.* = slab.claim(io).?;
+    for (ids[0..ordinary]) |*id| id.* = slab.claim(io).?;
     try testing.expectEqual(@as(?ConnId, null), slab.claim(io));
 
     slab.release(io, ids[2]);
@@ -320,8 +344,27 @@ test "exhausted slab returns null, recovers after release" {
     // Same slot, new generation: the old handle is dead.
     try testing.expect(ids[2] != again);
 
-    for (ids, 0..) |id, i| if (i != 2) slab.release(io, id);
+    for (ids[0..ordinary], 0..) |id, i| if (i != 2) slab.release(io, id);
     slab.release(io, again);
+}
+
+test "the reserve is reachable only through claimReserved" {
+    var slab: ConnSlab = try .init(testing.allocator, testLimits());
+    defer slab.deinit(testing.allocator);
+    const io = testing.io;
+
+    try testing.expect(slab.reserve > 0);
+    const ordinary = slab.free_list.len - slab.reserve;
+
+    var ids: [8]ConnId = undefined;
+    for (ids[0..ordinary]) |*id| id.* = slab.claim(io).?;
+    // The slab looks full to an ordinary connection...
+    try testing.expectEqual(@as(?ConnId, null), slab.claim(io));
+    // ...and a health probe still gets read.
+    const probe = slab.claimReserved(io).?;
+    slab.release(io, probe);
+
+    for (ids[0..ordinary]) |id| slab.release(io, id);
 }
 
 test "buffer regions are disjoint per connection and per region" {

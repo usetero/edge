@@ -41,7 +41,6 @@ class HealthMethodsPost(MatrixCase):
 
 
 class AbsoluteFormTarget(MatrixCase):
-    DEFECTS = {"stdio": "forwards the absolute-form target upstream as a path"}
 
     def test_absolute_form_target_is_not_forwarded_verbatim(self):
         before = self.intake.requests_seen()

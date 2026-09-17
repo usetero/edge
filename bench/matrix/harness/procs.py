@@ -38,8 +38,8 @@ class EchoIntake:
 
     BINARY = os.path.join(REPO_ROOT, "zig-out", "bin", "echo-server")
 
-    def __init__(self, latency_ms: int = 0):
-        self.port = free_port()
+    def __init__(self, latency_ms: int = 0, port: int | None = None):
+        self.port = port or free_port()
         self.log_path = tempfile.mktemp(suffix=".echo.log")
         env = dict(os.environ)
         env["ECHO_LATENCY_MS"] = str(latency_ms)

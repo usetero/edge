@@ -164,6 +164,11 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .large_buffer_count = limits.large_body_buffer_count,
             .large_buffer_size = limits.large_body_buffer_size,
         },
+        // Same reasoning as the request header cap: httpz's default of 16
+        // dropped the excess in silence, so an intake answer with more
+        // headers than that was relayed incomplete and still reported 202.
+        // A `Retry-After` on a 429 is exactly the header that vanished.
+        .response = .{ .max_header_count = limits_mod.MAX_FORWARD_HEADERS + 32 },
         .thread_pool = .{ .count = limits.thread_pool_count },
         .timeout = .{
             .request = limits_mod.REQUEST_TIMEOUT_SECONDS,
