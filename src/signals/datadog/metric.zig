@@ -196,6 +196,15 @@ pub const MetricSeries = struct {
     tags: ?[][]const u8 = null,
 
     extra: std.StringHashMapUnmanaged(AnyValue) = .empty,
+    /// Eagerly-serialized raw JSON for nested-container extras (`extra` values
+    /// that are `.object`/`.array`). zimdjson on-demand `AnyValue`s for
+    /// containers alias the parser's single shared per-document `Cursor`, so
+    /// once `parse` resumes the top-level iteration the cursor leaves the
+    /// container depth and the stored `AnyValue` can no longer be iterated.
+    /// Capturing the bytes here while the cursor is still inside the container
+    /// — and replaying them at serialize time — preserves nested extras
+    /// through the partial-drop re-serialization path (mirrors `log.zig`).
+    extra_raw_json: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     /// Free extra field keys allocated during parsing
     pub fn deinit(self: *MetricSeries, allocator: std.mem.Allocator) void {
@@ -204,12 +213,19 @@ pub const MetricSeries = struct {
             allocator.free(key.*);
         }
         self.extra.deinit(allocator);
+
+        var raw_it = self.extra_raw_json.valueIterator();
+        while (raw_it.next()) |raw| {
+            allocator.free(raw.*);
+        }
+        self.extra_raw_json.deinit(allocator);
         self.* = undefined;
     }
 
     /// Parse a MetricSeries from a zimdjson Value (object)
     pub fn parse(allocator: std.mem.Allocator, value: Value) !MetricSeries {
         var series: MetricSeries = .{};
+        errdefer series.deinit(allocator);
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -255,7 +271,44 @@ pub const MetricSeries = struct {
             } else {
                 // Store unknown fields in extra map - need to dupe the key since it's from the parser buffer
                 const key_copy = try allocator.dupe(u8, key);
-                try series.extra.put(allocator, key_copy, try field.value.asAny());
+                const any = field.value.asAny() catch |err| {
+                    allocator.free(key_copy);
+                    return err;
+                };
+                // getOrPut may allocate; guard key_copy until the map owns it.
+                const extra_gop = series.extra.getOrPut(allocator, key_copy) catch |err| {
+                    allocator.free(key_copy);
+                    return err;
+                };
+                if (extra_gop.found_existing) {
+                    // key_copy is a duplicate; the map already owns the original key.
+                    allocator.free(key_copy);
+                }
+                // On error after this point, series.deinit (via errdefer series.deinit above)
+                // will free all keys and values already inserted into the maps.
+                extra_gop.value_ptr.* = any;
+                // Nested containers alias the parser's shared cursor and cannot
+                // be re-iterated after the top-level loop advances; eagerly
+                // serialize them now while the cursor is still inside them.
+                switch (any) {
+                    .object, .array => {
+                        const raw_json = try stringifyAnyValue(allocator, any);
+                        errdefer allocator.free(raw_json);
+                        // Free the old raw JSON value if this key already had one.
+                        const raw_gop = try series.extra_raw_json.getOrPut(allocator, extra_gop.key_ptr.*);
+                        if (raw_gop.found_existing) {
+                            allocator.free(raw_gop.value_ptr.*);
+                        }
+                        raw_gop.value_ptr.* = raw_json;
+                    },
+                    else => {
+                        // A non-container value overwrites any previously stored raw JSON
+                        // for this key; remove and free it so the scalar takes precedence.
+                        if (series.extra_raw_json.fetchRemove(extra_gop.key_ptr.*)) |removed| {
+                            allocator.free(removed.value);
+                        }
+                    },
+                }
             }
         }
 
@@ -319,10 +372,31 @@ pub const MetricSeries = struct {
         var it = self.extra.iterator();
         while (it.next()) |entry| {
             try jws.objectField(entry.key_ptr.*);
-            try writeAnyValue(jws, entry.value_ptr.*);
+            if (self.extra_raw_json.get(entry.key_ptr.*)) |raw_json| {
+                try jws.beginWriteRaw();
+                try jws.writer.writeAll(raw_json);
+                jws.endWriteRaw();
+            } else {
+                try writeAnyValue(jws, entry.value_ptr.*);
+            }
         }
 
         try jws.endObject();
+    }
+
+    /// eagerly serialize an on-demand `AnyValue` to owned JSON bytes while the
+    /// parser cursor is still positioned inside the value. Used to capture
+    /// nested-container extras before the top-level parse loop advances the
+    /// shared cursor past them (see `extra_raw_json`).
+    fn stringifyAnyValue(allocator: std.mem.Allocator, value: AnyValue) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        var jws: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{},
+        };
+        try writeAnyValue(&jws, value);
+        return out.toOwnedSlice();
     }
 
     /// Write a zimdjson AnyValue to a JSON writer
@@ -528,6 +602,59 @@ test "MetricSeries - parse with extra fields" {
     try std.testing.expectEqual(@as(usize, 2), series.extra.count());
     try std.testing.expect(series.extra.contains("unknown_field"));
     try std.testing.expect(series.extra.contains("another_extra"));
+}
+
+test "MetricSeries - parse and reserialize preserves nested extra fields" {
+    // Regression for the zimdjson cursor-aliasing defect: nested-container
+    // extras must round-trip through parse -> jsonStringify. The eager
+    // extra_raw_json capture (mirroring log.zig) is what makes this work.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"metric": "test", "points": [],
+        \\ "extra_obj": {"k": "v", "n": 5}, "extra_arr": [1, 2, 3],
+        \\ "extra_str": "hello", "extra_num": 42, "extra_bool": true,
+        \\ "extra_null": null}
+    ;
+
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer {
+        allocator.free(series.points.?);
+        series.deinit(allocator);
+    }
+
+    // All six extras land in `extra`; only the container ones get a raw-json copy.
+    try std.testing.expectEqual(@as(usize, 6), series.extra.count());
+    try std.testing.expectEqual(@as(usize, 2), series.extra_raw_json.count());
+    try std.testing.expect(series.extra_raw_json.contains("extra_obj"));
+    try std.testing.expect(series.extra_raw_json.contains("extra_arr"));
+    try std.testing.expect(!series.extra_raw_json.contains("extra_str"));
+    try std.testing.expect(!series.extra_raw_json.contains("extra_num"));
+
+    // The captured raw bytes match the canonical JSON forms.
+    try std.testing.expectEqualStrings("{\"k\":\"v\",\"n\":5}", series.extra_raw_json.get("extra_obj").?);
+    try std.testing.expectEqualStrings("[1,2,3]", series.extra_raw_json.get("extra_arr").?);
+
+    // Re-serialize and confirm every leaf survives (the bug emptied the containers).
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(series, .{}, &out.writer);
+    const output = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"metric\":\"test\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"extra_str\":\"hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"extra_num\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"extra_bool\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"extra_null\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"extra_obj\":{\"k\":\"v\",\"n\":5}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"extra_arr\":[1,2,3]") != null);
+    // The emptied forms must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"extra_obj\":{}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"extra_arr\":[]") == null);
 }
 
 test "MetricPayload - parse series array" {

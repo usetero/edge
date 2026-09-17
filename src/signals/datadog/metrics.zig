@@ -814,6 +814,84 @@ test "processMetrics - extra fields are preserved when no metrics dropped" {
     try std.testing.expectEqual(@as(usize, 1), result.original_count);
 }
 
+test "processMetrics - nested extra fields preserved on partial drop" {
+    // Regression: zimdjson on-demand container AnyValues alias the parser's
+    // single shared cursor; storing one in `extra` and re-iterating it after
+    // the top-level parse loop advances the cursor yielded empty containers.
+    // On the partial-drop path (>=1 dropped AND >=1 kept) the kept series are
+    // re-serialized via MetricSeries.jsonStringify, so nested custom fields
+    // were silently lost (forwarded to upstream Datadog as `{}`/`[]`). Scalars
+    // round-tripped by value/stable-buffer slices and were unaffected.
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-debug"),
+        .name = try allocator.dupe(u8, "drop-debug"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^debug\\.") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    const metrics =
+        \\{"series": [
+        \\  {"metric": "debug.x", "type": 3, "points": []},
+        \\  {"metric": "kept.y", "type": 3, "points": [],
+        \\   "extra_obj": {"k": "v", "n": 5},
+        \\   "extra_arr": [1, 2, 3],
+        \\   "extra_str": "hello",
+        \\   "extra_num": 42}
+        \\]}
+    ;
+
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    // The dropped series is gone and the kept series survives.
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "kept.y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "debug.x") == null);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    try std.testing.expect(result.wasModified());
+
+    // Scalar extras round-trip.
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"extra_str\":\"hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"extra_num\":42") != null);
+
+    // Nested extras survive intact (the bug emptied these to {}/[]).
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"extra_obj\":{\"k\":\"v\",\"n\":5}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"extra_arr\":[1,2,3]") != null);
+
+    // Sanity: the emptied forms must NOT appear.
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"extra_obj\":{}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"extra_arr\":[]") == null);
+}
+
 test "processMetrics - filter on metric type" {
     const allocator = std.testing.allocator;
 
