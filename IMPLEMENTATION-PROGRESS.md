@@ -243,6 +243,26 @@ request target in `/stats`.
 Everything else on the ledger needs a change in `std`, in httpz, or a product
 decision about the streaming threshold.
 
+## A shed connection carries `Retry-After`
+
+A connection refused because the edge has no connection slot keeps its
+`503 Service Unavailable` and now carries `Retry-After: 1`. Both shed paths
+send it: the slab is full, and the Io implementation is at its task limit.
+
+503 is the honest status here, and 429 is not. Connection exhaustion is a
+condition of the whole proxy, not an allowance we granted one sender. The OTLP
+spec admits either status for an overloaded server and scopes `Retry-After` to
+both, and the collector retries 429, 502, 503 and 504 alike, so the status
+alone changes no client behaviour. What it does change is how a gateway reads
+it: collectors in gateway mode use 429 for a non-retryable tenant limit, and
+the edge is deployed as a gateway. The Datadog agent is equally indifferent to
+the two, because it backs off on every error status except 400, 401, 403 and
+413.
+
+So the header is the whole improvement. A sender that honours `Retry-After`
+waits the stated interval instead of retrying at once. `SHED_RETRY_AFTER_SECONDS`
+sets both the header and the fixed shed response, so the two cannot disagree.
+
 ## Findings
 
 ### Fixed

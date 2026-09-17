@@ -149,7 +149,8 @@ with its note.
 
 | Case | Fault injected | Must happen | Notes |
 |---|---|---|---|
-| c01 | More connections than the slab holds (8) | Shed with 503, counted by reason | |
+| c01 | More connections than the slab holds (8) | Shed with 503 and a `Retry-After`, counted by reason | |
+| c01b | Exactly `max_connections` senders at once | Every one served: the control reserve is capacity on top of the cap | found by a benchmark, not a test |
 | c02 | Health probe arrives with a 15-sender burst against a 3 s intake, 20 times | The probe stays under 1 s | slow, xfail httpz: a batch of 16 goes to one pool thread |
 | c03 | 12 idle sockets against 8 slots | Recovers on its own, without the senders closing | slow |
 | c04 | 48 senders against an intake that never answers | Health and the scrape answer inside a second | slow |

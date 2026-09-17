@@ -19,7 +19,7 @@ const thread_bufs = @import("../thread_bufs.zig");
 const log = std.log.scoped(.http_server);
 
 // Named event payloads: the type name is the telemetry event name.
-/// A connection refused before it carried a request, with the 503 sent.
+/// A connection refused before it carried a request, with the status sent.
 const ConnectionShed = struct { reason: []const u8, answered: u16 };
 
 pub const HttpServer = struct {
@@ -129,7 +129,7 @@ fn shedConnection(io: std.Io, stream: std.Io.net.Stream) void {
     var buf: [256]u8 = undefined;
     var writer = std.Io.net.Stream.Writer.init(stream, io, &buf);
     writer.interface.writeAll(
-        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        conn_mod.shed_response,
     ) catch return;
     writer.interface.flush() catch return;
 }

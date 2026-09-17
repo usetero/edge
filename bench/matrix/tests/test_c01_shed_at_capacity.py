@@ -1,7 +1,13 @@
 """C01: more connections than the slab holds.
 
-Shedding is correct. Shedding in silence is not: it is the signal an operator
-needs when a sidecar is at its ceiling.
+Shedding is correct past the cap, and silent shedding is not: it is the signal
+an operator needs when a sidecar is at its ceiling. Two things are asserted
+here. Nothing is shed at exactly `max_connections` senders, because the
+control reserve is capacity on top of the cap rather than a slice of it — a
+benchmark caught that the other way round. And past the cap the answer is 503
+with `Retry-After`, because running out of connections is a condition of this
+proxy rather than a limit on one sender, and the header is the part a sender
+can act on.
 """
 
 from harness import MatrixCase
@@ -34,5 +40,12 @@ class ShedAtCapacity(MatrixCase):
             any(s == 503 for s in statuses) or any(s is None for s in statuses),
             "past the ceiling the edge must shed, got %r" % statuses,
         )
+        for answer in answers:
+            if answer.status == 503:
+                self.assertIn(
+                    "retry-after",
+                    answer.head.lower(),
+                    "a shed answer must tell the sender how long to wait:\n%s" % answer.head,
+                )
         if self.frontend == "stdio":
             self.wait_for_metric('edge_connections_shed_total{reason="slab_full"}', 1, timeout=10)

@@ -42,7 +42,7 @@ const RequestFailed = struct { method: []const u8, path: []const u8, err: []cons
 const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 /// Same shape at warn level, for a request that held its connection task.
 const RequestSlow = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
-/// A connection refused before it carried a request, with the 503 sent.
+/// A connection refused before it carried a request, with the status sent.
 const ConnectionShed = struct { reason: []const u8, answered: u16 };
 /// An inbound read hit its deadline. `idle` is a keep-alive wait with no
 /// request in flight; `request` means a partial request stalled, which drops
@@ -147,8 +147,7 @@ pub fn serveConnection(
         if (shared.metrics) |metrics| metrics.recordConnectionShed(.slab_full);
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         shared.bus.warn(ConnectionShed{ .reason = "connection_slab_full", .answered = 503 });
-        const shed = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-        writeRawResponse(shared, io, stream, shed, 503);
+        writeRawResponse(shared, io, stream, shed_response, 503);
         return;
     };
     defer slab.release(io, conn_id);
@@ -190,7 +189,11 @@ pub fn serveConnection(
             if (shared.metrics) |metrics| metrics.recordConnectionShed(.slab_full);
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             shared.bus.warn(ConnectionShed{ .reason = "connection_slab_full", .answered = 503 });
-            request.respond("", .{ .status = .service_unavailable, .keep_alive = false }) catch |err| {
+            request.respond("", .{
+                .status = .service_unavailable,
+                .keep_alive = false,
+                .extra_headers = &.{.{ .name = "retry-after", .value = retry_after_value }},
+            }) catch |err| {
                 undeliverable(shared, 503, err);
             };
             return;
@@ -387,6 +390,20 @@ fn pathOf(target: []const u8) []const u8 {
     const query_start = std.mem.findScalar(u8, relative, '?');
     return if (query_start) |i| relative[0..i] else relative;
 }
+
+/// `Retry-After` as a header value, from the one constant that sets it.
+pub const retry_after_value = std.fmt.comptimePrint("{d}", .{limits_mod.SHED_RETRY_AFTER_SECONDS});
+
+/// The fixed answer to a connection we cannot serve. 503 with `Retry-After`,
+/// not 429: the edge ran out of connections process-wide, which is a condition
+/// of this proxy and not an allowance we granted one sender. The OTLP spec
+/// admits either status and scopes `Retry-After` to both, and collectors in
+/// gateway mode already read 429 as a non-retryable tenant limit, so 429 here
+/// would invite exactly that reading. The header is the part a sender acts on.
+pub const shed_response =
+    "HTTP/1.1 503 Service Unavailable\r\n" ++
+    "content-length: 0\r\nconnection: close\r\n" ++
+    "retry-after: " ++ retry_after_value ++ "\r\n\r\n";
 
 /// The paths the edge answers itself. They never reach an upstream, so they
 /// are the ones worth keeping a connection slot for.

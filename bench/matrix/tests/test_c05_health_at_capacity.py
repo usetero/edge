@@ -1,6 +1,6 @@
 """C05: a health probe while every connection slot is taken.
 
-Today the probe is shed with 503, which on ECS restarts the sidecar during the
+Today the probe is shed with the rest, which on ECS restarts the sidecar during the
 very spike that filled it. The case asserts the behaviour we want — health
 answers — so the choice is explicit rather than implied by the shed path.
 """

@@ -44,6 +44,11 @@ pub const CONN_ARENA_RESERVE_BYTES: usize = 16 * 1024;
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
+/// What a shed connection is told to wait, in seconds. The status alone is
+/// only half the signal: a retryable status makes a sender try again at once,
+/// and a sender that honours `Retry-After` needs the number to space it out.
+pub const SHED_RETRY_AFTER_SECONDS: u32 = 1;
+
 /// Connection slots held back for the control paths. A health probe that
 /// arrives while the slab is full is shed with 503 otherwise, and an
 /// orchestrator reads that as a dead process and restarts the container
