@@ -307,6 +307,13 @@ fn filterMetricsInPlace(
             // Filter metrics in place by shrinking the list
             var write_idx: usize = 0;
             for (scope_metrics.metrics.items) |*metric| {
+                // Capture the data-point count before per-data-point
+                // filtering. A metric whose `data` oneof is set but carries
+                // zero data points is a valid descriptor and must be
+                // forwarded untouched; only a metric whose data points were
+                // all dropped by policy is pruned (see the prune below).
+                const original_dp = dataPointCount(metric);
+
                 // The data point is the record unit for metrics (policy spec
                 // v1.7.1): each one is evaluated against its own attributes and
                 // dropped individually, and the metric itself goes only once
@@ -338,8 +345,8 @@ fn filterMetricsInPlace(
                 };
 
                 // A metric with no data at all is left alone; one whose data
-                // points were all dropped is pruned.
-                if (metric.data != null and dataPointCount(metric) == 0) continue;
+                // points were all dropped by policy is pruned.
+                if (original_dp > 0 and dataPointCount(metric) == 0) continue;
                 scope_metrics.metrics.items[write_idx] = metric.*;
                 write_idx += 1;
             }
@@ -438,6 +445,23 @@ fn processProtobufMetrics(
 
     // Filter metrics in-place
     const counts = filterMetricsInPlace(&metrics_data, registry, bus);
+
+    // Fast path: if nothing was modified, return the original data without
+    // re-encoding. Mirrors processProtobufLogs — avoids a destructive
+    // decode -> filter -> re-encode round-trip when no policy matched. This
+    // also preserves metrics whose `data` oneof is set but whose
+    // `data_points` list is empty (valid descriptors with no measurements
+    // this batch): re-encoding would run the prune below and a non-matching
+    // policy must not drop descriptor metadata.
+    if (counts.dropped_count == 0) {
+        const result = try allocator.alloc(u8, data.len);
+        @memcpy(result, data);
+        return .{
+            .data = result,
+            .dropped_count = 0,
+            .original_count = counts.original_count,
+        };
+    }
 
     // Re-serialize to protobuf into the arena (same reasoning as above).
     var output_writer = std.Io.Writer.Allocating.init(arena_alloc);
@@ -1235,4 +1259,247 @@ test "processMetrics - protobuf all metrics dropped" {
     try std.testing.expectEqual(@as(usize, 3), result.dropped_count);
     try std.testing.expectEqual(@as(usize, 3), result.original_count);
     try std.testing.expect(result.allDropped());
+}
+
+// =============================================================================
+// Regression tests: empty metric descriptors (data set, data_points empty)
+// =============================================================================
+
+/// Build a protobuf-encoded MetricsData carrying a mix of populated and empty
+/// gauge metrics, so tests can exercise the "data oneof set but data_points
+/// empty" wire form that the prune logic must not drop.
+fn createProtobufMetricsMixed(allocator: std.mem.Allocator, names_with_dps: []const struct {
+    name: []const u8,
+    data_points: usize,
+}) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var scope_metrics: ScopeMetrics = .{};
+    for (names_with_dps) |spec| {
+        var gauge: Gauge = .{};
+        var i: usize = 0;
+        while (i < spec.data_points) : (i += 1) {
+            try gauge.data_points.append(aa, .{
+                .value = .{ .as_int = @intCast(i) },
+            });
+        }
+        try scope_metrics.metrics.append(aa, .{
+            .name = spec.name,
+            .data = .{ .gauge = gauge },
+        });
+    }
+
+    var resource_metrics: ResourceMetrics = .{};
+    try resource_metrics.scope_metrics.append(aa, scope_metrics);
+
+    var metrics_data: MetricsData = .{};
+    try metrics_data.resource_metrics.append(aa, resource_metrics);
+
+    var output_writer = std.Io.Writer.Allocating.init(allocator);
+    errdefer output_writer.deinit();
+    try metrics_data.encode(&output_writer.writer, aa);
+    return output_writer.toOwnedSlice();
+}
+
+/// Collect surviving metric names (in decode order) into `out`. Returns the
+/// number written; the caller must size `out` to fit.
+fn collectMetricNames(decoded: *const MetricsData, out: [][]const u8) usize {
+    var n: usize = 0;
+    for (decoded.resource_metrics.items) |*rm| {
+        for (rm.scope_metrics.items) |*sm| {
+            for (sm.metrics.items) |m| {
+                out[n] = m.name;
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
+test "BUG REPRO: empty metric descriptor survives non-matching policy (protobuf)" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // A DROP policy whose regex matches nothing — but it still routes the
+    // metric signal through the decode -> filter -> re-encode path.
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "no-match"),
+        .name = try allocator.dupe(u8, "no-match"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "does-not-exist") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // One populated gauge + one empty gauge (`data` oneof SET, data_points empty).
+    const proto_data = try createProtobufMetricsMixed(allocator, &.{
+        .{ .name = "populated.gauge", .data_points = 1 },
+        .{ .name = "empty.gauge", .data_points = 0 },
+    });
+    defer allocator.free(proto_data);
+
+    var in_reader = std.Io.Reader.fixed(proto_data);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/x-protobuf",
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    // The policy matched nothing — no data points were evaluated/dropped.
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    // original_count is a data-point count (1 from the populated gauge).
+    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+
+    // Both metrics must survive (regression: empty.gauge was pruned).
+    var reader = std.Io.Reader.fixed(result.data);
+    var decoded = try MetricsData.decode(&reader, allocator);
+    defer decoded.deinit(allocator);
+    var names: [4][]const u8 = undefined;
+    const names_len = collectMetricNames(&decoded, &names);
+    try std.testing.expectEqual(@as(usize, 2), names_len);
+    try std.testing.expectEqualStrings("populated.gauge", names[0]);
+    try std.testing.expectEqualStrings("empty.gauge", names[1]);
+}
+
+test "filterMetricsInPlace: prunes policy-emptied metric but keeps originally-empty one (protobuf)" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // DROP by name match "drop": drops every data point of "drop.me", emptying
+    // it. The originally-empty "empty.gauge" and the unrelated "keep.me" must
+    // survive untouched.
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-by-name"),
+        .name = try allocator.dupe(u8, "drop-by-name"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "drop") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    const proto_data = try createProtobufMetricsMixed(allocator, &.{
+        .{ .name = "drop.me", .data_points = 1 },
+        .{ .name = "keep.me", .data_points = 1 },
+        .{ .name = "empty.gauge", .data_points = 0 },
+    });
+    defer allocator.free(proto_data);
+
+    var in_reader = std.Io.Reader.fixed(proto_data);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/x-protobuf",
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    // drop.me's single data point was dropped; keep.me and empty.gauge have no
+    // data points dropped.
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+
+    var reader = std.Io.Reader.fixed(result.data);
+    var decoded = try MetricsData.decode(&reader, allocator);
+    defer decoded.deinit(allocator);
+    var names: [4][]const u8 = undefined;
+    const names_len = collectMetricNames(&decoded, &names);
+    try std.testing.expectEqual(@as(usize, 2), names_len);
+    try std.testing.expectEqualStrings("keep.me", names[0]);
+    try std.testing.expectEqualStrings("empty.gauge", names[1]);
+}
+
+test "BUG REPRO: empty metric descriptor survives non-matching policy (JSON)" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "no-match"),
+        .name = try allocator.dupe(u8, "no-match"),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "does-not-exist") },
+    });
+    defer drop_policy.deinit(allocator);
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+    // Populated gauge (1 data point) + empty gauge (`gauge` set, dataPoints empty).
+    const metrics =
+        \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
+    ++
+        \\"metrics":[{"name":"populated.gauge","gauge":{"dataPoints":[{"asInt":"1"}]}},
+    ++
+        \\{"name":"empty.gauge","gauge":{"dataPoints":[]}}]}]}]}
+    ;
+
+    var in_reader = std.Io.Reader.fixed(metrics);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const stream_result = try processMetricsStream(
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        &in_reader,
+        &out_writer.writer,
+        "application/json",
+    );
+    const result: ProcessResult = .{
+        .data = try out_writer.toOwnedSlice(),
+        .dropped_count = stream_result.dropped_count,
+        .original_count = stream_result.original_count,
+        .was_transformed = stream_result.was_transformed,
+    };
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+
+    // Both metric descriptors survive (regression: empty.gauge was pruned).
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "populated.gauge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.data, "empty.gauge") != null);
 }
