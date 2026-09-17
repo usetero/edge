@@ -62,7 +62,14 @@ pub const Snapshot = struct {
         if (got_header != @sizeOf(SnapshotHeader)) return out;
         if (header.magic != SNAP_MAGIC or header.version != SNAP_VERSION) return out;
 
-        try out.ensureTotalCapacity(allocator, @intCast(header.count));
+        const file_size = try file.length(self.io);
+        const entry_space = if (file_size > @sizeOf(SnapshotHeader))
+            file_size - @sizeOf(SnapshotHeader)
+        else
+            0;
+        const max_entries = entry_space / @sizeOf(SnapshotEntry);
+        const hint = @min(header.count, max_entries);
+        try out.ensureTotalCapacity(allocator, @intCast(hint));
 
         var off: u64 = @sizeOf(SnapshotHeader);
         var i: u64 = 0;
