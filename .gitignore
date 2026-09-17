@@ -13,6 +13,8 @@
 .zig-cache-global/
 *.pyc
 zig-out/
+# The stdio frontend builds to its own prefix for the frontend comparison.
+zig-out-stdio/
 zig-pkg/
 /release/
 /debug/

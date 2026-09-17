@@ -78,6 +78,33 @@ tasks:
     cmds:
       - zig build test --summary all
 
+  test:matrix:
+    desc: "Fault matrix: inject faults on both sides of the edge, both frontends"
+    aliases: [tm, matrix]
+    vars:
+      # Everything the suite needs, so a contributor runs one command. python
+      # and uv come from hermit; requests and zstandard come from uv; oha is a
+      # brew dependency and the load cases skip without it.
+      UV: ./bin/uv run --python ./bin/python3 --with requests --with zstandard
+    cmds:
+      - "{{.UV}} bench/matrix/run.py {{.CLI_ARGS}}"
+
+  test:matrix:fast:
+    desc: "Fault matrix without the cases that wait on a 30 s deadline"
+    aliases: [tmf]
+    cmds:
+      - task: test:matrix
+        vars:
+          CLI_ARGS: "--fast {{.CLI_ARGS}}"
+
+  bench:sweep:
+    desc: "Throughput, latency and memory by axis, both frontends"
+    aliases: [sweep]
+    vars:
+      UV: ./bin/uv run --python ./bin/python3 --with requests
+    cmds:
+      - "{{.UV}} bench/perf/sweep.py {{.CLI_ARGS}}"
+
   format:
     desc: "Format all Zig source files"
     aliases: [fmt, f]

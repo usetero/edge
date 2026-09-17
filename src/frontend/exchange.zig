@@ -9,6 +9,7 @@ const service_mod = @import("../service/service.zig");
 const upstream_mod = @import("upstream.zig");
 const pipeline_mod = @import("../pipeline/pipeline.zig");
 const thread_bufs = @import("thread_bufs.zig");
+const limits_mod = @import("../core/limits.zig");
 
 const ThreadBufs = thread_bufs.ThreadBufs;
 
@@ -66,7 +67,7 @@ pub const BodySource = union(enum) {
 
 /// Upper bound on forwarded request headers; excess is an error, not a
 /// truncation.
-const max_forward_headers = 64;
+const max_forward_headers = limits_mod.MAX_FORWARD_HEADERS;
 
 /// Forwardable request headers into an arena-owned array. `iter` is any
 /// iterator whose `next()` yields `.{ .key, .value }`.
@@ -87,10 +88,18 @@ pub fn collectForwardHeaders(arena: std.mem.Allocator, iter: anytype) ![]std.htt
 /// frontend answers with this when nothing has reached the wire yet.
 pub fn errorStatus(err: anyerror) u16 {
     return switch (err) {
-        error.DecodedBodyTooLarge, error.BodyTooLarge => 413,
+        // The raw cap is actionable: the sender can split the batch. A
+        // decoded-size overrun fails open in paths.zig instead, because the
+        // sender cannot see our decode budget and the agent discards a 413
+        // permanently.
+        error.BodyTooLarge, error.DecodedBodyTooLarge => 413,
         error.InboundBodyTimeout => 408,
         error.InvalidRequestBody => 400,
+        // Our cap, and the sender can act on it. A 5xx would send an agent
+        // into a retry loop against a request that can never succeed.
+        error.TooManyHeaders => 431,
         error.UpstreamTimeout => 504,
+        error.UpstreamResponseTruncated => 502,
         error.OutOfMemory, error.WriteFailed => 503,
         else => 502,
     };
@@ -129,6 +138,9 @@ fn dialUpstream(
     return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.info(UpstreamRetried{ .path = in.path, .err = @errorName(err) });
+        // Counted like any other retry: a dial storm is invisible otherwise,
+        // since only this log line records it.
+        if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(true);
         return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client);
     };
 }
@@ -223,10 +235,19 @@ fn relayResponse(
     bufs: *ThreadBufs,
 ) !void {
     var extra_headers: [64]std.http.Header = undefined;
+    // Read before the body reader exists: creating it invalidates the head.
+    const declared = upstream_res.head.content_length;
     const relayed = try exec.collectUpstreamResponseHeaders(upstream_res, arena, &extra_headers);
     const out = try sink.begin(@intFromEnum(upstream_res.head.status), relayed);
     const upstream_body = upstream_res.reader(bufs.upstream);
-    _ = try pipeline_mod.streamReaderToWriter(upstream_body, out, max_response_body);
+    const copied = try pipeline_mod.streamReaderToWriter(upstream_body, out, max_response_body);
+    // An intake that declares more than it sends has not accepted the batch.
+    // The status is already on the wire, so the only honest signal is to fail
+    // here: the frontend then closes without finishing the body, and the
+    // sender retries instead of recording a success.
+    if (declared) |want| {
+        if (copied < want) return error.UpstreamResponseTruncated;
+    }
     try sink.end();
 }
 

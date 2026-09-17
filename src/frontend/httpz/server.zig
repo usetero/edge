@@ -151,6 +151,12 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .max_body_size = limits.max_body_size,
             .buffer_size = limits.recv_buf,
             .lazy_read_size = limits.large_body_buffer_size,
+            // Above our own forward cap on purpose. httpz's default of 32
+            // drops the excess in silence, so a request with more headers
+            // than that was forwarded incomplete and answered 202. With room
+            // to spare, our cap refuses the request instead. Past this count
+            // httpz truncates again, which needs a fix in httpz itself.
+            .max_header_count = limits_mod.MAX_FORWARD_HEADERS + 32,
         },
         .workers = .{
             .count = worker_count,
@@ -158,6 +164,11 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .large_buffer_count = limits.large_body_buffer_count,
             .large_buffer_size = limits.large_body_buffer_size,
         },
+        // Same reasoning as the request header cap: httpz's default of 16
+        // dropped the excess in silence, so an intake answer with more
+        // headers than that was relayed incomplete and still reported 202.
+        // A `Retry-After` on a 429 is exactly the header that vanished.
+        .response = .{ .max_header_count = limits_mod.MAX_FORWARD_HEADERS + 32 },
         .thread_pool = .{ .count = limits.thread_pool_count },
         .timeout = .{
             .request = limits_mod.REQUEST_TIMEOUT_SECONDS,
@@ -303,6 +314,12 @@ pub const Handler = struct {
         const path = req.url.path;
 
         var sink: Sink = .{ .res = res };
+        // Claim the whole namespace whatever the method; see the stdio note.
+        if (std.mem.startsWith(u8, path, "/_edge/") and req.method != .GET) {
+            res.status = 405;
+            res.body = "";
+            return;
+        }
         if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
             return endpoints.metrics(ctx, &sink, &httpz.writeMetrics);
         }
@@ -322,6 +339,11 @@ pub const Handler = struct {
             };
             const n: u32 = if ((try req.query()).get("n")) |raw| std.fmt.parseInt(u32, raw, 10) catch 50 else 50;
             return endpoints.recordTap(ctx, &sink, stage, n);
+        }
+        if (std.mem.startsWith(u8, path, "/_edge/")) {
+            res.status = 404;
+            res.body = "";
+            return;
         }
 
         const outcome = exec.planRequest(

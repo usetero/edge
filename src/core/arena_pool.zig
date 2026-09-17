@@ -16,7 +16,9 @@ pub const ArenaPool = struct {
     reserve: usize,
 
     pub fn init(gpa: std.mem.Allocator, limits: limits_mod.Limits) !ArenaPool {
-        const n = limits.max_connections;
+        // Matches the slab exactly, including the control reserve: a
+        // reserved connection claims an arena like any other.
+        const n = limits.connectionSlots();
         std.debug.assert(n > 0);
         std.debug.assert(n < std.math.maxInt(u16));
 

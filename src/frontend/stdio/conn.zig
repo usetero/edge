@@ -42,7 +42,7 @@ const RequestFailed = struct { method: []const u8, path: []const u8, err: []cons
 const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 /// Same shape at warn level, for a request that held its connection task.
 const RequestSlow = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
-/// A connection refused before it carried a request, with the 503 sent.
+/// A connection refused before it carried a request, with the status sent.
 const ConnectionShed = struct { reason: []const u8, answered: u16 };
 /// An inbound read hit its deadline. `idle` is a keep-alive wait with no
 /// request in flight; `request` means a partial request stalled, which drops
@@ -83,10 +83,29 @@ pub const Sink = struct {
     /// consumed before `begin`, so its slab region is reused here.
     buffer: []u8,
     body: ?std.http.BodyWriter = null,
+    /// Sink for a bodiless status, which is answered before the relay runs.
+    discard: std.Io.Writer.Discarding = .init(&.{}),
     status: u16 = 0,
+
+    /// 204 and 304 carry no body, and 1xx is interim. Streaming them frames
+    /// a chunked body onto a status that must not have one, which some
+    /// clients reject outright.
+    fn isBodiless(status: u16) bool {
+        return status == 204 or status == 304 or (status >= 100 and status < 200);
+    }
 
     pub fn begin(self: *Sink, status: u16, headers: []const std.http.Header) !*std.Io.Writer {
         self.status = status;
+        if (isBodiless(status)) {
+            try self.request.respond("", .{
+                .status = @enumFromInt(status),
+                .extra_headers = headers,
+            });
+            // Nothing to write, and `end` has nothing to finish. The relay
+            // still writes into this, so hand it a discard.
+            self.discard = .init(&.{});
+            return &self.discard.writer;
+        }
         self.body = try self.request.respondStreaming(self.buffer, .{
             .respond_options = .{ .status = @enumFromInt(status), .extra_headers = headers },
         });
@@ -114,13 +133,21 @@ pub fn serveConnection(
     // `inbound` is filled once the slab slot provides its receive buffer.
     var env: Env = undefined;
 
-    const conn_id = slab.claim(io) orelse {
-        // Load shed: no slab slot. One fixed write, then close.
+    // A full slab still keeps a couple of slots back, so a health probe can
+    // be read and answered during the spike that filled it. A connection
+    // served from the reserve gets exactly one request, and only a control
+    // path: anything else is shed after the head, not before it.
+    var reserved = false;
+    const conn_id = slab.claim(io) orelse claim_reserved: {
+        if (slab.claimReserved(io)) |id| {
+            reserved = true;
+            break :claim_reserved id;
+        }
+        // Load shed: no slab slot at all. One fixed write, then close.
         if (shared.metrics) |metrics| metrics.recordConnectionShed(.slab_full);
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         shared.bus.warn(ConnectionShed{ .reason = "connection_slab_full", .answered = 503 });
-        const shed = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-        writeRawResponse(shared, io, stream, shed, 503);
+        writeRawResponse(shared, io, stream, shed_response, 503);
         return;
     };
     defer slab.release(io, conn_id);
@@ -131,6 +158,7 @@ pub fn serveConnection(
     const arena_slot = arenas.claim(io);
     defer arenas.release(io, arena_slot);
 
+    slab.trackSocket(io, conn_id, stream);
     var inbound: deadline_reader_mod.DeadlineReader = .init(io, stream, slab.recvBuf(conn_id));
     env = .{ .shared = shared, .slab = slab, .arenas = arenas, .inbound = &inbound };
     var net_writer = std.Io.net.Stream.Writer.init(stream, io, slab.sendBuf(conn_id));
@@ -155,6 +183,21 @@ pub fn serveConnection(
                 return;
             },
         };
+        if (reserved and !isControlPath(pathOf(request.head.target))) {
+            // The reserve exists for the control paths. Everything else is
+            // shed here, one step later than usual, with the same status.
+            if (shared.metrics) |metrics| metrics.recordConnectionShed(.slab_full);
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            shared.bus.warn(ConnectionShed{ .reason = "connection_slab_full", .answered = 503 });
+            request.respond("", .{
+                .status = .service_unavailable,
+                .keep_alive = false,
+                .extra_headers = &.{.{ .name = "retry-after", .value = retry_after_value }},
+            }) catch |err| {
+                undeliverable(shared, 503, err);
+            };
+            return;
+        }
         handleRequest(&env, conn_id, arena_slot, &request) catch |err| {
             // handleRequest already reported and answered what it could; this
             // only decides the connection's fate.
@@ -163,6 +206,8 @@ pub fn serveConnection(
         };
         inbound.endRequest();
         arenas.reset(arena_slot);
+        // A reserved slot serves one request, so the next probe finds it free.
+        if (reserved) return;
     }
 }
 
@@ -183,7 +228,7 @@ fn handleRequest(
 
     // Head strings die when the body reader is created; the target must
     // outlive that for the upstream leg, logs and metrics.
-    const target = try arena.dupe(u8, request.head.target);
+    const target = try arena.dupe(u8, originForm(request.head.target));
     const path = pathOf(target);
     const method = service_mod.HttpMethod.fromStd(request.head.method);
     const known_path = exec.classifyKnownPath(path, method);
@@ -269,6 +314,13 @@ fn dispatch(
     const path = pathOf(target);
     const method = service_mod.HttpMethod.fromStd(request.head.method);
 
+    // Claim the whole namespace whatever the method. Matching only GET let
+    // `POST /_edge/metrics` fall through to the wildcard passthrough and
+    // travel to the intake, the same way `POST /_health` did.
+    if (std.mem.startsWith(u8, path, "/_edge/") and request.head.method != .GET) {
+        sink.status = 405;
+        return request.respond("", .{ .status = .method_not_allowed });
+    }
     if (request.head.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
         // std.http.Server keeps no counters of its own.
         return endpoints.metrics(ctx, sink, null);
@@ -288,6 +340,10 @@ fn dispatch(
         };
         const n: u32 = if (queryParam(target, "n")) |raw| std.fmt.parseInt(u32, raw, 10) catch 50 else 50;
         return endpoints.recordTap(ctx, sink, stage, n);
+    }
+    if (std.mem.startsWith(u8, path, "/_edge/")) {
+        sink.status = 404;
+        return request.respond("", .{ .status = .not_found });
     }
 
     const outcome = exec.planRequest(
@@ -330,8 +386,46 @@ fn dispatch(
 }
 
 fn pathOf(target: []const u8) []const u8 {
-    const query_start = std.mem.findScalar(u8, target, '?');
-    return if (query_start) |i| target[0..i] else target;
+    const relative = originForm(target);
+    const query_start = std.mem.findScalar(u8, relative, '?');
+    return if (query_start) |i| relative[0..i] else relative;
+}
+
+/// `Retry-After` as a header value, from the one constant that sets it.
+pub const retry_after_value = std.fmt.comptimePrint("{d}", .{limits_mod.SHED_RETRY_AFTER_SECONDS});
+
+/// The fixed answer to a connection we cannot serve. 503 with `Retry-After`,
+/// not 429: the edge ran out of connections process-wide, which is a condition
+/// of this proxy and not an allowance we granted one sender. The OTLP spec
+/// admits either status and scopes `Retry-After` to both, and collectors in
+/// gateway mode already read 429 as a non-retryable tenant limit, so 429 here
+/// would invite exactly that reading. The header is the part a sender acts on.
+pub const shed_response =
+    "HTTP/1.1 503 Service Unavailable\r\n" ++
+    "content-length: 0\r\nconnection: close\r\n" ++
+    "retry-after: " ++ retry_after_value ++ "\r\n\r\n";
+
+/// The paths the edge answers itself. They never reach an upstream, so they
+/// are the ones worth keeping a connection slot for.
+fn isControlPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/_health") or std.mem.startsWith(u8, path, "/_edge/");
+}
+
+/// The origin-form of a request target.
+///
+/// A sender configured with a proxy sends the absolute-form
+/// (`GET http://host/path HTTP/1.1`), which RFC 9112 §3.2.2 requires a server
+/// to accept. Treating the whole URL as a path routed it to the wildcard
+/// passthrough and shipped a mangled target upstream, so `/_health` behind a
+/// proxy setting became intake traffic.
+fn originForm(target: []const u8) []const u8 {
+    for ([_][]const u8{ "http://", "https://" }) |scheme| {
+        if (!std.ascii.startsWithIgnoreCase(target, scheme)) continue;
+        const after_scheme = target[scheme.len..];
+        const slash = std.mem.findScalar(u8, after_scheme, '/') orelse return "/";
+        return after_scheme[slash..];
+    }
+    return target;
 }
 
 /// Value of `name` in the target's query string, undecoded.
@@ -368,6 +462,23 @@ fn inboundBodyOf(
     if (len == 0) return .{ .bytes = "" };
     if (len > limits.max_body_size) return error.BodyTooLarge;
     const reader = try request.readerExpectContinue(buffer);
+    // A streamed body is consumed by its first send and can never be
+    // replayed, so a transport failure mid-exchange ends the batch with a
+    // 502. Bodies below the streaming threshold stay resident and can be
+    // dialed again; httpz draws the same line at `lazy_read_size`.
+    //
+    // Above the threshold the batch is not replayable, which is deliberate.
+    // The Datadog agent retries a 5xx with exponential backoff, so the cost
+    // is a delayed batch and a duplicate risk rather than lost data. Raising
+    // the line to `max_body_size` would make every batch replayable, at the
+    // price of one `max_body_size` buffer per concurrent request: the memory
+    // a policy deployment already pays through `residentBody`, and a
+    // passthrough deployment does not. See bench/matrix a30.
+    if (len <= limits.large_body_buffer_size) {
+        var capture: std.Io.Writer.Allocating = .init(arena);
+        _ = try pipeline_mod.streamReaderToWriter(reader, &capture.writer, limits.max_body_size);
+        return .{ .bytes = capture.written() };
+    }
     return .{ .lazy = .{ .reader = reader, .len = @intCast(len) } };
 }
 
