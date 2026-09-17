@@ -506,9 +506,11 @@ pub const DatadogLog = struct {
     /// Targeted lookup of `data.jsonPayload.{message,body,log}`.
     ///
     /// Returns null when the document is not the plain GCP object shape this
-    /// handles (an array anywhere on the path, a non-object, a parse failure),
-    /// which means "ask the flatten instead". An inner null means the shape
-    /// was understood and no body field is present.
+    /// handles (an array anywhere on the path, an array at a body-candidate
+    /// value, a non-object, a parse failure), which means "ask the flatten
+    /// instead": the targeted walk does not descend arrays, but flatten does.
+    /// An inner null means the shape was understood and no body field is
+    /// present.
     fn innerBodyDirect(self: *DatadogLog, allocator: std.mem.Allocator, raw: []const u8) ??[]const u8 {
         // Already flattened for an earlier lookup: reuse it, the work is done.
         if (self.message_unwrapped) return null;
@@ -549,6 +551,14 @@ pub const DatadogLog = struct {
                     const text = v.get() catch continue;
                     hits[slot] = allocator.dupe(u8, text) catch return null;
                 },
+                // The targeted walk cannot descend an array body candidate,
+                // but flatten does — defer to it (return the outer null, not
+                // an inner null) so `bodyForMatch` runs flatten instead of
+                // short-circuiting to `raw`. Otherwise a string sibling could
+                // win here while flatten's array-descent picks the array leaf,
+                // breaking the "both paths agree" invariant and flipping keep/
+                // drop policy decisions.
+                .array => return null,
                 else => {},
             }
         }
@@ -1662,6 +1672,21 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
         \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":\"secret\",\"message\":\"benign\"}}}"}
         ,
         \\{"message":"{\"data\":{\"jsonPayload\":{\"body\":\"first\",\"body\":\"second\",\"log\":\"l\"}}}"}
+        ,
+        // Array-valued body candidates: the targeted walk cannot descend
+        // arrays, so it must defer to flatten (which does). Without the
+        // `.array => return null` arm in `innerBodyDirect`, the first two
+        // shapes flip keep/drop policy decisions (`drop-debug-logs` matches
+        // `log_field: body` against /debug|trace/): the targeted path would
+        // resolve a wrong string sibling while flatten resolves the array's
+        // string leaf.
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":[\"innocuous\"],\"body\":\"debug stuff\"}}}"}
+        ,
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":[\"debug stuff\"],\"body\":\"innocuous\"}}}"}
+        ,
+        // A string leaf inside the array must be recovered by the flatten
+        // path the targeted walk defers to.
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":[\"the body\"]}}}"}
         ,
     };
 
