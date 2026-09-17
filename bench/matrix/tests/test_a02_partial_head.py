@@ -8,6 +8,7 @@ from harness import MatrixCase
 
 
 class PartialHead(MatrixCase):
+    EXPECT_PERMANENT_DROP = True
     EXPECT_METRICS_FOR = {"stdio": {'edge_inbound_timeouts_total{phase="request"}': 1}}
     EXPECT_LOGS_FOR = {"stdio": ["inbound.timeout"]}
     FORBID_LOGS = ["upstream"]

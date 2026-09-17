@@ -10,6 +10,7 @@ from harness import MatrixCase
 
 
 class TooManyHeaders(MatrixCase):
+    EXPECT_PERMANENT_DROP = True
     EXPECT_LOGS = ["request.failed", "TooManyHeaders"]
     FORBID_LOGS = ["upstream"]
 

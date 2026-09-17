@@ -4,6 +4,7 @@ from harness import MatrixCase
 
 
 class BodyTooLarge(MatrixCase):
+    EXPECT_PERMANENT_DROP = True
     EXPECT_METRICS = {'edge_responses_total{known_path="api_v2_logs",status_class="s4xx"}': 1}
     EXPECT_LOGS = ["request.failed", "BodyTooLarge"]
     FORBID_LOGS = ["upstream"]

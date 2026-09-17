@@ -40,6 +40,13 @@ pub const Fault = enum {
     /// Answer 202, then close at once, so the next pooled request finds a
     /// dead keep-alive connection.
     stale_keepalive,
+    /// Read the whole body, then close with no answer. The batch arrived, so
+    /// a retry delivers it twice: this is what pins at-least-once.
+    read_then_close,
+    /// Read the whole body, then answer 202 with a content-length it does not
+    /// fulfil. Unlike `truncate`, the batch was accepted before the answer
+    /// broke, which is the case where a retry duplicates rather than repairs.
+    truncate_after_read,
 };
 
 pub const ServerContext = struct {
@@ -498,6 +505,16 @@ fn handleRequest(
             return;
         },
         .close_early => return error.FaultCloseEarly,
+        // The body is already read and recorded by this point.
+        .read_then_close => return error.FaultReadThenClose,
+        .truncate_after_read => {
+            writeRaw(
+                ctx,
+                stream,
+                "HTTP/1.1 202 Accepted\r\ncontent-length: 4096\r\n\r\nshort",
+            );
+            return error.FaultTruncateAfterRead;
+        },
         .slow => try ctx.io.sleep(.fromMilliseconds(fault_arg), .awake),
         .status => {
             try request.respond("{\"faulted\":true}", .{

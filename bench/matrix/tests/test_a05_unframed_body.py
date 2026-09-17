@@ -4,6 +4,7 @@ from harness import MatrixCase
 
 
 class UnframedBody(MatrixCase):
+    EXPECT_PERMANENT_DROP = True
     def test_unframed_post_gets_an_answer(self):
         with self.raw(timeout=40) as client:
             client.send(b"POST /api/v2/logs HTTP/1.1\r\nHost: 127.0.0.1\r\n"

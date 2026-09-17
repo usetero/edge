@@ -9,6 +9,7 @@ from harness import MatrixCase
 
 
 class ChunkedInvalid(MatrixCase):
+    EXPECT_PERMANENT_DROP = True
     FORBID_LOGS = ["upstream"]
     SLOW = True
     DEFECTS = {"stdio": "waits for the request deadline instead of rejecting the bad chunk"}

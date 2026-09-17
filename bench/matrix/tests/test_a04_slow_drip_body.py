@@ -16,6 +16,7 @@ from harness import MatrixCase
 
 
 class SlowDripBody(MatrixCase):
+    EXPECT_PERMANENT_DROP = True
     EXPECT_METRICS_FOR = {"stdio": {'edge_inbound_timeouts_total{phase="request"}': 1}}
     FORBID_LOGS = ["upstream"]
     SLOW = True

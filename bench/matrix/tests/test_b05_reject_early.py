@@ -10,6 +10,10 @@ from harness import MatrixCase
 
 
 class RejectEarly(MatrixCase):
+    # The intake made the call, not us: we relay its 400. The invariant cannot
+    # tell a relayed 4xx from one of ours, which is exactly why a separate
+    # `edge_upstream_responses_total` is worth having.
+    EXPECT_PERMANENT_DROP = True
     EXPECT_METRICS = {'edge_responses_total{known_path="api_v2_logs",status_class="s4xx"}': 1}
     FORBID_LOGS = ["request.failed"]
     def test_an_early_rejection_is_relayed(self):

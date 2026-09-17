@@ -99,61 +99,80 @@ before it was fixed:
 - `FORBID_LOGS = ["upstream"]` matched the startup line `upstream.configured`,
   which the case-scoped diff now excludes.
 
+## Backlog triage (BACKLOG.md)
+
+Fourteen cases taken from the backlog, in three groups:
+
+- **Verified first, then written:** a22 health methods, a30 the streaming
+  threshold, b11b the truncation challenge. Two backlog claims did not
+  reproduce as written and were corrected before the case was added.
+- **Written as specified:** a19 framing conflicts, a35 decompression bomb,
+  b12 dial blackhole, b23 duplicate delivery, b24 retry amplification,
+  c04 hung-intake saturation, c05 health at capacity, c09 log back-pressure,
+  d01 to d03 SIGTERM behaviour.
+- **Skipped, with reasons in the review:** the framer and OTLP torture cases
+  belong in the Zig unit tests, the idle-close race is nondeterministic, and
+  the soak and tiny-profile modes are runner projects.
+
+Three universal invariants came with them, and each one caught something the
+per-case assertions missed: no phantom success, in-flight back to zero, and
+descriptors back to baseline.
+
+## The two challenges, settled with tests
+
+1. **"Log intake clients do not retry" is wrong.** From the agent's own
+   source, `comp/logs-library/client/http/destination.go`: 400, 401, 403 and
+   413 increment `payloads_dropped` and are never resent; every other error
+   status and every transport failure becomes a `RetryableError` with
+   exponential backoff. Encoded in `bench/matrix/harness/agent.py` and asserted
+   as an invariant: answering a drop-class status for a batch the intake never
+   received is permanent data loss. This raises the severity of our 4xx
+   choices and lowers it for our 5xx choices.
+2. **The b11 note was half right.** Two cases now separate the halves. When the
+   intake truncates *before* reading the body it received nothing, so our 502
+   and the agent's retry repair it. When it reads the whole batch and *then*
+   truncates, the batch is already in, and our 502 makes the agent deliver a
+   second copy, measured at exactly two. The fix worth making is to relay the
+   2xx when we know the body was fully sent, and count the truncation.
+
 ## Findings
 
 ### Fixed
 
-1. **stdio never retried any batch.** Every body with a `Content-Length` was
-   streamed, and a stream cannot be replayed, so one stale pooled connection
-   lost the batch. Log intake clients do not retry, so this was silent data
-   loss. Bodies below the streaming threshold are resident now, which is where
-   httpz already drew the line. Caught by b04, b09, b10.
-2. **A header flood answered 502.** Our cap, the sender's fault, so it answers
-   431. Caught by a14.
-3. **A retried dial was uncounted**, so a dial storm was invisible in
-   `edge_upstream_retries_total`. Caught by b01.
-4. **The streamed policy path dropped a body it could not decode.** With a
-   policy loaded, an undecodable batch never reached the intake, though
-   `execPipeBuffered` already failed open for the same condition. It now
-   forwards the raw batch, emits `policy.failed.open` with the stage, and
-   counts a module error. Caught by a09.
-5. **A truncated intake response was reported as 202.** The relay compares the
-   bytes copied against the declared `content-length` and fails with
-   `UpstreamResponseTruncated`, so the frontend closes without finishing the
-   body and the sender retries instead of recording a success. Caught by b11.
-6. **httpz dropped headers above its own cap in silence.** Its default
-   `max_header_count` is 32, below our 64-header forward cap, so a request
-   with more headers was forwarded incomplete and answered 202. The httpz
-   config now sits above our cap, and `MAX_FORWARD_HEADERS` in limits.zig is
-   the single source of truth. Caught by a14.
+1. **stdio never retried any batch.** Bodies below the streaming threshold are
+   resident now. Caught by b04, b09, b10.
+2. **A header flood answered 502**, now 431. Caught by a14. The agent retries
+   both, so this is about diagnosis rather than agent behaviour.
+3. **A retried dial was uncounted.** Caught by b01.
+4. **The streamed policy path dropped a body it could not decode**, which the
+   agent would have discarded for good on the 400. It fails open now, with
+   `policy.failed.open`. Caught by a09.
+5. **A truncated intake response was reported as 202.** Now
+   `UpstreamResponseTruncated`. See the challenge above for the nuance.
+6. **httpz dropped headers above its own cap in silence.** Caught by a14.
 
-### Corrected findings
+### New, from the backlog cases
 
-- **httpz does not mishandle an unsupported encoding.** The 502 came from our
-  own `std.http.Server` based echo intake refusing brotli. Verified against a
-  lenient intake: httpz forwards the batch and relays 200. The earlier entry
-  blaming httpz was wrong.
-- **httpz does cut off a dribbling sender.** Its request timeout runs from
-  accept, not per read, so a small dribbled body is caught. The per-read
-  restart only applies to a body above `lazy_read_size`. The declared defect
-  was removed after the runner reported XPASS.
+7. **`/_health` is GET-only, so any other method is forwarded to Datadog.**
+   An ALB or ECS check configured for HEAD tests the intake, not the edge, and
+   fails whenever the intake is unreachable. Both frontends. (a22)
+8. **stdio takes 30 s to shut down with idle keep-alive connections**, against
+   httpz's 2 s, because shutdown waits out the idle deadline. Every deployment
+   stalls one task at a time against the orchestrator's kill timeout. (d03)
+9. **A batch above the 64 KiB streaming threshold cannot be replayed**, so an
+   intake blip mid-exchange loses it. Agent batches routinely exceed it. Both
+   frontends. (a30)
+10. **A body that expands past the decoded cap answers 413**, which the agent
+    discards permanently, rather than forwarding what we cannot decode. (a35)
+11. **stdio forwards an absolute-form target upstream** as a path. (a22)
+12. **Health is shed at capacity** rather than reserved, which restarts the
+    sidecar during the spike that filled it. (c05)
 
 ### Open: needs a change in a dependency
 
-- **httpz hands a batch of up to 16 requests to one pool thread** (c02). A
-  health probe that arrives with a burst waited 3.0 to 6.0 s against a 3 s
-  intake. This is the reported ECS failure. Fix: one shared queue in
-  `thread_pool.zig`, plus a `received_at` stamp for a queue-wait metric.
-- **httpz refuses a pipelined pair** with 400 (a12). Fix: after
-  `requestDone`, parse the bytes already buffered as the next request.
-- **httpz closes a stalled sender with no status** (a02, a03). Fix: answer 408
-  before closing, and add a whole-request deadline.
-- **stdio cannot accept an unknown content encoding** (a10).
-  `std.http.Server` maps `content-encoding` through `ContentEncoding.fromString`
-  and fails the whole head with `HttpHeadersInvalid` for anything else, with no
-  distinct error to match on. An agent using brotli gets 400 and retries
-  forever. Fix: accept unknown encodings as opaque in std, or parse the head
-  ourselves.
-- **stdio waits for the request deadline on a broken chunk** (a07), so bad
-  framing holds a connection slot for 30 s. httpz refuses it at once. Fix:
-  std's chunked parser must error on an invalid size line.
+- httpz hands a batch of up to 16 requests to one pool thread (c02).
+- httpz refuses a pipelined pair (a12).
+- httpz closes a stalled sender with no status (a02, a03).
+- stdio cannot accept an unknown content encoding, because `std.http.Server`
+  fails the whole head (a10). The agent drops the batch for good on that 400.
+- stdio waits for the request deadline on a broken chunk (a07).

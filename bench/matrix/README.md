@@ -116,6 +116,13 @@ with its note.
 | a15 | Complete but invalid head | 400 at once | slow |
 | a15 | Incomplete garbage, no head terminator | Bounded by the deadline | slow |
 | a16 | zstd batch, what a current agent sends | 202, and the intake receives it | |
+| a19 | `Content-Length` with chunked, two lengths, a length that is not a number | A 4xx, and nothing reaches the intake | the smuggling surface |
+| a22 | `HEAD /_health`, `POST /_health` | Answered by the edge, never forwarded | xfail both: GET-only route, so other methods fall through to the passthrough |
+| a22 | `GET http://example.com/_health` | Not forwarded as a mangled target | xfail stdio |
+| a30 | 60 KiB batch, intake closes mid-request | Replayed, 202 | the resident side of the threshold |
+| a30 | 300 KiB batch, intake closes mid-request | Replayed, 202 | xfail both: a streamed batch cannot be replayed |
+| a35 | Small gzip that expands past the decoded cap, policies loaded | Bounded, and the batch is not lost | xfail both: 413, which the agent discards for good |
+| a35 | The same body with no policies loaded | Forwarded untouched, 202 | nothing reads it |
 
 ### `b*` — the edge to the intake
 
@@ -132,6 +139,11 @@ with its note.
 | b09 | Pooled keep-alive is already dead | Retried on a fresh dial, 202 | log intake clients do not retry |
 | b10 | Intake resets the connection | Retried, 202 | |
 | b11 | Intake declares more body than it sends | Never 202; `UpstreamResponseTruncated` | |
+| b11b | Intake truncates *before* reading the body | The batch never arrived, so a retry repairs it | settles the b11 challenge |
+| b11b | Intake reads the batch, *then* truncates | The batch is in, so our 502 costs a duplicate | settles the b11 challenge |
+| b12 | Dial into a full accept queue, so SYNs are dropped | An answer inside 35 s | slow, xfail both: the dial has no deadline |
+| b23 | Intake reads the whole batch, then closes with no answer | Exactly two copies at the intake | pins at-least-once |
+| b24 | Every request fails the same way, 100 of them | At most two attempts each, health unaffected | |
 
 ### `c*` — capacity
 
@@ -140,6 +152,17 @@ with its note.
 | c01 | More connections than the slab holds (8) | Shed with 503, counted by reason | |
 | c02 | Health probe arrives with a 15-sender burst against a 3 s intake, 20 times | The probe stays under 1 s | slow, xfail httpz: a batch of 16 goes to one pool thread |
 | c03 | 12 idle sockets against 8 slots | Recovers on its own, without the senders closing | slow |
+| c04 | 48 senders against an intake that never answers | Health and the scrape answer inside a second | slow |
+| c05 | A probe while every slot is held | Health answers at capacity | xfail both: shed with the rest, which restarts the sidecar during the spike |
+| c09 | 400 failing requests with a log pipe nobody drains | The edge keeps serving | slow |
+
+### `d*` — lifecycle
+
+| Case | Fault injected | Must happen | Notes |
+|---|---|---|---|
+| d01 | SIGTERM with four exchanges open against a 4 s intake | Exit inside 35 s, and no 202 for a batch never forwarded | slow |
+| d02 | SIGTERM while the intake is hung | Exit inside 20 s | slow |
+| d03 | SIGTERM with eight idle keep-alive connections | Exit inside 10 s | xfail stdio: waits out the 30 s idle deadline |
 
 Every case also asserts its telemetry, and the base class asserts that a
 counter which moved is explainable from the log.

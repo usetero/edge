@@ -44,6 +44,7 @@ class EchoIntake:
         env = dict(os.environ)
         env["ECHO_LATENCY_MS"] = str(latency_ms)
         self._log = open(self.log_path, "wb")
+        self._last_seen = 0
         self.proc = subprocess.Popen(
             [self.BINARY, str(self.port), tempfile.gettempdir()],
             stdout=self._log,
@@ -83,7 +84,17 @@ class EchoIntake:
         return int(self.stats().get("fault_applied", 0))
 
     def requests_seen(self) -> int:
-        return int(self.stats().get("total_requests", 0))
+        """Requests the intake recorded.
+
+        A case may stop the intake on purpose (b01), and the teardown
+        invariants still ask. Fall back to the last known count rather than
+        turning a deliberate outage into a harness error.
+        """
+        try:
+            self._last_seen = int(self.stats().get("total_requests", 0))
+        except (OSError, urllib.error.URLError, ValueError):
+            pass
+        return self._last_seen
 
     def stop(self) -> None:
         self.proc.terminate()
@@ -97,7 +108,13 @@ class EchoIntake:
 class Edge:
     """The edge binary under test, with a config written for this case."""
 
-    def __init__(self, upstream_url: str, config: dict | None = None, env: dict | None = None):
+    def __init__(
+        self,
+        upstream_url: str,
+        config: dict | None = None,
+        env: dict | None = None,
+        stall_logs: bool = False,
+    ):
         self.port = free_port()
         self.binary = os.environ.get("EDGE_BIN", os.path.join(REPO_ROOT, "zig-out", "bin", "edge"))
         merged = {
@@ -118,6 +135,17 @@ class Edge:
         self.err_path = tempfile.mktemp(suffix=".edge.err.log")
         self._out = open(self.out_path, "wb")
         self._err = open(self.err_path, "wb")
+        self.stalled_pipe = None
+        if stall_logs:
+            # A log destination nobody drains. A logger that blocks on a full
+            # pipe takes the data plane down with it, which is what an ECS log
+            # driver in blocking mode can do.
+            read_fd, write_fd = os.pipe()
+            self.stalled_pipe = read_fd
+            self._out.close()
+            self._err.close()
+            self._out = os.fdopen(write_fd, "wb")
+            self._err = self._out
         process_env = dict(os.environ)
         process_env.update(env or {})
         self.proc = subprocess.Popen(
@@ -147,6 +175,34 @@ class Edge:
     def alive(self) -> bool:
         return self.proc.poll() is None
 
+    @property
+    def pid(self) -> int:
+        return self.proc.pid
+
+    def descriptors(self) -> int:
+        """Open file descriptors, for the leak invariant."""
+        try:
+            out = subprocess.run(
+                ["lsof", "-p", str(self.proc.pid)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return -1
+        return max(0, len(out.stdout.splitlines()) - 1)
+
+    def terminate_and_wait(self, timeout: float = 30.0) -> tuple[int | None, float]:
+        """SIGTERM, then wait. Returns the exit code and how long it took."""
+        started = time.monotonic()
+        self.proc.terminate()
+        try:
+            code = self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            return None, time.monotonic() - started
+        return code, time.monotonic() - started
+
     def frontend(self) -> str | None:
         """Which frontend this binary actually carries, from its own log."""
         for line in self.logs().splitlines():
@@ -157,6 +213,8 @@ class Edge:
 
     def logs(self) -> str:
         """Both streams. INFO and WARN land on stdout, ERROR on stderr."""
+        if self.stalled_pipe is not None:
+            return ""  # the log destination is a pipe on purpose
         self._out.flush()
         self._err.flush()
         parts = []
@@ -191,8 +249,12 @@ class Edge:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
-        self._out.close()
-        self._err.close()
+        if self.stalled_pipe is not None:
+            os.close(self.stalled_pipe)
+            self._out.close()
+        else:
+            self._out.close()
+            self._err.close()
         try:
             os.unlink(self.config_path)
         except OSError:

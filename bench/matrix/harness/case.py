@@ -46,6 +46,7 @@ import tempfile
 import time
 import unittest
 
+from . import agent
 from .procs import Edge, EchoIntake
 from .raw import RawClient, request_head
 
@@ -65,6 +66,17 @@ class MatrixCase(unittest.TestCase):
     SLOW: bool = False
     EXPECT_SHED: bool = False
     DEFECTS: dict = {}
+    #: The case ends the edge process itself, so the post-case invariants that
+    #: need a live server are skipped.
+    TERMINATES_EDGE: bool = False
+    #: A policy that keeps nothing makes a 2xx with no upstream request
+    #: legitimate, so the phantom-success rule is relaxed.
+    ALLOW_PHANTOM_SUCCESS: bool = False
+    #: The case answers a status the agent drops on purpose, and the batch is
+    #: genuinely unforwardable (too large, ambiguous framing).
+    EXPECT_PERMANENT_DROP: bool = False
+    #: Data paths only: health and the scrape answer 2xx without an upstream.
+    DATA_PATHS = ("api_v2_logs", "api_v2_series", "v1_logs", "v1_metrics", "v1_traces", "other")
     EXPECT_METRICS: dict = {}
     EXPECT_METRICS_FOR: dict = {}
     EXPECT_LOGS: list = []
@@ -146,6 +158,8 @@ class MatrixCase(unittest.TestCase):
                 "--prefix zig-out-stdio" % (running, self.frontend),
             )
         self.baseline = self.edge.metrics()
+        self.baseline_descriptors = self.edge.descriptors()
+        self.baseline_intake = self.intake.requests_seen()
         # Expectations are about what this case produced, so the startup lines
         # (which name the configured upstream) must not count. Diff by line,
         # because stdout and stderr are flushed independently.
@@ -219,6 +233,37 @@ class MatrixCase(unittest.TestCase):
     def assert_not_logged(self, needle: str) -> None:
         self.assertNotIn(needle, self.case_logs())
 
+    def data_path_2xx(self) -> float:
+        """2xx answers on paths that must reach the intake."""
+        total = 0.0
+        for name, value in self.edge.metrics().items():
+            if not name.startswith("edge_responses_total") or 's2xx' not in name:
+                continue
+            if not any('known_path="%s"' % p in name for p in self.DATA_PATHS):
+                continue
+            total += value - self.baseline.get(name, 0.0)
+        return total
+
+    def dropped_by_agent(self) -> int:
+        """Data-path answers that make the agent discard the batch for good."""
+        total = 0
+        for name, value in self.edge.metrics().items():
+            if not name.startswith("edge_responses_total") or 's4xx' not in name:
+                continue
+            if not any('known_path="%s"' % p in name for p in self.DATA_PATHS):
+                continue
+            total += int(value - self.baseline.get(name, 0.0))
+        return total if self.data_path_4xx_was_a_drop() else 0
+
+    def data_path_4xx_was_a_drop(self) -> bool:
+        """True when the batch did not reach the intake.
+
+        The status class is all the metrics carry, so this is conservative:
+        a 4xx counts as a drop only when nothing was forwarded for it.
+        """
+        forwarded = self.intake.requests_seen() - self.baseline_intake
+        return forwarded < self.data_path_2xx() + 1
+
     def metric_delta(self, name: str) -> float:
         """How much a counter moved since the case started."""
         return self.edge.metric(name) - self.baseline.get(name, 0.0)
@@ -286,7 +331,51 @@ class MatrixCase(unittest.TestCase):
 
     def assert_invariants(self) -> None:
         """Holds in every cell, whatever the fault was."""
+        if self.TERMINATES_EDGE:
+            return
         self.assertTrue(self.edge.alive(), "the edge process died:\n%s" % self.edge.logs())
+
+        # No phantom success: the intake must have seen at least as many
+        # requests as the sender received 2xx answers on a data path. This one
+        # rule catches every "the edge answered for data it never forwarded".
+        if not self.ALLOW_PHANTOM_SUCCESS:
+            accepted = self.data_path_2xx()
+            forwarded = self.intake.requests_seen() - self.baseline_intake
+            self.assertGreaterEqual(
+                forwarded,
+                accepted,
+                "the sender got %d 2xx answers on data paths but the intake "
+                "saw %d requests" % (accepted, forwarded),
+            )
+
+        # No permanent loss: the agent discards a payload for good on 400,
+        # 401, 403 and 413 (see harness/agent.py). Answering one of those for
+        # a batch the intake never saw destroys customer data.
+        if not self.EXPECT_PERMANENT_DROP:
+            dropped = self.dropped_by_agent()
+            self.assertEqual(
+                dropped,
+                0,
+                "answered %d status(es) the agent drops permanently, for a batch "
+                "the intake never received" % dropped,
+            )
+
+        # In-flight returns to zero: the scrape itself is the only request
+        # still open when we look.
+        in_flight = self.edge.metric("edge_requests_in_flight")
+        self.assertLessEqual(in_flight, 1, "requests are still in flight: %s" % in_flight)
+
+        # Descriptors return to baseline, with room for pooled upstream
+        # connections and the scrape.
+        if self.baseline_descriptors > 0:
+            now = self.edge.descriptors()
+            if now > 0:
+                self.assertLessEqual(
+                    now,
+                    self.baseline_descriptors + 16,
+                    "descriptors leaked: %d against a baseline of %d"
+                    % (now, self.baseline_descriptors),
+                )
 
         # It must still serve after the fault.
         health = self.health()

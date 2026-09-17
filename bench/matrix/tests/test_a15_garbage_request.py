@@ -4,6 +4,7 @@ from harness import MatrixCase
 
 
 class GarbageRequest(MatrixCase):
+    EXPECT_PERMANENT_DROP = True
     SLOW = True
 
     def test_a_complete_but_invalid_head_is_rejected(self):

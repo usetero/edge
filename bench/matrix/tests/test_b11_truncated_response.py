@@ -11,6 +11,9 @@ from harness import MatrixCase
 
 
 class TruncatedResponse(MatrixCase):
+    # The intake's head is relayed as it arrives, so a 2xx is recorded before
+    # the body is known to be short. b11b measures what that costs.
+    ALLOW_PHANTOM_SUCCESS = True
     EXPECT_LOGS_FOR = {"stdio": ["response.truncated"]}
     EXPECT_LOGS = ["UpstreamResponseTruncated"]
 
