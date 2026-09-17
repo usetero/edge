@@ -514,6 +514,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
             io,
             config.s3_dump.flush_interval_ms,
             &runtime_metrics,
+            bus,
         });
     }
 
@@ -539,7 +540,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
 
     // Drain any buffered dump batches before we tear down (io is still live).
     if (s3_dump_active) {
-        runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
+        ext_rt.reportFlush(exts.flush(io, .{ .force = true }), &runtime_metrics, bus);
     }
 
     // Flush final policy stats to the control plane before teardown (io still

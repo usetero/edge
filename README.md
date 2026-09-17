@@ -503,22 +503,51 @@ OTLP distribution.
 
 Runtime metrics are exposed at `GET /_edge/metrics` in Prometheus text format.
 
-Core HTTP metrics:
+Every label is a bounded enum. No path, status code, policy id or client
+value ever becomes a label, so the series count cannot grow with traffic.
+
+Requests and responses:
 
 - `edge_requests_total{method,known_path}`
-- `edge_request_duration_seconds{known_path}` (histogram)
+- `edge_request_duration_seconds{known_path}` (histogram, 100 us to 30 s)
 - `edge_responses_total{known_path,status_class}`
-- `edge_request_errors_total{known_path,class}`
-- `edge_prefilter_decisions_total{route_kind,decision}`
+- `edge_request_errors_total{known_path,class}` — `class` is `uncaught` or `module`
+- `edge_requests_in_flight` (gauge) — against the thread pool count, the saturation signal
+- `edge_requests_invalid_total` — heads refused before routing, answered 400 (stdio only)
 
-Policy throughput metrics:
+Connections (stdio only, except the ceiling):
+
+- `edge_connections_total`
+- `edge_connections_active` (gauge)
+- `edge_connections_max` (gauge) — the configured ceiling, reported by both frontends
+- `edge_connections_shed_total{reason}` — `slab_full` or `concurrency`; the exhaustion signal
+- `edge_inbound_timeouts_total{phase}` — `request` counts dropped requests, `idle` counts reclaimed keep-alive slots
+
+Upstream:
+
+- `edge_upstream_attempts_total`
+- `edge_upstream_retries_total`
+- `edge_upstream_timeouts_total`
+
+Policy:
 
 - `edge_policy_records_evaluated_total{telemetry}`
 - `edge_policy_records_kept_total{telemetry}`
 - `edge_policy_records_dropped_total{telemetry}`
-- `edge_build_info{version,commit,distribution}` (gauge; always `1`)
+- `edge_policies_loaded{signal}` (gauge)
+- `edge_policies_rejected` (gauge) — patterns the matcher refused; a non-zero value means a rule an operator believes is live does nothing
 
-Request latency buckets are tuned for low-latency traffic from `0.1ms` to `5s`.
+s3-dump extension (present only when the extension is built in):
+
+- `edge_s3_dump_flushes_total`
+- `edge_s3_dump_objects_uploaded_total`, `edge_s3_dump_objects_failed_total`
+- `edge_s3_dump_records_uploaded_total`, `edge_s3_dump_records_dropped_total`
+- `edge_s3_dump_bytes_uploaded_total`
+- `edge_s3_dump_backlog_bytes` (gauge) — alert on this approaching `max_sealed_bytes`
+
+Build:
+
+- `edge_build_info{version,commit,distribution}` (gauge; always `1`)
 
 ## Design Principles
 

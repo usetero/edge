@@ -22,6 +22,9 @@ class PolicyDropAll(MatrixCase):
         ]
     }
     FORBID_LOGS = ["request.failed", "upstream.retried"]
+    # The one line that explains where the data went. Warned once for the
+    # process, then debug per batch.
+    EXPECT_LOGS = ["batch.dropped"]
 
     def test_a_dropped_batch_is_still_a_success_for_the_sender(self):
         response = self.post_logs(timeout=30)

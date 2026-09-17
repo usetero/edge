@@ -389,6 +389,67 @@ timeout, so the defect is declared again and the case proves it. Where a host
 refuses the route instead of dropping it, the case skips rather than claim a
 bound it did not test.
 
+## Observability review
+
+An audit of every metric and every log site, for gaps on one side and noise on
+the other.
+
+### Logs added
+
+Five places could lose or fail something with no line at all:
+
+1. **A batch policy empties.** Both paths now report it: the record path
+   forwards the empty batch, and the buffered path answers success and
+   forwards nothing. `batch.dropped` carries `forwarded`, so the line says
+   which happened. This is the first thing to read when an operator asks where
+   their data went. a41 asserts it.
+2. **An s3-dump flush that did not deliver.** `s3.dump.records.dropped` is
+   data lost for good, from a full backlog or an encode failure.
+   `s3.dump.upload.failed` is a failed upload that was requeued, which is the
+   leading indicator of the first. The counters gave the rate; nothing gave
+   the reason. Both the flush loop and the shutdown drain report through one
+   helper.
+3. **An `accept` that failed.** `accept.failed`. One inbound connection is
+   gone before it carried a request.
+4. **A watchdog that could not start.** `watchdog.spawn.failed`, on both
+   frontends. The spawn error was dropped on the floor, and the process shut
+   down with no reason given.
+5. **A listener that stopped.** `listen.failed` on httpz. It explains a
+   process that is up and deaf.
+
+Three of those were `std.log` free text before. A named type gives the event a
+stable telemetry name, so an alert can match it and this suite can assert it.
+
+Two events are warn-once-per-process, then debug: `batch.dropped` and
+`head.repaired`. The fact is what an operator needs, and it does not change
+between requests; the rate belongs to the counter. A warn per request at 87k
+rps is its own outage.
+
+### Metrics removed and trimmed
+
+- `edge_prefilter_decisions_total{route_kind,decision}` is gone. It answered
+  whether the prefilter took the fast path, which is tuning work, not
+  operation. That is 24 series, and no case or dashboard read it. The
+  `RouteKindLabel` enum and `prefilterRouteLabel` went with it.
+- `edge_request_duration_seconds` drops from 18 buckets to 11 boundaries, 100
+  us to 30 s. At 18 it was half the whole series budget (18 x 9 paths), finer
+  than any alert reads.
+
+The series budget goes from about 380 to about 240, and the README now lists
+every series with its labels.
+
+### Cardinality
+
+No unbounded label anywhere. Every label is a bounded enum, and the only
+string labels are `version` and `commit` on `edge_build_info`, one series per
+process. No path, status code, policy id or client value reaches a label, so
+the series count cannot grow with traffic.
+
+httpz keeps three events against stdio's twelve, and its connection metrics
+are compiled out (`conn_metrics_enabled`). That is left as it is: stdio is the
+default, and the comment that claimed httpz exports its own connection series
+through `endpoints.zig` was wrong, because no such series exists.
+
 ## Findings
 
 ### Fixed

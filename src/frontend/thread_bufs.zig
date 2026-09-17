@@ -14,6 +14,12 @@ const limits_mod = @import("../core/limits.zig");
 
 const log = std.log.scoped(.httpz_server);
 
+// Named event payloads: the type name is the telemetry event name.
+/// The watchdog reached an upstream past its deadline and could not shut the
+/// socket down. The handler thread stays blocked, so this is the last record
+/// of it.
+const UpstreamInterruptFailed = struct { err: []const u8 };
+
 pub const upstream_attempt_timeout_ns: i128 = 30 * std.time.ns_per_s;
 /// The watchdog only needs to catch a wedged upstream; 100 ms is far below
 /// the 30 s attempt timeout and costs nothing.
@@ -146,7 +152,8 @@ pub fn expireTrackedUpstreams(ctx: *exec.SharedCtx, force: bool) void {
         connection.stream_reader.stream.shutdown(ctx.io, .both) catch |err| {
             // The handler stays blocked on a socket nothing can interrupt, so
             // this is the last record of that thread.
-            log.warn("failed to interrupt upstream: {s}", .{@errorName(err)});
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            ctx.bus.warn(UpstreamInterruptFailed{ .err = @errorName(err) });
         };
     }
 }
