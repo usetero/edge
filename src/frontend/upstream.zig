@@ -8,16 +8,6 @@ const std = @import("std");
 /// Index of one configured upstream in this manager.
 pub const UpstreamId = enum(u32) { _ };
 
-/// Pre-parsed upstream components handed to outcome execution.
-pub const UpstreamConfig = struct {
-    scheme: []const u8,
-    host: []const u8,
-    port: u16,
-    base_path: []const u8,
-    max_request_body: u32,
-    max_response_body: u32,
-};
-
 /// Minimum buffer size required for TLS operations
 const tls_min_buffer = std.crypto.tls.max_ciphertext_record_len;
 
@@ -151,20 +141,6 @@ pub const UpstreamManager = struct {
         return @enumFromInt(@as(u32, @intCast(self.upstreams.len - 1)));
     }
 
-    pub fn getUpstreamConfig(self: *const UpstreamManager, upstream_id: UpstreamId) UpstreamConfig {
-        const idx = @intFromEnum(upstream_id);
-        const slice = self.upstreams.slice();
-
-        return .{
-            .scheme = slice.items(.scheme)[idx],
-            .host = slice.items(.host)[idx],
-            .port = slice.items(.port)[idx],
-            .base_path = slice.items(.base_path)[idx],
-            .max_request_body = slice.items(.max_request_body)[idx],
-            .max_response_body = slice.items(.max_response_body)[idx],
-        };
-    }
-
     pub fn getMaxResponseBody(self: *const UpstreamManager, upstream_id: UpstreamId) u32 {
         const idx = @intFromEnum(upstream_id);
         return self.upstreams.slice().items(.max_response_body)[idx];
@@ -230,46 +206,6 @@ pub const UpstreamManager = struct {
 // Tests
 // =============================================================================
 
-test "UpstreamManager createUpstream parses URL correctly" {
-    const allocator = std.testing.allocator;
-
-    var manager = UpstreamManager.init(std.Options.debug_io, allocator, 8);
-    defer manager.deinit();
-
-    const upstream_id = try manager.createUpstream(
-        "https://intake.logs.datadoghq.com/api/v2",
-        2048,
-        10 * 1024 * 1024,
-        10 * 1024 * 1024,
-    );
-
-    const config = manager.getUpstreamConfig(upstream_id);
-    try std.testing.expectEqualStrings("https", config.scheme);
-    try std.testing.expectEqualStrings("intake.logs.datadoghq.com", config.host);
-    try std.testing.expectEqual(@as(u16, 443), config.port);
-    try std.testing.expectEqualStrings("/api/v2", config.base_path);
-}
-
-test "UpstreamManager createUpstream with explicit port" {
-    const allocator = std.testing.allocator;
-
-    var manager = UpstreamManager.init(std.Options.debug_io, allocator, 8);
-    defer manager.deinit();
-
-    const upstream_id = try manager.createUpstream(
-        "http://localhost:8080/proxy",
-        2048,
-        1024,
-        1024,
-    );
-
-    const config = manager.getUpstreamConfig(upstream_id);
-    try std.testing.expectEqualStrings("http", config.scheme);
-    try std.testing.expectEqualStrings("localhost", config.host);
-    try std.testing.expectEqual(@as(u16, 8080), config.port);
-    try std.testing.expectEqualStrings("/proxy", config.base_path);
-}
-
 test "UpstreamManager buildUpstreamUri" {
     const allocator = std.testing.allocator;
 
@@ -315,22 +251,6 @@ test "UpstreamManager buildUpstreamUri with non-standard port" {
     const uri = try manager.buildUpstreamUri(allocator, upstream_id, "/test", "");
     defer allocator.free(uri);
     try std.testing.expectEqualStrings("http://localhost:9999/test", uri);
-}
-
-test "UpstreamManager multiple upstreams" {
-    const allocator = std.testing.allocator;
-
-    var manager = UpstreamManager.init(std.Options.debug_io, allocator, 8);
-    defer manager.deinit();
-
-    const id0 = try manager.createUpstream("https://api1.example.com", 2048, 1024, 1024);
-    const id1 = try manager.createUpstream("https://api2.example.com", 2048, 1024, 1024);
-
-    const config0 = manager.getUpstreamConfig(id0);
-    const config1 = manager.getUpstreamConfig(id1);
-
-    try std.testing.expectEqualStrings("api1.example.com", config0.host);
-    try std.testing.expectEqualStrings("api2.example.com", config1.host);
 }
 
 // =============================================================================
