@@ -1,5 +1,6 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
+const json_value = @import("json_value.zig");
 
 pub const Parser = zimdjson.ondemand.FullParser(.default);
 pub const Value = Parser.Value;
@@ -319,41 +320,10 @@ pub const MetricSeries = struct {
         var it = self.extra.iterator();
         while (it.next()) |entry| {
             try jws.objectField(entry.key_ptr.*);
-            try writeAnyValue(jws, entry.value_ptr.*);
+            try json_value.write(jws, entry.value_ptr.*);
         }
 
         try jws.endObject();
-    }
-
-    /// Write a zimdjson AnyValue to a JSON writer
-    fn writeAnyValue(jws: anytype, value: AnyValue) !void {
-        switch (value) {
-            .null => try jws.write(null),
-            .bool => |v| try jws.write(v),
-            .number => |n| switch (n) {
-                .unsigned => |v| try jws.write(v),
-                .signed => |v| try jws.write(v),
-                .double => |v| try jws.write(v),
-            },
-            .string => |v| try jws.write(v.get() catch ""),
-            .array => |arr| {
-                try jws.beginArray();
-                var it = arr.iterator();
-                while (it.next() catch null) |item| {
-                    try writeAnyValue(jws, item.asAny() catch continue);
-                }
-                try jws.endArray();
-            },
-            .object => |obj| {
-                try jws.beginObject();
-                var it = obj.iterator();
-                while (it.next() catch null) |field| {
-                    try jws.objectField(field.key.get() catch continue);
-                    try writeAnyValue(jws, field.value.asAny() catch continue);
-                }
-                try jws.endObject();
-            },
-        }
     }
 };
 
