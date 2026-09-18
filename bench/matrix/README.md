@@ -122,7 +122,7 @@ with its note.
 | a16 | zstd batch, what a current agent sends | 202, and the intake receives it | |
 | a19 | `Content-Length` with chunked, two lengths, a length that is not a number | A 4xx, and nothing reaches the intake | the smuggling surface |
 | a22 | `HEAD /_health`, `POST /_health` | Answered by the edge, never forwarded | |
-| a22 | `GET http://example.com/_health` | Not forwarded as a mangled target | xfail stdio |
+| a22 | `GET http://example.com/_health` | Not forwarded as a mangled target | |
 | a30 | 60 KiB batch, intake closes mid-request | Replayed, 202 | the resident side of the threshold |
 | a30 | 300 KiB batch, intake closes mid-request | Replayed, 202 | xfail both, by design: a streamed batch cannot be replayed, and the agent retries the 502 |
 | a34 | `gzip`, `GZIP`, `x-gzip`, `gzip ` | Every spelling reaches the intake | codings are case-insensitive (RFC 9110 §8.4.1) |
@@ -159,7 +159,7 @@ with its note.
 | c02 | Health probe arrives with a 15-sender burst against a 3 s intake, 20 times | The probe stays under 1 s | slow, xfail httpz: a batch of 16 goes to one pool thread |
 | c03 | 12 idle sockets against 8 slots | Recovers on its own, without the senders closing | slow |
 | c04 | 48 senders against an intake that never answers | Health and the scrape answer inside a second | slow |
-| c05 | A probe while every slot is held | Health answers at capacity | xfail both: shed with the rest, which restarts the sidecar during the spike |
+| c05 | A probe while every slot is held | Health answers at capacity | xfail httpz: shed with the rest, which restarts the sidecar during the spike |
 | c09 | 400 failing requests with a log pipe nobody drains | The edge keeps serving | slow |
 
 ### `d*` — lifecycle
