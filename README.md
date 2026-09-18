@@ -499,6 +499,113 @@ OTLP distribution.
 
 - `TERO_LOG_LEVEL` - Override log level (trace, debug, info, warn, err)
 
+## Production Sizing
+
+Peak concurrent connections drive the edge, not request rate. A sender holds a
+keep-alive connection open between batches, so one agent at 10 requests/sec and
+one at 1000 cost the same slot. Size from the number you can measure rather
+than one you derive: run for a day and read peak `edge_connections_active` off
+`/_edge/metrics`.
+
+Memory figures are from `bench/perf/sweep.py` on the default (stdio) frontend:
+21 MB at 16 live connections, 65 MB at 64, and 229 MB at 256. The first three
+rows below are measured; the fourth extends the same line, so leave more
+headroom there than the arithmetic asks for.
+
+| Peak `edge_connections_active` | `max_connections` | Memory request | Memory limit | CPU request | CPU limit |
+| ------------------------------ | ----------------- | -------------- | ------------ | ----------- | --------- |
+| 16                             | 64                | 64Mi           | 128Mi        | 250m        | 1         |
+| 64                             | 256               | 96Mi           | 256Mi        | 500m        | 2         |
+| 256                            | 1024              | 256Mi          | 512Mi        | 1           | 2         |
+| 512                            | 2048              | 512Mi          | 1Gi          | 2           | 4         |
+
+`max_connections` sits at roughly four times the measured peak on purpose. A
+slot reserves 64 KiB and commits a page only when a connection lands on it, so
+the headroom is free until you need it. Size memory from the peak, not from the
+cap. Alert before you reach it:
+`edge_connections_active / edge_connections_max > 0.8`.
+
+Request rate does not appear in the table because it does not change the answer
+for memory. It sets CPU and how long each connection stays busy: a connection
+owns its whole upstream exchange, so sustained throughput is about
+`concurrent connections / upstream_round_trip`. Against the Datadog intake at
+about 14 ms, 64 senders in flight sustain roughly 4.5k requests/sec.
+
+### The configuration
+
+Every row uses the same shape. Substitute one number.
+
+The blocks below carry the 256-connection row. Swap the four numbers for the
+row you picked.
+
+`config.json`:
+
+```json
+{
+  "listen_address": "0.0.0.0",
+  "listen_port": 8080,
+  "upstream_url": "https://http-intake.logs.us5.datadoghq.com",
+  "log_level": "info",
+  "max_connections": 1024,
+  "max_body_size": 1572864,
+  "max_decoded_bytes": 16777216
+}
+```
+
+Helm (`values.yaml`):
+
+```yaml
+config:
+  maxConnections: 1024
+  maxBodySize: 1572864
+resources:
+  requests:
+    cpu: "1"
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 512Mi
+```
+
+ECS, or anywhere the config file is baked into the image:
+
+```
+TERO_MAX_CONNECTIONS=1024
+TERO_MAX_BODY_SIZE=1572864
+TERO_MAX_DECODED_BYTES=16777216
+```
+
+### What the other knobs do
+
+- **Leave `max_body_size` at the 1.5 MiB default** unless your agents draw
+  413s. A Datadog agent batches up to about 5 MB uncompressed, which gzips well
+  under the cap, and an OTLP collector batch is smaller again. On the default
+  frontend the body cap no longer multiplies the footprint the way it did on
+  httpz, so raising it is cheap.
+- **Leave `max_decoded_bytes` at 16 MiB.** Agents compress, so a decoded batch
+  runs roughly ten times its wire size. Tying the two caps together rejects
+  ordinary compressed traffic.
+- **`thread_pool_count` does nothing on the default frontend.** Only the httpz
+  build (`-Dfrontend=httpz`) reads it. On stdio the runtime gives each
+  connection its own task, so `max_connections` is the concurrency dial. If you
+  carry a `threadPoolCount` from an older chart, it is inert; drop it.
+- **The 30-second deadlines are fixed.** One upstream attempt, one inbound
+  request and one idle keep-alive each get 30 seconds. None of the three is
+  configurable.
+
+### Two things to watch after you deploy
+
+The CPU column is a starting request, not a measured cost per request. We have
+throughput and memory numbers across this range; we do not yet have a CPU
+figure per thousand requests under a production payload mix. Set the request
+from the table, leave the limit generous, and read the throttle metric for a
+week before you tighten it.
+
+Watch `edge_connections_shed_total` from the first day. A `reason="slab_full"`
+count means raise `max_connections` and memory together. A
+`reason="concurrency"` count means the runtime refused another task, which on a
+small pod usually means the CPU request is too low.
+
 ## Prometheus Metrics
 
 Runtime metrics are exposed at `GET /_edge/metrics` in Prometheus text format.

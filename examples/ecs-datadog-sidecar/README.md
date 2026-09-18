@@ -145,7 +145,7 @@ Three things bite here:
    dependsOn = [{ containerName = "tero-edge", condition = "HEALTHY" }]
    ```
 
-Fluent Bit batches decompress well past Edge's 1 MB default body cap, so if
+Fluent Bit batches decompress well past Edge's 1.5 MB default body cap, so if
 payloads start getting rejected raise `TERO_MAX_BODY_SIZE` and
 `TERO_MAX_DECODED_BYTES`.
 
@@ -167,11 +167,11 @@ config file.
 | `TERO_SERVICE_NAME`      | `service.name`      | `edge`                                         |
 | `TERO_SERVICE_NAMESPACE` | `service.namespace` | `production`                                   |
 | `TERO_SERVICE_VERSION`   | `service.version`   | `latest`                                       |
-| `TERO_MAX_BODY_SIZE`     | `max_body_size`     | `1048576`                                      |
-| `TERO_MAX_DECODED_BYTES` | `max_decoded_bytes` | unset (falls back to `max_body_size`)          |
+| `TERO_MAX_BODY_SIZE`     | `max_body_size`     | `1572864`                                      |
+| `TERO_MAX_DECODED_BYTES` | `max_decoded_bytes` | unset (16 MiB, never below `max_body_size`)    |
 | `TERO_MAX_CONNECTIONS`   | `max_connections`   | `256`                                          |
-| `TERO_WORKER_COUNT`      | `worker_count`      | unset (1)                                      |
-| `TERO_THREAD_POOL_COUNT` | `thread_pool_count` | unset (128)                                    |
+| `TERO_WORKER_COUNT`      | `worker_count`      | httpz build only; inert here                   |
+| `TERO_THREAD_POOL_COUNT` | `thread_pool_count` | httpz build only; inert here                   |
 
 `policy_providers` is a list and cannot be set this way — override the config
 file instead. Full reference, including value substitution and the remaining
@@ -179,24 +179,29 @@ fields: https://docs.usetero.com/edge/edge-reference/config
 
 ## Sizing
 
-Set `memory` on the container. Edge holds a per-handler-thread workspace that
-is allocated on first use and then retained, so memory tracks the number of
-handler threads that have served a compressed body:
+Set `memory` on the container. Edge gives each connection its own task, so
+memory follows peak concurrency and not request rate, body size or thread
+count:
 
 ```
-memory ~= max_connections x 20 KiB
-        + thread_pool_count x (2 x max_body_size + 1.2 MiB)
+memory ~= 8 MiB + 0.9 MiB x peak concurrent connections
 ```
 
-At the defaults (256 connections, 128 threads, 1 MiB `max_body_size`) that is
-about **420 MiB**, which is why the example sets `memory = 768`.
+Measured: 21 MiB at 16 live connections, 65 MiB at 64, 229 MiB at 256. A
+sender holds its connection open between batches, so one agent at 10
+requests/sec and one at 1000 cost the same slot. The example sets
+`memory = 768` to leave headroom above the 256-connection figure: a policy
+route also holds a `max_body_size` body buffer and a streaming pump per
+runtime thread, which the formula above does not count.
 
-`thread_pool_count` is the dominant term, and it rose from 32 to 128 in
-v1.30.2. Two ways to cut the footprint:
+`TERO_MAX_CONNECTIONS` is a ceiling, not a reservation. A slot reserves 64 KiB
+of address space and commits a page only when a sender lands on it, so raising
+it well above today's peak costs almost nothing. Read your peak off
+`edge_connections_active` and size memory from that, not from the cap.
 
-- Set `TERO_THREAD_POOL_COUNT=32`. About 110 MiB at the same body size, at
-  lower throughput against a slow upstream.
-- Lower `TERO_MAX_BODY_SIZE` if your agents send smaller batches.
+`TERO_THREAD_POOL_COUNT` and `TERO_WORKER_COUNT` belong to the `httpz`
+frontend, which the shipped binary no longer uses. Both are inert; setting
+them changes nothing.
 
 If the task stops with no error in the logs, suspect the memory limit first.
 The OOM killer gives the process no chance to log, `essential = true` then
