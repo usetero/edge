@@ -22,16 +22,14 @@ securityContext: {}
 resources:
   requests:
     cpu: 50m
-    # Handler workspace is allocated on demand and then retained, so a pod
-    # under sustained load holds far more than it does at startup.
+    # Covers the default maxConnections of 256 held at once (229 MiB measured).
+    # Size this from your peak edge_connections_active, not from the cap.
     memory: 256Mi
   limits:
     cpu: 200m
-    # Sized for the default threadPoolCount of 128 at the maxBodySize below:
-    # ~540 MiB of retained per-thread workspace once every handler has seen
-    # compressed traffic. See the sizing formula under proxy.maxConnections.
-    # Set proxy.threadPoolCount lower to trade throughput for a smaller
-    # footprint: 32 threads need about 140 MiB.
+    # Headroom above the 256-connection figure. A policy route also holds a
+    # maxBodySize body buffer and a streaming pump per runtime thread, which
+    # the per-connection formula under proxy.maxConnections does not count.
     memory: 768Mi
 
 nodeSelector: {}
@@ -102,39 +100,35 @@ config:
   # Raw (compressed) body cap as received on the wire.
   maxBodySize: 1572864
 
-  # Max concurrent connections. When every slot is held the server stops
-  # accepting: pending connections queue in the kernel backlog and are then
-  # dropped, so senders time out while edge stays near-idle on CPU and memory.
-  # Alert on rate(httpz_connections[5m]) == 0 while rate(httpz_requests[5m])
-  # is above 0: existing keepalive connections still serve while new ones are
-  # refused, so the accept counter flattens as the request counter climbs.
+  # Max concurrent connections, and the concurrency dial on the shipped
+  # frontend. Past this cap a new connection is answered 503 with a
+  # Retry-After header, logged as connection.shed, and counted by
+  # edge_connections_shed_total{reason}. Senders back off and retry rather
+  # than time out, but a cap held for longer than a sender can buffer still
+  # costs you data. Alert on
+  # edge_connections_active / edge_connections_max > 0.8 for lead time.
   #
-  # A connection costs 20 KiB (the receive buffer), NOT maxBodySize. Sizing:
+  # Sizing follows peak concurrency, not request rate, body size or thread
+  # count. Each connection gets its own task:
   #
-  #   memory ~= maxConnections x 20 KiB
-  #           + threadPoolCount x (2 x maxBodySize + 1.2 MiB)
+  #   memory ~= 8 MiB + 0.9 MiB x peak concurrent connections
   #
-  # The second term is the per-handler workspace: the zstd window, record
-  # scratch and encoder, plus a resident body buffer and a streaming pump.
-  # It is allocated on demand and then retained for the life of the thread,
-  # so memory tracks the number of threads that have served a compressed
-  # body, not the number in flight now. Worked example at maxBodySize 2 MiB:
+  # Measured: 21 MiB at 16 live connections, 65 MiB at 64, 229 MiB at 256.
+  # A sender holds its connection open between batches, so one agent at 10
+  # requests/sec and one at 1000 cost the same slot.
   #
-  #   maxConnections | threadPoolCount | approx memory | suggested request
-  #   ---------------|-----------------|---------------|------------------
-  #   256            | 8               | 46 MiB        | 64Mi
-  #   256 (default)  | 128 (default)   | 666 MiB       | 256Mi
-  #   2048           | 16              | 123 MiB       | 192Mi
-  #   4096           | 32              | 246 MiB       | 320Mi
+  #   peak live connections | approx memory | suggested limit
+  #   ----------------------|---------------|----------------
+  #   16                    | 21 MiB        | 64Mi
+  #   64                    | 65 MiB        | 128Mi
+  #   256                   | 229 MiB       | 384Mi
+  #   512                   | ~470 MiB      | 768Mi
   #
-  # threadPoolCount is the dominant term. Lower it before you raise the
-  # memory limit if throughput allows: it is the only knob that bounds
-  # retained workspace. At this chart's own maxBodySize of 1.5 MiB the
-  # default 256/128 shape works out at about 540 MiB, which is what the
-  # resources block above is sized for.
+  # The cap itself is nearly free: a slot reserves 64 KiB of address space
+  # and commits a page only when a sender lands on it. Set maxConnections to
+  # about four times the peak you see on edge_connections_active, and size
+  # memory from that peak rather than from the cap.
   #
-  # Raise maxConnections and threadPoolCount together: connections admitted
-  # beyond what the handler pool can serve just queue until requestTimeout.
   # Also settable via the TERO_MAX_CONNECTIONS env override.
   maxConnections: 256
 
@@ -143,11 +137,12 @@ config:
   # binds: a 1 MiB compressed batch commonly expands past 10 MiB.
   maxDecodedBytes: null
 
-  # Optional httpz tuning (null = built-in defaults). workerCount is event-loop
-  # workers (default 1) and is clamped to maxConnections. threadPoolCount is
-  # request-handler threads per worker (default 128, raised from 32 in v1.30.2);
-  # pipeline scratch is allocated on demand, so this bounds retained workspaces,
-  # not a startup floor. It is the dominant memory term — see maxConnections.
+  # httpz-only tuning, and the shipped image does not run httpz. The default
+  # frontend gives each connection its own task and reads neither value, so
+  # both are inert here; maxConnections is the concurrency dial. They are kept
+  # for anyone who builds with -Dfrontend=httpz, where workerCount is
+  # event-loop workers (default 1, clamped to maxConnections) and
+  # threadPoolCount is handler threads per worker (default 128).
   workerCount: null
   threadPoolCount: null
 

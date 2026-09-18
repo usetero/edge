@@ -501,30 +501,42 @@ OTLP distribution.
 
 ## Production Sizing
 
-Peak concurrent connections drive the edge, not request rate. An agent holds a
-keep-alive connection open between batches, so one agent costs one connection
-whether it sends once a second or once a minute. Memory tracks the connections
-that are live; `max_connections` costs nothing until a sender takes the slot.
+Peak concurrent connections drive the edge, not request rate. A sender holds a
+keep-alive connection open between batches, so one agent at 10 requests/sec and
+one at 1000 cost the same slot. Size from the number you can measure rather
+than one you derive: run for a day and read peak `edge_connections_active` off
+`/_edge/metrics`.
 
-Pick a row by peak RPS, then check that `max_connections` still covers your
-agent count. These figures are from `bench/perf/sweep.py` on the default
-(stdio) frontend: 21 MB at 16 live connections, 65 MB at 64, and 229 MB at 256.
+Memory figures are from `bench/perf/sweep.py` on the default (stdio) frontend:
+21 MB at 16 live connections, 65 MB at 64, and 229 MB at 256. The first three
+rows below are measured; the fourth extends the same line, so leave more
+headroom there than the arithmetic asks for.
 
-| Peak RPS | Agents (1 conn each) | `max_connections` | Memory request | Memory limit | CPU request | CPU limit |
-| -------- | -------------------- | ----------------- | -------------- | ------------ | ----------- | --------- |
-| 500      | up to 64             | 512               | 96Mi           | 192Mi        | 250m        | 1         |
-| 2,000    | up to 256            | 1024              | 256Mi          | 512Mi        | 500m        | 2         |
-| 5,000    | up to 512            | 2048              | 512Mi          | 1Gi          | 1           | 2         |
-| 15,000   | up to 1024           | 4096              | 1Gi            | 2Gi          | 2           | 4         |
+| Peak `edge_connections_active` | `max_connections` | Memory request | Memory limit | CPU request | CPU limit |
+| ------------------------------ | ----------------- | -------------- | ------------ | ----------- | --------- |
+| 16                             | 64                | 64Mi           | 128Mi        | 250m        | 1         |
+| 64                             | 256               | 96Mi           | 256Mi        | 500m        | 2         |
+| 256                            | 1024              | 256Mi          | 512Mi        | 1           | 2         |
+| 512                            | 2048              | 512Mi          | 1Gi          | 2           | 4         |
 
-`max_connections` sits at roughly four times the expected peak on purpose. The
-slab reserves 64 KiB per slot and commits a page only when a connection lands
-on it, so the headroom is free until you need it. Alert before you reach it:
+`max_connections` sits at roughly four times the measured peak on purpose. A
+slot reserves 64 KiB and commits a page only when a connection lands on it, so
+the headroom is free until you need it. Size memory from the peak, not from the
+cap. Alert before you reach it:
 `edge_connections_active / edge_connections_max > 0.8`.
+
+Request rate does not appear in the table because it does not change the answer
+for memory. It sets CPU and how long each connection stays busy: a connection
+owns its whole upstream exchange, so sustained throughput is about
+`concurrent connections / upstream_round_trip`. Against the Datadog intake at
+about 14 ms, 64 senders in flight sustain roughly 4.5k requests/sec.
 
 ### The configuration
 
 Every row uses the same shape. Substitute one number.
+
+The blocks below carry the 256-connection row. Swap the four numbers for the
+row you picked.
 
 `config.json`:
 
@@ -548,7 +560,7 @@ config:
   maxBodySize: 1572864
 resources:
   requests:
-    cpu: 500m
+    cpu: "1"
     memory: 256Mi
   limits:
     cpu: "2"
