@@ -129,10 +129,10 @@ Provide auth either via:
 
 ## Sizing
 
-Memory is dominated by `config.threadPoolCount`, not by connection count. A
-handler thread allocates its workspace on first use and then retains it for
-the life of the thread, so a pod's memory tracks the number of threads that
-have served a compressed body:
+On the httpz frontend, memory is dominated by `config.threadPoolCount`, not by
+connection count. A handler thread allocates its workspace on first use and
+then retains it for the life of the thread, so a pod's memory tracks the number
+of threads that have served a compressed body:
 
 ```
 memory ~= maxConnections x 20 KiB
@@ -167,11 +167,11 @@ kernel gives the process no chance to log.
 - Each upstream attempt has a fixed 30s deadline; a request that exceeds it
   returns 504. Inbound requests and idle keep-alives also time out after 30s.
   None of these are configurable.
-- A handler thread owns its whole upstream exchange, so sustained throughput is
-  about `threadPoolCount / upstream_round_trip`. The Datadog intake answers in
-  about 14ms on a warm connection, so the default 128 threads sustain roughly
-  4.8k requests/sec per pod. Raise `threadPoolCount` and `resources.limits.memory`
-  together — see Sizing below.
+- On the httpz frontend, a handler thread owns its whole upstream exchange,
+  so sustained throughput is about `threadPoolCount / upstream_round_trip`. The
+  Datadog intake answers in about 14ms on a warm connection, so the default 128
+  threads sustain roughly 4.8k requests/sec per pod. Raise `threadPoolCount`
+  and `resources.limits.memory` together — see Sizing below.
 - Log intake routes replay once on a fresh upstream connection when the first
   attempt fails before a response. A replay can duplicate log lines if the
   upstream accepted the first attempt but its acknowledgement was lost.
