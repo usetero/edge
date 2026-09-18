@@ -2,8 +2,7 @@ const std = @import("std");
 const zimdjson = @import("zimdjson");
 const jscan = @import("../json_scan.zig");
 const policy = @import("policy_zig");
-const json_value = @import("json_value.zig");
-const extras = @import("log_extras.zig");
+const extras = @import("extras.zig");
 
 pub const Parser = zimdjson.ondemand.FullParser(.default);
 pub const Value = Parser.Value;
@@ -23,21 +22,15 @@ pub const DatadogLog = struct {
     environment: ?[]const u8 = null,
     custom_field: ?[]const u8 = null,
 
-    extra: std.StringHashMapUnmanaged(AnyValue) = .empty,
-    extra_raw_json: std.StringHashMapUnmanaged([]const u8) = .empty,
+    extra: extras.Materialized = .{},
 
     /// Unknown fields captured by `parseRaw` as verbatim spans of the input
     /// record — key and value both borrow the record bytes, so nothing here
     /// is owned. String values keep their quotes/escapes; `findExtraString`
     /// unescapes lazily
     /// only when a policy actually reads the field. Mutually exclusive with
-    /// `extra`/`extra_raw_json` (which the materializing `parse` fills).
+    /// `extra` (which the materializing `parse` fills).
     extra_spans: extras.Spans = .{},
-    /// The order `parse` met the keys of `extra`. A hash map has no order, and
-    /// both parse paths must serialize a record the same way, so the
-    /// materializing path records the order while the fast path keeps it by
-    /// construction. See `ExtraSpans`.
-    extra_order: std.ArrayListUnmanaged([]const u8) = .empty,
 
     /// Lazily-computed unwrapping of a JSON-stringified `message`/`msg`/`log`
     /// field (e.g. logs forwarded from GCP/Cloud Run, where the real payload
@@ -72,22 +65,9 @@ pub const DatadogLog = struct {
 
     /// Free extra field keys allocated during parsing
     pub fn deinit(self: *DatadogLog, allocator: std.mem.Allocator) void {
-        var it = self.extra.keyIterator();
-        while (it.next()) |key| {
-            allocator.free(key.*);
-        }
         self.extra.deinit(allocator);
 
-        var raw_it = self.extra_raw_json.valueIterator();
-        while (raw_it.next()) |raw| {
-            allocator.free(raw.*);
-        }
-        self.extra_raw_json.deinit(allocator);
-        // parseRaw contents (spans, unescaped strings) are arena-scoped by
-        // contract and never individually freed; only map storage goes here.
         self.extra_spans.deinit(allocator);
-        // The keys here are the same allocations `extra` owns and frees above.
-        self.extra_order.deinit(allocator);
         var flat_it = self.message_flat.iterator();
         while (flat_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
@@ -131,48 +111,7 @@ pub const DatadogLog = struct {
             } else if (std.mem.eql(u8, key, "custom_field")) {
                 log.custom_field = try field.value.asString();
             } else {
-                // Unknown field. `key` borrows the parser buffer, so a new
-                // entry has to dupe it, and `extra_order` records where it
-                // landed.
-                //
-                // A duplicate key keeps its first position and takes the last
-                // value, matching `ExtraSpans.get`'s backwards scan. Reuse the
-                // key the map already owns: `HashMap.put` replaces the value
-                // and keeps the original key pointer, so duping again would
-                // strand the copy — it enters neither the map nor
-                // `extra_order`, and `deinit` frees keys by walking the map.
-                const any = try field.value.asAny();
-                if (log.extra.getEntry(key)) |existing| {
-                    // A container value that is being replaced owns bytes.
-                    if (log.extra_raw_json.fetchRemove(existing.key_ptr.*)) |stale| {
-                        allocator.free(stale.value);
-                    }
-                    existing.value_ptr.* = any;
-                    switch (any) {
-                        .object, .array => try log.extra_raw_json.put(
-                            allocator,
-                            existing.key_ptr.*,
-                            try json_value.stringify(allocator, any),
-                        ),
-                        else => {},
-                    }
-                } else {
-                    const key_copy = try allocator.dupe(u8, key);
-                    {
-                        // Until the map owns it, this scope owns it.
-                        errdefer allocator.free(key_copy);
-                        try log.extra.put(allocator, key_copy, any);
-                    }
-                    try log.extra_order.append(allocator, key_copy);
-                    switch (any) {
-                        .object, .array => try log.extra_raw_json.put(
-                            allocator,
-                            key_copy,
-                            try json_value.stringify(allocator, any),
-                        ),
-                        else => {},
-                    }
-                }
+                try log.extra.put(allocator, key, try field.value.asAny());
             }
         }
 
@@ -300,18 +239,9 @@ pub const DatadogLog = struct {
             try jws.objectField("custom_field");
             try jws.write(v);
         }
-        // Write extra fields, in the order the record listed them.
-        for (self.extra_order.items) |key| {
-            const value = self.extra.get(key) orelse continue;
-            try jws.objectField(key);
-            if (self.extra_raw_json.get(key)) |raw_json| {
-                try jws.beginWriteRaw();
-                try jws.writer.writeAll(raw_json);
-                jws.endWriteRaw();
-            } else {
-                try json_value.write(jws, value);
-            }
-        }
+        // Extras in the order the record listed them; containers go out as
+        // the bytes captured at parse time.
+        try self.extra.write(jws);
         // parseRaw extras: verbatim spans of the input, all value types.
         for (self.extra_spans.items()) |entry| {
             try jws.objectField(entry.key);
@@ -360,7 +290,7 @@ pub const DatadogLog = struct {
             if (self.extra_spans.get(buf[0..pos])) |span| {
                 if (extras.spanString(allocator, span)) |s| return s;
             }
-            if (self.extra_raw_json.get(path[0])) |raw_json| {
+            if (self.extra.rawJson(path[0])) |raw_json| {
                 return extras.findNestedStringInRaw(allocator, raw_json, path[1..]);
             }
             if (self.extra_spans.get(path[0])) |span| {

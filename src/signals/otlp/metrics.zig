@@ -18,6 +18,7 @@
 //!         └── data (Gauge, Sum, Histogram, ExponentialHistogram, Summary)
 
 const std = @import("std");
+const stream_io = @import("../stream_io.zig");
 const proto = @import("proto");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
@@ -122,7 +123,7 @@ pub fn processMetricsStream(
     return switch (format) {
         .protobuf => processProtobufMetricsStream(allocator, registry, bus, in_reader, out_writer),
         .json => blk: {
-            const data = try readAll(allocator, in_reader);
+            const data = try stream_io.readAll(allocator, in_reader);
             defer allocator.free(data);
             const result = try processJsonMetrics(allocator, registry, bus, data);
             defer allocator.free(result.data);
@@ -134,7 +135,7 @@ pub fn processMetricsStream(
             };
         },
         .unknown => blk: {
-            try streamAll(in_reader, out_writer);
+            try stream_io.streamAll(in_reader, out_writer);
             break :blk .{
                 .dropped_count = 0,
                 .original_count = 0,
@@ -142,23 +143,6 @@ pub fn processMetricsStream(
             };
         },
     };
-}
-
-fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try streamAll(reader, &out.writer);
-    return out.toOwnedSlice();
-}
-
-fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
-    while (true) {
-        const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) break;
-    }
 }
 
 // =============================================================================
@@ -468,7 +452,7 @@ fn processProtobufMetricsStream(
     // fixed-buffer fallback allocator). See processProtobufMetrics below.
     var read_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer read_arena.deinit();
-    const data = try readAll(read_arena.allocator(), in_reader);
+    const data = try stream_io.readAll(read_arena.allocator(), in_reader);
 
     const result = try processProtobufMetrics(allocator, registry, bus, data);
     defer allocator.free(result.data);

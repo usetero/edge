@@ -21,6 +21,7 @@
 //!         └── Links
 
 const std = @import("std");
+const stream_io = @import("../stream_io.zig");
 const proto = @import("proto");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
@@ -127,7 +128,7 @@ pub fn processTracesStream(
     return switch (format) {
         .protobuf => processProtobufTracesStream(allocator, registry, bus, in_reader, out_writer),
         .json => blk: {
-            const data = try readAll(allocator, in_reader);
+            const data = try stream_io.readAll(allocator, in_reader);
             defer allocator.free(data);
             const result = try processJsonTraces(allocator, registry, bus, data);
             defer allocator.free(result.data);
@@ -139,7 +140,7 @@ pub fn processTracesStream(
             };
         },
         .unknown => blk: {
-            try streamAll(in_reader, out_writer);
+            try stream_io.streamAll(in_reader, out_writer);
             break :blk .{
                 .dropped_count = 0,
                 .original_count = 0,
@@ -147,23 +148,6 @@ pub fn processTracesStream(
             };
         },
     };
-}
-
-fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try streamAll(reader, &out.writer);
-    return out.toOwnedSlice();
-}
-
-fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
-    while (true) {
-        const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) break;
-    }
 }
 
 // =============================================================================
@@ -621,7 +605,7 @@ fn processProtobufTracesStream(
     in_reader: *std.Io.Reader,
     out_writer: *std.Io.Writer,
 ) !StreamProcessResult {
-    const data = try readAll(allocator, in_reader);
+    const data = try stream_io.readAll(allocator, in_reader);
     defer allocator.free(data);
 
     const result = try processProtobufTraces(allocator, registry, bus, data);

@@ -1,10 +1,17 @@
-//! Storage and typed reads for a log record's unknown ("extra") fields.
+//! Storage and typed reads for a record's unknown ("extra") fields.
 //!
-//! Two parse paths fill two different shapes, and they are mutually exclusive
-//! per record. The materializing `DatadogLog.parse` fills a map of typed
-//! `AnyValue`s plus owned JSON bytes for containers. The fast `parseRaw` fills
-//! `Spans`: verbatim slices of the record, nothing owned, nothing unescaped
-//! until a policy actually reads the field.
+//! Shared by logs and metric series. Both carry unknown fields, both must
+//! re-emit them verbatim when a policy drops a sibling and forces a
+//! re-serialization, and both used to do it with their own copy of the
+//! bookkeeping. The metric copy had drifted: it leaked a key on a duplicate,
+//! it re-emitted extras in hash order rather than the order the sender wrote
+//! them, and it emitted `{}` for a nested one.
+//!
+//! Two shapes, mutually exclusive per record. `Materialized` is what a
+//! zimdjson parse produces: typed `AnyValue`s, plus owned JSON bytes for the
+//! containers an on-demand cursor cannot revisit. `Spans` is what the fast
+//! byte-scanning path produces: verbatim slices of the record, nothing owned,
+//! nothing unescaped until a policy actually reads the field.
 
 const std = @import("std");
 const jscan = @import("../json_scan.zig");
@@ -147,3 +154,119 @@ pub fn findNestedStringInRaw(
         else => null,
     };
 }
+
+/// Unknown fields from a materializing (zimdjson) parse, in the order the
+/// record listed them.
+///
+/// Three pieces of state that have to move together, which is why they live
+/// behind one type: the typed values, the owned JSON bytes for container
+/// values, and the insertion order. Separating them is how the metric copy
+/// came to reorder its extras.
+pub const Materialized = struct {
+    values: std.StringHashMapUnmanaged(AnyValue) = .empty,
+    /// Object/array values, serialized while the parser's cursor was still
+    /// inside them. An on-demand container cannot be revisited once the walk
+    /// moves on, so without this a re-serialization emits an empty one.
+    raw_json: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Keys in first-seen order. These are the same allocations `values` owns.
+    order: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub fn deinit(self: *Materialized, allocator: std.mem.Allocator) void {
+        var it = self.values.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        self.values.deinit(allocator);
+
+        var raw_it = self.raw_json.valueIterator();
+        while (raw_it.next()) |raw| allocator.free(raw.*);
+        self.raw_json.deinit(allocator);
+
+        // Same allocations `values` freed above; only the list storage here.
+        self.order.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Record one unknown field. `key` may borrow the parser buffer.
+    ///
+    /// A duplicate key keeps the position it first took and takes the last
+    /// value. Reuse the key the map already owns: `HashMap.put` replaces the
+    /// value and keeps the original key pointer, so duping again strands the
+    /// copy — it enters neither the map nor `order`, and `deinit` frees keys
+    /// by walking the map.
+    pub fn put(
+        self: *Materialized,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        any: AnyValue,
+    ) !void {
+        if (self.values.getEntry(key)) |existing| {
+            // A container value being replaced owns bytes.
+            if (self.raw_json.fetchRemove(existing.key_ptr.*)) |stale| {
+                allocator.free(stale.value);
+            }
+            existing.value_ptr.* = any;
+            switch (any) {
+                .object, .array => try self.raw_json.put(
+                    allocator,
+                    existing.key_ptr.*,
+                    try json_value.stringify(allocator, any),
+                ),
+                else => {},
+            }
+            return;
+        }
+
+        const key_copy = try allocator.dupe(u8, key);
+        {
+            // Until the map owns it, this scope owns it.
+            errdefer allocator.free(key_copy);
+            try self.values.put(allocator, key_copy, any);
+        }
+        try self.order.append(allocator, key_copy);
+        switch (any) {
+            .object, .array => try self.raw_json.put(
+                allocator,
+                key_copy,
+                try json_value.stringify(allocator, any),
+            ),
+            else => {},
+        }
+    }
+
+    pub fn get(self: *const Materialized, key: []const u8) ?AnyValue {
+        return self.values.get(key);
+    }
+
+    pub fn rawJson(self: *const Materialized, key: []const u8) ?[]const u8 {
+        return self.raw_json.get(key);
+    }
+
+    pub fn contains(self: *const Materialized, key: []const u8) bool {
+        return self.values.contains(key);
+    }
+
+    pub fn count(self: *const Materialized) usize {
+        return self.values.count();
+    }
+
+    /// Keys in the order the record listed them.
+    pub fn keys(self: *const Materialized) []const []const u8 {
+        return self.order.items;
+    }
+
+    /// Emit every extra into an open JSON object, in record order. A container
+    /// goes out as its captured bytes; anything else is written from its
+    /// typed value.
+    pub fn write(self: *const Materialized, jws: anytype) !void {
+        for (self.order.items) |key| {
+            const value = self.values.get(key) orelse continue;
+            try jws.objectField(key);
+            if (self.raw_json.get(key)) |raw| {
+                try jws.beginWriteRaw();
+                try jws.writer.writeAll(raw);
+                jws.endWriteRaw();
+            } else {
+                try json_value.write(jws, value);
+            }
+        }
+    }
+};

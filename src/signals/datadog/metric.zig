@@ -1,6 +1,6 @@
 const std = @import("std");
 const zimdjson = @import("zimdjson");
-const json_value = @import("json_value.zig");
+const extras = @import("extras.zig");
 
 pub const Parser = zimdjson.ondemand.FullParser(.default);
 pub const Value = Parser.Value;
@@ -196,14 +196,13 @@ pub const MetricSeries = struct {
     /// A list of tags associated with the metric
     tags: ?[][]const u8 = null,
 
-    extra: std.StringHashMapUnmanaged(AnyValue) = .empty,
+    /// Unknown fields, in the order the series listed them. Shared with the
+    /// log record: this used to be a bare hash map here, which leaked a key on
+    /// a duplicate, re-emitted extras in hash order, and wrote `{}` for a
+    /// nested one because an on-demand container cannot be revisited.
+    extra: extras.Materialized = .{},
 
-    /// Free extra field keys allocated during parsing
     pub fn deinit(self: *MetricSeries, allocator: std.mem.Allocator) void {
-        var it = self.extra.keyIterator();
-        while (it.next()) |key| {
-            allocator.free(key.*);
-        }
         self.extra.deinit(allocator);
         self.* = undefined;
     }
@@ -211,6 +210,9 @@ pub const MetricSeries = struct {
     /// Parse a MetricSeries from a zimdjson Value (object)
     pub fn parse(allocator: std.mem.Allocator, value: Value) !MetricSeries {
         var series: MetricSeries = .{};
+        // `extra.put` owns key copies and container bytes from here on, so a
+        // failure mid-walk has to hand them back.
+        errdefer series.deinit(allocator);
 
         var obj = try value.asObject();
         var it = obj.iterator();
@@ -254,9 +256,7 @@ pub const MetricSeries = struct {
                 }
                 series.tags = try tags_list.toOwnedSlice(allocator);
             } else {
-                // Store unknown fields in extra map - need to dupe the key since it's from the parser buffer
-                const key_copy = try allocator.dupe(u8, key);
-                try series.extra.put(allocator, key_copy, try field.value.asAny());
+                try series.extra.put(allocator, key, try field.value.asAny());
             }
         }
 
@@ -316,12 +316,9 @@ pub const MetricSeries = struct {
             try jws.endArray();
         }
 
-        // Write extra fields
-        var it = self.extra.iterator();
-        while (it.next()) |entry| {
-            try jws.objectField(entry.key_ptr.*);
-            try json_value.write(jws, entry.value_ptr.*);
-        }
+        // Extras in the order the series listed them; a container goes out as
+        // the bytes captured at parse time.
+        try self.extra.write(jws);
 
         try jws.endObject();
     }
@@ -486,18 +483,99 @@ test "MetricSeries - parse with extra fields" {
     const doc = try parser.parseFromSlice(allocator, json);
     var series = try MetricSeries.parse(allocator, doc.asValue());
     defer allocator.free(series.points.?);
-    defer {
-        var it = series.extra.keyIterator();
-        while (it.next()) |key| {
-            allocator.free(key.*);
-        }
-        series.extra.deinit(allocator);
-    }
+    defer series.extra.deinit(allocator);
 
     try std.testing.expectEqualStrings("test", series.metric.?);
     try std.testing.expectEqual(@as(usize, 2), series.extra.count());
     try std.testing.expect(series.extra.contains("unknown_field"));
     try std.testing.expect(series.extra.contains("another_extra"));
+}
+
+test "MetricSeries - a duplicate extra key does not strand its key copy" {
+    // `HashMap.put` replaces the value and keeps the original key pointer, so
+    // an insert that dupes a second key strands it: it enters neither the map
+    // nor the order list, and `deinit` frees keys by walking the map. The
+    // testing allocator fails this test on that leak. The log record had the
+    // same bug; both now go through `extras.Materialized`.
+    const allocator = std.testing.allocator;
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"metric": "test", "points": [], "dupe": 1, "keep": "x", "dupe": 2}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.points.?);
+    defer series.extra.deinit(allocator);
+
+    // First position kept, last value taken.
+    try std.testing.expectEqual(@as(usize, 2), series.extra.count());
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(series, .{}, &out.writer);
+    try std.testing.expectEqualStrings(
+        "{\"metric\":\"test\",\"points\":[],\"dupe\":2,\"keep\":\"x\"}",
+        out.written(),
+    );
+}
+
+test "MetricSeries - extras serialize in the order the series listed them" {
+    // A bare hash map emits in bucket order, so a partial-drop payload reached
+    // the intake with its unknown fields shuffled. Order is not semantic in
+    // JSON, but it is what the sender wrote and what the sibling log path
+    // preserves; a record must not change shape because we dropped its
+    // neighbour.
+    const allocator = std.testing.allocator;
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"metric": "test", "points": [], "zeta": 1, "alpha": 2, "middle": 3, "beta": 4}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.points.?);
+    defer series.extra.deinit(allocator);
+
+    const want = [_][]const u8{ "zeta", "alpha", "middle", "beta" };
+    const got = series.extra.keys();
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(series, .{}, &out.writer);
+    try std.testing.expectEqualStrings(
+        "{\"metric\":\"test\",\"points\":[],\"zeta\":1,\"alpha\":2,\"middle\":3,\"beta\":4}",
+        out.written(),
+    );
+}
+
+test "MetricSeries - a nested extra survives re-serialization" {
+    // An on-demand object or array cannot be revisited once the parser's
+    // cursor moves past it, so re-serializing from the stored `AnyValue`
+    // emitted `{}` or `[]` and silently dropped the customer's data. The
+    // bytes are now captured while the cursor is still inside.
+    const allocator = std.testing.allocator;
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"metric": "test", "points": [], "obj": {"a": 1, "b": [2, 3]}, "arr": [{"c": "d"}], "scalar": 7}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var series = try MetricSeries.parse(allocator, doc.asValue());
+    defer allocator.free(series.points.?);
+    defer series.extra.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(series, .{}, &out.writer);
+    try std.testing.expectEqualStrings(
+        "{\"metric\":\"test\",\"points\":[],\"obj\":{\"a\":1,\"b\":[2,3]},\"arr\":[{\"c\":\"d\"}],\"scalar\":7}",
+        out.written(),
+    );
 }
 
 test "MetricPayload - parse series array" {
