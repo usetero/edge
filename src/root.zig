@@ -91,6 +91,7 @@ test {
     _ = @import("pipeline/tap.zig");
     _ = @import("signals/json_scan.zig");
     _ = @import("signals/stream_io.zig");
+    _ = @import("signals/datadog/extras.zig");
     _ = @import("signals/datadog/log_test.zig");
     _ = @import("signals/datadog/logs.zig");
     _ = @import("signals/datadog/metrics.zig");

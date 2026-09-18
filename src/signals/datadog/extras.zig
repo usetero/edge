@@ -270,3 +270,268 @@ pub const Materialized = struct {
         }
     }
 };
+
+// ============================== Tests ==============================
+
+const testing = std.testing;
+
+/// Parse `json` and hand the named field's `AnyValue` to `run`. The parser
+/// outlives the callback, which is what an on-demand value requires.
+fn withValue(
+    json: []const u8,
+    key: []const u8,
+    run: *const fn (AnyValue) anyerror!void,
+) !void {
+    var parser: Parser = .init;
+    defer parser.deinit(testing.allocator);
+    const doc = try parser.parseFromSlice(testing.allocator, json);
+    var obj = try doc.asValue().asObject();
+    var it = obj.iterator();
+    while (try it.next()) |field| {
+        if (std.mem.eql(u8, try field.key.get(), key)) return run(try field.value.asAny());
+    }
+    return error.KeyNotFound;
+}
+
+test "Spans: put, get and count" {
+    var spans: Spans = .{};
+    defer spans.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 0), spans.count());
+    try testing.expect(spans.get("absent") == null);
+
+    try spans.put(testing.allocator, "a", "1");
+    try spans.put(testing.allocator, "b", "\"two\"");
+    try testing.expectEqual(@as(usize, 2), spans.count());
+    try testing.expectEqualStrings("1", spans.get("a").?);
+    try testing.expectEqualStrings("\"two\"", spans.get("b").?);
+    try testing.expect(spans.get("c") == null);
+}
+
+test "Spans: a duplicate key resolves to the last, and both are kept" {
+    // The backwards scan is what makes last-wins work, and keeping both
+    // entries is what lets `parseRaw` re-emit the record as the sender wrote
+    // it. A map would collapse them; see the type comment.
+    var spans: Spans = .{};
+    defer spans.deinit(testing.allocator);
+
+    try spans.put(testing.allocator, "dupe", "1");
+    try spans.put(testing.allocator, "other", "9");
+    try spans.put(testing.allocator, "dupe", "2");
+
+    try testing.expectEqualStrings("2", spans.get("dupe").?);
+    try testing.expectEqual(@as(usize, 3), spans.count());
+
+    // `items` keeps document order, duplicates included.
+    const items = spans.items();
+    try testing.expectEqualStrings("dupe", items[0].key);
+    try testing.expectEqualStrings("1", items[0].value);
+    try testing.expectEqualStrings("dupe", items[2].key);
+    try testing.expectEqualStrings("2", items[2].value);
+}
+
+test "spanString: borrows a plain string, unescapes an escaped one, refuses a non-string" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("plain", spanString(a, "\"plain\"").?);
+    try testing.expectEqualStrings("a\"b", spanString(a, "\"a\\\"b\"").?);
+    try testing.expectEqualStrings("tab\there", spanString(a, "\"tab\\there\"").?);
+    try testing.expectEqualStrings("", spanString(a, "\"\"").?);
+    // Non-strings are not this function's business.
+    try testing.expect(spanString(a, "42") == null);
+    try testing.expect(spanString(a, "true") == null);
+    try testing.expect(spanString(a, "{\"k\":1}") == null);
+}
+
+test "spanTyped: classifies a raw value span by its first byte" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("hi", spanTyped(a, "\"hi\"").?.string);
+    try testing.expectEqual(true, spanTyped(a, "true").?.bool);
+    try testing.expectEqual(false, spanTyped(a, "false").?.bool);
+    try testing.expectEqual(@as(i64, 42), spanTyped(a, "42").?.int);
+    try testing.expectEqual(@as(i64, -7), spanTyped(a, "-7").?.int);
+    try testing.expectEqual(@as(f64, 1.5), spanTyped(a, "1.5").?.double);
+    // An exponent makes it a double even with no fraction.
+    try testing.expectEqual(@as(f64, 1e5), spanTyped(a, "1e5").?.double);
+
+    // JSON null is not scalar-matchable, and neither is a container or an
+    // empty span.
+    try testing.expect(spanTyped(a, "null") == null);
+    try testing.expect(spanTyped(a, "") == null);
+    try testing.expect(spanTyped(a, "{\"k\":1}") == null);
+    try testing.expect(spanTyped(a, "[1]") == null);
+}
+
+test "anyValueTyped: every variant, including the u64 that cannot be an int" {
+    const json =
+        \\{"b":true,"i":-5,"u":18446744073709551615,"d":2.5,"s":"txt","n":null,"o":{"k":1},"a":[1]}
+    ;
+    const check = struct {
+        fn boolean(v: AnyValue) anyerror!void {
+            try testing.expectEqual(true, anyValueTyped(v).?.bool);
+        }
+        fn signed(v: AnyValue) anyerror!void {
+            try testing.expectEqual(@as(i64, -5), anyValueTyped(v).?.int);
+        }
+        fn hugeUnsigned(v: AnyValue) anyerror!void {
+            // Past maxInt(i64) it cannot be an `.int`, so it widens to double
+            // rather than wrapping into a negative.
+            try testing.expect(anyValueTyped(v).?.double > 1.8e19);
+        }
+        fn double(v: AnyValue) anyerror!void {
+            try testing.expectEqual(@as(f64, 2.5), anyValueTyped(v).?.double);
+        }
+        fn string(v: AnyValue) anyerror!void {
+            try testing.expectEqualStrings("txt", anyValueTyped(v).?.string);
+        }
+        fn none(v: AnyValue) anyerror!void {
+            try testing.expect(anyValueTyped(v) == null);
+        }
+    };
+    try withValue(json, "b", check.boolean);
+    try withValue(json, "i", check.signed);
+    try withValue(json, "u", check.hugeUnsigned);
+    try withValue(json, "d", check.double);
+    try withValue(json, "s", check.string);
+    // Null and containers have no scalar form.
+    try withValue(json, "n", check.none);
+    try withValue(json, "o", check.none);
+    try withValue(json, "a", check.none);
+}
+
+test "findNestedStringInRaw: descends an object path and refuses the rest" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "{\"x\":{\"y\":{\"z\":\"found\"},\"n\":7},\"arr\":[{\"z\":\"in array\"}]}";
+
+    try testing.expectEqualStrings("found", findNestedStringInRaw(a, raw, &.{ "x", "y", "z" }).?);
+    // A missing segment, a non-string leaf, and an empty path all yield null.
+    try testing.expect(findNestedStringInRaw(a, raw, &.{ "x", "nope" }) == null);
+    try testing.expect(findNestedStringInRaw(a, raw, &.{ "x", "n" }) == null);
+    try testing.expect(findNestedStringInRaw(a, raw, &.{}) == null);
+    // Arrays are not descended: the walk only steps through objects.
+    try testing.expect(findNestedStringInRaw(a, raw, &.{ "arr", "z" }) == null);
+    // Malformed input fails open rather than propagating a parse error.
+    try testing.expect(findNestedStringInRaw(a, "{not json", &.{"x"}) == null);
+}
+
+/// Fill a `Materialized` from every unknown field of `json`, the way
+/// `DatadogLog.parse` and `MetricSeries.parse` both do.
+fn fillFrom(out: *Materialized, allocator: std.mem.Allocator, parser: *Parser, json: []const u8) !void {
+    const doc = try parser.parseFromSlice(allocator, json);
+    var obj = try doc.asValue().asObject();
+    var it = obj.iterator();
+    while (try it.next()) |field| {
+        try out.put(allocator, try field.key.get(), try field.value.asAny());
+    }
+}
+
+fn renderExtras(extras: *const Materialized, allocator: std.mem.Allocator) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+    try jws.beginObject();
+    try extras.write(&jws);
+    try jws.endObject();
+    return out.toOwnedSlice();
+}
+
+test "Materialized: keys come back in the order the record listed them" {
+    const gpa = testing.allocator;
+    var parser: Parser = .init;
+    defer parser.deinit(gpa);
+    var extras: Materialized = .{};
+    defer extras.deinit(gpa);
+
+    try fillFrom(&extras, gpa, &parser, "{\"zeta\":1,\"alpha\":2,\"middle\":3,\"beta\":4}");
+
+    const want = [_][]const u8{ "zeta", "alpha", "middle", "beta" };
+    try testing.expectEqual(want.len, extras.keys().len);
+    for (want, extras.keys()) |expected, actual| try testing.expectEqualStrings(expected, actual);
+    try testing.expectEqual(@as(usize, 4), extras.count());
+    try testing.expect(extras.contains("middle"));
+    try testing.expect(!extras.contains("absent"));
+    try testing.expect(extras.get("absent") == null);
+}
+
+test "Materialized: a duplicate keeps its position, takes the last value, strands nothing" {
+    // `HashMap.put` keeps the original key pointer on a duplicate, so an
+    // insert that dupes a second key leaves it unreachable: it enters neither
+    // the map nor `order`, and `deinit` frees keys by walking the map. The
+    // testing allocator fails this test on that leak.
+    const gpa = testing.allocator;
+    var parser: Parser = .init;
+    defer parser.deinit(gpa);
+    var extras: Materialized = .{};
+    defer extras.deinit(gpa);
+
+    try fillFrom(&extras, gpa, &parser, "{\"dupe\":1,\"keep\":\"x\",\"dupe\":2}");
+
+    try testing.expectEqual(@as(usize, 2), extras.count());
+    const rendered = try renderExtras(&extras, gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("{\"dupe\":2,\"keep\":\"x\"}", rendered);
+}
+
+test "Materialized: containers are captured at parse time and re-emitted whole" {
+    // An on-demand container cannot be revisited once the cursor moves past
+    // it, so a re-serialization from the stored value alone emits `{}`.
+    const gpa = testing.allocator;
+    var parser: Parser = .init;
+    defer parser.deinit(gpa);
+    var extras: Materialized = .{};
+    defer extras.deinit(gpa);
+
+    try fillFrom(&extras, gpa, &parser, "{\"obj\":{\"a\":1,\"b\":[2,3]},\"arr\":[{\"c\":\"d\"}],\"s\":7}");
+
+    try testing.expectEqualStrings("{\"a\":1,\"b\":[2,3]}", extras.rawJson("obj").?);
+    try testing.expectEqualStrings("[{\"c\":\"d\"}]", extras.rawJson("arr").?);
+    // A scalar carries no captured bytes; it is written from its typed value.
+    try testing.expect(extras.rawJson("s") == null);
+
+    const rendered = try renderExtras(&extras, gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("{\"obj\":{\"a\":1,\"b\":[2,3]},\"arr\":[{\"c\":\"d\"}],\"s\":7}", rendered);
+}
+
+test "Materialized: replacing a container hands its captured bytes back" {
+    // Both directions: a container replaced by another, and a container
+    // replaced by a scalar, where the stale bytes have no successor to
+    // overwrite them. A leak here fails the test.
+    const gpa = testing.allocator;
+    var parser: Parser = .init;
+    defer parser.deinit(gpa);
+    var extras: Materialized = .{};
+    defer extras.deinit(gpa);
+
+    const json = "{\"obj\":{\"a\":1},\"obj\":{\"b\":2}," ++
+        "\"gone\":[1,2],\"gone\":9,\"grew\":1,\"grew\":{\"c\":3}}";
+    try fillFrom(&extras, gpa, &parser, json);
+
+    try testing.expectEqual(@as(usize, 3), extras.count());
+    try testing.expectEqualStrings("{\"b\":2}", extras.rawJson("obj").?);
+    try testing.expect(extras.rawJson("gone") == null);
+    try testing.expectEqualStrings("{\"c\":3}", extras.rawJson("grew").?);
+
+    const rendered = try renderExtras(&extras, gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("{\"obj\":{\"b\":2},\"gone\":9,\"grew\":{\"c\":3}}", rendered);
+}
+
+test "Materialized: an empty set deinits clean and writes nothing" {
+    const gpa = testing.allocator;
+    var extras: Materialized = .{};
+    defer extras.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 0), extras.count());
+    try testing.expectEqual(@as(usize, 0), extras.keys().len);
+    const rendered = try renderExtras(&extras, gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("{}", rendered);
+}
