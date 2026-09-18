@@ -451,6 +451,12 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
 
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
+    // How many threads may scan at once, which here is how many connections we
+    // admit: the frontend runs a task per connection, so nothing else bounds
+    // it. Undeclared, the library sizes its scratch pool from a default that
+    // has to guess. Set before the loader starts, so the first index build
+    // sees it rather than the one after the first policy sync.
+    registry.setScanConcurrency(config.max_connections);
 
     // s3-dump extension: wired before the loader subscribes providers so the
     // sync hooks reach every provider. Stays inert unless enabled with targets.

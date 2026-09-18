@@ -159,7 +159,10 @@ pub fn evalLogRecord(
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
-    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf, sink);
+    // No reusable scan state here: this path evaluates one record, so the
+    // 8 KiB `ScanState.init` clear would replace a clear sized by the policy
+    // count and cost more than it saves. Only the batch path below reuses one.
+    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf, sink, null);
     if (!result.keep) return .drop;
     if (!result.mutated) return .keep;
 
@@ -373,6 +376,9 @@ fn filterLog(
     allocator: std.mem.Allocator,
     policy_id_buf: [][]const u8,
     sink: ?policy.ExtensionSink,
+    /// Reusable across the records of one batch. Null makes the engine keep
+    /// its per-record state, which is the cheaper choice for a single record.
+    scan_state: ?*policy.ScanState,
 ) FilterLogResult {
     var field_ctx: FieldAccessorContext = .{ .log = log, .allocator = allocator };
     const result = engine.evaluate(
@@ -380,7 +386,12 @@ fn filterLog(
         &log_accessor,
         &field_ctx,
         policy_id_buf,
-        .{ .scratch = allocator, .io = engine.bus.io, .extension_sink = sink },
+        .{
+            .scratch = allocator,
+            .io = engine.bus.io,
+            .extension_sink = sink,
+            .scan_state = scan_state,
+        },
     );
     // The extension sink (s3-dump) fires INSIDE evaluate — after keep, before
     // transforms — so it snapshots the pre-transform record by design (policy
@@ -500,6 +511,12 @@ fn processJsonLogsWithFilter(
     defer state.deinit();
     const arena = state.allocator();
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
+    // One state for the whole batch. The engine's fallback clears one byte
+    // per policy for every record, so this trades `records x policies` bytes
+    // of memset for a single 8 KiB clear here plus an undo of the policies
+    // each record actually touched. It pays once `records x policies` passes
+    // roughly 8192, which a real agent batch clears easily.
+    var scan_state: policy.ScanState = .init();
 
     switch (value_type) {
         .array => {
@@ -514,7 +531,7 @@ fn processJsonLogsWithFilter(
                 };
 
                 state.original_count += 1;
-                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, sink);
+                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, sink, &scan_state);
                 if (filter_result.mutated) state.mutated = true;
                 if (filter_result.keep) {
                     try state.kept.append(arena, log_obj);
@@ -531,7 +548,7 @@ fn processJsonLogsWithFilter(
             };
 
             state.original_count = 1;
-            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, sink);
+            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, sink, &scan_state);
             if (filter_result.mutated) state.mutated = true;
             if (filter_result.keep) {
                 try state.kept.append(arena, log_obj);
