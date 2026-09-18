@@ -103,8 +103,8 @@ Provide auth either via:
 | `config.maxBodySize`                | int    | `1572864`                                      | Raw request body cap as received on the wire                  |
 | `config.maxConnections`             | int    | `256`                                          | Max concurrent connections; also caps workerCount             |
 | `config.maxDecodedBytes`            | int    | `null`                                         | Post-decompression ceiling (null = 16 MiB, min maxBodySize)   |
-| `config.workerCount`                | int    | `null`                                         | httpz event-loop workers (null = 1; max maxConnections)       |
-| `config.threadPoolCount`            | int    | `null`                                         | httpz handler threads per worker (null = 128)                 |
+| `config.workerCount`                | int    | `null`                                         | httpz build only; inert on the shipped frontend               |
+| `config.threadPoolCount`            | int    | `null`                                         | httpz build only; inert on the shipped frontend               |
 | `config.service.name`               | string | `""`                                           | Service name sent on policy sync (omitted if empty)           |
 | `config.service.namespace`          | string | `""`                                           | Service namespace sent on policy sync (omitted if empty)      |
 | `config.service.version`            | string | `""`                                           | Service version sent on policy sync (omitted if empty)        |
@@ -129,52 +129,48 @@ Provide auth either via:
 
 ## Sizing
 
-Memory is dominated by `config.threadPoolCount`, not by connection count. A
-handler thread allocates its workspace on first use and then retains it for
-the life of the thread, so a pod's memory tracks the number of threads that
-have served a compressed body:
+Memory tracks the connections that are live right now, and CPU tracks the
+records you send. The shipped frontend gives each connection its own task, so
+neither follows `threadPoolCount`.
 
-```
-memory ~= maxConnections x 20 KiB
-        + threadPoolCount x (2 x maxBodySize + 1.2 MiB)
-```
+| payload |   RPS |  CPU | memory, 64 senders | memory, 256 senders |
+| ------- | ----: | ---: | -----------------: | ------------------: |
+| ~1 KB   |   100 | 100m |             128 Mi |              256 Mi |
+| ~1 KB   | 1,000 | 100m |             128 Mi |              256 Mi |
+| ~1 KB   | 5,000 | 250m |             128 Mi |              256 Mi |
+| ~100 KB |   100 | 100m |             128 Mi |              320 Mi |
+| ~100 KB | 1,000 | 500m |             128 Mi |              320 Mi |
+| ~100 KB | 5,000 |    3 |             128 Mi |              320 Mi |
+| ~1 MB   |   100 | 500m |             256 Mi |              640 Mi |
+| ~1 MB   | 1,000 |    6 |             256 Mi |              640 Mi |
 
-A connection itself costs 20 KiB, the receive buffer — not `maxBodySize`.
+CPU is driven by records, not requests, so a 1 MB batch costs roughly a
+thousand times a 1 KB one. Policy count barely matters: 4,000 policies cost
+the same as 1,000. Set `maxConnections` to about four times your sender count;
+a slot reserves 64 KiB and commits a page only when a sender lands on it, so
+headroom is free.
 
-Worked example at `maxBodySize` 2 MiB:
+`config.threadPoolCount` and `config.workerCount` belong to the `httpz`
+frontend, which the shipped image no longer uses. Both are inert here. If you
+carry a `threadPoolCount` from an older chart, drop it.
 
-| maxConnections | threadPoolCount | approx memory | suggested request |
-| -------------- | --------------- | ------------- | ----------------- |
-| 256            | 8               | 46 MiB        | 64Mi              |
-| 256 (default)  | 128 (default)   | 666 MiB       | 256Mi             |
-| 2048           | 16              | 123 MiB       | 192Mi             |
-| 4096           | 32              | 246 MiB       | 320Mi             |
-
-At this chart's own `maxBodySize` of 1.5 MiB the default 256/128 shape works
-out at about 540 MiB, which is what the shipped `resources` block is sized
-for. `threadPoolCount` rose from 32 to 128 in v1.30.2, so a chart pinned to
-the old resource values will not hold the current default.
-
-To cut the footprint, lower `threadPoolCount` before you raise the memory
-limit: it is the only knob that bounds retained workspace. 32 threads need
-about 140 MiB, at lower throughput against a slow upstream.
-
-If a pod is OOMKilled with nothing in its logs, suspect this first. The
-kernel gives the process no chance to log.
+If a pod is OOMKilled with nothing in its logs, look at peak
+`edge_connections_active` first. The kernel gives the process no chance to log.
 
 ## Notes
 
 - Each upstream attempt has a fixed 30s deadline; a request that exceeds it
   returns 504. Inbound requests and idle keep-alives also time out after 30s.
   None of these are configurable.
-- A handler thread owns its whole upstream exchange, so sustained throughput is
-  about `threadPoolCount / upstream_round_trip`. The Datadog intake answers in
-  about 14ms on a warm connection, so the default 128 threads sustain roughly
-  4.8k requests/sec per pod. Raise `threadPoolCount` and `resources.limits.memory`
-  together — see Sizing below.
+- A connection owns its whole upstream exchange, so sustained throughput is
+  about `concurrent connections / upstream_round_trip`. The Datadog intake
+  answers in about 14ms on a warm connection, so 64 senders in flight sustain
+  roughly 4.5k requests/sec per pod. `maxConnections` is the ceiling on that.
 - Log intake routes replay once on a fresh upstream connection when the first
-  attempt fails before a response. A replay can duplicate log lines if the
-  upstream accepted the first attempt but its acknowledgement was lost.
+  attempt fails before a response, if the body was buffered. A streamed
+  passthrough body is sent once and has nothing to replay. A replay can
+  duplicate log lines if the upstream accepted the first attempt but its
+  acknowledgement was lost.
 - `workspace_id` is not required in `config.json`.
 - If `tero.url` is set, chart requires either `tero.apiKey` or
   `tero.existingSecret.name`.
