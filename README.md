@@ -499,29 +499,67 @@ OTLP distribution.
 
 - `TERO_LOG_LEVEL` - Override log level (trace, debug, info, warn, err)
 
+## Sizing
+
+Find your payload size and request rate for CPU. Memory is set by how many
+senders connect, not by request rate, because an agent holds its connection open
+between batches.
+
+| payload |   RPS |  CPU | memory, 64 senders | memory, 256 senders |
+| ------- | ----: | ---: | -----------------: | ------------------: |
+| ~1 KB   |   100 | 100m |             128 Mi |              256 Mi |
+| ~1 KB   |   500 | 100m |             128 Mi |              256 Mi |
+| ~1 KB   | 1,000 | 100m |             128 Mi |              256 Mi |
+| ~1 KB   | 5,000 | 250m |             128 Mi |              256 Mi |
+| ~100 KB |   100 | 100m |             128 Mi |              320 Mi |
+| ~100 KB |   500 | 250m |             128 Mi |              320 Mi |
+| ~100 KB | 1,000 | 500m |             128 Mi |              320 Mi |
+| ~100 KB | 5,000 |    1 |             128 Mi |              320 Mi |
+| ~1 MB   |   100 | 500m |             256 Mi |              640 Mi |
+| ~1 MB   |   500 |    2 |             256 Mi |              640 Mi |
+| ~1 MB   | 1,000 |    4 |             256 Mi |              640 Mi |
+
+Set `maxConnections` to about four times your sender count. A slot reserves 64
+KiB and commits a page only when a sender lands on it, so headroom is free.
+
+CPU is driven by records, not requests, so a 1 MB batch costs roughly a thousand
+times a 1 KB one. Policy count barely matters: 4,000 policies cost the same as
+1,000. Rows assume policies are loaded and an upstream answering in about 14 ms.
+
+Measured on an M4 Max with the shipped frontend. CPU is rounded up to the next
+usual limit, memory carries 30% over the measured peak. Alert on
+`edge_connections_active / edge_connections_max > 0.8`, and on
+`edge_connections_shed_total` above zero.
+
 ## Prometheus Metrics
 
 Runtime metrics are exposed at `GET /_edge/metrics` in Prometheus text format.
 
-Every label is a bounded enum. No path, status code, policy id or client
-value ever becomes a label, so the series count cannot grow with traffic.
+Every label is a bounded enum. No path, status code, policy id or client value
+ever becomes a label, so the series count cannot grow with traffic.
 
 Requests and responses:
 
 - `edge_requests_total{method,known_path}`
 - `edge_request_duration_seconds{known_path}` (histogram, 100 us to 30 s)
 - `edge_responses_total{known_path,status_class}`
-- `edge_request_errors_total{known_path,class}` — `class` is `uncaught` or `module`
-- `edge_requests_in_flight` (gauge) — against the thread pool count, the saturation signal
-- `edge_requests_invalid_total` — heads refused before routing, answered 400 (stdio only)
+- `edge_request_errors_total{known_path,class}` — `class` is `uncaught` or
+  `module`
+- `edge_requests_in_flight` (gauge) — against the thread pool count, the
+  saturation signal
+- `edge_requests_invalid_total` — heads refused before routing, answered 400
+  (stdio only)
 
 Connections (stdio only, except the ceiling):
 
 - `edge_connections_total`
 - `edge_connections_active` (gauge)
-- `edge_connections_max` (gauge) — the configured ceiling, reported by both frontends
-- `edge_connections_shed_total{reason}` — `slab_full` or `concurrency`; the exhaustion signal
-- `edge_inbound_timeouts_total{phase}` — `request` counts dropped requests, `idle` counts reclaimed keep-alive slots
+- `edge_connections_max` (gauge) — the configured ceiling, reported by both
+  frontends
+- `edge_connections_shed_total{reason}` — `slab_full` or `concurrency`; the
+  exhaustion signal
+- `edge_inbound_timeouts_total{phase}` — `request` counts dropped requests,
+  `idle` counts reclaimed keep-alive slots
 
 Upstream:
 
@@ -535,7 +573,8 @@ Policy:
 - `edge_policy_records_kept_total{telemetry}`
 - `edge_policy_records_dropped_total{telemetry}`
 - `edge_policies_loaded{signal}` (gauge)
-- `edge_policies_rejected` (gauge) — patterns the matcher refused; a non-zero value means a rule an operator believes is live does nothing
+- `edge_policies_rejected` (gauge) — patterns the matcher refused; a non-zero
+  value means a rule an operator believes is live does nothing
 
 s3-dump extension (present only when the extension is built in):
 
@@ -543,7 +582,8 @@ s3-dump extension (present only when the extension is built in):
 - `edge_s3_dump_objects_uploaded_total`, `edge_s3_dump_objects_failed_total`
 - `edge_s3_dump_records_uploaded_total`, `edge_s3_dump_records_dropped_total`
 - `edge_s3_dump_bytes_uploaded_total`
-- `edge_s3_dump_backlog_bytes` (gauge) — alert on this approaching `max_sealed_bytes`
+- `edge_s3_dump_backlog_bytes` (gauge) — alert on this approaching
+  `max_sealed_bytes`
 
 Build:
 
