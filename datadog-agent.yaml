@@ -12,7 +12,7 @@ data:
       "listen_port": 8080,
       "upstream_url": "https://agent-http-intake.logs.us5.datadoghq.com",
       "log_level": "info",
-      "max_body_size": 1048576,
+      "max_body_size": 1572864,
       "policy_providers": [
         {
           "id": "file",
@@ -97,11 +97,14 @@ spec:
               protocol: TCP
           resources:
             requests:
-              cpu: 50m
-              memory: 32Mi
+              cpu: 100m
+              memory: 128Mi
             limits:
-              cpu: 200m
-              memory: 64Mi
+              # 64Mi OOMKilled: measured peak is 79 MB at 64 senders with
+              # policies loaded, and 167 MB with 1 MB batches. See the sizing
+              # table in charts/tero-edge/README.md.
+              cpu: 500m
+              memory: 256Mi
           volumeMounts:
             - name: tero-edge-config
               mountPath: /etc/tero

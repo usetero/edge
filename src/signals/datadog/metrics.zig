@@ -1,4 +1,5 @@
 const std = @import("std");
+const stream_io = @import("../stream_io.zig");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const datadog_metric = @import("metric.zig");
@@ -65,7 +66,7 @@ pub fn processMetricsStream(
     content_type: []const u8,
 ) !StreamProcessResult {
     if (std.mem.indexOf(u8, content_type, "application/json") == null) {
-        try streamAll(in_reader, out_writer);
+        try stream_io.streamAll(in_reader, out_writer);
         return .{
             .dropped_count = 0,
             .original_count = 0,
@@ -73,7 +74,7 @@ pub fn processMetricsStream(
         };
     }
 
-    const data = try readAll(allocator, in_reader);
+    const data = try stream_io.readAll(allocator, in_reader);
     defer allocator.free(data);
 
     const result = try processJsonMetricsWithFilter(allocator, registry, bus, data);
@@ -85,23 +86,6 @@ pub fn processMetricsStream(
         .dropped_count = result.dropped_count,
         .original_count = result.original_count,
     };
-}
-
-fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try streamAll(reader, &out.writer);
-    return out.toOwnedSlice();
-}
-
-fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
-    while (true) {
-        const n = reader.stream(writer, .unlimited) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) break;
-    }
 }
 
 /// Context for field accessor - holds the MetricSeries struct.
@@ -146,7 +130,7 @@ fn lookupMetricAttribute(series: *MetricSeries, tags_cache: ?[]const u8, path: [
     }
 
     // Check extra fields (supports nested dotted-key paths)
-    return findExtraField(&series.extra, path);
+    return findExtraField(&series.extra.values, path);
 }
 
 const findExtraField = otlp_attr.findExtraField;

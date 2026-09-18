@@ -83,8 +83,8 @@ tasks:
     aliases: [tm, matrix]
     vars:
       # Everything the suite needs, so a contributor runs one command. python
-      # and uv come from hermit; requests and zstandard come from uv; oha is a
-      # brew dependency and the load cases skip without it.
+      # and uv come from hermit; requests and zstandard come from uv. Nothing
+      # else is required: the suite drives the edge directly.
       UV: ./bin/uv run --python ./bin/python3 --with requests --with zstandard
     cmds:
       - "{{.UV}} bench/matrix/run.py {{.CLI_ARGS}}"
@@ -371,6 +371,22 @@ tasks:
       - task: do
       - task: build:safe
       - task: test:s3-e2e
+      # The fault matrix, minus the cases that sit out a 30 s or 120 s
+      # deadline. Measured on an M4 Max: this shape is about 5 minutes, the
+      # full suite 29. A gate people skip catches nothing, so the slow cases
+      # belong in `signoff:full` rather than here.
+      - task: test:matrix:fast
+      - gh signoff
+
+  signoff:full:
+    desc: "Sign off with the complete fault matrix, deadline cases included"
+    cmds:
+      - task: do
+      - task: build:safe
+      - task: test:s3-e2e
+      # About 29 minutes. Worth it before a release or after touching the
+      # inbound read path, where the deadline cases are the regression guard.
+      - task: test:matrix
       - gh signoff
 
   install:
