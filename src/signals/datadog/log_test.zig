@@ -1281,3 +1281,53 @@ test "DatadogLog - unwrappedAttribute falls through for array-string entries aft
         log.unwrappedAttribute(allocator, &note_path).?,
     );
 }
+test "DatadogLog - parseRaw rejects malformed container interiors (parse parity)" {
+    // Regression: FieldWalker.valueEnd used to skip every non-bracket,
+    // non-string interior byte of a container, so bracket-balanced but
+    // structurally malformed unknown-field values (trailing/missing commas,
+    // missing values, non-string keys, malformed scalar tokens) were stored
+    // verbatim in `extra_spans` and never routed to the validating fallback.
+    // A full parser rejects each of these; parseRaw must too, so semantics
+    // never depend on the fast path (logs.zig evalLogRecord contract).
+    const allocator = std.testing.allocator;
+
+    const bad_record_values = [_][]const u8{
+        "[1,]", // trailing comma in array
+        "[,]", // leading comma in array
+        "[1 2]", // missing comma in array
+        "[1,,2]", // double comma / missing value in array
+        "{\"k\":}", // missing object value
+        "{1:2}", // non-string object key
+        "{\"a\":1,}", // trailing comma in object
+        "[tru]", // malformed scalar token in array
+        "[1e+]", // incomplete number in array
+        "{\"a\":1 \"b\":2}", // missing comma between object pairs
+    };
+    for (bad_record_values) |val| {
+        var buf: [128]u8 = undefined;
+        const json = std.fmt.bufPrint(
+            &buf,
+            "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
+            .{val},
+        ) catch unreachable;
+        try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator, json));
+    }
+
+    // The known-field boundary: a malformed container in a KNOWN string field
+    // already routed to the validating path via `stringSpan` before this fix.
+    // Pin that the known-field path still rejects a container-shaped value.
+    try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator,
+        \\{"message":[1,],"service":"s"}
+    ));
+
+    // Valid containers in unknown fields still parse byte-for-byte.
+    var ok = try DatadogLog.parseRaw(allocator,
+        \\{"message":"m","http":{"method":"GET","code":200},"tags":["a","b"],"empty":{},"n":42,"ok":true}
+    );
+    defer ok.deinit(allocator);
+    try std.testing.expectEqualStrings("{\"method\":\"GET\",\"code\":200}", ok.extra_spans.get("http").?);
+    try std.testing.expectEqualStrings("[\"a\",\"b\"]", ok.extra_spans.get("tags").?);
+    try std.testing.expectEqualStrings("{}", ok.extra_spans.get("empty").?);
+    try std.testing.expectEqualStrings("42", ok.extra_spans.get("n").?);
+    try std.testing.expectEqualStrings("true", ok.extra_spans.get("ok").?);
+}

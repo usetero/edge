@@ -140,30 +140,115 @@ pub const FieldWalker = struct {
         switch (self.raw[start]) {
             '"' => return self.stringEnd(start) orelse error.Malformed,
             '{', '[' => {
-                // Opener kinds as a bit-stack (0 = object, 1 = array):
-                // depth counts alone accept mismatched closers like `[{]}`.
-                // Nesting beyond 64 levels falls to the validating parser.
+                // Opener kinds as a bit-stack (0 = object, 1 = array): depth
+                // counts alone accept mismatched closers like `[{]}`. Nesting
+                // beyond 64 levels falls to the validating parser.
+                //
+                // A per-depth position state machine validates the container
+                // grammar (commas, colons, string keys, values, closers) as the
+                // span is scanned, instead of skipping every non-bracket,
+                // non-string interior byte. Structural-grammar malformations a
+                // full parser rejects (trailing/leading/missing commas, missing
+                // values, non-string object keys, malformed scalar tokens)
+                // error here so the validating fallback runs and semantics
+                // never depend on this fast path.
+                const Pos = enum(u3) {
+                    start, // after opener: array -> value|`]`; object -> key|`}`
+                    after_elem, // after a full element: comma|closer
+                    after_comma, // after `,`: value (array) or key (object)
+                    after_key, // after an object key string: colon (object only)
+                    after_colon, // after an object `:`: value (object only)
+                };
                 var stack: u64 = 0;
                 var depth: u8 = 0;
+                var pos = [_]Pos{.start} ** 65;
                 var i = start;
                 while (i < self.raw.len) : (i += 1) {
                     const byte = self.raw[i];
                     switch (byte) {
-                        // Bulk of container bytes are string keys/values:
-                        // vault over them with the vectorized scan.
-                        '"' => i = (self.stringEnd(i) orelse return error.Malformed) - 1,
+                        // Inter-token whitespace, and the documented control-byte
+                        // deviation (raw < 0x20 inside container interiors) are
+                        // skipped without consuming a grammar slot.
+                        ' ', 0x00...0x1f => {},
+                        // Strings vault over their content; whether the string is
+                        // an object key or a value is decided by container shape
+                        // and position below.
+                        '"' => {
+                            i = (self.stringEnd(i) orelse return error.Malformed) - 1;
+                            if ((stack & 1) == 0) { // object: key or value
+                                switch (pos[depth]) {
+                                    .start, .after_comma => pos[depth] = .after_key,
+                                    .after_colon => pos[depth] = .after_elem,
+                                    .after_elem, .after_key => return error.Malformed,
+                                }
+                            } else { // array: value only
+                                switch (pos[depth]) {
+                                    .start, .after_comma => pos[depth] = .after_elem,
+                                    else => return error.Malformed,
+                                }
+                            }
+                        },
                         '{', '[' => {
                             if (depth == 64) return error.Malformed;
+                            if (depth != 0) {
+                                if ((stack & 1) == 0) { // object: value must follow `:`
+                                    if (pos[depth] != .after_colon) return error.Malformed;
+                                } else { // array: value at start or after a comma
+                                    switch (pos[depth]) {
+                                        .start, .after_comma => {},
+                                        else => return error.Malformed,
+                                    }
+                                }
+                                pos[depth] = .after_elem;
+                            }
                             stack = (stack << 1) | @intFromBool(byte == '[');
                             depth += 1;
+                            pos[depth] = .start;
                         },
                         '}', ']' => {
                             if ((stack & 1) != @intFromBool(byte == ']')) return error.Malformed;
+                            switch (pos[depth]) {
+                                .start, .after_elem => {}, // empty container or after a value
+                                .after_comma, .after_key, .after_colon => return error.Malformed,
+                            }
                             stack >>= 1;
                             depth -= 1;
                             if (depth == 0) return i + 1;
+                            pos[depth] = .after_elem;
                         },
-                        else => {},
+                        ',' => {
+                            if (pos[depth] != .after_elem) return error.Malformed;
+                            pos[depth] = .after_comma;
+                        },
+                        ':' => {
+                            if ((stack & 1) != 0 or pos[depth] != .after_key) return error.Malformed;
+                            pos[depth] = .after_colon;
+                        },
+                        else => {
+                            // A scalar value: run to the next structural byte
+                            // or whitespace and validate the literal, so `tru`,
+                            // `1e+`, or a non-string object key inside a
+                            // container fails open to the validating parser.
+                            if ((stack & 1) == 0) { // object: scalars are values only
+                                if (pos[depth] != .after_colon) return error.Malformed;
+                            } else { // array: value at start or after a comma
+                                switch (pos[depth]) {
+                                    .start, .after_comma => {},
+                                    else => return error.Malformed,
+                                }
+                            }
+                            const tok_start = i;
+                            i += 1;
+                            while (i < self.raw.len) : (i += 1) {
+                                switch (self.raw[i]) {
+                                    ',', '}', ']', ' ', 0x00...0x1f => break,
+                                    else => {},
+                                }
+                            }
+                            if (!validValueSpan(self.raw[tok_start..i])) return error.Malformed;
+                            pos[depth] = .after_elem;
+                            i -= 1;
+                        },
                     }
                 }
                 return error.Malformed;
@@ -409,6 +494,88 @@ test "FieldWalker - mismatched container closers error" {
     );
     const field = (try ok.nextField()).?;
     try testing.expectEqualStrings("[{\"a\":[1]},[]]", field.value);
+}
+
+test "FieldWalker - container interior grammar is validated" {
+    // Bracket-balanced but structurally malformed container VALUES must error
+    // rather than be waved through to policy eval. A full validator rejects
+    // every one of these; the walker must too, so the validating/fail-open
+    // fallback runs (semantics never depend on the fast path).
+    const bad_values = [_][]const u8{
+        "[1,]", // trailing comma in array
+        "[,]", // leading comma in array
+        "[1 2]", // missing comma in array
+        "[1,,2]", // double comma in array
+        "{\"k\":}", // missing object value
+        "{1:2}", // non-string object key
+        "{\"a\":1,}", // trailing comma in object
+        "{,\"a\":1}", // leading comma in object
+        "{\"a\":1 \"b\":2}", // missing comma between object pairs
+        "{\"a\":1::2}", // extra colon in object
+        "{\"a\" 1}", // missing colon (scalar where colon expected)
+        "[tru]", // malformed scalar token in array
+        "[1e+]", // incomplete number in array
+        "[1 1]", // two scalars in array (missing comma)
+        "[\"a\" \"b\"]", // missing comma between string values
+        "{\"k\":,}", // comma where value expected
+        "{\"k\":}}", // closer where value expected (object)
+    };
+    for (bad_values) |val| {
+        var buf: [256]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"x\":{s}}}", .{val}) catch unreachable;
+        var walker = try FieldWalker.init(json);
+        try testing.expectError(error.Malformed, walker.nextField());
+    }
+}
+
+test "FieldWalker - valid containers still parse with all value types" {
+    // Positive coverage: the stricter grammar must still accept every shape
+    // a full parser accepts, including empty containers, every scalar, mixed
+    // nesting, and inter-token whitespace (incl. documented control bytes).
+    const ok_values = [_]struct { val: []const u8, want: []const u8 }{
+        .{ .val = "[1]", .want = "[1]" },
+        .{ .val = "[1,2,3]", .want = "[1,2,3]" },
+        .{ .val = "[]", .want = "[]" },
+        .{ .val = "{}", .want = "{}" },
+        .{ .val = "{\"k\":\"v\"}", .want = "{\"k\":\"v\"}" },
+        .{ .val = "{\"a\":1,\"b\":2}", .want = "{\"a\":1,\"b\":2}" },
+        .{ .val = "[1,2,null,true,false,\"s\",{},[]]", .want = "[1,2,null,true,false,\"s\",{},[]]" },
+        .{ .val = "-0.5", .want = "-0.5" },
+        .{ .val = "123.456e-7", .want = "123.456e-7" },
+        .{ .val = "[{\"a\":[1]},[],{\"k\":\"v\"}]", .want = "[{\"a\":[1]},[],{\"k\":\"v\"}]" },
+    };
+    for (ok_values) |t| {
+        var buf: [256]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"x\":{s}}}", .{t.val}) catch unreachable;
+        var walker = try FieldWalker.init(json);
+        const field = (try walker.nextField()).?;
+        try testing.expectEqualStrings("x", field.key);
+        try testing.expectEqualStrings(t.want, field.value);
+        try testing.expectEqual(@as(?FieldWalker.RawField, null), try walker.nextField());
+    }
+
+    // Inter-token whitespace and the documented raw control-byte deviation
+    // (< 0x20 inside container interiors) must still parse.
+    var ws = try FieldWalker.init("{\"a\":[1,\n\t 2],\"d\":\"\x7f\"}");
+    _ = (try ws.nextField()).?;
+    const d = (try ws.nextField()).?;
+    try testing.expectEqualStrings("\"\x7f\"", d.value);
+
+    // A raw control byte sitting where whitespace is valid (between tokens)
+    // is accepted per the documented deviation; the surrounding grammar is
+    // still validated, so malformations around it are rejected.
+    var ctrl_ok = try FieldWalker.init("{\"x\":[1,\x0b2]}");
+    const cf = (try ctrl_ok.nextField()).?;
+    try testing.expectEqualStrings("[1,\x0b2]", cf.value);
+
+    // The control byte does NOT mask a trailing comma.
+    var ctrl_bad = try FieldWalker.init("{\"x\":[1,\x0b,]}");
+    try testing.expectError(error.Malformed, ctrl_bad.nextField());
+
+    // 64-deep nesting still parses once the interior is grammar-valid.
+    const deep_ok = "{\"x\":" ++ "[" ** 64 ++ "]" ** 64 ++ "}";
+    var deep = try FieldWalker.init(deep_ok);
+    _ = (try deep.nextField()).?;
 }
 
 test "FieldWalker - nesting beyond 64 levels falls to the validating parser" {

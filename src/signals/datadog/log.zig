@@ -241,7 +241,13 @@ pub const DatadogLog = struct {
         }
         // Extras in the order the record listed them; containers go out as
         // the bytes captured at parse time.
-        try self.extra.write(jws);
+        // `extra` values were materialized by the validating parse, so
+        // `write` only fails here with the writer's `WriteFailed`. Non-write
+        // errors are impossible in practice; coerce them to `WriteFailed` to
+        // keep this method within the `std.json.Stringify` contract
+        // (`error{WriteFailed}!void`) now that `json_value.write` propagates
+        // malformed-container errors for the parse-time `stringify` path.
+        self.extra.write(jws) catch return error.WriteFailed;
         // parseRaw extras: verbatim spans of the input, all value types.
         for (self.extra_spans.items()) |entry| {
             try jws.objectField(entry.key);
