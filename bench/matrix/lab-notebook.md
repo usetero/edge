@@ -919,3 +919,43 @@ runs on both frontends.
 drives 32 raw senders at once leaves 32 pooled sockets, and the descriptor
 budget allows 16 above the baseline. The original c06 passes only because
 `requests` paces its threads. The chunked class uses 12 senders.
+
+## Scaling sweep on the Mac Studio, PR #348 branch (2026-09-22)
+
+`bench/scaling/run.sh`, edge only, 50k requests, 64 oha connections, policy
+counts 0 and 1000. Twelve cells: upstream latency 0 and 10 ms, handler threads
+64 and 256, max connections 256, 1024 and 2048. Every row is 100 percent
+success with 50000 requests at the intake. Raw results:
+`~/pr348-sweep/` on the Mac Studio and
+`bench/scaling/results/pr348-mac-studio-2026-09-22/` locally.
+
+| scenario | policies | req/s at 0 ms | req/s at 10 ms | p99 at 0 ms | p99 at 10 ms | RSS MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| OTLP Logs | 0 | 85.3k to 86.6k | 1072 to 1100 | 2.1 to 2.2 | 92 | 33 |
+| OTLP Logs | 1000 | 48.4k to 65.8k | 1067 to 1085 | 2.1 to 2.7 | 95 | 79 |
+| OTLP Metrics | 0 | 84.9k to 86.8k | 1085 to 1097 | 2.1 | 92 | 33 |
+| OTLP Metrics | 1000 | 75.1k to 78.0k | 1057 to 1087 | 2.1 to 2.2 | 94 | 77 |
+| OTLP Traces | 0 | 85.6k to 86.5k | 1067 to 1102 | 2.1 | 92 | 33 |
+| OTLP Traces | 1000 | 50.3k to 62.2k | 1057 to 1086 | 2.1 to 2.8 | 95 | 78 |
+| DD Logs | 0 | 5212 to 5575 | 969 to 1021 | 12.9 to 14.4 | 112 to 116 | 63 |
+| DD Logs | 1000 | 442 to 449 | 442 to 446 | 182 to 185 | 227 to 231 | 187 to 192 |
+| DD Metrics | 0 | 83.4k to 86.2k | 1075 to 1099 | 2.1 | 92 | 34 |
+| DD Metrics | 1000 | 78.3k to 79.7k | 1081 to 1095 | 2.1 | 94 | 80 |
+
+The range in each cell is the spread across the six thread and max-connection
+combinations at that latency.
+
+- **The thread and max-connection axes are flat.** The stdio frontend gives
+  each connection its own task and reads neither value. At 10 ms the mean
+  req/s by threads is 1094 against 1087 for OTLP Logs, and by max connections
+  1088, 1086 and 1098. The spread at 0 ms on the 1000-policy OTLP rows is
+  run-to-run noise on a CPU-bound scenario, not an axis effect.
+- **At 10 ms the intake is the ceiling, not the edge.** Every scenario but one
+  converges on about 1090 req/s with a p50 of 62 ms and the edge at 10 to 40
+  percent of one core. 64 connections over 1090 req/s is 59 ms per round trip:
+  the echo server's 10 ms sleep runs at about 60 ms on this host, as noted
+  under the sweep table above. The edge adds under 1 ms to that.
+- **DD Logs at 1000 policies is CPU-bound at about 445 req/s** at both
+  latencies, with the edge at 15.5 cores of 16 and 190 MB RSS. That is the
+  4 MiB decoded batch against 1000 policies. It is the one scenario where
+  the edge, not the intake, sets the rate.
