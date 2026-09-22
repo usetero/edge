@@ -304,9 +304,8 @@ pub fn build(b: *std.Build) void {
     run_pool_harness.step.dependOn(b.getInstallStep()); // harness spawns zig-out/bin/edge
     pool_harness_step.dependOn(&run_pool_harness.step);
 
-    // Chunked-request end-to-end harness (stdio frontend): reproduces the
-    // forward_raw chunked arena-retention regression and verifies the streaming
-    // fix against the real edge binary (see src/bench/chunked_harness.zig).
+    // End-to-end chunked-request harness for the stdio frontend. It runs the
+    // real edge binary; see src/bench/chunked_harness.zig.
     const chunked_harness = b.addExecutable(.{
         .name = "chunked-harness",
         .root_module = b.createModule(.{

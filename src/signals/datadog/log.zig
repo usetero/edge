@@ -241,12 +241,8 @@ pub const DatadogLog = struct {
         }
         // Extras in the order the record listed them; containers go out as
         // the bytes captured at parse time.
-        // `extra` values were materialized by the validating parse, so
-        // `write` only fails here with the writer's `WriteFailed`. Non-write
-        // errors are impossible in practice; coerce them to `WriteFailed` to
-        // keep this method within the `std.json.Stringify` contract
-        // (`error{WriteFailed}!void`) now that `json_value.write` propagates
-        // malformed-container errors for the parse-time `stringify` path.
+        // The validating parse already materialized `extra`, so only the
+        // writer can fail here. Coerce to the `std.json.Stringify` error set.
         self.extra.write(jws) catch return error.WriteFailed;
         // parseRaw extras: verbatim spans of the input, all value types.
         for (self.extra_spans.items()) |entry| {
@@ -508,28 +504,15 @@ pub const DatadogLog = struct {
     /// unwrapped JSON message. Returns null when the message is not JSON or
     /// the path is absent.
     ///
-    /// When the wrapper tree has been edited in this transform pass
-    /// (`message_dirty`), consult the live `message_tree` first so a prior
-    /// `setWrapped`/`deleteWrapped` wins over the one-shot `message_flat`
-    /// snapshot. `ensureUnwrapped` builds `message_flat` from the ORIGINAL
-    /// `message` exactly once and never refreshes it, so without this check
-    /// every wrapped-attribute read after the first write observes the
-    /// pre-transform value — a redaction policy with more than one regex
-    /// `redact` on the same path would lose every earlier rule's edit and
-    /// leak the scrubbed content back into the forwarded record.
+    /// When this pass edited the wrapper tree (`message_dirty`), the live
+    /// `message_tree` wins over the one-shot `message_flat` snapshot. Without
+    /// this, a second regex redact on the same path reads the pre-transform
+    /// value and undoes the first.
     ///
-    /// The tree is only authoritative when it actually resolves the path
-    /// through an object parent (the shape `setWrapped`/`deleteWrapped`
-    /// operate on): a present string leaf returns the live (possibly edited)
-    /// value, a missing leaf returns null (a `deleteWrapped` removal must read
-    /// as absent, not the stale flat), and a non-string leaf returns null.
-    /// When an ancestor in the path is not an object (e.g. an array that the
-    /// flattener reaches but the object walker does not descend into), fall
-    /// through to `message_flat`, which stays authoritative for never-edited
-    /// and array-flattened paths.  When an ancestor is an object but a
-    /// segment key is absent — meaning a prior `deleteWrapped` or
-    /// `setWrapped` removed it — return null directly so a stale
-    /// `message_flat` entry cannot surface deleted data.
+    /// The tree is authoritative only when every ancestor is an object: a
+    /// string leaf returns the live value, and a missing key returns null. A
+    /// non-object ancestor or a non-string leaf falls through to
+    /// `message_flat`, which stays authoritative for array-flattened paths.
     pub fn unwrappedAttribute(
         self: *DatadogLog,
         allocator: std.mem.Allocator,
@@ -538,56 +521,25 @@ pub const DatadogLog = struct {
         if (path.len == 0) return null;
         self.ensureUnwrapped(allocator);
 
-        // See the doc comment above: when the tree was edited this pass, the
-        // live `message_tree` wins over the one-shot `message_flat` snapshot
-        // for object-ancestor paths.  Walk the ancestors manually so we can
-        // distinguish "key absent from object" (ancestor deleted → return null)
-        // from "ancestor is an array" (array-flattened path → defer to flat).
+        // Walk the ancestors by hand: a missing key in an object is a deleted
+        // path (null); an array ancestor or a non-string leaf belongs to the
+        // flattener (fall through to `message_flat`).
         if (self.message_dirty) {
-            if (self.message_tree) |*parsed| {
+            if (self.message_tree) |*parsed| tree: {
                 var current = &parsed.value;
-                // Walk all but the last segment (the ancestors).
-                var deferred_to_flat = false;
                 for (path[0 .. path.len - 1]) |segment| {
-                    switch (current.*) {
-                        .object => |*obj| {
-                            if (obj.getPtr(segment)) |child| {
-                                current = child;
-                            } else {
-                                // Segment is absent from an object ancestor: the
-                                // key was deleted or never written via setWrapped/
-                                // deleteWrapped.  Return null so the stale flat
-                                // snapshot does not surface removed data.
-                                return null;
-                            }
-                        },
-                        // Non-object ancestor (e.g. array): the path passes
-                        // through an array the flattener handles; defer to flat.
-                        else => {
-                            deferred_to_flat = true;
-                            break;
-                        },
-                    }
+                    const obj = switch (current.*) {
+                        .object => |*o| o,
+                        else => break :tree,
+                    };
+                    current = obj.getPtr(segment) orelse return null;
                 }
-                if (!deferred_to_flat) {
-                    // `current` is now the parent node.
-                    switch (current.*) {
-                        .object => |*obj| {
-                            if (obj.getPtr(path[path.len - 1])) |entry| switch (entry.*) {
-                                .string => |s| return s,
-                                // Non-string leaf (array, object, number, …): the tree
-                                // value is not a scalar string, but `flattenValue` may
-                                // have stored a string from inside it (e.g. array
-                                // containing a string).  Fall through to `message_flat`
-                                // so those entries are not silently dropped.
-                                else => {},
-                            } else return null;
-                        },
-                        // Parent isn't an object (e.g. an array the flattener
-                        // reaches via array-of-objects); defer to `message_flat`.
-                        else => {},
-                    }
-                }
+                const parent = switch (current.*) {
+                    .object => |*o| o,
+                    else => break :tree,
+                };
+                const leaf = parent.getPtr(path[path.len - 1]) orelse return null;
+                if (leaf.* == .string) return leaf.string;
             }
         }
 

@@ -497,11 +497,10 @@ fn queryParam(target: []const u8, name: []const u8) ?[]const u8 {
 }
 
 /// Classify the body and enforce max_body_size before the shared path sees
-/// it. A Content-Length body stays on the socket as `.lazy`; a chunked body
-/// (no declared length) stays on the socket as `.streamed` and is pumped
-/// socket->upstream by the shared path, so no body-sized buffer lands in the
-/// reset-retained per-connection arena. `max_body_size` is stamped onto the
-/// streamed body and enforced during that pump. Invalidates the head strings.
+/// it. A Content-Length body stays on the socket as `.lazy`. A chunked body
+/// stays on the socket as `.streamed` with `max_body_size` as its cap, so no
+/// body-sized buffer lands in the per-connection arena. Invalidates the head
+/// strings.
 fn inboundBodyOf(
     request: *std.http.Server.Request,
     limits: limits_mod.Limits,
@@ -697,21 +696,17 @@ test "query parameters are read from the target" {
     try testing.expectEqualStrings("/a/b", pathOf("/a/b"));
 }
 
-/// Test `Limits` small enough to build inline; mirrors the helper in
-/// arena_pool.zig/conn_slab.zig. Only the fields `inboundBodyOf` reads
-/// (`max_body_size`) matter here.
 var test_chunked: ChunkedBody = .{};
 
+/// Small test `Limits`, as in arena_pool.zig. Only `max_body_size` and
+/// `large_body_buffer_size` matter here.
 fn testLimits() limits_mod.Limits {
     return .resolve(.{ .max_body_size = 128, .max_connections = 2 });
 }
 
-/// Drives a `std.http.Server` from an in-memory raw request (no networking):
-/// `Reader.fixed` backs `receiveHead`, and a discarding writer absorbs the
-/// optional "100 Continue" (never sent for an absent `Expect` header).
-/// Self-referential (server points at in_reader/discard; request points at
-/// server), so it must be constructed in place via `parseRequestInto`, never
-/// returned by value (the move would dangle the internal pointers).
+/// Drives a `std.http.Server` from an in-memory raw request. The struct is
+/// self-referential, so build it in place with `parseRequestInto` and never
+/// return it by value.
 const Parsed = struct {
     in_reader: std.Io.Reader,
     discard_buf: [16]u8 = undefined,
@@ -728,10 +723,8 @@ fn parseRequestInto(p: *Parsed, raw: []const u8) !void {
 }
 
 test "inboundBodyOf: chunked body stays on the socket as .streamed (no arena capture)" {
-    // Regression: pre-fix this branch drained the whole chunked body into the
-    // per-connection arena as `.bytes`; the arena's `reset(.retain_capacity)`
-    // then pinned body-sized capacity for the connection's life. The fix
-    // returns `.streamed` so the shared path pumps socket->upstream.
+    // Regression: this branch drained the chunked body into the arena, which
+    // retained body-sized capacity for the connection's life.
     const raw =
         "POST /forward HTTP/1.1\r\n" ++
         "Host: x\r\n" ++
@@ -751,16 +744,13 @@ test "inboundBodyOf: chunked body stays on the socket as .streamed (no arena cap
 
     const body = try inboundBodyOf(&p.request, limits, &body_buf, arena, &test_chunked);
 
-    // The body must NOT be arena-buffered (.bytes); it must stay on the socket
-    // as a streaming reader carrying the max_body_size cap.
+    // The body stays on the socket with the max_body_size cap.
     try testing.expect(body == .streamed);
     try testing.expectEqual(@as(usize, limits.max_body_size), body.streamed.max_bytes);
-    // `inboundBodyOf` no longer touches an arena, so the caller's arena capacity
-    // is unchanged — the regression's whole point: zero body-sized retention.
+    // The arena capacity is unchanged: no body-sized retention.
     try testing.expectEqual(cap_before, arena_state.queryCapacity());
 
-    // Draining the streamed reader through the bounded pump yields the exact
-    // decoded body (what `exchange.sendBody` pumps to the upstream).
+    // The pump yields the exact decoded body.
     var out_buf: [64]u8 = undefined;
     var out_writer = std.Io.Writer.fixed(&out_buf);
     const n = try pipeline_mod.streamReaderToWriter(body.streamed.reader, &out_writer, limits.max_body_size);
@@ -769,9 +759,8 @@ test "inboundBodyOf: chunked body stays on the socket as .streamed (no arena cap
 }
 
 test "inboundBodyOf: chunked body over max_body_size is rejected mid-stream" {
-    // The cap c33e387 added is preserved: a chunked body larger than
-    // max_body_size fails with BodyTooLarge during the upstream pump, rather
-    // than being streamed unbounded (the pre-c33e387 vector).
+    // A chunked body larger than max_body_size fails with BodyTooLarge during
+    // the pump.
     const raw =
         "POST /forward HTTP/1.1\r\n" ++
         "Host: x\r\n" ++
@@ -788,8 +777,7 @@ test "inboundBodyOf: chunked body over max_body_size is rejected mid-stream" {
     const body = try inboundBodyOf(&p.request, limits, &body_buf, testing.allocator, &test_chunked);
     try testing.expect(body == .streamed);
 
-    // Pumping through the cap (as `exchange.sendBody` does) rejects the over-cap
-    // body instead of silently truncating it.
+    // The pump rejects the over-cap body; it does not truncate it.
     var sink: std.Io.Writer.Discarding = .init(&body_buf);
     try testing.expectError(
         error.BodyTooLarge,
@@ -798,12 +786,9 @@ test "inboundBodyOf: chunked body over max_body_size is rejected mid-stream" {
 }
 
 test "inboundBodyOf: a Content-Length body is never .streamed" {
-    // The Content-Length path keeps its pre-checked length and never becomes
-    // the unknown-length `.streamed` variant that chunked bodies use. Which of
-    // `.bytes` and `.lazy` it takes depends on `large_body_buffer_size`: at or
-    // below the threshold the body is captured resident so the batch stays
-    // replayable, above it the reader stays on the socket. Both are asserted
-    // here, because the two cases together are the whole contract.
+    // A Content-Length body is `.bytes` at or below `large_body_buffer_size`,
+    // so the batch stays replayable, and `.lazy` above it. It is never
+    // `.streamed`.
     const raw =
         "POST /forward HTTP/1.1\r\n" ++
         "Host: x\r\n" ++
@@ -815,7 +800,7 @@ test "inboundBodyOf: a Content-Length body is never .streamed" {
     var body_buf: [256]u8 = undefined;
     const limits = testLimits();
 
-    // The resident capture allocates, so give it an arena the test owns.
+    // The resident capture allocates, so the test owns an arena.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

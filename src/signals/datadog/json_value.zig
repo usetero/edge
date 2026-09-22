@@ -33,15 +33,9 @@ pub fn stringify(allocator: std.mem.Allocator, value: AnyValue) ![]u8 {
 /// `jws` is `anytype` because callers hold it by pointer or by value depending
 /// on how they opened the object.
 ///
-/// Malformed containers (e.g. a trailing comma that zimdjson's ondemand
-/// parser tokenized structurally but did not reject until an element is
-/// materialized) surface as errors from `iterator().next()`, `key.get()`, or
-/// `value.asAny()`. Those errors propagate -- they are NOT swallowed -- so a
-/// malformed container aborts serialization cleanly. Swallowing them would
-/// advance the writer past a `beginObject`/`objectField` without a matching
-/// value, leaving it in the `.the_beginning`/`.colon` state where `endObject`
-/// is `unreachable` and would crash the process. Callers route that error to
-/// the validating-path fail-open.
+/// A malformed container surfaces as an error from the ondemand iterator, and
+/// the error propagates. A swallowed error would leave `jws` after an
+/// `objectField` with no value, where `endObject` is `unreachable`.
 pub fn write(jws: anytype, value: AnyValue) !void {
     switch (value) {
         .null => try jws.write(null),

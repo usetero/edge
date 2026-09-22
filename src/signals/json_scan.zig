@@ -144,14 +144,9 @@ pub const FieldWalker = struct {
                 // counts alone accept mismatched closers like `[{]}`. Nesting
                 // beyond 64 levels falls to the validating parser.
                 //
-                // A per-depth position state machine validates the container
-                // grammar (commas, colons, string keys, values, closers) as the
-                // span is scanned, instead of skipping every non-bracket,
-                // non-string interior byte. Structural-grammar malformations a
-                // full parser rejects (trailing/leading/missing commas, missing
-                // values, non-string object keys, malformed scalar tokens)
-                // error here so the validating fallback runs and semantics
-                // never depend on this fast path.
+                // A per-depth position validates the container grammar. A
+                // malformation a full parser rejects errors here too, so the
+                // verdict never depends on this fast path.
                 const Pos = enum(u3) {
                     start, // after opener: array -> value|`]`; object -> key|`}`
                     after_elem, // after a full element: comma|closer
@@ -166,13 +161,10 @@ pub const FieldWalker = struct {
                 while (i < self.raw.len) : (i += 1) {
                     const byte = self.raw[i];
                     switch (byte) {
-                        // Inter-token whitespace, and the documented control-byte
-                        // deviation (raw < 0x20 inside container interiors) are
-                        // skipped without consuming a grammar slot.
+                        // Whitespace and the documented raw control bytes take no
+                        // grammar slot.
                         ' ', 0x00...0x1f => {},
-                        // Strings vault over their content; whether the string is
-                        // an object key or a value is decided by container shape
-                        // and position below.
+                        // Vault over the string; the position decides key or value.
                         '"' => {
                             i = (self.stringEnd(i) orelse return error.Malformed) - 1;
                             if ((stack & 1) == 0) { // object: key or value
@@ -225,10 +217,8 @@ pub const FieldWalker = struct {
                             pos[depth] = .after_colon;
                         },
                         else => {
-                            // A scalar value: run to the next structural byte
-                            // or whitespace and validate the literal, so `tru`,
-                            // `1e+`, or a non-string object key inside a
-                            // container fails open to the validating parser.
+                            // A scalar: run to the next structural byte or
+                            // whitespace, then validate the literal.
                             if ((stack & 1) == 0) { // object: scalars are values only
                                 if (pos[depth] != .after_colon) return error.Malformed;
                             } else { // array: value at start or after a comma
@@ -497,10 +487,8 @@ test "FieldWalker - mismatched container closers error" {
 }
 
 test "FieldWalker - container interior grammar is validated" {
-    // Bracket-balanced but structurally malformed container VALUES must error
-    // rather than be waved through to policy eval. A full validator rejects
-    // every one of these; the walker must too, so the validating/fail-open
-    // fallback runs (semantics never depend on the fast path).
+    // A bracket-balanced but malformed container value must error, as a full
+    // parser does.
     const bad_values = [_][]const u8{
         "[1,]", // trailing comma in array
         "[,]", // leading comma in array
@@ -529,9 +517,8 @@ test "FieldWalker - container interior grammar is validated" {
 }
 
 test "FieldWalker - valid containers still parse with all value types" {
-    // Positive coverage: the stricter grammar must still accept every shape
-    // a full parser accepts, including empty containers, every scalar, mixed
-    // nesting, and inter-token whitespace (incl. documented control bytes).
+    // The stricter grammar must still accept every shape a full parser
+    // accepts.
     const ok_values = [_]struct { val: []const u8, want: []const u8 }{
         .{ .val = "[1]", .want = "[1]" },
         .{ .val = "[1,2,3]", .want = "[1,2,3]" },
@@ -554,25 +541,23 @@ test "FieldWalker - valid containers still parse with all value types" {
         try testing.expectEqual(@as(?FieldWalker.RawField, null), try walker.nextField());
     }
 
-    // Inter-token whitespace and the documented raw control-byte deviation
-    // (< 0x20 inside container interiors) must still parse.
+    // Whitespace and the documented raw control bytes must still parse.
     var ws = try FieldWalker.init("{\"a\":[1,\n\t 2],\"d\":\"\x7f\"}");
     _ = (try ws.nextField()).?;
     const d = (try ws.nextField()).?;
     try testing.expectEqualStrings("\"\x7f\"", d.value);
 
-    // A raw control byte sitting where whitespace is valid (between tokens)
-    // is accepted per the documented deviation; the surrounding grammar is
-    // still validated, so malformations around it are rejected.
+    // A raw control byte between tokens is accepted; the grammar around it
+    // is still checked.
     var ctrl_ok = try FieldWalker.init("{\"x\":[1,\x0b2]}");
     const cf = (try ctrl_ok.nextField()).?;
     try testing.expectEqualStrings("[1,\x0b2]", cf.value);
 
-    // The control byte does NOT mask a trailing comma.
+    // The control byte does not hide a trailing comma.
     var ctrl_bad = try FieldWalker.init("{\"x\":[1,\x0b,]}");
     try testing.expectError(error.Malformed, ctrl_bad.nextField());
 
-    // 64-deep nesting still parses once the interior is grammar-valid.
+    // 64-deep nesting still parses.
     const deep_ok = "{\"x\":" ++ "[" ** 64 ++ "]" ** 64 ++ "}";
     var deep = try FieldWalker.init(deep_ok);
     _ = (try deep.nextField()).?;

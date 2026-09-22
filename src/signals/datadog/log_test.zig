@@ -1044,11 +1044,9 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
 }
 
 test "DatadogLog - unwrappedAttribute observes a setWrapped edit on the same path" {
-    // Regression (PR #203): `setWrapped` mutates `message_tree` but leaves the
-    // one-shot `message_flat` snapshot stale, so a later wrapped-attribute
-    // read on the same path returned the pre-transform value. Two composing
-    // redacts on the same path would then each compute against the original
-    // value and the earlier rule's edit was lost.
+    // Regression (PR #203): `setWrapped` edits `message_tree` but leaves
+    // `message_flat` stale, so a later read on the same path returned the
+    // pre-transform value.
     const allocator = std.testing.allocator;
 
     var parser: Parser = .init;
@@ -1100,10 +1098,8 @@ test "DatadogLog - unwrappedAttribute observes a setWrapped edit on the same pat
 }
 
 test "DatadogLog - unwrappedAttribute returns null after deleteWrapped removes the leaf" {
-    // The removed-leaf case: `deleteWrapped` leaves the stale flat entry in
-    // place, but a later read must observe the leaf as absent (not the stale
-    // value). This is what makes remove→add (upsert=false) and remove→redact
-    // on the same wrapped path resolve correctly.
+    // `deleteWrapped` leaves the stale flat entry in place, but a later read
+    // must see the leaf as absent.
     const allocator = std.testing.allocator;
 
     var parser: Parser = .init;
@@ -1150,11 +1146,9 @@ test "DatadogLog - unwrappedAttribute returns null after deleteWrapped removes t
 }
 
 test "DatadogLog - unwrappedAttribute returns null when an ancestor object key was deleted" {
-    // Regression for: deleteWrapped(["data","jsonPayload"]) followed by
-    // unwrappedAttribute(["data","jsonPayload","email"]) must return null, not
-    // the stale message_flat value.  Before the fix, navigateParent returned
-    // null when the parent object no longer contained "jsonPayload", and the
-    // code fell through to message_flat which still held the original value.
+    // deleteWrapped(["data","jsonPayload"]) then a read of
+    // ["data","jsonPayload","email"] must return null, not the stale flat
+    // value.
     const allocator = std.testing.allocator;
 
     var parser: Parser = .init;
@@ -1194,12 +1188,9 @@ test "DatadogLog - unwrappedAttribute returns null when an ancestor object key w
 }
 
 test "DatadogLog - unwrappedAttribute still resolves array-of-objects paths after an unrelated edit" {
-    // Guard against an over-eager tree-first fix: the flattener reaches
-    // string leaves inside array-of-objects (arrays don't extend the dotted
-    // path), but `navigateParent` only descends into objects, so when the
-    // direct parent is an array the tree can't resolve the path. The read
-    // must then defer to the flat — even when the tree is dirty from an edit
-    // to an unrelated sibling path.
+    // The flattener reaches string leaves inside an array of objects, but
+    // the tree walk only descends into objects. The read must defer to the
+    // flat, also when an unrelated edit made the tree dirty.
     const allocator = std.testing.allocator;
 
     var parser: Parser = .init;
@@ -1224,9 +1215,7 @@ test "DatadogLog - unwrappedAttribute still resolves array-of-objects paths afte
     // Edit an unrelated sibling so the tree is dirty for the rest of the pass.
     try std.testing.expect(log.setWrapped(allocator, &note_path, "new"));
 
-    // The array-of-objects leaf must still resolve via the flat fallback; a
-    // fix that returned null when the tree parent isn't an object would
-    // regress this read.
+    // The array-of-objects leaf must still resolve through the flat.
     try std.testing.expectEqualStrings(
         "Started",
         log.unwrappedAttribute(allocator, &arr_path).?,
@@ -1239,11 +1228,9 @@ test "DatadogLog - unwrappedAttribute still resolves array-of-objects paths afte
 }
 
 test "DatadogLog - unwrappedAttribute falls through for array-string entries after an unrelated edit" {
-    // Guard the fix for the case where `items` is an array whose direct
-    // elements are strings (not objects).  `flattenValue` stores the first
-    // string element under the parent key ("items"), so `message_flat` has
-    // the value, but before the fix the tree-first branch returned null for
-    // the array leaf instead of falling through to `message_flat`.
+    // `items` is an array of strings. `flattenValue` stores the first string
+    // under "items", so the flat has the value and the tree leaf is not a
+    // string.
     const allocator = std.testing.allocator;
 
     var parser: Parser = .init;
@@ -1268,9 +1255,7 @@ test "DatadogLog - unwrappedAttribute falls through for array-string entries aft
     // Dirty the tree with an unrelated edit.
     try std.testing.expect(log.setWrapped(allocator, &note_path, "new"));
 
-    // The array-string leaf must still resolve via the flat fallback; before
-    // the fix the tree branch returned null for the array value and left the
-    // secret visible to a subsequent redact check.
+    // The array-string leaf must still resolve through the flat.
     try std.testing.expectEqualStrings(
         "secret",
         log.unwrappedAttribute(allocator, &items_path).?,
@@ -1282,13 +1267,9 @@ test "DatadogLog - unwrappedAttribute falls through for array-string entries aft
     );
 }
 test "DatadogLog - parseRaw rejects malformed container interiors (parse parity)" {
-    // Regression: FieldWalker.valueEnd used to skip every non-bracket,
-    // non-string interior byte of a container, so bracket-balanced but
-    // structurally malformed unknown-field values (trailing/missing commas,
-    // missing values, non-string keys, malformed scalar tokens) were stored
-    // verbatim in `extra_spans` and never routed to the validating fallback.
-    // A full parser rejects each of these; parseRaw must too, so semantics
-    // never depend on the fast path (logs.zig evalLogRecord contract).
+    // Regression: FieldWalker.valueEnd skipped the interior bytes of a
+    // container, so a malformed unknown-field value went into `extra_spans`
+    // verbatim. parseRaw must reject what a full parser rejects.
     const allocator = std.testing.allocator;
 
     const bad_record_values = [_][]const u8{
@@ -1313,9 +1294,8 @@ test "DatadogLog - parseRaw rejects malformed container interiors (parse parity)
         try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator, json));
     }
 
-    // The known-field boundary: a malformed container in a KNOWN string field
-    // already routed to the validating path via `stringSpan` before this fix.
-    // Pin that the known-field path still rejects a container-shaped value.
+    // A container in a known string field already went to the validating
+    // path. Pin that it still does.
     try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator,
         \\{"message":[1,],"service":"s"}
     ));

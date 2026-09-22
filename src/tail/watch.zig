@@ -246,21 +246,13 @@ pub const Watcher = struct {
 
         try self.detectPathReplacement(idx);
         const size = self.readActiveSizeOrReset(idx) orelse return;
-        // A checkpoint lane may hold an offset above the current file size (the
-        // file shrank after that checkpoint was saved). The prefix hash
-        // recomputed at open cannot then tell a benign truncation from an
-        // in-place rewrite, so reset and re-emit conservatively (at-least-once);
-        // the emitted event lets the runtime reconcile the stale checkpoint, and
-        // a no-emit here would loop (applyCheckpointOffsetOne would keep
-        // resurrecting the stale offset). With no checkpoint lane the offset
-        // only grows via emitted appends, so the stored prefix hash predates any
-        // truncation and maybeHandleContentRewrite is allowed to gate the reset
-        // on the prefix comparison.
-        //
-        // Additionally, after resetting the in-memory offset we immediately
-        // update the lane's in-memory store so that applyCheckpointOffsetOne
-        // cannot resurrect the stale (higher) checkpoint value on the very next
-        // collect call before the async worker has drained the new offset.
+        // A checkpoint lane may hold an offset above the file size: the file
+        // shrank after the checkpoint. The prefix hash from open cannot tell a
+        // truncation from a rewrite, so reset and re-emit (at-least-once). The
+        // emitted event lets the runtime reconcile the checkpoint; a no-emit
+        // would loop, because applyCheckpointOffsetOne restores the stale
+        // offset. Reset the lane store now for the same reason. With no lane,
+        // maybeHandleContentRewrite gates the reset on the prefix hash.
         if (checkpoint_lane) |lane| {
             if (size < self.offsets.items[i]) {
                 self.offsets.items[i] = 0;
@@ -535,12 +527,9 @@ pub const Watcher = struct {
 
         const observed = try prefixHash(self.io, file, prefix_len);
         if (observed == self.head_prefix_hashes.items[i]) {
-            // Prefix unchanged: the file may have shrunk (partial truncation).
-            // Clamp the offset to the new size so emitReadableRange finds
-            // nothing to deliver.  Do NOT reset to 0 here -- that would
-            // re-emit already-delivered bytes.  The checkpoint-lane reset to
-            // 0 (which triggers a conservative at-least-once re-emit) is
-            // handled earlier in processDirtyIndex.
+            // Prefix unchanged: the file may have shrunk. Clamp the offset to
+            // the size, so no delivered bytes are re-emitted. The checkpoint
+            // lane reset to 0 happens earlier, in processDirtyIndex.
             if (size < self.offsets.items[i]) self.offsets.items[i] = size;
             // The identity fingerprint may have been computed on a shorter file
             // (e.g. after a partially written copytruncate).  Refresh it so that
@@ -1031,7 +1020,7 @@ fn appendBytes(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8)
     try f.writePositionalAll(io, bytes, size);
 }
 
-test "REPRO: partial truncation with unchanged prefix re-emits already-delivered bytes" {
+test "watch: partial truncation with unchanged prefix emits nothing under .head" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Options.debug_io;
@@ -1098,10 +1087,8 @@ test "watch: partial truncation with unchanged prefix does not inject stale byte
     try w.collect(&events, .tail, null); // Collect #3: must NOT inject stale [0, 8]
     try testing.expectEqual(@as(usize, 0), events.items.len);
 
-    // Collect #4: the truncation must also not swallow what comes next. The
-    // offset has to follow the file down to 8, or the writer's next 8 bytes
-    // land below a stale offset of 16 and are never delivered -- silent data
-    // loss, the mirror of the stale-byte injection above.
+    // Collect #4: the offset must follow the file down to 8, or the next 8
+    // bytes are lost.
     try appendBytes(io, tmp.dir, "tail.log", "next...\n"); // -> 16 bytes again
     events.clearRetainingCapacity();
     try w.collect(&events, .tail, null);
@@ -1111,9 +1098,7 @@ test "watch: partial truncation with unchanged prefix does not inject stale byte
 }
 
 test "watch: copytruncate to zero then append emits new content from start" {
-    // Regression guard for removing the unconditional reset in processDirtyIndex:
-    // a truncate-to-zero must still bring the offset down to 0 so that content
-    // written afterwards is delivered from byte 0.
+    // A truncate to zero must still reset the offset to 0.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Options.debug_io;
@@ -1147,11 +1132,8 @@ test "watch: copytruncate to zero then append emits new content from start" {
 }
 
 test "watch: checkpoint resume with offset above size re-emits conservatively without looping" {
-    // Regression guard for the checkpoint resume path. A durable lane may hold
-    // an offset above the live file size (the file was truncated after the
-    // checkpoint was saved). The conservative reset+re-emit must terminate: a
-    // no-emit would let applyCheckpointOffsetOne keep resurrecting the stale
-    // offset and re-queueing the index forever (collect would never return).
+    // A lane may hold an offset above the file size. The reset and re-emit
+    // must terminate; a no-emit would loop forever in collect.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Options.debug_io;
@@ -1163,8 +1145,7 @@ test "watch: checkpoint resume with offset above size re-emits conservatively wi
     const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
-    // Open once under .checkpoint purely to discover the file identity the
-    // watcher computes for the live file, then release it.
+    // Open once to learn the file identity, then release.
     var w0 = try Watcher.init(
         testing.allocator,
         std.Options.debug_io,
@@ -1179,14 +1160,14 @@ test "watch: checkpoint resume with offset above size re-emits conservatively wi
     const id = w0.identities.items[0] orelse return error.NoIdentity;
     w0.deinit();
 
-    // Persist a stale checkpoint offset (16) above the file size (8) for that
-    // identity, then recover it synchronously into a Lane (no worker required).
+    // Persist a stale offset (16) above the file size (8), then recover it
+    // into a Lane.
     const state_dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
     {
         var wal = try checkpoint_mod.wal.Wal.init(testing.allocator, io, state_dir);
-        // `last_seen_ns` must be recent: `Store.getOffset` treats an entry
-        // older than the lane's TTL as expired and returns null.
+        // `last_seen_ns` must be recent, or `Store.getOffset` treats the entry
+        // as expired.
         const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds());
         try wal.append(1, .{ .identity = id, .offset = 16, .last_seen_ns = now_ns });
         try wal.sync();
@@ -1206,8 +1187,7 @@ test "watch: checkpoint resume with offset above size re-emits conservatively wi
     defer lane.deinit();
     try testing.expectEqual(@as(?u64, 16), lane.getOffset(id));
 
-    // Restart the watcher under .checkpoint; the lane pushes the in-memory
-    // offset to 16, above the file size (8).
+    // Restart under .checkpoint; the lane pushes the offset to 16.
     var w = try Watcher.init(testing.allocator, std.Options.debug_io, .poll, &.{abs}, "-", .checkpoint, 1000, 50, 1000);
     defer w.deinit();
     w.applyCheckpointLane(&lane);
@@ -1215,22 +1195,19 @@ test "watch: checkpoint resume with offset above size re-emits conservatively wi
 
     var events: std.ArrayList(Event) = .empty;
     defer events.deinit(testing.allocator);
-    // Must terminate (no infinite re-queue loop) and re-emit the surviving range
-    // once, conservatively, from byte 0.
+    // Collect must terminate and re-emit the surviving range once from byte 0.
     try w.collect(&events, .checkpoint, &lane);
     try testing.expectEqual(@as(usize, 1), events.items.len);
     try testing.expectEqual(@as(u64, 0), events.items[0].start_offset);
     try testing.expectEqual(@as(u64, 8), events.items[0].end_offset);
     try testing.expectEqual(@as(u64, 8), w.offsets.items[0]);
 
-    // The lane's in-memory store dropped the stale 16 synchronously. Without
-    // this, the next reopen of the file (rotation, path replacement) resurrects
-    // the offset above the file size and re-emits the range again.
+    // The lane store dropped the stale 16 at once; otherwise the next reopen
+    // re-emits the range.
     try testing.expectEqual(@as(?u64, 0), lane.getOffset(id));
 
-    // A second collect must NOT re-emit the same range even though the async
-    // checkpoint worker has not yet drained the new offset update from the
-    // queue (the in-memory store was updated synchronously by resetOffset).
+    // A second collect must not re-emit the range while the worker has not
+    // drained the queue.
     events.clearRetainingCapacity();
     try w.collect(&events, .checkpoint, &lane);
     try testing.expectEqual(@as(usize, 0), events.items.len);

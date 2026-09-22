@@ -3,14 +3,11 @@
 //! records what each connection received, then sends chunked
 //! (Transfer-Encoding: chunked) POSTs through edge and asserts:
 //!
-//!   * a chunked passthrough (`forward_raw`) body reaches the upstream as
-//!     chunked, decoded byte-exact, with no Content-Length — the regression
-//!     fixed by restoring the streaming path (pre-fix the body was
-//!     arena-buffered and forwarded as content-length)
-//!   * a chunked body over `max_body_size` is rejected (not 200) — the cap
-//!     c33e387 added is preserved (sent mid-stream, no up-front length check)
-//!   * a chunked body on the replayable logs path (`pipe_stream`) and the
-//!     buffered metrics path (`pipe_buffered`) round-trip with policies active
+//!   * a chunked `forward_raw` body reaches the upstream as chunked, byte
+//!     exact, with no Content-Length
+//!   * a chunked body over `max_body_size` is rejected mid-stream
+//!   * a chunked body on `pipe_stream` and `pipe_buffered` round-trips with
+//!     policies active
 //!
 //! Mirrors src/bench/upstream_pool_harness.zig's process model (bind mock,
 //! spawn edge, poll /_health) but adds a recording mock and chunked sending.
@@ -45,31 +42,48 @@ const Recorded = struct {
 const Mock = struct {
     server: std.Io.net.Server,
     io: std.Io,
+    group: *std.Io.Group,
     lock: std.Io.Mutex = .init,
     last: Recorded = .{},
-    accepted: std.atomic.Value(u32) = .init(0),
     body_store: []u8,
 
+    /// One task per connection, and the connection stays open across
+    /// requests. A mock that closes after one response leaves a stale pooled
+    /// connection behind, and the next scenario then measures a transport
+    /// failure (502) instead of the behaviour it is about.
     fn serve(self: *Mock) void {
         const io = self.io;
         while (true) {
-            var stream = self.server.accept(io) catch return; // error.Canceled on shutdown
-            _ = self.accepted.fetchAdd(1, .monotonic);
-            self.handleConn(stream);
-            stream.close(io);
+            const stream = self.server.accept(io) catch return; // error.Canceled on shutdown
+            self.group.concurrent(io, Mock.handleConn, .{ self, stream }) catch {
+                var s = stream;
+                s.close(io);
+            };
         }
     }
 
-    fn handleConn(self: *Mock, stream: std.Io.net.Stream) void {
+    fn snapshot(self: *Mock) Recorded {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        return self.last;
+    }
+
+    fn handleConn(self: *Mock, stream_in: std.Io.net.Stream) void {
         const io = self.io;
+        var stream = stream_in;
+        defer stream.close(io);
         var recv: [16 * 1024]u8 = undefined;
         var send: [4 * 1024]u8 = undefined;
         var nr = std.Io.net.Stream.Reader.init(stream, io, &recv);
         var nw = std.Io.net.Stream.Writer.init(stream, io, &send);
         var server = std.http.Server.init(&nr.interface, &nw.interface);
-        if (server.reader.state != .ready) return;
-        var req = server.receiveHead() catch return;
+        while (server.reader.state == .ready) {
+            var req = server.receiveHead() catch return;
+            self.handleRequest(&req) catch return;
+        }
+    }
 
+    fn handleRequest(self: *Mock, req: *std.http.Server.Request) !void {
         // Inspect framing from the raw head BEFORE the body reader invalidates
         // the head strings (readerExpectNone invalidates them).
         var saw_chunked_te = false;
@@ -81,20 +95,19 @@ const Mock = struct {
         }
 
         var body_buf: [64 * 1024]u8 = undefined;
-        const body_reader = req.readerExpectContinue(&body_buf) catch return;
+        const body_reader = try req.readerExpectContinue(&body_buf);
         var total: usize = 0;
         const cap = self.body_store.len;
         while (total < cap) {
-            const n = body_reader.readSliceShort(self.body_store[total..]) catch break;
+            const n = try body_reader.readSliceShort(self.body_store[total..]);
             if (n == 0) break;
             total += n;
         }
-        // ziglint-ignore: Z026 (best-effort drain of a possibly-truncated body)
-        _ = body_reader.discardRemaining() catch {};
-        req.respond("ok", .{ .keep_alive = true }) catch return;
+        _ = try body_reader.discardRemaining();
+        try req.respond("ok", .{ .keep_alive = true });
 
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         self.last = .{
             .saw_chunked_te = saw_chunked_te,
             .saw_content_length = saw_content_length,
@@ -134,10 +147,9 @@ fn readStatus(req: *std.http.Client.Request) u16 {
     return @intFromEnum(res.head.status);
 }
 
-/// Send a chunked POST, retrying once on transport failure/non-200. The mock
-/// upstream closes after one response, so a stale pooled connection can fail
-/// the first send; edge evicts it and the retry dials fresh (mirrors the pool
-/// harness's sendWithRetry). Over-cap bodies use `sendChunked` directly.
+/// Send a chunked POST, and retry once on a transport failure or a non-200.
+/// Over-cap bodies use `sendChunked` directly, because the status is the
+/// point.
 fn sendChunkedRetry(client: *std.http.Client, uri: std.Uri, content_type: []const u8, body: []const u8) u16 {
     const s1 = sendChunked(client, uri, content_type, body);
     if (s1 == 200) return s1;
@@ -241,11 +253,10 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var body_store: [4 * 1024 * 1024]u8 = undefined; // 4 MiB recording buffer
-    var mock: Mock = .{ .server = server, .io = io, .body_store = &body_store };
-    defer mock.server.deinit(io);
-
     var group: std.Io.Group = .init;
     defer group.cancel(io);
+    var mock: Mock = .{ .server = server, .io = io, .group = &group, .body_store = &body_store };
+    defer mock.server.deinit(io);
     try group.concurrent(io, Mock.serve, .{&mock});
 
     const edge_port = try freePort(io, 19080);
@@ -282,28 +293,23 @@ pub fn main(init: std.process.Init) !void {
         const uri = try std.Uri.parse(
             try std.fmt.bufPrint(&uri_buf, "http://127.0.0.1:{d}/forward", .{edge_port}),
         );
-        const accepted_before = mock.accepted.load(.monotonic);
         const status = sendChunkedRetry(&client, uri, "text/plain", body);
         // ziglint-ignore: Z026 (best-effort pacing; a missed sleep is harmless)
         io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
-        const accepted_after = mock.accepted.load(.monotonic);
 
-        checks += 4;
+        checks += 3;
         const ok_status = status == 200;
-        const ok_dialed = accepted_after >= accepted_before + 1;
-        const rec = mock.last;
+        const rec = mock.snapshot();
         const ok_chunked = rec.saw_chunked_te and !rec.saw_content_length and rec.clean;
         const ok_body = rec.body_len == body.len and std.mem.eql(u8, mock.body_store[0..rec.body_len], body);
         if (ok_status) passes += 1 else fails += 1;
-        if (ok_dialed) passes += 1 else fails += 1;
         if (ok_chunked) passes += 1 else fails += 1;
         if (ok_body) passes += 1 else fails += 1;
         std.debug.print(
-            "  chunked passthrough /forward: status={d} dialed={s} upstream_tE={s} upstream_CL={s} body={s}" ++
+            "  chunked passthrough /forward: status={d} upstream_tE={s} upstream_CL={s} body={s}" ++
                 " (sent {d}B, upstream got {d}B)\n",
             .{
                 status,
-                if (ok_dialed) "yes" else "NO",
                 if (rec.saw_chunked_te) "chunked" else "(none)",
                 if (rec.saw_content_length) "present" else "absent",
                 if (ok_body) "byte-exact" else "MISMATCH",
@@ -326,14 +332,13 @@ pub fn main(init: std.process.Init) !void {
         const status = sendChunked(&client, uri, "text/plain", big);
 
         checks += 1;
-        // Acceptance: edge must NOT return 200. Either 413 or a transport
-        // failure (0) after edge tore the connection down mid-stream both count
-        // as "rejected" — the cap fired. A 200 would be the regression.
-        const ok = status != 200;
+        // The cap answers 413. A 200 is the regression; a 502 means the edge
+        // failed on the upstream before the cap tripped, which is not the cap.
+        const ok = status == 413;
         if (ok) passes += 1 else fails += 1;
         std.debug.print(
             "  chunked over-cap /forward (2M+64B): status={d} ({s})\n",
-            .{ status, if (ok) "rejected" else "ACCEPTED (REGRESSION)" },
+            .{ status, if (ok) "rejected by the cap" else "NOT 413" },
         );
     }
 
@@ -345,20 +350,19 @@ pub fn main(init: std.process.Init) !void {
         const uri = try std.Uri.parse(
             try std.fmt.bufPrint(&uri_buf, "http://127.0.0.1:{d}/api/v2/logs", .{edge_port}),
         );
-        const accepted_before = mock.accepted.load(.monotonic);
         const status = sendChunkedRetry(&client, uri, "application/json", body);
         // ziglint-ignore: Z026
         io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
-        const accepted_after = mock.accepted.load(.monotonic);
 
         checks += 2;
         const ok_status = status == 200;
-        const ok_dialed = accepted_after >= accepted_before + 1;
+        const got = mock.snapshot().body_len;
+        const ok_body = got == body.len;
         if (ok_status) passes += 1 else fails += 1;
-        if (ok_dialed) passes += 1 else fails += 1;
+        if (ok_body) passes += 1 else fails += 1;
         std.debug.print(
-            "  chunked pipe_stream /api/v2/logs: status={d} dialed={s} ({d}B -> upstream {d}B)\n",
-            .{ status, if (ok_dialed) "yes" else "NO", body.len, mock.last.body_len },
+            "  chunked pipe_stream /api/v2/logs: status={d} upstream_body={s} ({d}B -> upstream {d}B)\n",
+            .{ status, if (ok_body) "complete" else "SHORT", body.len, got },
         );
     }
 
@@ -370,20 +374,19 @@ pub fn main(init: std.process.Init) !void {
         const uri = try std.Uri.parse(
             try std.fmt.bufPrint(&uri_buf, "http://127.0.0.1:{d}/api/v2/series", .{edge_port}),
         );
-        const accepted_before = mock.accepted.load(.monotonic);
         const status = sendChunkedRetry(&client, uri, "application/json", body);
         // ziglint-ignore: Z026
         io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
-        const accepted_after = mock.accepted.load(.monotonic);
 
         checks += 2;
         const ok_status = status == 200;
-        const ok_dialed = accepted_after >= accepted_before + 1;
+        const got = mock.snapshot().body_len;
+        const ok_body = got == body.len;
         if (ok_status) passes += 1 else fails += 1;
-        if (ok_dialed) passes += 1 else fails += 1;
+        if (ok_body) passes += 1 else fails += 1;
         std.debug.print(
-            "  chunked pipe_buffered /api/v2/series: status={d} dialed={s} ({d}B -> upstream {d}B)\n",
-            .{ status, if (ok_dialed) "yes" else "NO", body.len, mock.last.body_len },
+            "  chunked pipe_buffered /api/v2/series: status={d} upstream_body={s} ({d}B -> upstream {d}B)\n",
+            .{ status, if (ok_body) "complete" else "SHORT", body.len, got },
         );
     }
 

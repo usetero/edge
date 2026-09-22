@@ -169,21 +169,14 @@ pub const ConnSlab = struct {
         return ConnId.pack(slot, entry.generation);
     }
 
-    /// Releases a slot back to the free list, bumping the generation so any
-    /// stale ConnId held elsewhere asserts instead of aliasing the new owner.
-    /// Advises the OS to decommit the buffer pages so idle RSS returns to near
-    /// zero between connections.
+    /// Releases a slot back to the free list and bumps the generation, so a
+    /// stale ConnId asserts instead of aliasing the new owner. Advises the OS
+    /// to decommit the buffer pages, so idle RSS returns to near zero.
     ///
-    /// The decommit runs inside the critical section, before the slot becomes
-    /// claimable. The free list is LIFO, so the just-released slot is the next
-    /// one `claim` returns; a concurrent connection task is parked on this same
-    /// mutex and reuses the slot the instant it is dropped. Performing the
-    /// `madvise` after unlock would race that claimer: MADV_DONTNEED (Linux) /
-    /// FREE_REUSABLE (macOS) discard anonymous pages with no coordination with
-    /// concurrent writers, zeroing recvBuf/sendBuf/bodyBuf a brand-new owner is
-    /// already using. Holding the lock across the one syscall is cheap —
-    /// `release` fires once per connection lifetime, not per request — and it
-    /// is the only thing that keeps the decommit off a live owner's pages.
+    /// The decommit runs under the mutex. The free list is LIFO, so the next
+    /// `claim` returns this slot. A decommit after unlock would zero the pages
+    /// of the new owner. The lock is held once per connection, so the cost is
+    /// small.
     pub fn release(self: *ConnSlab, io: std.Io, id: ConnId) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -203,13 +196,6 @@ pub const ConnSlab = struct {
         // deducted from RSS. On macOS (FREE_REUSABLE) they're immediately
         // reclaimable and drop from the physical footprint. Pages are re-faulted
         // as zeroed on next use — the slab's zero-alloc hot path is preserved.
-        //
-        // This must run while the slot is still exclusively ours (the mutex is
-        // held): the slot is now on top of the LIFO free list, so the next
-        // `claim` will hand it to a new connection and bind these pages to a
-        // live reader/writer. Decommitting after unlock would let the kernel
-        // zero a live owner's data, so the madvise completes before the lock —
-        // and the slot's claimability — is released.
         //
         // madvise requires page-aligned address and length. In production all
         // buffer size constants are multiples of 4 KiB, so the slot region is
@@ -421,9 +407,9 @@ test "state machine transitions are tracked" {
     slab.release(io, id);
 }
 
-// Per-conn region is a whole number of pages so release's madvise path is
-// actually exercised. The default testLimits() buffers are far below a
-// page, so the aligned_end <= aligned_base guard skips the decommit entirely.
+// Page-sized buffers, so `release` reaches the madvise call. The default
+// testLimits() buffers are smaller than a page, and the alignment guard skips
+// the decommit.
 fn pageAlignedLimits() limits_mod.Limits {
     return .{
         .max_connections = 4,
@@ -441,14 +427,10 @@ fn pageAlignedLimits() limits_mod.Limits {
     };
 }
 
-test "release decommits page-aligned slot buffers before the slot is claimable" {
-    // Exercises the madvise code path (page-sized buffers) and asserts the slab
-    // survives the in-lock decommit: a re-claimed slot's buffers are still
-    // usable, and on Linux MADV_DONTNEED has zeroed them. The release() TOCTOU
-    // race itself needs real OS threads (testing.io is single-threaded, so its
-    // mutex does not exclude concurrent access) and is covered by the threaded
-    // harness in the fix's test plan; this unit test guards the decommit path
-    // that the default sub-page testLimits() never reaches.
+test "release decommits page-aligned slot buffers and the slot stays usable" {
+    // The slab must survive the in-lock decommit: a re-claimed slot is still
+    // usable, and on Linux MADV_DONTNEED zeroed it. The race itself needs OS
+    // threads; testing.io is single-threaded.
     var slab: ConnSlab = try .init(testing.allocator, pageAlignedLimits());
     defer slab.deinit(testing.allocator);
     const io = testing.io;
@@ -459,17 +441,15 @@ test "release decommits page-aligned slot buffers before the slot is claimable" 
     try testing.expectEqual(@as(u8, 0xAA), a_recv[0]);
     slab.release(io, a);
 
-    // LIFO: the just-released slot is the next one claimed, so the madvise'd
-    // region is exactly what the new owner receives.
+    // LIFO: the released slot is the next claim.
     const b = slab.claim(io).?;
     try testing.expectEqual(a.index(), b.index());
     const b_recv = slab.recvBuf(b);
 
     switch (builtin.os.tag) {
-        // MADV_DONTNEED discards the anonymous page; the next fault reads zeros.
+        // MADV_DONTNEED discards the page; the next read returns zeros.
         .linux => try testing.expectEqual(@as(u8, 0x00), b_recv[0]),
-        // Other platforms: the decommit may be a no-op or only advisory, so
-        // just confirm the buffer is still writable/readable (slab intact).
+        // Elsewhere the decommit is advisory; only check the buffer stays usable.
         else => {},
     }
     @memset(b_recv, 0xBB);

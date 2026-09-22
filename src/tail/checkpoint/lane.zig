@@ -121,14 +121,17 @@ pub const Lane = struct {
         return self.store.getOffset(identity);
     }
 
-    /// Synchronously update the in-memory store so that `getOffset` for
-    /// `identity` returns `offset` immediately, without waiting for the async
-    /// checkpoint worker to drain the queue.  This is needed when a truncation
-    /// forces an in-memory offset reset: without it, `applyCheckpointOffsetOne`
-    /// can resurrect the stale (higher) checkpoint value on the very next
-    /// `collect` call, duplicating the re-emitted range.  The update is NOT
-    /// persisted to the WAL here; the normal async enqueue path handles
-    /// durability once the consumer acknowledges the re-emitted range.
+    /// Update the in-memory store now, so `getOffset` returns `offset` before
+    /// the worker drains the queue. A truncation reset needs this; otherwise
+    /// `applyCheckpointOffsetOne` restores the stale higher offset on the next
+    /// `collect`. The WAL is not written here; the normal enqueue path
+    /// persists the offset after the consumer acknowledges the range.
+    ///
+    /// Known gap: an update for the pre-truncation range can still sit in the
+    /// queue. The worker then writes the stale offset back, and the next
+    /// `collect` re-emits the range one more time. Delivery is at-least-once,
+    /// so this is bounded and accepted. The fix is to apply checkpoint offsets
+    /// only at open; see #349.
     pub fn resetOffset(self: *Lane, identity: tail_types.FileIdentity, offset: u64) void {
         const now_ns: i64 = @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
         self.store.upsert(.{
@@ -136,10 +139,8 @@ pub const Lane = struct {
             .offset = offset,
             .last_seen_ns = now_ns,
         }) catch |err| {
-            // The caller cannot act on this: the in-memory offset is already
-            // reset, so the worst case is the stale higher offset surviving in
-            // the store until the async worker drains the queue. Log it so a
-            // duplicated re-emit after a rotation is traceable.
+            // The caller cannot act on this. The stale offset then survives
+            // until the worker drains the queue, and the range is emitted twice.
             log.warn("resetOffset upsert failed: {}", .{err});
         };
     }

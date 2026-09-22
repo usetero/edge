@@ -271,10 +271,8 @@ fn filterLog(
             .scratch = allocator,
             .io = engine.bus.io,
             .extension_sink = sink,
-            // Null leaves the engine holding its own per-record state. A
-            // reusable `ScanState` only pays off across a batch, and
-            // `evalLogRecord` is the one caller: it handles one record, so the
-            // 8 KiB `ScanState.init` clear would cost more than it saves.
+            // Null: the engine keeps its own state. A shared `ScanState` pays
+            // off only across a batch, and this call handles one record.
             .scan_state = null,
         },
     );
@@ -746,14 +744,9 @@ test "evalLogRecord - transform yields replace with serialized record" {
 }
 
 test "evalLogRecord - malformed unknown-field container fails open to keep under matching policy" {
-    // Regression (Datadog logs / json_scan): FieldWalker.valueEnd used to
-    // accept bracket-balanced-but-structurally-malformed container values in
-    // unknown fields and store them verbatim, so a matching drop policy
-    // returned `.drop` and a matching mutating policy returned `.replace` —
-    // making verdicts depend on the fast path, contrary to the contract on
-    // evalLogRecord. After the fix, parseRaw rejects these records, the
-    // materializing `DatadogLog.parse` rejects them too, and both policy
-    // shapes fail open to `.keep` (the record is forwarded verbatim).
+    // Regression: FieldWalker.valueEnd accepted malformed containers in
+    // unknown fields, so the verdict depended on the fast path. Now both
+    // parsers reject them and the record fails open to `.keep`.
     const allocator = std.testing.allocator;
 
     var parser: Parser = .init;
@@ -763,13 +756,8 @@ test "evalLogRecord - malformed unknown-field container fails open to keep under
     noop_bus.init(std.Options.debug_io);
     const bus = noop_bus.eventBus();
 
-    // Every input has a malformed container in an UNKNOWN field `x` whose
-    // brackets balance but whose interior violates JSON grammar. The buggy
-    // fast path accepted these and let the policy run; the corrected path
-    // rejects them (parseRaw -> DatadogLog.parse) and fail-opens to `.keep`.
-    // Each of these is verified to be rejected by the materializing fallback
-    // (zimdjson ondemand is lazy; DatadogLog.parse's field iteration rejects
-    // them), mirroring the bug report's corrected-path verdicts table.
+    // Each input has a bracket-balanced but malformed container in the
+    // unknown field `x`.
     const malformed_values = [_][]const u8{
         "[1,]", // trailing comma in array
         "[,]", // leading comma in array
@@ -811,9 +799,7 @@ test "evalLogRecord - malformed unknown-field container fails open to keep under
             );
         }
 
-        // Contrast: a well-formed matching record IS dropped (the fallback
-        // accepts a valid object, so the policy runs). Guards against the
-        // fix over-broadening into a keep-everything regression.
+        // A well-formed matching record is still dropped.
         const good = "{\"message\":\"matched\",\"service\":\"s\",\"x\":[1,2]}";
         var good_arena = std.heap.ArenaAllocator.init(allocator);
         defer good_arena.deinit();
@@ -864,9 +850,7 @@ test "evalLogRecord - malformed unknown-field container fails open to keep under
             );
         }
 
-        // Contrast: a well-formed matching record IS replaced (`service`
-        // removed). The malformed path used to also `.replace` with the bad
-        // span baked in; the fix sends malformed records to `.keep` instead.
+        // A well-formed matching record is still replaced.
         const good = "{\"message\":\"matched\",\"service\":\"s\",\"x\":[1,2]}";
         var good_arena = std.heap.ArenaAllocator.init(allocator);
         defer good_arena.deinit();
@@ -877,14 +861,9 @@ test "evalLogRecord - malformed unknown-field container fails open to keep under
 }
 
 test "evalLogRecord - two regex redacts on the same wrapped path compose" {
-    // Regression (PR #203): the policy engine re-reads a field via the
-    // accessor before each transform write. For a wrapped `message`, reads
-    // go through `unwrappedAttribute`, which served a one-shot `message_flat`
-    // snapshot built from the ORIGINAL `message`; `setWrapped` mutated the
-    // live `message_tree` but never refreshed the flat, so rule N+1 read the
-    // pre-transform value and overwrote rule N's edit. Two regex `redact`s on
-    // the same nested path would then lose every earlier rule's substitution
-    // and leak the scrubbed content back into the forwarded record.
+    // Regression (PR #203): the engine re-reads the field before each
+    // transform. `unwrappedAttribute` served a stale `message_flat`, so rule 2
+    // overwrote rule 1.
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -892,11 +871,8 @@ test "evalLogRecord - two regex redacts on the same wrapped path compose" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    // keep=all + two regex redacts on data.jsonPayload.email, one per token
-    // of the address: scrub the local-part, then scrub the domain. Each rule
-    // needs its own replacement template, which a single alternation regex
-    // cannot express -- exactly the routine configuration that triggered the
-    // leak.
+    // keep=all with two regex redacts on data.jsonPayload.email: the local
+    // part, then the domain.
     var transform: proto.policy.LogTransform = .{};
 
     var email_path: proto.policy.AttributePath = .{};
@@ -956,8 +932,7 @@ test "evalLogRecord - two regex redacts on the same wrapped path compose" {
     );
     try std.testing.expect(verdict == .replace);
 
-    // Both redactions compose: the forwarded email carries BOTH replacement
-    // tokens and neither original PII substring.
+    // Both redactions compose: both replacement tokens, neither original.
     try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "ALICE_R@EXAMPLE_R.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "alice@example.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "alice") == null);

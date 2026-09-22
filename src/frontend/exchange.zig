@@ -57,12 +57,10 @@ pub const Inbound = struct {
 // `begin` commits status and headers and returns the body writer; `end`
 // finishes the body. Each frontend has a small adapter.
 
-/// What goes upstream: a slice the frontend already buffered, or a body still
-/// on the inbound socket with its declared length. A `chunked` source is an
-/// unknown-length stream forwarded as chunked transfer-encoding, pumped
-/// socket->upstream through the thread's pump buffer so nothing body-sized is
-/// resident. A stream/chunked source is consumed by the first send and is
-/// never retried.
+/// What goes upstream: a slice the frontend already buffered, a body still on
+/// the inbound socket with its declared length, or a `chunked` body with no
+/// length. The pump forwards a `chunked` body as chunked transfer-encoding.
+/// The first send consumes a stream or chunked source; neither is retried.
 pub const BodySource = union(enum) {
     bytes: []const u8,
     stream: struct { reader: *std.Io.Reader, len: usize },
@@ -151,12 +149,9 @@ fn dialUpstream(
     };
 }
 
-/// Record a watchdog timeout: the warn line names the phase and the path, the
-/// counter makes the rate alertable.
 /// Report a watchdog timeout: warn on the bus, count it, and return the one
-/// error `errorStatus` maps to 504. Every upstream path that arms the watchdog
-/// must funnel its timed-out failures through here, or a stall reads as a 502
-/// and is indistinguishable from a broken upstream.
+/// error `errorStatus` maps to 504. Every path that arms the watchdog must
+/// return its timeout through here, or a stall reads as a 502.
 pub fn timedOut(ctx: *exec.SharedCtx, path: []const u8, phase: []const u8) error{UpstreamTimeout} {
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     ctx.bus.warn(UpstreamTimedOut{ .path = path, .phase = phase });
@@ -206,6 +201,13 @@ pub fn exchange(
                     });
                     break :blk early;
                 } else |_| {}
+            }
+            // Our cap on a chunked body, hit mid-send: half the body is
+            // upstream, so the connection must close, but the upstream did
+            // nothing wrong and must not be reported as evicted.
+            if (err == error.BodyTooLarge) {
+                markUpstreamClosing(&upstream_req);
+                return err;
             }
             evictUpstream(ctx, &upstream_req, in.path, err);
             if (bufs.timed_out.load(.acquire)) return timedOut(ctx, in.path, "head");
@@ -290,12 +292,10 @@ fn sendAndReceiveHead(
     return request.receiveHead(&.{});
 }
 
-/// Send the request body upstream. A buffered slice goes out as an exact
-/// content-length; a `stream` (declared length) and a `chunked` (unknown
-/// length) source pump client socket -> upstream socket through the thread's
-/// pump buffer (sized by `exchange` before the send), so nothing body-sized is
-/// ever resident. The chunked pump honours `max_bytes` so the `max_body_size`
-/// cap the frontend would otherwise have pre-checked is enforced mid-stream.
+/// Send the request body upstream. A buffered slice goes out with an exact
+/// content-length. A `stream` or `chunked` source pumps socket to socket
+/// through the pump buffer that `exchange` sized. The chunked pump enforces
+/// `max_bytes` mid-stream, because the frontend had no length to pre-check.
 fn sendBody(
     upstream_req: *std.http.Client.Request,
     method: std.http.Method,

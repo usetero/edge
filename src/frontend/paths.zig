@@ -39,11 +39,10 @@ pub const InboundBody = union(enum) {
     /// Still on the client socket. `len` is the declared Content-Length,
     /// already checked against max_body_size by the frontend.
     lazy: struct { reader: *std.Io.Reader, len: usize },
-    /// Still on the client socket with no declared length (chunked). The
-    /// frontend stamped `max_bytes` (its `max_body_size`) so the cap is
-    /// enforced during the pump. `forward_raw` streams this socket->upstream
-    /// with no body-sized buffering; the policy paths drain it resident via
-    /// `residentBody` (they read the body twice). Never replayable.
+    /// Still on the client socket with no declared length (chunked). The pump
+    /// enforces `max_bytes`, the frontend's `max_body_size`. `forward_raw`
+    /// streams it upstream; the policy paths drain it through `residentBody`.
+    /// Never replayable.
     streamed: struct { reader: *std.Io.Reader, max_bytes: usize },
 };
 
@@ -59,9 +58,8 @@ fn bufferLazyBody(reader: *std.Io.Reader, dst: []u8, len: usize) ![]const u8 {
 }
 
 /// Forward an inbound body as-is: buffered bytes go with the route's replay
-/// policy; a lazy or streamed body streams socket to socket and cannot be
-/// replayed (a chunked body is forwarded upstream as chunked, preserving its
-/// unknown-length framing instead of buffering it resident).
+/// policy. A lazy or streamed body streams socket to socket and cannot be
+/// replayed. A chunked body goes upstream as chunked.
 fn forwardInbound(
     ctx: *exec.SharedCtx,
     in: Inbound,
@@ -83,11 +81,9 @@ fn forwardInbound(
     }
 }
 
-/// Drain a lazy body into this thread's body buffer; the policy paths read
-/// the body twice (probe, then encode), so it must be resident. A streamed
-/// (chunked) body has no length to pre-check, so it is drained here through
-/// the bounded pump instead of being captured arena-resident by the
-/// frontend — keeping body-sized retention per thread, not per connection.
+/// Drain a lazy or streamed body into this thread's body buffer; the policy
+/// paths read the body twice (probe, then encode), so it must be resident.
+/// The thread buffer, not the connection arena, holds the body-sized memory.
 fn residentBody(ctx: *exec.SharedCtx, inbound: InboundBody) ![]const u8 {
     return switch (inbound) {
         .bytes => |b| b,
@@ -290,16 +286,13 @@ pub fn execFetchFiltered(
     defer upstream_req.deinit();
     thread_bufs.trackUpstream(ctx.io, bufs, upstream_req.connection);
     defer thread_bufs.trackUpstream(ctx.io, bufs, null);
-    // Scope eviction to the upstream send+head phase: a reused dead keep-alive
-    // fails here, so evict it from the pool. Past receiveHead the response
-    // streams straight to the client, so a non-timeout failure there is a
-    // client disconnect or a local filter error, and must NOT mark a healthy
-    // upstream connection closing and churn the pool. A watchdog timeout in
-    // either phase has already set connection.closing, so evicting and
-    // reporting it as a timeout is harmless and matches `exchange`.
+    // Evict only on a send or head failure: that is where a dead keep-alive
+    // fails. After receiveHead a non-timeout failure is a client disconnect or
+    // a filter error, and must not evict a healthy upstream connection. A
+    // timeout in either phase evicts and reports 504, as `exchange` does.
     var upstream_res = blk: {
         upstream_req.sendBodiless() catch |err| break :blk err;
-        break :blk upstream_req.receiveHead(&.{}) catch |err| break :blk err;
+        break :blk upstream_req.receiveHead(&.{});
     } catch |err| {
         exchange.evictUpstream(ctx, &upstream_req, in.path, err);
         if (bufs.timed_out.load(.acquire)) return exchange.timedOut(ctx, in.path, "head");

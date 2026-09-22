@@ -873,3 +873,49 @@ exits with SIGABRT (134), not SIGSEGV (139).
 - stdio cannot accept an unknown content encoding, because `std.http.Server`
   fails the whole head (a10). The agent drops the batch for good on that 400.
 - stdio waits for the request deadline on a broken chunk (a07).
+
+## Cases added for the combined fix branch (PR #348)
+
+Seven additions, each aimed at a fix the branch carries end to end. Every one
+runs on both frontends.
+
+- **a06 `ChunkedBodyIdentity`, `ChunkedBodyUnderPolicies`.** A multi-chunk body
+  larger than the pump buffer reaches the intake byte for byte, with and
+  without a keep-all policy. Pins the socket-to-socket pump and the resident
+  drain on the policy path.
+- **a08 `ChunkedBodyTooLarge`.** A chunked body over `max_body_size` answers
+  413 mid-stream and the intake records nothing. The streaming design may open
+  the upstream before the cap trips, so this class does not forbid upstream
+  log lines.
+- **a16 `LargeZstdBatchWithPolicies`.** A frame that decodes to 3 MiB under a
+  keep-all policy is accepted. Covers the decode window cap and the zero
+  return from the decompressor in the bounded copy.
+- **a52 `RedactionComposes`.** Two regex redacts on the same wrapped path both
+  reach the intake. The check is on the forwarded bytes.
+- **a53 `MalformedContainerFailsOpen`.** A record with `"x":[1,]` under a
+  matching drop policy is forwarded as sent.
+- **c06 `ChunkedBodiesCostNoMoreThanContentLength`.** Three Content-Length
+  rounds as the control, then four chunked rounds. A chunked round must cost
+  no more resident memory than a declared one, and the chunked rounds must
+  not grow.
+- **c11 `SlotChurnIntegrity`.** 64 senders, a fresh connection per batch, 1280
+  distinct bodies checked at the intake. The only test that can reach the
+  slot decommit race, because the unit test I/O is single-threaded.
+
+### Two httpz defects the new cases found
+
+- **httpz answers a chunked 413 itself.** httpz enforces its own body cap
+  before the edge handler runs, so the response has no log line and no
+  `edge_responses_total` count. An operator cannot see it. Declared in a08.
+- **httpz grows with chunked bodies.** With 12 senders and 900 KiB bodies,
+  RSS rises about 23 MB when the bodies switch from Content-Length to chunked,
+  and about 12 MB per round after that. Content-Length rounds grow about
+  6 MB per round on httpz too, which the original c06 bound of 32 MB hides.
+  stdio is flat in both regimes. Declared in c06.
+
+### What the descriptor invariant taught us here
+
+`std.http.Client` pools up to 32 idle upstream connections. A case that
+drives 32 raw senders at once leaves 32 pooled sockets, and the descriptor
+budget allows 16 above the baseline. The original c06 passes only because
+`requests` paces its threads. The chunked class uses 12 senders.
