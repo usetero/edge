@@ -396,6 +396,43 @@ test "streaming zstd encode is decodable by buffered oracle" {
     }
 }
 
+test "buffered zstd oracle rejects truncated streaming-encoded frame" {
+    // The in-tree streaming ZstdCompressor (encoding.zig) never calls
+    // ZSTD_CCtx_setPledgedSrcSize, so every frame it emits carries
+    // ZSTD_CONTENTSIZE_UNKNOWN and is decoded through decompressZstdStreaming.
+    // Truncating such a frame before its end must surface
+    // error.DecompressionFailed, not a silent partial plaintext — the exact
+    // latent silent-data-corruption defect decompressZstdStreaming had before
+    // its post-loop frame-complete guard.
+    const allocator = testing.allocator;
+
+    const payload_len: usize = 300_000;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    // Stream-encode via the in-tree encoder at a fine and a coarse chunk size.
+    for ([_]usize{ 1, 4096 }) |chunk| {
+        const encoded = try encodeAll(.zstd, payload, chunk);
+        defer allocator.free(encoded);
+
+        // A complete frame round-trips through the buffered oracle.
+        {
+            const decoded = try buffered.decompressZstd(allocator, encoded, 0);
+            defer allocator.free(decoded);
+            try testing.expectEqualSlices(u8, payload, decoded);
+        }
+
+        // Truncate at several lengths (the header at the start stays intact, so
+        // every case still routes through the streaming branch). All must error.
+        for ([_]usize{ 1, 16, 64, encoded.len / 2 }) |drop| {
+            if (drop >= encoded.len) continue;
+            const truncated = encoded[0 .. encoded.len - drop];
+            try testing.expectError(error.DecompressionFailed, buffered.decompressZstd(allocator, truncated, 0));
+        }
+    }
+}
+
 test "zstd compression contexts are cached and reused across encoders" {
     var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 4096);
     defer out.deinit();
