@@ -796,9 +796,13 @@ test "inboundBodyOf: chunked body over max_body_size is rejected mid-stream" {
     );
 }
 
-test "inboundBodyOf: Content-Length body stays .lazy on the socket" {
-    // No regression for the Content-Length path: it remains a lazy reader with
-    // a pre-checked length, never arena-buffered, never chunked.
+test "inboundBodyOf: a Content-Length body is never .streamed" {
+    // The Content-Length path keeps its pre-checked length and never becomes
+    // the unknown-length `.streamed` variant that chunked bodies use. Which of
+    // `.bytes` and `.lazy` it takes depends on `large_body_buffer_size`: at or
+    // below the threshold the body is captured resident so the batch stays
+    // replayable, above it the reader stays on the socket. Both are asserted
+    // here, because the two cases together are the whole contract.
     const raw =
         "POST /forward HTTP/1.1\r\n" ++
         "Host: x\r\n" ++
@@ -810,9 +814,24 @@ test "inboundBodyOf: Content-Length body stays .lazy on the socket" {
     var body_buf: [256]u8 = undefined;
     const limits = testLimits();
 
-    const body = try inboundBodyOf(&p.request, limits, &body_buf, testing.allocator, &test_chunked);
-    try testing.expect(body == .lazy);
-    try testing.expectEqual(@as(usize, 11), body.lazy.len);
+    // The resident capture allocates, so give it an arena the test owns.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 11 bytes, under the 128-byte test threshold: captured resident.
+    const body = try inboundBodyOf(&p.request, limits, &body_buf, arena, &test_chunked);
+    try testing.expect(body == .bytes);
+    try testing.expectEqualStrings("hello world", body.bytes);
+
+    // The same path above the threshold stays lazy on the socket.
+    var small = limits;
+    small.large_body_buffer_size = 4;
+    var p2: Parsed = undefined;
+    try parseRequestInto(&p2, raw);
+    const lazy_body = try inboundBodyOf(&p2.request, small, &body_buf, arena, &test_chunked);
+    try testing.expect(lazy_body == .lazy);
+    try testing.expectEqual(@as(usize, 11), lazy_body.lazy.len);
 }
 
 test "inboundBodyOf: bodiless method yields empty .bytes" {
