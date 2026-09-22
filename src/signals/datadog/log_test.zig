@@ -1010,6 +1010,21 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
         ,
         \\{"message":"{\"data\":{\"jsonPayload\":{\"body\":\"first\",\"body\":\"second\",\"log\":\"l\"}}}"}
         ,
+        // Array-valued body candidates: the targeted walk cannot descend
+        // arrays, so it must defer to flatten (which does). Without the
+        // `.array => return null` arm in `innerBodyDirect`, the first two
+        // shapes flip keep/drop policy decisions (`drop-debug-logs` matches
+        // `log_field: body` against /debug|trace/): the targeted path would
+        // resolve a wrong string sibling while flatten resolves the array's
+        // string leaf.
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":[\"innocuous\"],\"body\":\"debug stuff\"}}}"}
+        ,
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":[\"debug stuff\"],\"body\":\"innocuous\"}}}"}
+        ,
+        // A string leaf inside the array must be recovered by the flatten
+        // path the targeted walk defers to.
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":[\"the body\"]}}}"}
+        ,
     };
 
     for (cases, 0..) |json, i| {
