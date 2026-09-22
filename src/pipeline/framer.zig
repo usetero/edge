@@ -23,8 +23,6 @@ pub const frame_json_array = @import("frame_json_array.zig");
 pub const frame_protobuf = @import("frame_protobuf.zig");
 
 pub const WireFormat = enum {
-    /// No records: pure copy. The pipeline uses this for passthrough routes.
-    raw,
     /// Newline-delimited records (NDJSON, plain log lines).
     ndjson,
     /// Top-level JSON array; each element is a record (Datadog logs bodies).
@@ -56,29 +54,7 @@ pub const Stats = struct {
     desynced: bool = false,
 };
 
-pub const RawFramer = struct {
-    stats: Stats = .{},
-
-    pub fn init(scratch: []u8) RawFramer {
-        _ = scratch;
-        return .{};
-    }
-
-    pub fn ingest(self: *RawFramer, chunk: []const u8, out: *std.Io.Writer, sink: anytype) !void {
-        _ = self;
-        _ = sink;
-        try out.writeAll(chunk);
-    }
-
-    pub fn finish(self: *RawFramer, out: *std.Io.Writer, sink: anytype) !void {
-        _ = self;
-        _ = out;
-        _ = sink;
-    }
-};
-
 pub const Framer = union(WireFormat) {
-    raw: RawFramer,
     ndjson: frame_ndjson.NdjsonFramer,
     json_array: frame_json_array.JsonArrayFramer,
     otlp_protobuf: frame_protobuf.ProtobufFramer,
@@ -89,7 +65,6 @@ pub const Framer = union(WireFormat) {
     /// (the connection's record-scratch slab region in production).
     pub fn init(format: WireFormat, scratch: []u8) Framer {
         return switch (format) {
-            .raw => .{ .raw = .init(scratch) },
             .ndjson => .{ .ndjson = .init(scratch) },
             .json_array => .{ .json_array = .init(scratch) },
             .otlp_protobuf => .{ .otlp_protobuf = .init(scratch) },
@@ -121,26 +96,4 @@ test {
     _ = frame_ndjson;
     _ = frame_json_array;
     _ = frame_protobuf;
-}
-
-const testing = std.testing;
-
-const NeverSink = struct {
-    pub fn onRecord(_: *NeverSink, _: []const u8) !Decision {
-        return .drop; // must never be consulted for raw
-    }
-};
-
-test "raw framer copies bytes verbatim" {
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-
-    var framer: Framer = .init(.raw, &.{});
-    var sink: NeverSink = .{};
-
-    try framer.ingest("hello ", &out.writer, &sink);
-    try framer.ingest("world", &out.writer, &sink);
-    try framer.finish(&out.writer, &sink);
-    try testing.expectEqualStrings("hello world", out.written());
-    try testing.expectEqual(@as(u64, 0), framer.stats().records);
 }

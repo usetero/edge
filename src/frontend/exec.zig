@@ -495,7 +495,7 @@ pub const RecordSink = struct {
             break :blk switch (self.format) {
                 .json_array => try self.evalJsonRecord(arena, bytes),
                 .otlp_protobuf => try self.evalProtobufRecord(arena, bytes),
-                // raw/ndjson/prom_text never reach a policy sink today.
+                // ndjson/prom_text never reach a policy sink today.
                 else => .keep,
             };
         };
@@ -618,7 +618,7 @@ pub fn routeLabel(signal: service_mod.Signal, format: framer_mod.WireFormat) run
             .metric => .otlp_metrics,
             .trace => .otlp_traces,
         },
-        // raw/ndjson/prom_text outcomes never run the record pipeline.
+        // ndjson/prom_text outcomes never run the record pipeline.
         else => unreachable,
     };
 }
