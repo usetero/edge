@@ -437,6 +437,38 @@ test "checkpoint/lane: corrupted snapshot falls back to wal replay" {
     try testing.expectEqual(@as(?u64, 777), recovered.getOffset(id));
 }
 
+test "checkpoint/lane: corrupted snapshot count degrades to wal replay" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(state_dir);
+
+    const id: tail_types.FileIdentity = .{ .dev = 30, .inode = 31, .fingerprint = 32 };
+    const value: checkpoint_types.Value = .{
+        .identity = id,
+        .offset = 888,
+        .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
+    };
+
+    var snap = try snapshot_mod.Snapshot.init(testing.allocator, testing.io, state_dir);
+    defer snap.deinit();
+    var vals: [1]checkpoint_types.Value = .{value};
+    try snap.write(vals[0..]);
+
+    const snap_path = try std.fs.path.join(testing.allocator, &.{ state_dir, "checkpoint.snap" });
+    defer testing.allocator.free(snap_path);
+    try corruptByte(testing.io, snap_path, 15);
+
+    var wal = try wal_mod.Wal.init(testing.allocator, testing.io, state_dir);
+    defer wal.deinit();
+    try wal.append(1, value);
+    try wal.sync();
+
+    var recovered = try Lane.init(testing.allocator, testing.io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    defer recovered.deinit();
+    try testing.expectEqual(@as(?u64, 888), recovered.getOffset(id));
+}
+
 test "checkpoint/lane: missing state files initialize cleanly" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
