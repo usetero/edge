@@ -467,6 +467,24 @@ pub const Watcher = struct {
         self.pending_detected_ns.items[i] = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
     }
 
+    /// Recompute the CRC32 fingerprint from the live file after a same-inode
+    /// content rewrite is detected (copytruncate / in-place rewrite). The
+    /// watcher pins `identities.items[i].fingerprint` at open time and never
+    /// refreshes it for the same inode otherwise; without this refresh, every
+    /// post-rotation enqueue is filed under the stale fingerprint, so a
+    /// checkpoint-based restart misses `by_identity` and (without the
+    /// store-level gate) silently resumes from a stale cross-version offset.
+    fn refreshIdentityFingerprint(self: *Watcher, idx: u32, file: std.Io.File) !void {
+        const i: usize = @intCast(idx);
+        if (self.identities.items[i]) |id| {
+            self.identities.items[i] = .{
+                .dev = id.dev,
+                .inode = id.inode,
+                .fingerprint = try computeFingerprint(self.io, file),
+            };
+        }
+    }
+
     fn maybeHandleContentRewrite(self: *Watcher, idx: u32, size: u64) !void {
         const i: usize = @intCast(idx);
         const file = self.files.items[i] orelse return;
@@ -481,6 +499,7 @@ pub const Watcher = struct {
             prefix_len = @min(@as(u64, 64), size);
             self.head_prefix_lens.items[i] = @intCast(prefix_len);
             self.head_prefix_hashes.items[i] = try prefixHash(self.io, file, prefix_len);
+            try self.refreshIdentityFingerprint(idx, file);
             return;
         }
 
@@ -489,14 +508,24 @@ pub const Watcher = struct {
             const new_len: u64 = @min(@as(u64, 64), size);
             self.head_prefix_lens.items[i] = @intCast(new_len);
             self.head_prefix_hashes.items[i] = try prefixHash(self.io, file, new_len);
+            try self.refreshIdentityFingerprint(idx, file);
             return;
         }
 
         const observed = try prefixHash(self.io, file, prefix_len);
-        if (observed == self.head_prefix_hashes.items[i]) return;
+        if (observed == self.head_prefix_hashes.items[i]) {
+            // The prefix is unchanged, but the identity fingerprint may have been
+            // computed on a shorter file (e.g. after a partially written
+            // copytruncate).  Refresh it so that ongoing checkpoints and a
+            // future checkpoint-based restart both use a fingerprint that covers
+            // the current file content rather than the partial prefix.
+            try self.refreshIdentityFingerprint(idx, file);
+            return;
+        }
 
         if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
         self.head_prefix_hashes.items[i] = observed;
+        try self.refreshIdentityFingerprint(idx, file);
     }
 
     fn maybeSwitchPending(self: *Watcher, idx: u32) !void {
@@ -851,4 +880,105 @@ test "watch public API: init cleans up cleanly when backend registration fails a
             // Expected: clean error propagation; init's errdefer already ran deinit.
         }
     }
+}
+
+test "checkpoint resume after copytruncate emits full new content (no silent skip)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Phase 1: create file with content A, record identity (FP_A).
+    {
+        const f = try tmp.dir.createFile(io, "tail.log", .{});
+        defer f.close(io);
+        var buf: [8192]u8 = undefined;
+        @memset(buf[0..], 'A');
+        try f.writeStreamingAll(io, buf[0..]);
+    }
+    const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
+    defer testing.allocator.free(abs);
+
+    const id_a: types.FileIdentity = blk: {
+        const f = try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_only });
+        defer f.close(io);
+        const st = try fstatHandle(f.handle);
+        break :blk .{ .dev = st.dev, .inode = st.ino, .fingerprint = try computeFingerprint(io, f) };
+    };
+
+    // Phase 2: durably checkpoint offset N under FP_A via the live lane worker.
+    const N: u64 = 4096;
+    const state_dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(state_dir);
+
+    const lifecycle_mod = @import("../core/lifecycle.zig");
+    {
+        var lifecycle: lifecycle_mod.Lifecycle = .init;
+        var lane = try checkpoint_mod.Lane.init(
+            testing.allocator,
+            io,
+            state_dir,
+            16,
+            64,
+            5,
+            72 * 60 * 60 * 1000,
+            64,
+            60_000,
+        );
+        try lane.start(&lifecycle);
+        _ = try lane.enqueue(.{
+            .identity = id_a,
+            .byte_offset = N,
+            .last_seen_size = N,
+            .last_seen_ns = @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds()),
+        });
+        var tries: usize = 0;
+        while (tries < 200 and lane.getOffset(id_a) != N) : (tries += 1) {
+            try io.sleep(.fromNanoseconds(2 * std.time.ns_per_ms), .awake);
+        }
+        try testing.expectEqual(N, lane.getOffset(id_a).?);
+        lifecycle.requestShutdown(io);
+        lifecycle.shutdown(io);
+        lane.finalize();
+        lane.deinit();
+    }
+
+    // Phase 3: copytruncate — replace content A with content B (FP_B != FP_A, size >= N).
+    {
+        const f = try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_write });
+        defer f.close(io);
+        try f.setLength(io, 0);
+        var buf: [8192]u8 = undefined;
+        @memset(buf[0..], 'B');
+        try f.writePositionalAll(io, buf[0..], 0);
+        try f.sync(io);
+    }
+
+    // Phase 4: recover lane from durable state (simulates restart).
+    var recovered = try checkpoint_mod.Lane.init(
+        testing.allocator,
+        io,
+        state_dir,
+        16,
+        64,
+        5,
+        72 * 60 * 60 * 1000,
+        64,
+        60_000,
+    );
+    defer recovered.deinit();
+
+    // Phase 5: checkpoint-based restart. The by_inode gate (Change 1) rejects the
+    // stale FP_A offset, so the watcher reads new content from offset 0.
+    var w = try Watcher.init(testing.allocator, io, .poll, &.{abs}, "-", .checkpoint, 1000, 50, 1000);
+    defer w.deinit();
+    w.applyCheckpointLane(&recovered);
+
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+    try w.collect(&events, .checkpoint, &recovered);
+
+    // FIX: full new content [0, 8192) is emitted — NOT the stale [N, 8192).
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 0), events.items[0].start_offset);
+    try testing.expectEqual(@as(u64, 8192), events.items[0].end_offset);
 }

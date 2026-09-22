@@ -45,6 +45,15 @@ pub const Lifecycle = struct {
         self.shutdown_event.set(io);
     }
 
+    /// Like `requestShutdown` but without the diagnostic log. Used by
+    /// short-lived paths (e.g. edge-tail's stdin mode) that reach normal
+    /// completion and want to keep stderr clean; the signal path still uses
+    /// the logging `requestShutdown`. Idempotent and safe from any thread.
+    pub fn requestShutdownQuiet(self: *Lifecycle, io: std.Io) void {
+        if (self.shutdown_requested.swap(true, .acq_rel)) return;
+        self.shutdown_event.set(io);
+    }
+
     pub fn isShuttingDown(self: *const Lifecycle) bool {
         return self.shutdown_requested.load(.acquire);
     }
