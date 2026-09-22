@@ -194,6 +194,37 @@ test "eval stream public API: json attribute matching and miss" {
     try testing.expect(try eval.evalLine("{\"message\":\"x\",\"ddsource\":\"app\"}"));
 }
 
+test "eval stream public API: malformed json line does not abort evaluation" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const policy_path = try writePolicyFile(&tmp,
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "drop-nginx",
+        \\      "name": "drop-nginx",
+        \\      "log": {
+        \\        "match": [{ "log_attribute": "ddsource", "regex": "^nginx$" }],
+        \\        "keep": "none"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    );
+    defer testing.allocator.free(policy_path);
+
+    var stdio_bus = testBus();
+    var eval = try StreamEvaluator.init(testing.allocator, .json, policy_path, stdio_bus.eventBus());
+    defer eval.deinit();
+
+    try testing.expect(try eval.evalLine("{\"message\":\"x\",\"ddsource\":\"app\"}"));
+
+    try testing.expect(try eval.evalLine("{not valid json}"));
+
+    try testing.expect(!(try eval.evalLine("{\"message\":\"y\",\"ddsource\":\"nginx\"}")));
+}
+
 test "eval stream public API: logfmt severity matching" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
