@@ -63,10 +63,7 @@ pub fn evalLogRecord(
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
-    // No reusable scan state here: this path evaluates one record, so the
-    // 8 KiB `ScanState.init` clear would replace a clear sized by the policy
-    // count and cost more than it saves. Only the batch path below reuses one.
-    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf, sink, null);
+    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf, sink);
     if (!result.keep) return .drop;
     if (!result.mutated) return .keep;
 
@@ -263,9 +260,6 @@ fn filterLog(
     allocator: std.mem.Allocator,
     policy_id_buf: [][]const u8,
     sink: ?policy.ExtensionSink,
-    /// Reusable across the records of one batch. Null makes the engine keep
-    /// its per-record state, which is the cheaper choice for a single record.
-    scan_state: ?*policy.ScanState,
 ) FilterLogResult {
     var field_ctx: FieldAccessorContext = .{ .log = log, .allocator = allocator };
     const result = engine.evaluate(
@@ -277,7 +271,11 @@ fn filterLog(
             .scratch = allocator,
             .io = engine.bus.io,
             .extension_sink = sink,
-            .scan_state = scan_state,
+            // Null leaves the engine holding its own per-record state. A
+            // reusable `ScanState` only pays off across a batch, and
+            // `evalLogRecord` is the one caller: it handles one record, so the
+            // 8 KiB `ScanState.init` clear would cost more than it saves.
+            .scan_state = null,
         },
     );
     // The extension sink (s3-dump) fires INSIDE evaluate — after keep, before

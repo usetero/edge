@@ -744,11 +744,12 @@ test "inboundBodyOf: chunked body stays on the socket as .streamed (no arena cap
     try parseRequestInto(&p, raw);
     var body_buf: [256]u8 = undefined;
     const limits = testLimits();
-    const arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const cap_before = arena.queryCapacity();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cap_before = arena_state.queryCapacity();
 
-    const body = try inboundBodyOf(&p.request, limits, &body_buf, testing.allocator, &test_chunked);
+    const body = try inboundBodyOf(&p.request, limits, &body_buf, arena, &test_chunked);
 
     // The body must NOT be arena-buffered (.bytes); it must stay on the socket
     // as a streaming reader carrying the max_body_size cap.
@@ -756,7 +757,7 @@ test "inboundBodyOf: chunked body stays on the socket as .streamed (no arena cap
     try testing.expectEqual(@as(usize, limits.max_body_size), body.streamed.max_bytes);
     // `inboundBodyOf` no longer touches an arena, so the caller's arena capacity
     // is unchanged — the regression's whole point: zero body-sized retention.
-    try testing.expectEqual(cap_before, arena.queryCapacity());
+    try testing.expectEqual(cap_before, arena_state.queryCapacity());
 
     // Draining the streamed reader through the bounded pump yields the exact
     // decoded body (what `exchange.sendBody` pumps to the upstream).

@@ -38,18 +38,24 @@ pub const CHUNK_BUF_BYTES: usize = 4 * 1024;
 pub const ZSTD_WINDOW_MIN: usize = 256 * 1024;
 /// Largest window a zstd frame may declare (format limit, 2^23).
 pub const ZSTD_WINDOW_MAX: usize = 8 * 1024 * 1024;
-/// Largest decode window cap `Limits.resolve` will choose. The per-handler
-/// codec scratch is `window + ~0.5 MiB` (decode block + encode + record
-/// scratch + chunk), and a policy path also pins a `max_body_size` resident
-/// body buffer and a 512 KiB streaming pump per thread, so at the default 128
-/// handler threads a pod holds roughly `128 x (window + max_body_size + 1.2 MiB)`.
-/// 2 MiB lands the shipped 256/128/1.5 MiB shape at ~607 MiB — under the
-/// 768 MiB pod limit with margin. It also covers the producer regime the
-/// 16 MiB decoded cap targets: one-shot libzstd at the default level clamps its
-/// declared window at 2 MiB, so a 2 MiB cap admits every such frame the
-/// decoded cap admits. Producers forcing a larger window (windowLog >= 22,
-/// i.e. >= 4 MiB) are refused; admit them by raising this constant together
-/// with the pod memory limit (or lowering `thread_pool_count`). See PR #320.
+/// Largest decode window cap `Limits.resolve` will choose.
+///
+/// The window sizes `ThreadBufs.decode`, which is `threadlocal`: one per OS
+/// thread that has decoded a compressed body, allocated on demand and then
+/// retained. The shipped stdio frontend runs on the inherited `Io.Threaded`,
+/// whose pool defaults to the CPU count, so the multiplier is cores — NOT
+/// `thread_pool_count`, which #331 made inert. Per thread the codec scratch is
+/// `window + ~0.5 MiB` (decode block, encode, record scratch, chunk).
+///
+/// 2 MiB is chosen for what it admits, not for the budget: one-shot libzstd at
+/// the default level clamps its declared window at 2 MiB, so a 2 MiB cap
+/// admits every frame of that regime the 16 MiB decoded cap admits. Producers
+/// forcing a larger window (windowLog >= 22, i.e. >= 4 MiB) are refused; admit
+/// them by raising this constant together with the pod memory limit. On a
+/// 4-core pod the cap costs about 10 MiB of retained decode scratch.
+///
+/// Size a deployment from measured RSS, not from this constant: see the Sizing
+/// table in charts/tero-edge/README.md. See PR #320.
 pub const ZSTD_WINDOW_BUDGET_MAX: usize = 2 * 1024 * 1024;
 
 /// Per-connection arena budget for cold allocations (header copies, upstream
