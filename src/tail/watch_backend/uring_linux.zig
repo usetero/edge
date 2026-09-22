@@ -171,7 +171,10 @@ fn ensureDirectoryWatch(u: *State, path: []const u8) !void {
     const owned_dir_path = try u.allocator.dupe(u8, dir_path);
     errdefer u.allocator.free(owned_dir_path);
 
-    const wd = inotifyAddWatch(u.fd, owned_dir_path, INOTIFY_MASK) catch return;
+    const wd = inotifyAddWatch(u.fd, owned_dir_path, INOTIFY_MASK) catch {
+        u.allocator.free(owned_dir_path);
+        return;
+    };
     errdefer inotifyRmWatch(u.fd, wd);
 
     try u.dir_path_to_wd.put(owned_dir_path, wd);
@@ -207,7 +210,7 @@ fn markTrackedInDirDirty(self: anytype, dir_path: []const u8) void {
 // inotify was removed from std.posix in Zig 0.16; wrap std.os.linux directly.
 fn inotifyInit1(flags: u32) !std.posix.fd_t {
     const rc = std.os.linux.inotify_init1(flags);
-    return switch (std.posix.errno(rc)) {
+    return switch (std.os.linux.errno(rc)) {
         .SUCCESS => @intCast(rc),
         .INVAL => error.InvalidArgument,
         .MFILE => error.ProcessFdQuotaExceeded,
@@ -220,7 +223,7 @@ fn inotifyInit1(flags: u32) !std.posix.fd_t {
 fn inotifyAddWatch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
     const path_c = try std.posix.toPosixPath(path);
     const rc = std.os.linux.inotify_add_watch(fd, &path_c, mask);
-    return switch (std.posix.errno(rc)) {
+    return switch (std.os.linux.errno(rc)) {
         .SUCCESS => @intCast(rc),
         .ACCES => error.AccessDenied,
         .NOENT => error.FileNotFound,
@@ -233,4 +236,31 @@ fn inotifyAddWatch(fd: std.posix.fd_t, path: []const u8, mask: u32) !i32 {
 
 fn inotifyRmWatch(fd: std.posix.fd_t, wd: i32) void {
     _ = std.os.linux.inotify_rm_watch(fd, wd);
+}
+
+const testing = std.testing;
+
+test "ensureDirectoryWatch does not leak when parent directory is missing" {
+    if (comptime builtin.os.tag != .linux) return;
+    var u = init(std.testing.allocator, std.Options.debug_io) catch |err| switch (err) {
+        error.PermissionDenied, error.SystemOutdated => return error.SkipZigTest,
+        else => return err,
+    };
+    defer deinit(&u);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(root_abs);
+    const target = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/nonexistent_subdir_uring_leak/tail.log",
+        .{root_abs},
+    );
+    defer testing.allocator.free(target);
+
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        try ensureDirectoryWatch(&u, target);
+    }
 }

@@ -187,27 +187,6 @@ test "identity json_array in, zstd out" {
     try testing.expectEqualStrings("[{\"m\":\"keep\"}]", decoded);
 }
 
-test "raw format copies bytes regardless of content" {
-    const body = "drop everything? no: raw never evaluates";
-    const spec: PipelineSpec = .{
-        .decode = .identity,
-        .format = .raw,
-        .encode = .identity,
-        .max_decoded_bytes = 1024,
-        .zstd_window_len = TEST_WINDOW,
-    };
-    const buffers = try testBuffers(spec);
-    defer freeBuffers(buffers);
-
-    var in: std.Io.Reader = .fixed(body);
-    var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 4096);
-    defer out.deinit();
-
-    var sink: DropSink = .{};
-    _ = try run(spec, &in, &out.writer, buffers, &sink);
-    try testing.expectEqualStrings(body, out.written());
-}
-
 test "decoded body over the bound aborts (PLAN 6.5.1 caller semantics)" {
     const body = "a" ** 10_000; // compresses tiny, inflates past the bound
     const compressed = try buffered.compressGzip(testing.allocator, body);

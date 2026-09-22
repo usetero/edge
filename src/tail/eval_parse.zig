@@ -50,7 +50,10 @@ pub fn parseLogfmtAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
 }
 
 pub fn parseJsonAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, line, .{});
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, line, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
     if (parsed != .object) return;
 
     var it = parsed.object.iterator();
@@ -119,4 +122,23 @@ test "eval parse: logfmt extracts severity and attrs" {
     const ctx = try parseLine(arena.allocator(), .logfmt, "severity_text=INFO ddsource=app msg=ok");
     try testing.expectEqualStrings("INFO", ctx.severity.?);
     try testing.expectEqual(@as(usize, 3), ctx.attrs.items.len);
+}
+
+test "eval parse: malformed json falls back to raw line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const ctx = try parseLine(arena.allocator(), .json, "{not valid json");
+    try testing.expectEqualStrings("{not valid json", ctx.message.?);
+    try testing.expect(ctx.severity == null);
+    try testing.expectEqual(@as(usize, 0), ctx.attrs.items.len);
+}
+
+test "eval parse: truncated json falls back to raw line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const ctx = try parseLine(arena.allocator(), .json, "{\"message\":\"partia");
+    try testing.expectEqualStrings("{\"message\":\"partia", ctx.message.?);
+    try testing.expectEqual(@as(usize, 0), ctx.attrs.items.len);
 }

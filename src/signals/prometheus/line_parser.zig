@@ -193,12 +193,16 @@ fn parseCommentLine(line: []const u8) ParsedLine {
     const rest = line[pos..];
 
     // Check for HELP
-    if (std.mem.startsWith(u8, rest, "HELP")) {
+    if (std.mem.startsWith(u8, rest, "HELP") and
+        (rest.len == 4 or rest[4] == ' ' or rest[4] == '\t'))
+    {
         return parseHelpLine(rest[4..]);
     }
 
     // Check for TYPE
-    if (std.mem.startsWith(u8, rest, "TYPE")) {
+    if (std.mem.startsWith(u8, rest, "TYPE") and
+        (rest.len == 4 or rest[4] == ' ' or rest[4] == '\t'))
+    {
         return parseTypeLine(rest[4..]);
     }
 
@@ -422,6 +426,62 @@ test "parseLine - comment lines" {
         .comment => |c| try std.testing.expectEqualStrings("", c),
         else => return error.UnexpectedResult,
     }
+}
+
+test "parseLine - comments whose first token begins with HELP/TYPE" {
+    // Per the exposition format spec, only a standalone HELP/TYPE token after
+    // `#` introduces metadata; a token that merely begins with those letters
+    // (e.g. HELPFUL, TYPES:) is a plain comment and must be preserved as such.
+    const helpful = parseLine("# HELPFUL info about the system");
+    switch (helpful) {
+        .comment => |c| try std.testing.expectEqualStrings("HELPFUL info about the system", c),
+        else => return error.UnexpectedResult,
+    }
+
+    const types = parseLine("# TYPES: examples here");
+    switch (types) {
+        .comment => |c| try std.testing.expectEqualStrings("TYPES: examples here", c),
+        else => return error.UnexpectedResult,
+    }
+
+    // HELP/TYPE immediately followed by a non-whitespace character merges into a
+    // single token and must not be treated as metadata.
+    const help_merged = parseLine("# HELPX not metadata");
+    switch (help_merged) {
+        .comment => |c| try std.testing.expectEqualStrings("HELPX not metadata", c),
+        else => return error.UnexpectedResult,
+    }
+
+    const type_merged = parseLine("# TYPEX not metadata");
+    switch (type_merged) {
+        .comment => |c| try std.testing.expectEqualStrings("TYPEX not metadata", c),
+        else => return error.UnexpectedResult,
+    }
+
+    // A tab is a valid token separator, so HELP/TYPE followed by a tab still
+    // dispatches as metadata (word-boundary check accepts '\t').
+    const help_tab = parseLine("# HELP\thttp_requests_total\tTotal HTTP requests");
+    switch (help_tab) {
+        .help => |h| {
+            try std.testing.expectEqualStrings("http_requests_total", h.metric_name);
+            try std.testing.expectEqualStrings("Total HTTP requests", h.description);
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const type_tab = parseLine("# TYPE\ttemperature\tgauge");
+    switch (type_tab) {
+        .type_info => |t| {
+            try std.testing.expectEqualStrings("temperature", t.metric_name);
+            try std.testing.expectEqual(MetricType.gauge, t.metric_type);
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    // HELP/TYPE as the entire comment (no following token) is still a parse
+    // error because the metric name is missing — same as before the fix.
+    try std.testing.expectEqual(@as(ParsedLine, .{ .parse_error = {} }), parseLine("# HELP"));
+    try std.testing.expectEqual(@as(ParsedLine, .{ .parse_error = {} }), parseLine("# TYPE"));
 }
 
 test "parseLine - HELP lines" {

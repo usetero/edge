@@ -147,6 +147,7 @@ pub const JsonArrayFramer = struct {
                     const byte = chunk[i];
                     i += 1;
                     if (isJsonWhitespace(byte)) continue;
+                    try self.writeClose(out);
                     try self.enterDesync(out, chunk[i - 1 ..]);
                     return;
                 },
@@ -467,6 +468,23 @@ test "truncated input flushes buffered bytes and closes best-effort" {
     const got = try runChunked(input, 4, 64, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("[{\"a\":1},{\"b\":]", got);
+}
+
+test "trailing junk after complete array keeps closing brackets" {
+    for ([_]usize{ 1, 7, 4096 }) |chunk| {
+        var sink: TestSink = .{ .allocator = testing.allocator };
+        defer sink.deinit();
+        const got = try runChunked("[1]extra", chunk, 64, &sink);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("[1]extra", got);
+    }
+    for ([_]usize{ 1, 7, 4096 }) |chunk| {
+        var sink: TestSink = .{ .allocator = testing.allocator };
+        defer sink.deinit();
+        const got = try runChunked("[](", chunk, 64, &sink);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("[](", got);
+    }
 }
 
 test "stats are accounted" {

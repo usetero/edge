@@ -114,6 +114,7 @@ test {
     _ = @import("frontend/paths.zig");
     _ = @import("frontend/endpoints.zig");
     _ = @import("frontend/thread_bufs.zig");
+    _ = @import("runtime/mode.zig");
     _ = @import("runtime/distro.zig");
     _ = @import("runtime/extensions.zig");
     _ = @import("signals/prometheus/root.zig");
