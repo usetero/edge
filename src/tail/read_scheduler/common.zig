@@ -39,7 +39,7 @@ pub fn processBatchScalar(
 /// instead would assign the same key to two hard-linked paths tracked as
 /// separate watcher entries, causing their framer states to collide.
 pub fn eventKey(evt: watch_mod.Event) u64 {
-    return @as(u64, @bitCast(@as(i64, evt.file.handle)));
+    return @bitCast(@as(i64, evt.file.handle));
 }
 
 pub fn readTailScalar(

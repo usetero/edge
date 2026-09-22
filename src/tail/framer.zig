@@ -200,7 +200,7 @@ pub const LineFramer = struct {
         try self.inner.finish(writer, &sink);
         // Drain every parked stream: load it into `inner`, flush, then discard.
         // We collect the keys up front because draining empties the map.
-        var keys: std.ArrayListUnmanaged(u64) = .empty;
+        var keys: std.ArrayList(u64) = .empty;
         defer keys.deinit(self.allocator);
         {
             var it = self.streams.iterator();
