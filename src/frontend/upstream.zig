@@ -353,11 +353,16 @@ test "UpstreamManager multiple upstreams" {
     const id0 = try manager.createUpstream("https://api1.example.com", 2048, 1024, 1024);
     const id1 = try manager.createUpstream("https://api2.example.com", 2048, 1024, 1024);
 
-    const config0 = manager.getUpstreamConfig(id0);
-    const config1 = manager.getUpstreamConfig(id1);
+    // Asserted through the live API: `getUpstreamConfig` was the dead
+    // accessor this test used to read, and `buildUpstreamUri` is what
+    // production actually calls to reach a host.
+    const uri0 = try manager.buildUpstreamUri(allocator, id0, "/x", "");
+    defer allocator.free(uri0);
+    const uri1 = try manager.buildUpstreamUri(allocator, id1, "/x", "");
+    defer allocator.free(uri1);
 
-    try std.testing.expectEqualStrings("api1.example.com", config0.host);
-    try std.testing.expectEqualStrings("api2.example.com", config1.host);
+    try std.testing.expectEqualStrings("https://api1.example.com/x", uri0);
+    try std.testing.expectEqualStrings("https://api2.example.com/x", uri1);
 }
 
 // =============================================================================
