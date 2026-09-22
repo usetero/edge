@@ -269,8 +269,34 @@ pub const Runtime = struct {
         // The canceled tasks can't reliably do final file IO; drain and
         // flush on this (uncanceled) thread.
         checkpoint.finalize();
-        try output.flush();
+        // Drain before the flush: the framer may still hold a trailing record
+        // with no newline, and `deinit` would drop it.
+        try Runtime.drainFramer(self.cfg.read_from, &framer, output, &evaluator);
         if (loop.failure) |err| return err;
+    }
+    /// Emit whatever the framer is still holding in scratch, then flush.
+    ///
+    /// The watcher sizes events to the raw stat size, not to a newline
+    /// boundary, so a trailing record without a `\n` sits in scratch and
+    /// `deinit` would free it silently. Scoped to `.tail`/`.checkpoint`:
+    /// `.head` re-reads the whole file from 0 on restart, so emitting at
+    /// shutdown would duplicate it. `finish` drains the parked per-file
+    /// streams as well as the active one, so a multi-file batch loses
+    /// nothing. Parse errors from a half-record are swallowed so the flush
+    /// still runs; allocation and writer errors propagate.
+    fn drainFramer(
+        read_from: types.ReadFrom,
+        framer: *framer_mod.LineFramer,
+        output: *io_mod.Output,
+        evaluator: *eval_stream.StreamEvaluator,
+    ) !void {
+        if (read_from != .head) {
+            framer.finish(output.writer(), evaluator, Runtime.evalLineFilter) catch |err| switch (err) {
+                error.OutOfMemory, error.WriteFailed => return err,
+                else => {}, // half-record parse errors must not block the flush
+            };
+        }
+        try output.flush();
     }
 };
 
