@@ -205,10 +205,34 @@ pub fn collectUpstreamResponseHeaders(
     arena: std.mem.Allocator,
     buffer: []std.http.Header,
 ) ![]std.http.Header {
+    // RFC 7230 §6.1: headers listed in the Connection field are hop-by-hop
+    // and must not be forwarded.  Collect all Connection-option tokens first.
+    var conn_opts: std.ArrayList([]const u8) = .empty;
+    {
+        var it = upstream_res.head.iterateHeaders();
+        while (it.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+            var tok_it = std.mem.tokenizeScalar(u8, header.value, ',');
+            while (tok_it.next()) |tok| {
+                const name = std.mem.trim(u8, tok, " \t");
+                if (name.len > 0) try conn_opts.append(arena, name);
+            }
+        }
+    }
+
     var count: usize = 0;
     var it = upstream_res.head.iterateHeaders();
     while (it.next()) |header| {
         if (upstream_mod.shouldSkipResponseHeader(header.name)) continue;
+        // Also skip any header nominated as hop-by-hop via Connection.
+        var skip = false;
+        for (conn_opts.items) |opt| {
+            if (std.ascii.eqlIgnoreCase(header.name, opt)) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
         if (count >= buffer.len) break;
         buffer[count] = .{
             .name = try arena.dupe(u8, header.name),
@@ -672,4 +696,84 @@ test "contentEncodingName round-trips through the codec layer" {
         @as(?encoding_mod.ContentEncoding, null),
         encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.deflate)),
     );
+}
+
+test "collectUpstreamResponseHeaders strips hop-by-hop Connection and transport headers" {
+    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
+        "content-type: application/json\r\n" ++
+        "connection: close\r\n" ++
+        "x-foo: bar\r\n" ++
+        "content-length: 42\r\n" ++
+        "transfer-encoding: chunked\r\n\r\n";
+
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+    var upstream_res: std.http.Client.Response = .{ .request = undefined, .head = head };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var buffer: [16]std.http.Header = undefined;
+    const relayed = try collectUpstreamResponseHeaders(&upstream_res, arena.allocator(), &buffer);
+
+    // Exactly the two end-to-end headers survive; hop-by-hop Connection and
+    // transport-owned content-length/transfer-encoding are dropped.
+    try testing.expectEqual(@as(usize, 2), relayed.len);
+
+    var saw_content_type = false;
+    var saw_x_foo = false;
+    for (relayed) |header| {
+        try testing.expect(!upstream_mod.shouldSkipResponseHeader(header.name));
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            try testing.expectEqualStrings("application/json", header.value);
+            saw_content_type = true;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-foo")) {
+            try testing.expectEqualStrings("bar", header.value);
+            saw_x_foo = true;
+        } else {
+            return error.UnexpectedRelayedHeader;
+        }
+    }
+    try testing.expect(saw_content_type);
+    try testing.expect(saw_x_foo);
+}
+
+test "collectUpstreamResponseHeaders strips Connection-nominated hop-by-hop headers" {
+    // An upstream that uses Connection: X-Upstream-State to mark a
+    // per-connection field.  That field must not be relayed downstream.
+    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
+        "content-type: text/plain\r\n" ++
+        "connection: X-Upstream-State, Keep-Alive\r\n" ++
+        "x-upstream-state: active\r\n" ++
+        "keep-alive: timeout=5\r\n" ++
+        "x-end-to-end: ok\r\n" ++
+        "content-length: 5\r\n\r\n";
+
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+    var upstream_res: std.http.Client.Response = .{ .request = undefined, .head = head };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var buffer: [16]std.http.Header = undefined;
+    const relayed = try collectUpstreamResponseHeaders(&upstream_res, arena.allocator(), &buffer);
+
+    // Only the two genuine end-to-end headers should survive.
+    // content-length, connection, x-upstream-state, and keep-alive are all dropped.
+    try testing.expectEqual(@as(usize, 2), relayed.len);
+
+    var saw_content_type = false;
+    var saw_x_end_to_end = false;
+    for (relayed) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            try testing.expectEqualStrings("text/plain", header.value);
+            saw_content_type = true;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-end-to-end")) {
+            try testing.expectEqualStrings("ok", header.value);
+            saw_x_end_to_end = true;
+        } else {
+            return error.UnexpectedRelayedHeader;
+        }
+    }
+    try testing.expect(saw_content_type);
+    try testing.expect(saw_x_end_to_end);
 }
