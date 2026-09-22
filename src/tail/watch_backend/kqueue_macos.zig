@@ -154,7 +154,10 @@ fn ensureDirectoryWatch(kq: *State, path: []const u8) !void {
     errdefer kq.allocator.free(owned_dir_path);
 
     const dir = std.Io.Dir.cwd().openDir(kq.io, owned_dir_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => {
+            kq.allocator.free(owned_dir_path);
+            return;
+        },
         else => return err,
     };
     const dir_fd = dir.handle;
@@ -170,6 +173,7 @@ fn ensureDirectoryWatch(kq: *State, path: []const u8) !void {
     }};
     if (kevent(kq.fd, changes[0..], &.{}, null) < 0) {
         closeFd(dir_fd);
+        kq.allocator.free(owned_dir_path);
         return;
     }
     try kq.dir_watches.append(kq.allocator, .{ .path = owned_dir_path, .fd = dir_fd });
@@ -196,5 +200,29 @@ fn markTrackedInDirDirty(self: anytype, dir_path: []const u8) void {
         if (std.mem.eql(u8, tracked_dir, dir_path)) {
             self.markDirty(@intCast(i));
         }
+    }
+}
+
+const testing = std.testing;
+
+test "ensureDirectoryWatch does not leak when parent directory is missing" {
+    if (comptime builtin.os.tag != .macos) return;
+    var kq = try init(std.testing.allocator, std.Options.debug_io);
+    defer deinit(&kq);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(root_abs);
+    const target = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/nonexistent_subdir_kqueue_leak/tail.log",
+        .{root_abs},
+    );
+    defer testing.allocator.free(target);
+
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        try ensureDirectoryWatch(&kq, target);
     }
 }

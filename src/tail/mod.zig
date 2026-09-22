@@ -32,4 +32,6 @@ test {
     _ = @import("read_scheduler/common.zig");
     _ = @import("read_scheduler/poll.zig");
     _ = @import("watch_backend/poll.zig");
+    _ = @import("watch_backend/uring_linux.zig");
+    _ = @import("watch_backend/kqueue_macos.zig");
 }

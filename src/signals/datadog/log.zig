@@ -475,6 +475,14 @@ pub const DatadogLog = struct {
                     const text = v.get() catch continue;
                     hits[slot] = allocator.dupe(u8, text) catch return null;
                 },
+                // The targeted walk cannot descend an array body candidate,
+                // but flatten does -- defer to it (return the outer null, not
+                // an inner null) so `bodyForMatch` runs flatten instead of
+                // short-circuiting to `raw`. Otherwise a string sibling could
+                // win here while flatten's array-descent picks the array leaf,
+                // breaking the "both paths agree" invariant and flipping
+                // keep/drop policy decisions.
+                .array => return null,
                 else => {},
             }
         }

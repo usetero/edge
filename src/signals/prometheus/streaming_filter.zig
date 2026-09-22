@@ -2191,6 +2191,73 @@ test "PolicyStreamingFilter - comments preserved regardless of policy" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "metric_b") == null);
 }
 
+test "PolicyStreamingFilter - comments whose first token begins with HELP/TYPE preserved" {
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // Create DROP policy for all metrics starting with "metric_"
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "drop-all"),
+        .name = try allocator.dupe(u8, "drop-all"),
+        .enabled = true,
+        .target = .{
+            .metric = .{
+                .keep = false,
+            },
+        },
+    };
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = .{ .metric_field = .METRIC_FIELD_NAME },
+        .match = .{ .regex = try allocator.dupe(u8, "^metric_") },
+    });
+    defer drop_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{drop_policy}, "test-provider", .file);
+
+    var line_buf: [1024]u8 = undefined;
+    var metadata_buf: [1536]u8 = undefined;
+    var output_buf: [4096]u8 = undefined;
+    var filtering_buf: [512]u8 = undefined;
+
+    const input =
+        \\# HELPFUL info about the system
+        \\# TYPES: examples here
+        \\# This is a regular comment
+        \\metric_a 1
+        \\metric_b 2
+        \\
+    ;
+
+    const result = try streamWithFilteringWriter(
+        input,
+        &line_buf,
+        &metadata_buf,
+        &output_buf,
+        &filtering_buf,
+        &registry,
+        noop_bus.eventBus(),
+        allocator,
+    );
+
+    // The HELP/TYPE-prefixed comments must survive policy filtering, exactly
+    // like a regular comment, rather than being misclassified as metadata and
+    // dropped (or repositioned before a kept sample's metric line).
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELPFUL info about the system") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPES: examples here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# This is a regular comment") != null);
+    // Metrics matching the drop policy are still dropped.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "metric_a") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "metric_b") == null);
+    // No spurious HELP/TYPE metadata is emitted for the bogus metric names
+    // that the buggy parser would have derived ("FUL", "S:").
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# HELP FUL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "# TYPE S:") == null);
+}
+
 test "PolicyStreamingFilter - empty lines preserved regardless of policy" {
     const allocator = std.testing.allocator;
 

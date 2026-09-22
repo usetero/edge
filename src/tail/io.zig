@@ -111,14 +111,32 @@ pub const Output = struct {
         const buf = try allocator.alloc(u8, write_buf_size);
         errdefer allocator.free(buf);
 
-        // Open (creating if necessary) without truncating, then position the
-        // positional writer at end-of-file so writes append.
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+        // Open the output file with `O_APPEND` and write through a streaming
+        // writer so each `writev` is positioned at the live end-of-file by
+        // the kernel. This is the only way to remain correct when anything
+        // else mutates the output file while edge-tail is running (an operator
+        // truncating it, a sibling process appending to it): a positional
+        // writer seeded once from `stat().size` goes stale, leaving flushes to
+        // land at that stale offset via `pwritev`, which either prepends a NUL
+        // hole (after an external truncation) or overwrites externally
+        // appended bytes (after a sibling append).
+        //
+        // `std.Io.Dir`'s `createFile`/`openFile` expose no `O_APPEND` option,
+        // so the descriptor is opened directly via `std.posix.openat` against
+        // the current working directory.
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+            .ACCMODE = .RDWR,
+            .APPEND = true,
+            .CREAT = true,
+            .CLOEXEC = true,
+        }, 0o644);
+        const file: std.Io.File = .{
+            .handle = fd,
+            .flags = .{ .nonblocking = false },
+        };
         errdefer file.close(io);
 
-        const end_pos: u64 = (try file.stat(io)).size;
-        var fw = file.writer(io, buf);
-        fw.pos = end_pos;
+        const fw = file.writerStreaming(io, buf);
         return .{
             .allocator = allocator,
             .io = io,
@@ -170,4 +188,86 @@ test "io public API: file output writes bytes through std.Io.Writer" {
     const read_back = try tmp.dir.readFileAlloc(io, path, testing.allocator, .limited(4096));
     defer testing.allocator.free(read_back);
     try testing.expectEqualStrings("old\nnew\n", read_back);
+}
+
+test "Output.initFileAppend: external truncation between writes does not prepend a NUL hole" {
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = "out.log";
+    {
+        const seed = try tmp.dir.createFile(io, path, .{ .truncate = true });
+        defer seed.close(io);
+        try seed.writeStreamingAll(io, "old\n");
+    }
+
+    const abs = try tmp.dir.realPathFileAlloc(io, path, testing.allocator);
+    defer testing.allocator.free(abs);
+
+    var out = try Output.initFileAppend(testing.allocator, io, abs, 1024);
+    defer out.deinit();
+
+    // First append lands at the initial EOF (4), yielding "old\nnew\n".
+    try out.writer().writeAll("new\n");
+    try out.flush();
+
+    // Externally truncate the output file to zero in place (same inode),
+    // simulating logrotate copytruncate / `: > out`.
+    {
+        const trunc = try tmp.dir.createFile(io, path, .{ .truncate = true });
+        trunc.close(io);
+    }
+
+    // The live EOF is now 0. A true `O_APPEND` write must land the next payload
+    // at 0; a stale-offset `pwritev` (seeded once from `stat().size` at startup)
+    // would land "more\n" at the stale offset (8), producing an 8-byte NUL hole
+    // on read-back instead of preserving the truncation.
+    try out.writer().writeAll("more\n");
+    try out.flush();
+
+    const read_back = try tmp.dir.readFileAlloc(io, path, testing.allocator, .limited(4096));
+    defer testing.allocator.free(read_back);
+
+    // No NUL bytes should ever appear in the output under true append mode.
+    for (read_back) |b| try testing.expect(b != 0);
+    try testing.expectEqualStrings("more\n", read_back);
+}
+
+test "Output.initFileAppend: externally-appended bytes are not overwritten by this process" {
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = "out.log";
+    {
+        const seed = try tmp.dir.createFile(io, path, .{ .truncate = true });
+        seed.close(io);
+    }
+
+    const abs = try tmp.dir.realPathFileAlloc(io, path, testing.allocator);
+    defer testing.allocator.free(abs);
+
+    // Open this process's output handle against the empty file first.
+    var out = try Output.initFileAppend(testing.allocator, io, abs, 1024);
+    defer out.deinit();
+
+    // Before this process flushes anything, a sibling descriptor appends "X\n"
+    // to the same file. Under true `O_APPEND` this process's subsequent write
+    // must land after "X\n" (yielding "X\nY\n"); a stale-offset `pwritev` would
+    // land "Y\n" at the offset captured at startup (0), overwriting "X\n" and
+    // yielding "Y\n".
+    {
+        var sibling = try Output.initFileAppend(testing.allocator, io, abs, 1024);
+        defer sibling.deinit();
+        try sibling.writer().writeAll("X\n");
+        try sibling.flush();
+    }
+
+    try out.writer().writeAll("Y\n");
+    try out.flush();
+
+    const read_back = try tmp.dir.readFileAlloc(io, path, testing.allocator, .limited(4096));
+    defer testing.allocator.free(read_back);
+    try testing.expectEqualStrings("X\nY\n", read_back);
 }
