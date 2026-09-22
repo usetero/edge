@@ -1042,3 +1042,242 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
         if (via_direct) |d| try testing.expectEqualStrings(via_flat.?, d);
     }
 }
+
+test "DatadogLog - unwrappedAttribute observes a setWrapped edit on the same path" {
+    // Regression (PR #203): `setWrapped` mutates `message_tree` but leaves the
+    // one-shot `message_flat` snapshot stale, so a later wrapped-attribute
+    // read on the same path returned the pre-transform value. Two composing
+    // redacts on the same path would then each compute against the original
+    // value and the earlier rule's edit was lost.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"email\":\"alice@example.com\"}}}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    const path = [_][]const u8{ "data", "jsonPayload", "email" };
+
+    // Prime the one-shot flat cache with a read (mirrors the engine reading
+    // via `unwrappedAttribute` for the first redact rule).
+    try std.testing.expectEqualStrings(
+        "alice@example.com",
+        log.unwrappedAttribute(allocator, &path).?,
+    );
+
+    // Rule 1 edits the leaf. The tree is now dirty; the flat is NOT refreshed.
+    try std.testing.expect(log.setWrapped(allocator, &path, "ALICE_R@example.com"));
+
+    // A later read on the same path must return rule 1's edit, not the stale
+    // flat snapshot of the original value. Pre-fix this returned
+    // "alice@example.com".
+    try std.testing.expectEqualStrings(
+        "ALICE_R@example.com",
+        log.unwrappedAttribute(allocator, &path).?,
+    );
+
+    // Rule 2 composes on top of rule 1's edit, then reads it back.
+    try std.testing.expect(log.setWrapped(allocator, &path, "ALICE_R@EXAMPLE_R.com"));
+    try std.testing.expectEqualStrings(
+        "ALICE_R@EXAMPLE_R.com",
+        log.unwrappedAttribute(allocator, &path).?,
+    );
+
+    // The forwarded record carries both redactions and neither original token.
+    log.finalizeWrapped(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(log, .{}, &out.writer);
+    const output = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, output, "ALICE_R@EXAMPLE_R.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "alice") == null);
+}
+
+test "DatadogLog - unwrappedAttribute returns null after deleteWrapped removes the leaf" {
+    // The removed-leaf case: `deleteWrapped` leaves the stale flat entry in
+    // place, but a later read must observe the leaf as absent (not the stale
+    // value). This is what makes remove→add (upsert=false) and remove→redact
+    // on the same wrapped path resolve correctly.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"email\":\"alice@example.com\",\"note\":\"keep\"}}}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    const email_path = [_][]const u8{ "data", "jsonPayload", "email" };
+    const note_path = [_][]const u8{ "data", "jsonPayload", "note" };
+
+    // Prime the flat with a read.
+    try std.testing.expectEqualStrings(
+        "alice@example.com",
+        log.unwrappedAttribute(allocator, &email_path).?,
+    );
+
+    // Remove the leaf — the tree is now dirty and the leaf is gone.
+    try std.testing.expect(log.deleteWrapped(allocator, &email_path));
+
+    // Reading the removed leaf returns null, not the stale flat value.
+    try std.testing.expect(log.unwrappedAttribute(allocator, &email_path) == null);
+
+    // A sibling leaf that was never edited still resolves (the flat fallback
+    // stays authoritative for never-edited paths even while the tree is dirty).
+    try std.testing.expectEqualStrings(
+        "keep",
+        log.unwrappedAttribute(allocator, &note_path).?,
+    );
+
+    // The forwarded record no longer carries the removed leaf or its value.
+    log.finalizeWrapped(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(log, .{}, &out.writer);
+    const output = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, output, "email") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "keep") != null);
+}
+
+test "DatadogLog - unwrappedAttribute returns null when an ancestor object key was deleted" {
+    // Regression for: deleteWrapped(["data","jsonPayload"]) followed by
+    // unwrappedAttribute(["data","jsonPayload","email"]) must return null, not
+    // the stale message_flat value.  Before the fix, navigateParent returned
+    // null when the parent object no longer contained "jsonPayload", and the
+    // code fell through to message_flat which still held the original value.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"email\":\"alice@example.com\"}}}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    const email_path = [_][]const u8{ "data", "jsonPayload", "email" };
+    const payload_path = [_][]const u8{ "data", "jsonPayload" };
+
+    // Prime the flat cache with a read.
+    try std.testing.expectEqualStrings(
+        "alice@example.com",
+        log.unwrappedAttribute(allocator, &email_path).?,
+    );
+
+    // Delete the ancestor object ("jsonPayload"), not the leaf directly.
+    try std.testing.expect(log.deleteWrapped(allocator, &payload_path));
+
+    // Reading through the now-absent ancestor must return null, not the stale
+    // flat entry for "data.jsonPayload.email".
+    try std.testing.expect(log.unwrappedAttribute(allocator, &email_path) == null);
+
+    // The forwarded record must not carry the removed subtree.
+    log.finalizeWrapped(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(log, .{}, &out.writer);
+    const output = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, output, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "jsonPayload") == null);
+}
+
+test "DatadogLog - unwrappedAttribute still resolves array-of-objects paths after an unrelated edit" {
+    // Guard against an over-eager tree-first fix: the flattener reaches
+    // string leaves inside array-of-objects (arrays don't extend the dotted
+    // path), but `navigateParent` only descends into objects, so when the
+    // direct parent is an array the tree can't resolve the path. The read
+    // must then defer to the flat — even when the tree is dirty from an edit
+    // to an unrelated sibling path.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"{\"items\":[{\"event_type\":\"Started\"}],\"note\":\"orig\"}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    const arr_path = [_][]const u8{ "items", "event_type" };
+    const note_path = [_][]const u8{"note"};
+
+    // The array-of-objects leaf resolves through the flat (first leaf wins).
+    try std.testing.expectEqualStrings(
+        "Started",
+        log.unwrappedAttribute(allocator, &arr_path).?,
+    );
+
+    // Edit an unrelated sibling so the tree is dirty for the rest of the pass.
+    try std.testing.expect(log.setWrapped(allocator, &note_path, "new"));
+
+    // The array-of-objects leaf must still resolve via the flat fallback; a
+    // fix that returned null when the tree parent isn't an object would
+    // regress this read.
+    try std.testing.expectEqualStrings(
+        "Started",
+        log.unwrappedAttribute(allocator, &arr_path).?,
+    );
+    // The edited sibling reflects the live tree value, not the stale flat.
+    try std.testing.expectEqualStrings(
+        "new",
+        log.unwrappedAttribute(allocator, &note_path).?,
+    );
+}
+
+test "DatadogLog - unwrappedAttribute falls through for array-string entries after an unrelated edit" {
+    // Guard the fix for the case where `items` is an array whose direct
+    // elements are strings (not objects).  `flattenValue` stores the first
+    // string element under the parent key ("items"), so `message_flat` has
+    // the value, but before the fix the tree-first branch returned null for
+    // the array leaf instead of falling through to `message_flat`.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    const json =
+        \\{"message":"{\"items\":[\"secret\"],\"note\":\"orig\"}"}
+    ;
+    const doc = try parser.parseFromSlice(allocator, json);
+    var log = try DatadogLog.parse(allocator, doc.asValue());
+    defer log.deinit(allocator);
+
+    const items_path = [_][]const u8{"items"};
+    const note_path = [_][]const u8{"note"};
+
+    // Before any edit the flat is authoritative.
+    try std.testing.expectEqualStrings(
+        "secret",
+        log.unwrappedAttribute(allocator, &items_path).?,
+    );
+
+    // Dirty the tree with an unrelated edit.
+    try std.testing.expect(log.setWrapped(allocator, &note_path, "new"));
+
+    // The array-string leaf must still resolve via the flat fallback; before
+    // the fix the tree branch returned null for the array value and left the
+    // secret visible to a subsequent redact check.
+    try std.testing.expectEqualStrings(
+        "secret",
+        log.unwrappedAttribute(allocator, &items_path).?,
+    );
+    // The edited sibling reflects the live tree value.
+    try std.testing.expectEqualStrings(
+        "new",
+        log.unwrappedAttribute(allocator, &note_path).?,
+    );
+}
