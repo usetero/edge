@@ -178,18 +178,26 @@ pub const UpstreamManager = struct {
         }
 
         // Add base path if present and not just "/"
-        if (base_path.len > 0 and !std.mem.eql(u8, base_path, "/")) {
+        const wrote_base = base_path.len > 0 and !std.mem.eql(u8, base_path, "/");
+        if (wrote_base) {
             try writer.writeAll(base_path);
         }
 
-        // Add separator if needed between base_path and request_path
+        // Add request path, joining it with the base path. When the written
+        // base path ends with '/' and the request path begins with '/', drop
+        // the request's leading '/' so the boundary has a single '/' rather
+        // than '//'. Otherwise insert a '/' only when neither side provides one.
         if (request_path.len > 0) {
-            const needs_separator = (base_path.len == 0 or base_path[base_path.len - 1] != '/') and
-                request_path[0] != '/';
-            if (needs_separator) {
-                try writer.writeAll("/");
+            const base_ends_with_slash = wrote_base and base_path[base_path.len - 1] == '/';
+            if (base_ends_with_slash and request_path[0] == '/') {
+                try writer.writeAll(request_path[1..]);
+            } else {
+                const needs_separator = !base_ends_with_slash and request_path[0] != '/';
+                if (needs_separator) {
+                    try writer.writeAll("/");
+                }
+                try writer.writeAll(request_path);
             }
-            try writer.writeAll(request_path);
         }
 
         // Add query string if present
@@ -251,6 +259,105 @@ test "UpstreamManager buildUpstreamUri with non-standard port" {
     const uri = try manager.buildUpstreamUri(allocator, upstream_id, "/test", "");
     defer allocator.free(uri);
     try std.testing.expectEqualStrings("http://localhost:9999/test", uri);
+}
+
+test "UpstreamManager buildUpstreamUri collapse boundary slashes" {
+    const allocator = std.testing.allocator;
+    var manager = UpstreamManager.init(std.Options.debug_io, allocator, 8);
+    defer manager.deinit();
+    const upstream_id = try manager.createUpstream(
+        "https://internal-gateway.corp/datadog/",
+        2048,
+        1024,
+        1024,
+    );
+
+    // Trailing-slash base + leading-slash request collapses to a single '/'.
+    const uri1 = try manager.buildUpstreamUri(allocator, upstream_id, "/api/v2/logs", "");
+    defer allocator.free(uri1);
+    try std.testing.expectEqualStrings("https://internal-gateway.corp/datadog/api/v2/logs", uri1);
+
+    // Query string is still appended after the collapsed path.
+    const uri2 = try manager.buildUpstreamUri(allocator, upstream_id, "/api/v2/logs", "ddapikey=1");
+    defer allocator.free(uri2);
+    try std.testing.expectEqualStrings("https://internal-gateway.corp/datadog/api/v2/logs?ddapikey=1", uri2);
+
+    // Trailing-slash base + request without leading '/' still joins correctly.
+    const uri3 = try manager.buildUpstreamUri(allocator, upstream_id, "api/v2/logs", "");
+    defer allocator.free(uri3);
+    try std.testing.expectEqualStrings("https://internal-gateway.corp/datadog/api/v2/logs", uri3);
+
+    // Empty request path leaves the base path as-is.
+    const uri4 = try manager.buildUpstreamUri(allocator, upstream_id, "", "");
+    defer allocator.free(uri4);
+    try std.testing.expectEqualStrings("https://internal-gateway.corp/datadog/", uri4);
+
+    // Every emitted URI must round-trip through std.Uri.parse with no '//' in
+    // the path component (i.e. the malformed join no longer reaches the wire).
+    const expected = "https://internal-gateway.corp/datadog/api/v2/logs";
+    const parsed = try std.Uri.parse(expected);
+    const path_str: []const u8 = switch (parsed.path) {
+        .raw, .percent_encoded => |s| s,
+    };
+    try std.testing.expectEqualStrings("/datadog/api/v2/logs", path_str);
+    try std.testing.expect(std.mem.indexOf(u8, path_str, "//") == null);
+}
+
+test "UpstreamManager buildUpstreamUri join boundary combinations" {
+    const allocator = std.testing.allocator;
+    var manager = UpstreamManager.init(std.Options.debug_io, allocator, 8);
+    defer manager.deinit();
+
+    // base_path == "" (path-less upstream URL)
+    const empty_id = try manager.createUpstream("https://host.example.com", 2048, 1024, 1024);
+    const e1 = try manager.buildUpstreamUri(allocator, empty_id, "/api/v2/logs", "");
+    defer allocator.free(e1);
+    try std.testing.expectEqualStrings("https://host.example.com/api/v2/logs", e1);
+    const e2 = try manager.buildUpstreamUri(allocator, empty_id, "", "");
+    defer allocator.free(e2);
+    try std.testing.expectEqualStrings("https://host.example.com", e2);
+
+    // base_path == "/" (root) is collapsed to nothing by the line-205 guard.
+    const root_id = try manager.createUpstream("https://host.example.com/", 2048, 1024, 1024);
+    const r1 = try manager.buildUpstreamUri(allocator, root_id, "/api/v2/logs", "");
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings("https://host.example.com/api/v2/logs", r1);
+
+    // base_path without trailing '/' + leading-slash request: single '/'.
+    const plain_id = try manager.createUpstream("https://host.example.com/v2", 2048, 1024, 1024);
+    const p1 = try manager.buildUpstreamUri(allocator, plain_id, "/logs", "");
+    defer allocator.free(p1);
+    try std.testing.expectEqualStrings("https://host.example.com/v2/logs", p1);
+    // base_path without trailing '/' + request without leading '/': separator inserted.
+    const p2 = try manager.buildUpstreamUri(allocator, plain_id, "logs", "");
+    defer allocator.free(p2);
+    try std.testing.expectEqualStrings("https://host.example.com/v2/logs", p2);
+
+    // base_path with trailing '/' + leading-slash request: collapses to single '/'.
+    const slash_id = try manager.createUpstream("https://host.example.com/v2/", 2048, 1024, 1024);
+    const s1 = try manager.buildUpstreamUri(allocator, slash_id, "/logs", "");
+    defer allocator.free(s1);
+    try std.testing.expectEqualStrings("https://host.example.com/v2/logs", s1);
+    // base_path with trailing '/' + request without leading '/': no extra separator.
+    const s2 = try manager.buildUpstreamUri(allocator, slash_id, "logs", "");
+    defer allocator.free(s2);
+    try std.testing.expectEqualStrings("https://host.example.com/v2/logs", s2);
+}
+
+test "UpstreamManager multiple upstreams" {
+    const allocator = std.testing.allocator;
+
+    var manager = UpstreamManager.init(std.Options.debug_io, allocator, 8);
+    defer manager.deinit();
+
+    const id0 = try manager.createUpstream("https://api1.example.com", 2048, 1024, 1024);
+    const id1 = try manager.createUpstream("https://api2.example.com", 2048, 1024, 1024);
+
+    const config0 = manager.getUpstreamConfig(id0);
+    const config1 = manager.getUpstreamConfig(id1);
+
+    try std.testing.expectEqualStrings("api1.example.com", config0.host);
+    try std.testing.expectEqualStrings("api2.example.com", config1.host);
 }
 
 // =============================================================================
