@@ -44,9 +44,13 @@ src/
 ├── lambda_main.zig       # AWS Lambda extension entry point
 ├── root.zig              # Library root (public API exports)
 │
-├── modules/              # Protocol-specific processing modules
-├── proxy/                # HTTP proxy infrastructure
-├── prometheus/           # Prometheus metric parsing and filtering
+├── core/                 # Runtime primitives: limits, conn slab, arena pool, Io
+├── frontend/             # Inbound HTTP: stdio and httpz, and the shared paths
+├── service/              # Routing and per-signal request planning
+├── signals/              # Protocol record types and their policy accessors
+├── pipeline/             # Framing, codecs, and the streaming record pipeline
+├── runtime/              # Process lifecycle, distributions, metrics
+├── tail/                 # File and stdin tailing for edge-tail
 ├── config/               # Configuration parsing (non-policy)
 ├── lambda/               # AWS Lambda extension support
 └── zonfig/               # Comptime configuration with env overrides
@@ -65,92 +69,52 @@ Edge consumes the following shared modules from
 
 ## Package Overview
 
-Each package is designed to be as independent as possible, with clear interfaces
-for integration.
+### `core/` - Runtime primitives
 
-### `modules/` - Protocol Modules
+`limits.zig` holds every buffer constant and the data-plane budget.
+`conn_slab.zig` and `arena_pool.zig` are the per-connection slot allocators the
+stdio frontend claims from. `io_select.zig` is the only place outside the
+platform backends that names a concrete `std.Io` implementation.
 
-Protocol-specific request processing modules that plug into the proxy
-infrastructure.
+### `frontend/` - Inbound HTTP
 
-**Key exports:**
+Two frontends behind one comptime switch (`-Dfrontend`, default `stdio`), and
+the request path they share. `stdio/` is `std.Io`-native and runs a task per
+connection; `httpz/` is the older event loop with a worker pool. `paths.zig`,
+`exchange.zig` and `exec.zig` are frontend-neutral: routing outcomes, the
+upstream exchange with its retry and eviction rules, and the per-record
+evaluation loop.
 
-- `ProxyModule` - Vtable interface for request processing
-- `ModuleRegistration` - Module configuration (routes, upstream, etc.)
-- `DatadogModule` - Datadog log ingestion with policy-based filtering
-- `OtlpModule` - OpenTelemetry log ingestion with policy-based filtering
-- `PrometheusModule` - Prometheus metrics scraping with streaming policy-based
-  filtering
-- `PassthroughModule` - No-op passthrough for unhandled routes
+### `service/` - Routing
 
-**Dependencies:** `policy_zig`, `proto`, `o11y`
+`router.zig` matches a method and path to a plan. The per-signal files decide
+what that plan is: forward raw, pipe through the policy engine, or answer
+locally. `health.zig` and the metrics endpoint are the paths the edge answers
+itself.
 
-#### OtlpModule
+### `signals/` - Record types
 
-The OTLP module handles OpenTelemetry log ingestion with policy-based filtering.
-It processes the standard OTLP JSON format (`ExportLogsServiceRequest`).
+One directory per wire format (`datadog/`, `otlp/`, `prometheus/`), each
+holding the record type, its parse paths, and the field accessor the policy
+engine calls. `json_scan.zig` and `stream_io.zig` are shared across them.
 
-**Supported filter match cases:**
+### `pipeline/` - Framing and codecs
 
-- `log_body` - Match against log message body
-- `log_severity_text` - Match against severity text (INFO, DEBUG, ERROR, etc.)
-- `log_severity_number` - Match against severity number (1-24)
-- `log_attribute` - Match against log record attributes
-- `resource_attribute` - Match against resource attributes (e.g.,
-  `service.name`)
-- `scope_name` - Match against instrumentation scope name
-- `scope_version` - Match against instrumentation scope version
-- `scope_attribute` - Match against scope attributes
+`framer.zig` and the `frame_*.zig` files cut a body into records without
+holding it resident. `encoding.zig` and `compress_buffered.zig` are the gzip
+and zstd paths. `tap.zig` mirrors traffic for debugging.
 
-**Routes:**
+### `runtime/` - Process lifecycle
 
-- `POST /v1/logs` - OTLP log ingestion endpoint
+`app.zig` composes a distribution and owns startup and shutdown.
+`runtime_metrics.zig` is the Prometheus registry; every label is a bounded
+enum.
 
----
+### `config/` and `zonfig/` - Configuration
 
-### `proxy/` - HTTP Proxy Infrastructure
-
-Core HTTP proxy server and routing infrastructure.
-
-**Key exports:**
-
-- `ProxyServer` - HTTP server with module-based request routing
-- `Router` - Route matching (path patterns, method bitmasks)
-- `UpstreamClient` - HTTP client for forwarding requests
-- `compress` - gzip compression/decompression utilities
-
-**Dependencies:** `o11y`, links to httpz
-
----
-
-### `prometheus/` - Prometheus Metrics
-
-Streaming Prometheus exposition format parsing and policy-based filtering.
-
-**Key exports:**
-
-- `PolicyStreamingFilter` - Streaming filter that applies policies to metrics
-- `FilteringWriter` - Writer that filters metrics line-by-line
-- `FieldAccessor` - Maps policy field references to Prometheus metric fields
-- `LineParser` - Prometheus exposition format parser
-
-**Dependencies:** `policy_zig`, `proto`, `o11y`
-
----
-
-### `config/` - Configuration Parsing
-
-Application configuration loading and parsing (non-policy configuration).
-
-**Key exports:**
-
-- `ProxyConfig` - Main proxy configuration struct
-- `ProviderConfig` - Policy provider configuration (re-exported from policy-zig)
-- `ServiceMetadata` - Service metadata (re-exported from policy-zig)
-
-**Dependencies:** `policy_zig`
-
----
+`zonfig` is the comptime loader: a struct declaration becomes a JSON schema
+with `TERO_`-prefixed environment overrides and a post-load `validate` hook.
+`config/types.zig` is the shape the proxy loads through it.
 
 ## Distributions
 
@@ -499,29 +463,67 @@ OTLP distribution.
 
 - `TERO_LOG_LEVEL` - Override log level (trace, debug, info, warn, err)
 
+## Sizing
+
+Find your payload size and request rate for CPU. Memory is set by how many
+senders connect, not by request rate, because an agent holds its connection open
+between batches.
+
+| payload |   RPS |  CPU | memory, 64 senders | memory, 256 senders |
+| ------- | ----: | ---: | -----------------: | ------------------: |
+| ~1 KB   |   100 | 100m |             128 Mi |              256 Mi |
+| ~1 KB   |   500 | 100m |             128 Mi |              256 Mi |
+| ~1 KB   | 1,000 | 100m |             128 Mi |              256 Mi |
+| ~1 KB   | 5,000 | 250m |             128 Mi |              256 Mi |
+| ~100 KB |   100 | 100m |             128 Mi |              320 Mi |
+| ~100 KB |   500 | 250m |             128 Mi |              320 Mi |
+| ~100 KB | 1,000 | 500m |             128 Mi |              320 Mi |
+| ~100 KB | 5,000 |    1 |             128 Mi |              320 Mi |
+| ~1 MB   |   100 | 500m |             256 Mi |              640 Mi |
+| ~1 MB   |   500 |    2 |             256 Mi |              640 Mi |
+| ~1 MB   | 1,000 |    4 |             256 Mi |              640 Mi |
+
+Set `maxConnections` to about four times your sender count. A slot reserves 64
+KiB and commits a page only when a sender lands on it, so headroom is free.
+
+CPU is driven by records, not requests, so a 1 MB batch costs roughly a thousand
+times a 1 KB one. Policy count barely matters: 4,000 policies cost the same as
+1,000. Rows assume policies are loaded and an upstream answering in about 14 ms.
+
+Measured on an M4 Max with the shipped frontend. CPU is rounded up to the next
+usual limit, memory carries 30% over the measured peak. Alert on
+`edge_connections_active / edge_connections_max > 0.8`, and on
+`edge_connections_shed_total` above zero.
+
 ## Prometheus Metrics
 
 Runtime metrics are exposed at `GET /_edge/metrics` in Prometheus text format.
 
-Every label is a bounded enum. No path, status code, policy id or client
-value ever becomes a label, so the series count cannot grow with traffic.
+Every label is a bounded enum. No path, status code, policy id or client value
+ever becomes a label, so the series count cannot grow with traffic.
 
 Requests and responses:
 
 - `edge_requests_total{method,known_path}`
 - `edge_request_duration_seconds{known_path}` (histogram, 100 us to 30 s)
 - `edge_responses_total{known_path,status_class}`
-- `edge_request_errors_total{known_path,class}` — `class` is `uncaught` or `module`
-- `edge_requests_in_flight` (gauge) — against the thread pool count, the saturation signal
-- `edge_requests_invalid_total` — heads refused before routing, answered 400 (stdio only)
+- `edge_request_errors_total{known_path,class}` — `class` is `uncaught` or
+  `module`
+- `edge_requests_in_flight` (gauge) — against the thread pool count, the
+  saturation signal
+- `edge_requests_invalid_total` — heads refused before routing, answered 400
+  (stdio only)
 
 Connections (stdio only, except the ceiling):
 
 - `edge_connections_total`
 - `edge_connections_active` (gauge)
-- `edge_connections_max` (gauge) — the configured ceiling, reported by both frontends
-- `edge_connections_shed_total{reason}` — `slab_full` or `concurrency`; the exhaustion signal
-- `edge_inbound_timeouts_total{phase}` — `request` counts dropped requests, `idle` counts reclaimed keep-alive slots
+- `edge_connections_max` (gauge) — the configured ceiling, reported by both
+  frontends
+- `edge_connections_shed_total{reason}` — `slab_full` or `concurrency`; the
+  exhaustion signal
+- `edge_inbound_timeouts_total{phase}` — `request` counts dropped requests,
+  `idle` counts reclaimed keep-alive slots
 
 Upstream:
 
@@ -535,7 +537,8 @@ Policy:
 - `edge_policy_records_kept_total{telemetry}`
 - `edge_policy_records_dropped_total{telemetry}`
 - `edge_policies_loaded{signal}` (gauge)
-- `edge_policies_rejected` (gauge) — patterns the matcher refused; a non-zero value means a rule an operator believes is live does nothing
+- `edge_policies_rejected` (gauge) — patterns the matcher refused; a non-zero
+  value means a rule an operator believes is live does nothing
 
 s3-dump extension (present only when the extension is built in):
 
@@ -543,7 +546,8 @@ s3-dump extension (present only when the extension is built in):
 - `edge_s3_dump_objects_uploaded_total`, `edge_s3_dump_objects_failed_total`
 - `edge_s3_dump_records_uploaded_total`, `edge_s3_dump_records_dropped_total`
 - `edge_s3_dump_bytes_uploaded_total`
-- `edge_s3_dump_backlog_bytes` (gauge) — alert on this approaching `max_sealed_bytes`
+- `edge_s3_dump_backlog_bytes` (gauge) — alert on this approaching
+  `max_sealed_bytes`
 
 Build:
 

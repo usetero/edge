@@ -390,6 +390,25 @@ pub const RuntimeMetrics = struct {
         inline for (std.meta.tags(SignalLabel)) |signal| {
             try self.internal.edge_policies_loaded.set(.{ .signal = signal }, 0);
         }
+
+        // The two drop signals. Both were left unseeded, and production shows
+        // what that costs: a 24-hour scrape of the fleet carries
+        // `edge_inbound_timeouts_total{phase="idle"}` and no `phase="request"`
+        // series at all, and no `edge_connections_shed_total` in any form.
+        // These are the series an operator alerts on, so the alert binds to
+        // nothing and a dashboard reads "no data" where it should read zero —
+        // the same silence the shed path was added to break.
+        //
+        // "Time series that are not present until something happens are
+        // difficult to deal with ... export a default value such as 0 for any
+        // time series you know may exist in advance."
+        // https://prometheus.io/docs/practices/instrumentation/
+        inline for (std.meta.tags(ShedReasonLabel)) |reason| {
+            try self.internal.edge_connections_shed_total.incrBy(.{ .reason = reason }, 0);
+        }
+        inline for (std.meta.tags(InboundPhaseLabel)) |phase| {
+            try self.internal.edge_inbound_timeouts_total.incrBy(.{ .phase = phase }, 0);
+        }
     }
 
     pub fn deinit(self: *RuntimeMetrics) void {
@@ -553,6 +572,34 @@ pub fn statusClass(status: u16) StatusClassLabel {
 // ============================== Tests ==============================
 
 const testing = std.testing;
+
+test "drop-path series are present at zero before anything drops" {
+    // A counter that only appears once it fires is the failure this whole
+    // metric set exists to prevent: the alert binds to no series and the
+    // dashboard reads "no data" rather than zero. Production proved it -- a
+    // 24-hour scrape of the fleet carried `edge_inbound_timeouts_total` for
+    // the `idle` phase only, and no `edge_connections_shed_total` at all,
+    // because neither had ever been incremented.
+    //
+    // Prometheus is explicit: "export a default value such as 0 for any time
+    // series you know may exist in advance."
+    var metrics: RuntimeMetrics = try .init(testing.allocator, testing.io, .datadog);
+    defer metrics.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try metrics.writePrometheus(&out.writer);
+    const text = out.written();
+
+    for ([_][]const u8{
+        "edge_connections_shed_total{reason=\"slab_full\"} 0",
+        "edge_connections_shed_total{reason=\"concurrency\"} 0",
+        "edge_inbound_timeouts_total{phase=\"idle\"} 0",
+        "edge_inbound_timeouts_total{phase=\"request\"} 0",
+    }) |series| {
+        try testing.expect(std.mem.indexOf(u8, text, series) != null);
+    }
+}
 
 test "connection and saturation series reach the scrape" {
     var metrics: RuntimeMetrics = try .init(testing.allocator, testing.io, .datadog);

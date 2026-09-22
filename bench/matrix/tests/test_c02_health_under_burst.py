@@ -20,6 +20,12 @@ class HealthUnderBurst(MatrixCase):
     # The stall depends on the probe landing in the same event batch as the
     # senders, which is probabilistic: measured at roughly 3 in 10 bursts.
     # Eight bursts flapped, so run twenty.
+    #
+    # Twenty is still not enough to be certain. Three isolated runs of this
+    # case gave XPASS, XPASS, then the defect at 3.02 s against the 1.0 s
+    # bound. So the runner will periodically report this as "no longer
+    # failing (remove the DEFECTS note)" while the defect is live. Do not
+    # remove the note on one green run; the httpz batch is still there.
     SLOW = True
     BURSTS = 20
     SENDERS = 15
