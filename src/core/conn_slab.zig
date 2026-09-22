@@ -302,8 +302,6 @@ fn testLimits() limits_mod.Limits {
         .recv_buf = 64,
         .send_buf = 64,
         .upstream_write_buf = 64,
-        .decode_buf = 128,
-        .encode_buf = 128,
         .body_buf = 32,
         .chunk_buf = 32,
         .zstd_window_len = 64,

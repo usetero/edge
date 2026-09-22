@@ -17,15 +17,6 @@ pub const UPSTREAM_WRITE_BUF_BYTES: usize = 20 * 1024;
 /// fit here for policy evaluation; larger records fail open per PLAN §6.5.
 pub const RECORD_SCRATCH_BYTES: usize = 256 * 1024;
 
-/// Streaming encoder window/staging: must cover flate.max_window_len (64 KiB)
-/// and one zstd block (128 KiB) with slack. encoding.zig's tests assert this
-/// stays >= its actual requirement so the layers can't drift apart.
-pub const ENCODE_BUF_BYTES: usize = 192 * 1024;
-
-/// Decoder needs the zstd window (config-derived, see Limits.zstd_window_len)
-/// plus one block of slack; this constant is the non-window part.
-pub const DECODE_SLACK_BYTES: usize = 192 * 1024;
-
 /// HTTP body reader staging (chunked-decoding side, std.http.Server).
 pub const BODY_BUF_BYTES: usize = 8 * 1024;
 
@@ -109,9 +100,6 @@ pub const Limits = struct {
     recv_buf: usize,
     send_buf: usize,
     upstream_write_buf: usize,
-    /// Streaming decoder window region (zstd window + slack).
-    decode_buf: usize,
-    encode_buf: usize,
     body_buf: usize,
     chunk_buf: usize,
     /// zstd decode window cap; frames declaring more fail the decode.
@@ -162,8 +150,6 @@ pub const Limits = struct {
             .recv_buf = RECV_BUF_BYTES,
             .send_buf = SEND_BUF_BYTES,
             .upstream_write_buf = UPSTREAM_WRITE_BUF_BYTES,
-            .decode_buf = zstd_window_len + DECODE_SLACK_BYTES,
-            .encode_buf = ENCODE_BUF_BYTES,
             .body_buf = BODY_BUF_BYTES,
             .chunk_buf = CHUNK_BUF_BYTES,
             .zstd_window_len = zstd_window_len,
