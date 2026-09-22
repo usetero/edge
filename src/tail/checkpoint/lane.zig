@@ -135,7 +135,13 @@ pub const Lane = struct {
             .identity = identity,
             .offset = offset,
             .last_seen_ns = now_ns,
-        }) catch {};
+        }) catch |err| {
+            // The caller cannot act on this: the in-memory offset is already
+            // reset, so the worst case is the stale higher offset surviving in
+            // the store until the async worker drains the queue. Log it so a
+            // duplicated re-emit after a rotation is traceable.
+            log.warn("resetOffset upsert failed: {}", .{err});
+        };
     }
 
     fn recover(self: *Lane) !void {
