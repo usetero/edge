@@ -290,10 +290,20 @@ pub fn execFetchFiltered(
     defer upstream_req.deinit();
     thread_bufs.trackUpstream(ctx.io, bufs, upstream_req.connection);
     defer thread_bufs.trackUpstream(ctx.io, bufs, null);
+    // Scope eviction to the upstream send+head phase: a reused dead keep-alive
+    // fails here, so evict it from the pool. Past receiveHead the response
+    // streams straight to the client, so a non-timeout failure there is a
+    // client disconnect or a local filter error, and must NOT mark a healthy
+    // upstream connection closing and churn the pool. A watchdog timeout in
+    // either phase has already set connection.closing, so evicting and
+    // reporting it as a timeout is harmless and matches `exchange`.
     var upstream_res = blk: {
-        errdefer |err| exchange.evictUpstream(ctx, &upstream_req, in.path, err);
-        try upstream_req.sendBodiless();
-        break :blk try upstream_req.receiveHead(&.{});
+        upstream_req.sendBodiless() catch |err| break :blk err;
+        break :blk upstream_req.receiveHead(&.{}) catch |err| break :blk err;
+    } catch |err| {
+        exchange.evictUpstream(ctx, &upstream_req, in.path, err);
+        if (bufs.timed_out.load(.acquire)) return exchange.timedOut(ctx, in.path, "head");
+        return err;
     };
     var extra_headers: [64]std.http.Header = undefined;
     const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, in.arena, &extra_headers);
@@ -318,7 +328,13 @@ pub fn execFetchFiltered(
 
     const upstream_body = upstream_res.reader(bufs.upstream);
     const max_in = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes;
-    _ = try pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in);
+    _ = pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in) catch |err| {
+        if (bufs.timed_out.load(.acquire)) {
+            exchange.evictUpstream(ctx, &upstream_req, in.path, err);
+            return exchange.timedOut(ctx, in.path, "relay");
+        }
+        return err;
+    };
     _ = try filtering.finish();
     try sink.end();
 }

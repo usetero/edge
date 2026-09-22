@@ -41,8 +41,16 @@ class ScrapeWithHungIntake(MatrixCase):
 
         self.intake.arm("hang")
         started = time.monotonic()
+        status = None
         try:
-            requests.get(self.edge.url + "/metrics", timeout=120)
+            status = requests.get(self.edge.url + "/metrics", timeout=120).status_code
         except Exception:
             pass
         self.assertLess(time.monotonic() - started, 45, "the scrape outlived the deadline")
+        # A stall must read as 504, not 502. The watchdog shuts the upstream
+        # socket down, so the in-flight send/receive fails with a generic
+        # transport error; without the timed_out check on this path that error
+        # falls through to the 502 arm and a stalled upstream is
+        # indistinguishable from a broken one.
+        if status is not None:
+            self.assertEqual(504, status, "a stalled upstream must read as 504")

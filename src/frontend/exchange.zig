@@ -153,7 +153,11 @@ fn dialUpstream(
 
 /// Record a watchdog timeout: the warn line names the phase and the path, the
 /// counter makes the rate alertable.
-fn timedOut(ctx: *exec.SharedCtx, path: []const u8, phase: []const u8) error{UpstreamTimeout} {
+/// Report a watchdog timeout: warn on the bus, count it, and return the one
+/// error `errorStatus` maps to 504. Every upstream path that arms the watchdog
+/// must funnel its timed-out failures through here, or a stall reads as a 502
+/// and is indistinguishable from a broken upstream.
+pub fn timedOut(ctx: *exec.SharedCtx, path: []const u8, phase: []const u8) error{UpstreamTimeout} {
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     ctx.bus.warn(UpstreamTimedOut{ .path = path, .phase = phase });
     if (ctx.metrics) |metrics| metrics.recordUpstreamTimeout();
