@@ -44,6 +44,7 @@ pub const Lane = struct {
         snapshot_interval_ms: u64,
     ) !Lane {
         if (max_slots == 0) return error.InvalidCheckpointSlots;
+        if (interval_ms == 0) return error.InvalidCheckpointInterval;
         if (sync_batch == 0) return error.InvalidCheckpointSyncBatch;
         if (snapshot_interval_ms == 0) return error.InvalidCheckpointSnapshotInterval;
 
@@ -455,4 +456,58 @@ test "checkpoint/lane: missing state files initialize cleanly" {
 
     var recreated = try Lane.init(testing.allocator, testing.io, state_dir, 8, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     defer recreated.deinit();
+}
+
+test "checkpoint/lane: rejects zero checkpoint tunables" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(state_dir);
+
+    // Mirrors the validateConfig guards as a defense-in-depth layer: a
+    // caller that constructs a Lane directly must still be rejected.
+    try testing.expectError(error.InvalidCheckpointSlots, Lane.init(
+        testing.allocator,
+        testing.io,
+        state_dir,
+        8,
+        0,
+        5,
+        72 * 60 * 60 * 1000,
+        64,
+        60_000,
+    ));
+    try testing.expectError(error.InvalidCheckpointInterval, Lane.init(
+        testing.allocator,
+        testing.io,
+        state_dir,
+        8,
+        8,
+        0,
+        72 * 60 * 60 * 1000,
+        64,
+        60_000,
+    ));
+    try testing.expectError(error.InvalidCheckpointSyncBatch, Lane.init(
+        testing.allocator,
+        testing.io,
+        state_dir,
+        8,
+        8,
+        5,
+        72 * 60 * 60 * 1000,
+        0,
+        60_000,
+    ));
+    try testing.expectError(error.InvalidCheckpointSnapshotInterval, Lane.init(
+        testing.allocator,
+        testing.io,
+        state_dir,
+        8,
+        8,
+        5,
+        72 * 60 * 60 * 1000,
+        64,
+        0,
+    ));
 }
