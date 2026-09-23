@@ -89,8 +89,7 @@ assert the fault actually fired.
 `self.raw()` owns a socket, so a case can send a partial head, a body shorter
 than its `Content-Length`, one byte per second, pipelined requests, or bytes
 that are not HTTP at all. `self.post_logs()` and `requests` cover the
-well-formed cases, and `harness.load` drives `oha` where a case needs real
-load.
+well-formed cases.
 
 ## The cases
 
@@ -178,4 +177,3 @@ counter which moved is explainable from the log.
 - `python3` and `uv` from hermit (`bin/`).
 - `requests` and `zstandard`, supplied by `uv run --with`. Without `zstandard`
   the zstd case skips rather than fails.
-- `oha` for the load cases (`brew install oha`); those cases skip without it.
