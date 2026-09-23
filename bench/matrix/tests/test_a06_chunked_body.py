@@ -1,5 +1,7 @@
 """A06: a well-formed chunked request, which agents send when streaming."""
 
+import http.client
+
 from harness import MatrixCase
 
 
@@ -92,3 +94,25 @@ class ChunkedBodyUnderPolicies(MatrixCase):
         bodies = self.intake.capture_stop()
         self.assertEqual(1, len(bodies), "the intake recorded %d bodies" % len(bodies))
         self.assertEqual(BIG_BATCH, bodies[0], "a kept chunked batch must reach the intake unmodified")
+
+
+class ChunkedBodyKeepAlive(MatrixCase):
+    EXPECT_METRICS = {'edge_responses_total{known_path="api_v2_logs",status_class="s2xx"}': 2}
+    FORBID_LOGS = ["request.failed"]
+
+    def test_two_chunked_batches_share_one_connection_without_mixing(self):
+        bodies = [b'[{"message":"first"}]', b'[{"message":"second"}]']
+        self.intake.capture_start("a06-keep-alive")
+        with self.raw(timeout=30) as client:
+            for body in bodies:
+                client.send(self.head(body_len=None, extra="Transfer-Encoding: chunked"))
+                client.send(chunked(body, chunk=7))
+                # Consume the full response so the next head cannot be
+                # mistaken for bytes left over from the previous response.
+                response = http.client.HTTPResponse(client.sock)
+                response.begin()
+                self.assertEqual(202, response.status)
+                self.assertFalse(response.will_close, "the edge ended the keep-alive connection")
+                response.read()
+                response.close()
+        self.assertEqual(bodies, self.intake.capture_stop())

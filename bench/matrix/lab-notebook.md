@@ -959,3 +959,38 @@ combinations at that latency.
   latencies, with the edge at 15.5 cores of 16 and 190 MB RSS. That is the
   4 MiB decoded batch against 1000 policies. It is the one scenario where
   the edge, not the intake, sets the rate.
+
+### Against master (`df26f84`, the merge base)
+
+The same twelve cells on the same host, run straight after the branch sweep.
+Both runs are 120 of 120 rows at 100 percent success with 50000 requests at
+the intake. Raw results:
+`bench/scaling/results/master-df26f84-mac-studio-2026-09-22/` locally and
+`~/master-sweep/` on the Mac Studio.
+
+Median req/s across the six cells at each latency:
+
+| scenario | policies | master 0 ms | branch 0 ms | master 10 ms | branch 10 ms |
+| --- | --- | --- | --- | --- | --- |
+| OTLP Logs | 0 | 85,994 | 86,316 | 1082 | 1094 |
+| OTLP Logs | 1000 | 63,578 | 58,131 | 1076 | 1079 |
+| OTLP Metrics | 0 | 85,943 | 86,093 | 1092 | 1090 |
+| OTLP Metrics | 1000 | 76,178 | 76,700 | 1075 | 1082 |
+| OTLP Traces | 0 | 85,731 | 86,117 | 1089 | 1091 |
+| OTLP Traces | 1000 | 55,293 | 52,285 | 1069 | 1072 |
+| DD Logs | 0 | 5368 | 5486 | 999 | 998 |
+| DD Logs | 1000 | 446 | 446 | 444 | 444 |
+| DD Metrics | 0 | 86,194 | 85,530 | 1088 | 1088 |
+| DD Metrics | 1000 | 79,292 | 79,076 | 1078 | 1090 |
+
+- **No regression.** 38 of 40 medians are within 2.2 percent, and p99, RSS
+  and CPU match to the decimal.
+- **The two larger gaps are noise.** OTLP Logs and Traces at 1000 policies
+  and 0 ms are CPU-bound and swing 23 to 30 percent between cells on either
+  tree. In both rows the branch has the lowest and the highest cell: OTLP
+  Logs runs 48.4k to 65.8k on the branch against 58.5k to 65.0k on master,
+  and OTLP Traces peaks at 62.2k on the branch against 56.6k on master. The
+  branch does not change `src/signals/otlp`.
+- **The runs were not interleaved.** Master ran second, so thermal drift
+  would favour the branch if anything. A tighter comparison of the two noisy
+  rows needs alternating reps, as `~/drive.sh` on the Mac Studio does.

@@ -121,30 +121,6 @@ pub const Lane = struct {
         return self.store.getOffset(identity);
     }
 
-    /// Update the in-memory store now, so `getOffset` returns `offset` before
-    /// the worker drains the queue. A truncation reset needs this; otherwise
-    /// `applyCheckpointOffsetOne` restores the stale higher offset on the next
-    /// `collect`. The WAL is not written here; the normal enqueue path
-    /// persists the offset after the consumer acknowledges the range.
-    ///
-    /// Known gap: an update for the pre-truncation range can still sit in the
-    /// queue. The worker then writes the stale offset back, and the next
-    /// `collect` re-emits the range one more time. Delivery is at-least-once,
-    /// so this is bounded and accepted. The fix is to apply checkpoint offsets
-    /// only at open; see #349.
-    pub fn resetOffset(self: *Lane, identity: tail_types.FileIdentity, offset: u64) void {
-        const now_ns: i64 = @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
-        self.store.upsert(.{
-            .identity = identity,
-            .offset = offset,
-            .last_seen_ns = now_ns,
-        }) catch |err| {
-            // The caller cannot act on this. The stale offset then survives
-            // until the worker drains the queue, and the range is emitted twice.
-            log.warn("resetOffset upsert failed: {}", .{err});
-        };
-    }
-
     fn recover(self: *Lane) !void {
         var snapshot_values = try self.snapshot.load(self.allocator);
         defer snapshot_values.deinit(self.allocator);

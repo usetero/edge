@@ -500,51 +500,15 @@ pub const DatadogLog = struct {
         return winner;
     }
 
-    /// Attribute fallback: look up `path` (joined with '.') inside the
-    /// unwrapped JSON message. Returns null when the message is not JSON or
-    /// the path is absent.
-    ///
-    /// When this pass edited the wrapper tree (`message_dirty`), the live
-    /// `message_tree` wins over the one-shot `message_flat` snapshot. Without
-    /// this, a second regex redact on the same path reads the pre-transform
-    /// value and undoes the first.
-    ///
-    /// The tree is authoritative only when every ancestor is an object: a
-    /// string leaf returns the live value, and a missing key returns null. A
-    /// non-object ancestor or a non-string leaf falls through to
-    /// `message_flat`, which stays authoritative for array-flattened paths.
+    /// Attribute fallback into a JSON-wrapped message. Once edited, the tree
+    /// supplies live values using the same dotted paths and first-string-wins
+    /// order as the original flattened snapshot.
     pub fn unwrappedAttribute(
         self: *DatadogLog,
         allocator: std.mem.Allocator,
         path: []const []const u8,
     ) ?[]const u8 {
         if (path.len == 0) return null;
-        self.ensureUnwrapped(allocator);
-
-        // Walk the ancestors by hand: a missing key in an object is a deleted
-        // path (null); an array ancestor or a non-string leaf belongs to the
-        // flattener (fall through to `message_flat`).
-        if (self.message_dirty) {
-            if (self.message_tree) |*parsed| tree: {
-                var current = &parsed.value;
-                for (path[0 .. path.len - 1]) |segment| {
-                    const obj = switch (current.*) {
-                        .object => |*o| o,
-                        else => break :tree,
-                    };
-                    current = obj.getPtr(segment) orelse return null;
-                }
-                const parent = switch (current.*) {
-                    .object => |*o| o,
-                    else => break :tree,
-                };
-                const leaf = parent.getPtr(path[path.len - 1]) orelse return null;
-                if (leaf.* == .string) return leaf.string;
-            }
-        }
-
-        if (self.message_flat.count() == 0) return null;
-
         var buf: [512]u8 = undefined;
         var pos: usize = 0;
         for (path, 0..) |segment, i| {
@@ -557,7 +521,41 @@ pub const DatadogLog = struct {
             @memcpy(buf[pos .. pos + segment.len], segment);
             pos += segment.len;
         }
-        return self.message_flat.get(buf[0..pos]);
+        const dotted_path = buf[0..pos];
+        if (self.message_tree) |parsed| {
+            return findTreeString(parsed.value, dotted_path, 0);
+        }
+        self.ensureUnwrapped(allocator);
+        return self.message_flat.get(dotted_path);
+    }
+
+    /// Read the tree as `flattenValue` would: arrays do not extend the path,
+    /// literal dots in keys are preserved, and the first string leaf wins.
+    /// Matching prefixes avoids building another map after every edit.
+    fn findTreeString(value: std.json.Value, path: []const u8, prefix_len: usize) ?[]const u8 {
+        switch (value) {
+            .string => |s| return if (prefix_len != 0 and prefix_len == path.len) s else null,
+            .object => |obj| {
+                var offset = prefix_len;
+                if (offset != 0) {
+                    if (offset == path.len or path[offset] != '.') return null;
+                    offset += 1;
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (!std.mem.startsWith(u8, path[offset..], key)) continue;
+                    if (findTreeString(entry.value_ptr.*, path, offset + key.len)) |s| return s;
+                }
+            },
+            .array => |arr| {
+                for (arr.items) |item| {
+                    if (findTreeString(item, path, prefix_len)) |s| return s;
+                }
+            },
+            else => {},
+        }
+        return null;
     }
 
     /// Lazily parse `message` into a mutable, re-serializable JSON tree for

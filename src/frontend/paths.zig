@@ -286,10 +286,8 @@ pub fn execFetchFiltered(
     defer upstream_req.deinit();
     thread_bufs.trackUpstream(ctx.io, bufs, upstream_req.connection);
     defer thread_bufs.trackUpstream(ctx.io, bufs, null);
-    // Evict only on a send or head failure: that is where a dead keep-alive
-    // fails. After receiveHead a non-timeout failure is a client disconnect or
-    // a filter error, and must not evict a healthy upstream connection. A
-    // timeout in either phase evicts and reports 504, as `exchange` does.
+    // A dead keep-alive fails during send or receiveHead. Body handling below
+    // also evicts incomplete responses and distinguishes watchdog timeouts.
     var upstream_res = blk: {
         upstream_req.sendBodiless() catch |err| break :blk err;
         break :blk upstream_req.receiveHead(&.{});
@@ -298,6 +296,7 @@ pub fn execFetchFiltered(
         if (bufs.timed_out.load(.acquire)) return exchange.timedOut(ctx, in.path, "head");
         return err;
     };
+    const declared = upstream_res.head.content_length;
     var extra_headers: [64]std.http.Header = undefined;
     const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, in.arena, &extra_headers);
     const out = try sink.begin(@intFromEnum(upstream_res.head.status), relayed);
@@ -321,13 +320,20 @@ pub fn execFetchFiltered(
 
     const upstream_body = upstream_res.reader(bufs.upstream);
     const max_in = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes;
-    _ = pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in) catch |err| {
-        if (bufs.timed_out.load(.acquire)) {
-            exchange.evictUpstream(ctx, &upstream_req, in.path, err);
-            return exchange.timedOut(ctx, in.path, "relay");
+    const copied = pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in);
+    // Socket shutdown can surface as EOF, so a successful copy does not prove
+    // the response completed. Never finish a timed-out or short exposition.
+    if (bufs.timed_out.load(.acquire)) {
+        exchange.evictUpstream(ctx, &upstream_req, in.path, error.UpstreamTimeout);
+        return exchange.timedOut(ctx, in.path, "relay");
+    }
+    const n = try copied;
+    if (declared) |want| {
+        if (n < want) {
+            exchange.evictUpstream(ctx, &upstream_req, in.path, error.UpstreamResponseTruncated);
+            return error.UpstreamResponseTruncated;
         }
-        return err;
-    };
+    }
     _ = try filtering.finish();
     try sink.end();
 }

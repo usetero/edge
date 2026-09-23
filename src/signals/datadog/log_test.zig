@@ -1088,6 +1088,7 @@ test "DatadogLog - unwrappedAttribute observes a setWrapped edit on the same pat
 
     // The forwarded record carries both redactions and neither original token.
     log.finalizeWrapped(allocator);
+    try std.testing.expectEqualStrings("ALICE_R@EXAMPLE_R.com", log.unwrappedAttribute(allocator, &path).?);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try std.json.Stringify.value(log, .{}, &out.writer);
@@ -1266,6 +1267,42 @@ test "DatadogLog - unwrappedAttribute falls through for array-string entries aft
         log.unwrappedAttribute(allocator, &note_path).?,
     );
 }
+test "DatadogLog - wrapped dotted paths keep their meaning after edits" {
+    const testing = std.testing;
+    const cases = [_]struct { raw: []const u8, path: []const []const u8 }{
+        .{ .raw = "{\"http.method\":\"GET\",\"note\":\"old\"}", .path = &.{ "http", "method" } },
+        .{ .raw = "{\"http\":{\"method\":\"GET\"},\"note\":\"old\"}", .path = &.{"http.method"} },
+        .{
+            .raw = "{\"http.method\":\"GET\",\"http\":{\"method\":\"POST\"},\"note\":\"old\"}",
+            .path = &.{ "http", "method" },
+        },
+    };
+    for (cases) |case| {
+        var log: DatadogLog = .{ .message = case.raw };
+        defer log.deinit(testing.allocator);
+        try testing.expectEqualStrings("GET", log.unwrappedAttribute(testing.allocator, case.path).?);
+        try testing.expect(log.setWrapped(testing.allocator, &.{"note"}, "new"));
+        const after = log.unwrappedAttribute(testing.allocator, case.path);
+        try testing.expect(after != null);
+        try testing.expectEqualStrings("GET", after.?);
+        log.finalizeWrapped(testing.allocator);
+        try testing.expectEqualStrings("GET", log.unwrappedAttribute(testing.allocator, case.path).?);
+    }
+}
+
+test "DatadogLog - replacing a wrapped ancestor removes its old descendants" {
+    const testing = std.testing;
+    var log: DatadogLog = .{ .message = "{\"http\":{\"token\":\"secret\"}}" };
+    defer log.deinit(testing.allocator);
+    const path = &[_][]const u8{ "http", "token" };
+    try testing.expectEqualStrings("secret", log.unwrappedAttribute(testing.allocator, path).?);
+    try testing.expect(log.setWrapped(testing.allocator, &.{"http"}, "redacted"));
+    try testing.expect(log.unwrappedAttribute(testing.allocator, path) == null);
+    log.finalizeWrapped(testing.allocator);
+    try testing.expect(log.unwrappedAttribute(testing.allocator, path) == null);
+    try testing.expectEqualStrings("{\"http\":\"redacted\"}", log.message_rewrapped.?);
+}
+
 test "DatadogLog - parseRaw rejects malformed container interiors (parse parity)" {
     // Regression: FieldWalker.valueEnd skipped the interior bytes of a
     // container, so a malformed unknown-field value went into `extra_spans`

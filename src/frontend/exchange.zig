@@ -310,26 +310,18 @@ fn sendBody(
         .stream, .chunked => bufs.pump,
     };
     std.debug.assert(write_buf.len > 0);
+    upstream_req.transfer_encoding = switch (body) {
+        .bytes => |b| .{ .content_length = b.len },
+        .stream => |st| .{ .content_length = st.len },
+        .chunked => .chunked,
+    };
+    var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
     switch (body) {
-        .bytes => |b| {
-            upstream_req.transfer_encoding = .{ .content_length = b.len };
-            var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
-            try body_writer.writer.writeAll(b);
-            try body_writer.end();
-        },
-        .stream => |st| {
-            upstream_req.transfer_encoding = .{ .content_length = st.len };
-            var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
-            try st.reader.streamExact(&body_writer.writer, st.len);
-            try body_writer.end();
-        },
-        .chunked => |ch| {
-            upstream_req.transfer_encoding = .chunked;
-            var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
-            _ = try pipeline_mod.streamReaderToWriter(ch.reader, &body_writer.writer, ch.max_bytes);
-            try body_writer.end();
-        },
+        .bytes => |b| try body_writer.writer.writeAll(b),
+        .stream => |st| try st.reader.streamExact(&body_writer.writer, st.len),
+        .chunked => |ch| _ = try pipeline_mod.streamReaderToWriter(ch.reader, &body_writer.writer, ch.max_bytes),
     }
+    try body_writer.end();
     try upstream_req.connection.?.flush();
 }
 
