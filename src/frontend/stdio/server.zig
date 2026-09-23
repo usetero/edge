@@ -1,13 +1,13 @@
-//! std.Io-native frontend: accept loop on std.Io.net (PLAN.md §9). One
+//! std.Io-native frontend: accept loop on std.Io.net. One
 //! concurrent task per connection via Lifecycle.spawn; the Io implementation
 //! decides what "concurrent" means. Shutdown is structured:
 //! Lifecycle.shutdown cancels the accept task and every connection task
 //! together.
 //!
-//! Owns the frontend-specific per-connection state — the conn slab and the
-//! arena pool (PLAN-FRONTEND-SWAP.md §2) — so composing a different frontend
-//! never pays this one's memory reservation. Body-sized scratch and the
-//! upstream deadline watchdog are shared with httpz (../thread_bufs.zig).
+//! Owns the frontend-specific per-connection state (the conn slab and the
+//! arena pool), so composing a different frontend never pays this one's
+//! memory reservation. Body-sized scratch and the upstream deadline watchdog
+//! are shared with httpz (../thread_bufs.zig).
 const std = @import("std");
 const conn_mod = @import("conn.zig");
 const exec = @import("../exec.zig");
@@ -46,11 +46,7 @@ pub const HttpServer = struct {
         var arenas: arena_pool_mod.ArenaPool = try .init(ctx.gpa, ctx.limits);
         errdefer arenas.deinit(ctx.gpa);
 
-        var addr_buf: [64]u8 = undefined;
-        const addr_str = try std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
-            listen_address[0], listen_address[1], listen_address[2], listen_address[3],
-        });
-        const address = try std.Io.net.IpAddress.parse(addr_str, listen_port);
+        const address: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = listen_address, .port = listen_port } };
         const listener = try address.listen(ctx.io, .{
             .reuse_address = true,
             // Default 128 overflows instantly when a load spike (or error
@@ -119,7 +115,8 @@ pub const HttpServer = struct {
                     if (self.ctx.metrics) |metrics| metrics.recordConnectionShed(.concurrency);
                     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
                     self.ctx.bus.warn(ConnectionShed{ .reason = "io_concurrency_unavailable", .answered = 503 });
-                    shedConnection(io, stream);
+                    defer stream.close(io);
+                    conn_mod.writeRawResponse(self.ctx, io, stream, conn_mod.shed_response, 503);
                 },
             };
         }
@@ -131,14 +128,4 @@ fn watchUpstreamDeadlines(ctx: *exec.SharedCtx, lifecycle: *lifecycle_mod.Lifecy
         try ctx.io.sleep(.fromMilliseconds(thread_bufs.watchdog_interval_ms), .awake);
         thread_bufs.expireTrackedUpstreams(ctx, false);
     }
-}
-
-fn shedConnection(io: std.Io, stream: std.Io.net.Stream) void {
-    defer stream.close(io);
-    var buf: [256]u8 = undefined;
-    var writer = std.Io.net.Stream.Writer.init(stream, io, &buf);
-    writer.interface.writeAll(
-        conn_mod.shed_response,
-    ) catch return;
-    writer.interface.flush() catch return;
 }

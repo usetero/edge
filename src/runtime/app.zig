@@ -245,19 +245,9 @@ pub const Engine = struct {
         errdefer self.upstreams.deinit();
         const max_body = options.max_body_size;
         const upstream_ids: exec_mod.UpstreamIds = .{
-            .default = try self.upstreams.createUpstream(options.upstream_url, 2048, max_body, max_body),
-            .logs = try self.upstreams.createUpstream(
-                options.logs_url orelse options.upstream_url,
-                2048,
-                max_body,
-                max_body,
-            ),
-            .metrics = try self.upstreams.createUpstream(
-                options.metrics_url orelse options.upstream_url,
-                2048,
-                max_body,
-                max_body,
-            ),
+            .default = try self.upstreams.createUpstream(options.upstream_url, max_body),
+            .logs = try self.upstreams.createUpstream(options.logs_url orelse options.upstream_url, max_body),
+            .metrics = try self.upstreams.createUpstream(options.metrics_url orelse options.upstream_url, max_body),
         };
 
         std.debug.assert(kinds.len <= self.services_buf.len);

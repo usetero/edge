@@ -9,10 +9,8 @@ const std = @import("std");
 const log = std.log.scoped(.lifecycle);
 
 pub const Lifecycle = struct {
-    /// All long-lived tasks. Spawn with `spawn`; connection tasks MUST be
-    /// concurrent (Group.async tasks are not guaranteed to run until the
-    /// group is awaited — verified against 0.16 docs, see
-    /// .rewrite/zigdoc-notes.md).
+    /// All long-lived tasks. Connection tasks must be concurrent: a
+    /// Group.async task may not run until the group is awaited.
     group: std.Io.Group,
     /// Flipped exactly once; pollable from accept loops between blocking ops.
     shutdown_requested: std.atomic.Value(bool),

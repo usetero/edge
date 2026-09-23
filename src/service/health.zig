@@ -1,13 +1,9 @@
 //! Health service: static 200 response, no upstream, no body read.
-//! Ported from modules/health_module.zig.
 const std = @import("std");
 const service = @import("service.zig");
 
-/// Every method, not only GET. The route is what claims the path, so a
-/// GET-only route let `HEAD /_health` and `POST /_health` fall through to the
-/// wildcard passthrough and travel to the intake. A load balancer configured
-/// for HEAD then tested the intake instead of this process, and failed
-/// whenever the intake was unreachable.
+/// Every method, not only GET. The route claims the path, so no method on
+/// `/_health` falls through to the passthrough and reaches the intake.
 pub const routes = [_]service.RoutePattern{
     .exact("/_health", .all),
 };

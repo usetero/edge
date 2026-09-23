@@ -14,6 +14,7 @@ const limits_mod = @import("../core/limits.zig");
 const ThreadBufs = thread_bufs.ThreadBufs;
 
 // Named event payloads: the type name is the telemetry event name.
+const UpstreamConnectionError = struct { err: []const u8, phase: []const u8 };
 const UpstreamRetried = struct { path: []const u8, err: []const u8 };
 /// A pooled connection failed and was destroyed instead of re-pooled.
 const UpstreamConnectionEvicted = struct { path: []const u8, err: []const u8 };
@@ -57,14 +58,18 @@ pub const Inbound = struct {
 // `begin` commits status and headers and returns the body writer; `end`
 // finishes the body. Each frontend has a small adapter.
 
-/// What goes upstream: a slice the frontend already buffered, a body still on
-/// the inbound socket with its declared length, or a `chunked` body with no
-/// length. The pump forwards a `chunked` body as chunked transfer-encoding.
-/// The first send consumes a stream or chunked source; neither is retried.
+/// What goes upstream. The first send consumes a `lazy` or `streamed` body,
+/// so neither is retried.
 pub const BodySource = union(enum) {
+    /// Fully buffered by the frontend. Zero-copy slice.
     bytes: []const u8,
-    stream: struct { reader: *std.Io.Reader, len: usize },
-    chunked: struct { reader: *std.Io.Reader, max_bytes: usize },
+    /// Still on the client socket. `len` is the declared Content-Length. The
+    /// frontend already checked it against max_body_size.
+    lazy: struct { reader: *std.Io.Reader, len: usize },
+    /// Still on the client socket with no declared length (chunked). The pump
+    /// enforces `max_bytes` and forwards the body as chunked. The policy paths
+    /// drain it through `paths.residentBody`.
+    streamed: struct { reader: *std.Io.Reader, max_bytes: usize },
 };
 
 /// Upper bound on forwarded request headers; excess is an error, not a
@@ -115,7 +120,82 @@ pub fn openUpstream(
     in: Inbound,
     choice: service_mod.UpstreamChoice,
 ) !std.http.Client.Request {
-    return exec.openUpstream(ctx, in.arena, in.method, in.target, in.headers, choice);
+    return open(ctx, in, choice, &ctx.upstreams.http_client);
+}
+
+/// Opens a request against the configured upstream on `client`. The retry
+/// path gives the client that keeps no idle connections. `in.headers` must be
+/// hop-by-hop-filtered and stay valid for the request life. `in.target` goes
+/// upstream verbatim.
+fn open(
+    ctx: *exec.SharedCtx,
+    in: Inbound,
+    choice: service_mod.UpstreamChoice,
+    client: *std.http.Client,
+) !std.http.Client.Request {
+    const query_start = std.mem.findScalar(u8, in.target, '?');
+    const path = if (query_start) |i| in.target[0..i] else in.target;
+    const query = if (query_start) |i| in.target[i + 1 ..] else "";
+
+    const upstream_id = ctx.upstream_ids.resolve(choice);
+    const uri_str = try ctx.upstreams.buildUpstreamUri(in.arena, upstream_id, path, query);
+    const uri = try std.Uri.parse(uri_str);
+
+    return client.request(in.method, uri, .{
+        .extra_headers = in.headers,
+        .redirect_behavior = .unhandled,
+        .headers = .{ .accept_encoding = .omit },
+    }) catch |err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.err(UpstreamConnectionError{ .err = @errorName(err), .phase = "connect" });
+        return err;
+    };
+}
+
+/// Collects the upstream response headers a frontend relays to the client.
+/// It skips hop-by-hop and transport-owned headers. It copies the values
+/// into the arena, because the head strings die when the body reader exists.
+pub fn collectUpstreamResponseHeaders(
+    upstream_res: *std.http.Client.Response,
+    arena: std.mem.Allocator,
+    buffer: []std.http.Header,
+) ![]std.http.Header {
+    // RFC 7230 §6.1: headers listed in the Connection field are hop-by-hop
+    // and must not be forwarded. Collect all Connection-option tokens first.
+    var conn_opts: std.ArrayList([]const u8) = .empty;
+    {
+        var it = upstream_res.head.iterateHeaders();
+        while (it.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+            var tok_it = std.mem.tokenizeScalar(u8, header.value, ',');
+            while (tok_it.next()) |tok| {
+                const name = std.mem.trim(u8, tok, " \t");
+                if (name.len > 0) try conn_opts.append(arena, name);
+            }
+        }
+    }
+
+    var count: usize = 0;
+    var it = upstream_res.head.iterateHeaders();
+    while (it.next()) |header| {
+        if (upstream_mod.shouldSkipResponseHeader(header.name)) continue;
+        // Also skip any header nominated as hop-by-hop via Connection.
+        var skip = false;
+        for (conn_opts.items) |opt| {
+            if (std.ascii.eqlIgnoreCase(header.name, opt)) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+        if (count >= buffer.len) break;
+        buffer[count] = .{
+            .name = try arena.dupe(u8, header.name),
+            .value = try arena.dupe(u8, header.value),
+        };
+        count += 1;
+    }
+    return buffer[0..count];
 }
 
 /// Open the upstream request, dialing a second time if the first dial fails.
@@ -139,13 +219,13 @@ fn dialUpstream(
             });
         }
     }
-    return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client) catch |err| {
+    return open(ctx, in, choice, client) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         ctx.bus.info(UpstreamRetried{ .path = in.path, .err = @errorName(err) });
         // Counted like any other retry: a dial storm is invisible otherwise,
         // since only this log line records it.
         if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(true);
-        return exec.openUpstreamWithClient(ctx, in.arena, in.method, in.target, in.headers, choice, client);
+        return open(ctx, in, choice, client);
     };
 }
 
@@ -173,11 +253,11 @@ pub fn exchange(
     replayable: bool,
 ) !void {
     const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
-    if (body == .stream or body == .chunked) _ = try bufs.ensurePump(ctx.gpa);
+    if (body == .lazy or body == .streamed) _ = try bufs.ensurePump(ctx.gpa);
     const retry = body == .bytes and (replayable or in.method == .GET or in.method == .HEAD);
     const attempts: usize = if (retry) 2 else 1;
     for (0..attempts) |attempt| {
-        const client = if (attempt == 0) ctx.upstreams.getHttpClient() else &ctx.upstreams.retry_client;
+        const client = if (attempt == 0) &ctx.upstreams.http_client else &ctx.upstreams.retry_client;
         if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(attempt > 0);
         var upstream_req = try dialUpstream(ctx, in, choice, client);
         defer upstream_req.deinit();
@@ -202,7 +282,7 @@ pub fn exchange(
                     break :blk early;
                 } else |_| {}
             }
-            // Our cap on a chunked body, hit mid-send: half the body is
+            // Our cap on a streamed body, hit mid-send: half the body is
             // upstream, so the connection must close, but the upstream did
             // nothing wrong and must not be reported as evicted.
             if (err == error.BodyTooLarge) {
@@ -249,7 +329,7 @@ fn relayResponse(
     var extra_headers: [64]std.http.Header = undefined;
     // Read before the body reader exists: creating it invalidates the head.
     const declared = upstream_res.head.content_length;
-    const relayed = try exec.collectUpstreamResponseHeaders(upstream_res, arena, &extra_headers);
+    const relayed = try collectUpstreamResponseHeaders(upstream_res, arena, &extra_headers);
     const out = try sink.begin(@intFromEnum(upstream_res.head.status), relayed);
     const upstream_body = upstream_res.reader(bufs.upstream);
     const copied = try pipeline_mod.streamReaderToWriter(upstream_body, out, max_response_body);
@@ -293,8 +373,8 @@ fn sendAndReceiveHead(
 }
 
 /// Send the request body upstream. A buffered slice goes out with an exact
-/// content-length. A `stream` or `chunked` source pumps socket to socket
-/// through the pump buffer that `exchange` sized. The chunked pump enforces
+/// content-length. A `lazy` or `streamed` source pumps socket to socket
+/// through the pump buffer that `exchange` sized. The `streamed` pump enforces
 /// `max_bytes` mid-stream, because the frontend had no length to pre-check.
 fn sendBody(
     upstream_req: *std.http.Client.Request,
@@ -303,23 +383,23 @@ fn sendBody(
     bufs: *ThreadBufs,
 ) !void {
     if (!method.requestHasBody()) return upstream_req.sendBodiless();
-    // `stream` and `chunked` read into the thread's pump buffer; `bytes` reuses
+    // `lazy` and `streamed` read into the thread's pump buffer; `bytes` reuses
     // the upstream write buffer (the body is already resident).
     const write_buf = switch (body) {
         .bytes => bufs.upstream,
-        .stream, .chunked => bufs.pump,
+        .lazy, .streamed => bufs.pump,
     };
     std.debug.assert(write_buf.len > 0);
     upstream_req.transfer_encoding = switch (body) {
         .bytes => |b| .{ .content_length = b.len },
-        .stream => |st| .{ .content_length = st.len },
-        .chunked => .chunked,
+        .lazy => |st| .{ .content_length = st.len },
+        .streamed => .chunked,
     };
     var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
     switch (body) {
         .bytes => |b| try body_writer.writer.writeAll(b),
-        .stream => |st| try st.reader.streamExact(&body_writer.writer, st.len),
-        .chunked => |ch| _ = try pipeline_mod.streamReaderToWriter(ch.reader, &body_writer.writer, ch.max_bytes),
+        .lazy => |st| try st.reader.streamExact(&body_writer.writer, st.len),
+        .streamed => |ch| _ = try pipeline_mod.streamReaderToWriter(ch.reader, &body_writer.writer, ch.max_bytes),
     }
     try body_writer.end();
     try upstream_req.connection.?.flush();
@@ -446,4 +526,84 @@ test "only write-side failures are probed for an early upstream response" {
     try testing.expect(!isSendSideFailure(error.ReadFailed));
     try testing.expect(!isSendSideFailure(error.UnexpectedEndOfStream));
     try testing.expect(!isSendSideFailure(error.HttpConnectionClosing));
+}
+
+test "collectUpstreamResponseHeaders strips hop-by-hop Connection and transport headers" {
+    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
+        "content-type: application/json\r\n" ++
+        "connection: close\r\n" ++
+        "x-foo: bar\r\n" ++
+        "content-length: 42\r\n" ++
+        "transfer-encoding: chunked\r\n\r\n";
+
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+    var upstream_res: std.http.Client.Response = .{ .request = undefined, .head = head };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var buffer: [16]std.http.Header = undefined;
+    const relayed = try collectUpstreamResponseHeaders(&upstream_res, arena.allocator(), &buffer);
+
+    // Exactly the two end-to-end headers survive; hop-by-hop Connection and
+    // transport-owned content-length/transfer-encoding are dropped.
+    try testing.expectEqual(@as(usize, 2), relayed.len);
+
+    var saw_content_type = false;
+    var saw_x_foo = false;
+    for (relayed) |header| {
+        try testing.expect(!upstream_mod.shouldSkipResponseHeader(header.name));
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            try testing.expectEqualStrings("application/json", header.value);
+            saw_content_type = true;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-foo")) {
+            try testing.expectEqualStrings("bar", header.value);
+            saw_x_foo = true;
+        } else {
+            return error.UnexpectedRelayedHeader;
+        }
+    }
+    try testing.expect(saw_content_type);
+    try testing.expect(saw_x_foo);
+}
+
+test "collectUpstreamResponseHeaders strips Connection-nominated hop-by-hop headers" {
+    // An upstream that uses Connection: X-Upstream-State to mark a
+    // per-connection field.  That field must not be relayed downstream.
+    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
+        "content-type: text/plain\r\n" ++
+        "connection: X-Upstream-State, Keep-Alive\r\n" ++
+        "x-upstream-state: active\r\n" ++
+        "keep-alive: timeout=5\r\n" ++
+        "x-end-to-end: ok\r\n" ++
+        "content-length: 5\r\n\r\n";
+
+    const head = try std.http.Client.Response.Head.parse(response_bytes);
+    var upstream_res: std.http.Client.Response = .{ .request = undefined, .head = head };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var buffer: [16]std.http.Header = undefined;
+    const relayed = try collectUpstreamResponseHeaders(&upstream_res, arena.allocator(), &buffer);
+
+    // Only the two genuine end-to-end headers should survive.
+    // content-length, connection, x-upstream-state, and keep-alive are all dropped.
+    try testing.expectEqual(@as(usize, 2), relayed.len);
+
+    var saw_content_type = false;
+    var saw_x_end_to_end = false;
+    for (relayed) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            try testing.expectEqualStrings("text/plain", header.value);
+            saw_content_type = true;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-end-to-end")) {
+            try testing.expectEqualStrings("ok", header.value);
+            saw_x_end_to_end = true;
+        } else {
+            return error.UnexpectedRelayedHeader;
+        }
+    }
+    try testing.expect(saw_content_type);
+    try testing.expect(saw_x_end_to_end);
 }

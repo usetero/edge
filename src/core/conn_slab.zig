@@ -13,7 +13,6 @@ const log = std.log.scoped(.conn_slab);
 /// generation into the handle makes stale-handle use detectable (ABA guard)
 /// while keeping references at 32 bits per DoD guidelines.
 pub const ConnId = enum(u32) {
-    none = std.math.maxInt(u32),
     _,
 
     fn pack(slot: u16, gen: u16) ConnId {
@@ -21,43 +20,18 @@ pub const ConnId = enum(u32) {
     }
 
     pub fn index(self: ConnId) u16 {
-        std.debug.assert(self != .none);
         return @truncate(@intFromEnum(self));
     }
 
     pub fn generation(self: ConnId) u16 {
-        std.debug.assert(self != .none);
         return @truncate(@intFromEnum(self) >> 16);
     }
 };
 
-/// Connection lifecycle states; transitions are asserted in setState so a
-/// driver bug surfaces as a crash in debug builds, not silent corruption.
-pub const ConnState = enum(u8) {
-    free,
-    accepted,
-    reading_head,
-    piping,
-    responding,
-    closing,
-
-    fn legalNext(self: ConnState, next: ConnState) bool {
-        return switch (self) {
-            .free => next == .accepted,
-            .accepted => next == .reading_head or next == .closing,
-            .reading_head => next == .piping or next == .responding or next == .closing,
-            .piping => next == .responding or next == .closing,
-            // keep-alive loops back to reading_head for the next request.
-            .responding => next == .reading_head or next == .closing,
-            .closing => next == .free,
-        };
-    }
-};
-
-/// Hot data: touched on every state transition. SoA via MultiArrayList keeps
-/// the state bytes densely packed for scans.
+/// Hot data: touched on every claim and release. `claimed` lets claim and
+/// release assert that a slot is not claimed twice or released twice.
 const ConnHot = struct {
-    state: ConnState,
+    claimed: bool,
     generation: u16,
 };
 
@@ -93,7 +67,7 @@ pub const ConnSlab = struct {
         var hot: std.MultiArrayList(ConnHot) = .empty;
         errdefer hot.deinit(gpa);
         try hot.resize(gpa, n);
-        for (0..n) |i| hot.set(i, .{ .state = .free, .generation = 0 });
+        for (0..n) |i| hot.set(i, .{ .claimed = false, .generation = 0 });
 
         // The buffer region is page-granular and process-lifetime; going
         // through page_allocator keeps reserved-but-untouched pages out of
@@ -163,8 +137,8 @@ pub const ConnSlab = struct {
         const slot = self.free_list[self.free_count];
 
         const entry = self.hot.get(slot);
-        std.debug.assert(entry.state == .free);
-        self.hot.set(slot, .{ .state = .accepted, .generation = entry.generation });
+        std.debug.assert(!entry.claimed);
+        self.hot.set(slot, .{ .claimed = true, .generation = entry.generation });
         self.sockets[slot] = null;
         return ConnId.pack(slot, entry.generation);
     }
@@ -183,24 +157,18 @@ pub const ConnSlab = struct {
 
         const slot = self.checkedIndex(id);
         const entry = self.hot.get(slot);
-        std.debug.assert(entry.state != .free);
-        self.hot.set(slot, .{ .state = .free, .generation = entry.generation +% 1 });
+        std.debug.assert(entry.claimed);
+        self.hot.set(slot, .{ .claimed = false, .generation = entry.generation +% 1 });
         self.sockets[slot] = null;
 
         std.debug.assert(self.free_count < self.free_list.len);
         self.free_list[self.free_count] = slot;
         self.free_count += 1;
 
-        // One madvise per connection close: tell the OS these pages are no
-        // longer needed. On Linux (DONTNEED) pages are immediately zeroed and
-        // deducted from RSS. On macOS (FREE_REUSABLE) they're immediately
-        // reclaimable and drop from the physical footprint. Pages are re-faulted
-        // as zeroed on next use — the slab's zero-alloc hot path is preserved.
-        //
-        // madvise requires page-aligned address and length. In production all
-        // buffer size constants are multiples of 4 KiB, so the slot region is
-        // naturally aligned. Tests use tiny buffer sizes where it isn't; the
-        // aligned_end ≤ aligned_base guard skips the call safely.
+        // Decommit the slot's pages: DONTNEED on Linux, FREE_REUSABLE on
+        // macOS. The next use faults in zeroed pages, with no allocation.
+        // madvise needs page-aligned bounds; the guard skips a slot that is
+        // not aligned.
         const page = std.heap.page_size_min;
         const base = @as(usize, slot) * self.limits.perConnBytes();
         const aligned_base = std.mem.alignForward(usize, base, page);
@@ -217,16 +185,6 @@ pub const ConnSlab = struct {
                 log.warn("madvise failed for slot {d}: {s}", .{ slot, @errorName(err) });
             };
         }
-    }
-
-    pub fn setState(self: *ConnSlab, io: std.Io, id: ConnId, next: ConnState) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-
-        const slot = self.checkedIndex(id);
-        const entry = self.hot.get(slot);
-        std.debug.assert(entry.state.legalNext(next));
-        self.hot.set(slot, .{ .state = next, .generation = entry.generation });
     }
 
     /// Records the socket a claimed slot is serving. Call once the stream is
@@ -295,25 +253,10 @@ pub const ConnSlab = struct {
 
 const testing = std.testing;
 
-fn testLimits() limits_mod.Limits {
-    return .{
-        .max_connections = 4,
-        .max_body_size = 1024,
-        .record_scratch = 256,
-        .recv_buf = 64,
-        .send_buf = 64,
-        .upstream_write_buf = 64,
-        .body_buf = 32,
-        .chunk_buf = 32,
-        .zstd_window_len = 64,
-        .large_body_buffer_count = 1,
-        .large_body_buffer_size = 1024,
-        .conn_arena_reserve = 64,
-    };
-}
+const test_limits: limits_mod.Limits = .resolve(.{ .max_body_size = 128, .max_connections = 4 });
 
 test "claim and release cycle slots without allocating" {
-    var slab: ConnSlab = try .init(testing.allocator, testLimits());
+    var slab: ConnSlab = try .init(testing.allocator, test_limits);
     defer slab.deinit(testing.allocator);
     const io = testing.io;
 
@@ -328,7 +271,7 @@ test "claim and release cycle slots without allocating" {
 }
 
 test "exhausted slab returns null, recovers after release" {
-    var slab: ConnSlab = try .init(testing.allocator, testLimits());
+    var slab: ConnSlab = try .init(testing.allocator, test_limits);
     defer slab.deinit(testing.allocator);
     const io = testing.io;
 
@@ -349,7 +292,7 @@ test "exhausted slab returns null, recovers after release" {
 }
 
 test "the reserve is reachable only through claimReserved" {
-    var slab: ConnSlab = try .init(testing.allocator, testLimits());
+    var slab: ConnSlab = try .init(testing.allocator, test_limits);
     defer slab.deinit(testing.allocator);
     const io = testing.io;
 
@@ -357,7 +300,7 @@ test "the reserve is reachable only through claimReserved" {
     // The promise: `claim` yields exactly `max_connections` slots, and the
     // reserve is extra.
     const ordinary = slab.free_list.len - slab.reserve;
-    try testing.expectEqual(testLimits().max_connections, ordinary);
+    try testing.expectEqual(test_limits.max_connections, ordinary);
 
     var ids: [8]ConnId = undefined;
     for (ids[0..ordinary]) |*id| id.* = slab.claim(io).?;
@@ -371,7 +314,7 @@ test "the reserve is reachable only through claimReserved" {
 }
 
 test "buffer regions are disjoint per connection and per region" {
-    var slab: ConnSlab = try .init(testing.allocator, testLimits());
+    var slab: ConnSlab = try .init(testing.allocator, test_limits);
     defer slab.deinit(testing.allocator);
     const io = testing.io;
 
@@ -389,49 +332,16 @@ test "buffer regions are disjoint per connection and per region" {
     try testing.expectEqual(@as(u8, 0xBB), slab.sendBuf(a)[0]);
     try testing.expectEqual(@as(u8, 0xCC), slab.bodyBuf(a)[0]);
     try testing.expectEqual(@as(u8, 0xDD), slab.recvBuf(b)[0]);
-    try testing.expectEqual(@as(usize, 64), slab.recvBuf(a).len);
-    try testing.expectEqual(@as(usize, 32), slab.bodyBuf(a).len);
-}
-
-test "state machine transitions are tracked" {
-    var slab: ConnSlab = try .init(testing.allocator, testLimits());
-    defer slab.deinit(testing.allocator);
-    const io = testing.io;
-
-    const id = slab.claim(io).?;
-    slab.setState(io, id, .reading_head);
-    slab.setState(io, id, .piping);
-    slab.setState(io, id, .responding);
-    slab.setState(io, id, .reading_head); // keep-alive
-    slab.setState(io, id, .closing);
-    slab.release(io, id);
-}
-
-// Page-sized buffers, so `release` reaches the madvise call. The default
-// testLimits() buffers are smaller than a page, and the alignment guard skips
-// the decommit.
-fn pageAlignedLimits() limits_mod.Limits {
-    return .{
-        .max_connections = 4,
-        .max_body_size = 4096,
-        .record_scratch = 4096,
-        .recv_buf = 4096,
-        .send_buf = 4096,
-        .upstream_write_buf = 4096,
-        .body_buf = 4096,
-        .chunk_buf = 4096,
-        .zstd_window_len = 4096,
-        .large_body_buffer_count = 1,
-        .large_body_buffer_size = 4096,
-        .conn_arena_reserve = 4096,
-    };
+    try testing.expectEqual(limits_mod.RECV_BUF_BYTES, slab.recvBuf(a).len);
+    try testing.expectEqual(limits_mod.SEND_BUF_BYTES, slab.sendBuf(a).len);
+    try testing.expectEqual(limits_mod.BODY_BUF_BYTES, slab.bodyBuf(a).len);
 }
 
 test "release decommits page-aligned slot buffers and the slot stays usable" {
     // The slab must survive the in-lock decommit: a re-claimed slot is still
     // usable, and on Linux MADV_DONTNEED zeroed it. The race itself needs OS
     // threads; testing.io is single-threaded.
-    var slab: ConnSlab = try .init(testing.allocator, pageAlignedLimits());
+    var slab: ConnSlab = try .init(testing.allocator, test_limits);
     defer slab.deinit(testing.allocator);
     const io = testing.io;
 

@@ -13,11 +13,10 @@ const service_mod = @import("../service/service.zig");
 const pipeline_mod = @import("../pipeline/pipeline.zig");
 const limits_mod = @import("../core/limits.zig");
 const prom = @import("../signals/prometheus/root.zig");
+const runtime_metrics = @import("../runtime/runtime_metrics.zig");
 const exchange = @import("exchange.zig");
 const thread_bufs = @import("thread_bufs.zig");
 
-const log = std.log.scoped(.httpz_server);
-const BodySource = exchange.BodySource;
 const Inbound = exchange.Inbound;
 
 // Named event payloads: the type name is the telemetry event name.
@@ -32,74 +31,71 @@ const PolicyFailedOpen = struct { path: []const u8, stage: []const u8, err: []co
 /// process, then a line per batch at debug: at full rate a line per batch is
 /// its own outage, and `edge_policy_records_dropped_total` carries the rate.
 const BatchDropped = struct { path: []const u8, signal: []const u8, forwarded: bool };
+/// Per-request trace at debug level.
+const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
+/// Same shape at warn level, for a request that held its thread or task.
+const RequestSlow = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 
-pub const InboundBody = union(enum) {
-    /// Fully buffered by the frontend. Zero-copy slice.
-    bytes: []const u8,
-    /// Still on the client socket. `len` is the declared Content-Length,
-    /// already checked against max_body_size by the frontend.
-    lazy: struct { reader: *std.Io.Reader, len: usize },
-    /// Still on the client socket with no declared length (chunked). The pump
-    /// enforces `max_bytes`, the frontend's `max_body_size`. `forward_raw`
-    /// streams it upstream; the policy paths drain it through `residentBody`.
-    /// Never replayable.
-    streamed: struct { reader: *std.Io.Reader, max_bytes: usize },
-};
+/// Warn past this. `RequestCompleted` is debug level, which production turns
+/// off. Without this line, a request that waited seconds on a stalled
+/// upstream leaves no record.
+const slow_request_seconds: f64 = 5;
 
-fn bufferLazyBody(reader: *std.Io.Reader, dst: []u8, len: usize) ![]const u8 {
-    std.debug.assert(len <= dst.len);
-    var fixed: std.Io.Writer = .fixed(dst[0..len]);
-    reader.streamExact(&fixed, len) catch |err| return switch (err) {
-        // The sender closed before `len` bytes arrived.
-        error.EndOfStream => error.InboundBodyTruncated,
-        error.ReadFailed, error.WriteFailed => |e| e,
-    };
-    return dst[0..len];
-}
+/// The frontend decides the variant. See `exchange.BodySource`.
+pub const InboundBody = exchange.BodySource;
 
-/// Forward an inbound body as-is: buffered bytes go with the route's replay
-/// policy. A lazy or streamed body streams socket to socket and cannot be
-/// replayed. A chunked body goes upstream as chunked.
-fn forwardInbound(
-    ctx: *exec.SharedCtx,
-    in: Inbound,
-    sink: anytype,
-    upstream: service_mod.UpstreamChoice,
-    inbound: InboundBody,
-    replayable: bool,
-) !void {
+/// Drain a lazy or streamed body into this thread's body buffer. The policy
+/// paths read the body twice (probe, then encode), so it must be resident.
+/// The thread buffer, not the connection arena, holds the body-sized memory.
+fn residentBody(ctx: *exec.SharedCtx, inbound: InboundBody) ![]const u8 {
+    if (inbound == .bytes) return inbound.bytes;
+    const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
+    const dst = try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size);
     switch (inbound) {
-        .bytes => |b| return exchange.exchange(ctx, in, sink, upstream, .{ .bytes = b }, replayable),
+        .bytes => unreachable,
         .lazy => |l| {
-            const body: BodySource = .{ .stream = .{ .reader = l.reader, .len = l.len } };
-            return exchange.exchange(ctx, in, sink, upstream, body, false);
+            std.debug.assert(l.len <= dst.len);
+            var fixed: std.Io.Writer = .fixed(dst[0..l.len]);
+            l.reader.streamExact(&fixed, l.len) catch |err| return switch (err) {
+                // The sender closed before `len` bytes arrived.
+                error.EndOfStream => error.InboundBodyTruncated,
+                error.ReadFailed, error.WriteFailed => |e| e,
+            };
+            return dst[0..l.len];
         },
-        .streamed => |s| {
-            const body: BodySource = .{ .chunked = .{ .reader = s.reader, .max_bytes = s.max_bytes } };
-            return exchange.exchange(ctx, in, sink, upstream, body, false);
+        .streamed => |st| {
+            var fixed: std.Io.Writer = .fixed(dst);
+            const n = try pipeline_mod.streamReaderToWriter(st.reader, &fixed, st.max_bytes);
+            return dst[0..n];
         },
     }
 }
 
-/// Drain a lazy or streamed body into this thread's body buffer; the policy
-/// paths read the body twice (probe, then encode), so it must be resident.
-/// The thread buffer, not the connection arena, holds the body-sized memory.
-fn residentBody(ctx: *exec.SharedCtx, inbound: InboundBody) ![]const u8 {
-    return switch (inbound) {
-        .bytes => |b| b,
-        .lazy => |l| blk: {
-            const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
-            const dst = try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size);
-            break :blk try bufferLazyBody(l.reader, dst, l.len);
-        },
-        .streamed => |s| blk: {
-            const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
-            const dst = try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size);
-            var fixed: std.Io.Writer = .fixed(dst);
-            const n = try pipeline_mod.streamReaderToWriter(s.reader, &fixed, s.max_bytes);
-            break :blk dst[0..n];
-        },
-    };
+/// Request-end bookkeeping for both frontends: duration and response
+/// metrics, then one trace line. The line is `RequestSlow` at warn level past
+/// `slow_request_seconds`, and `RequestCompleted` at debug level otherwise.
+pub fn finishRequest(
+    ctx: *exec.SharedCtx,
+    method: []const u8,
+    path: []const u8,
+    known_path: runtime_metrics.KnownPathLabel,
+    status: u16,
+    start_ns: i128,
+) void {
+    const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+    if (ctx.metrics) |metrics| {
+        metrics.recordRequestDuration(known_path, elapsed_s);
+        metrics.recordResponse(known_path, runtime_metrics.statusClass(status));
+    }
+    const duration_ms = elapsed_s * std.time.ms_per_s;
+    if (elapsed_s >= slow_request_seconds) {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.warn(RequestSlow{ .method = method, .path = path, .status = status, .duration_ms = duration_ms });
+    } else {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.debug(RequestCompleted{ .method = method, .path = path, .status = status, .duration_ms = duration_ms });
+    }
 }
 
 pub fn execForwardRaw(
@@ -109,12 +105,21 @@ pub fn execForwardRaw(
     body: InboundBody,
     fwd: service_mod.Forward,
 ) !void {
-    return forwardInbound(ctx, in, sink, fwd.upstream, body, fwd.replayable);
+    return exchange.exchange(ctx, in, sink, fwd.upstream, body, fwd.replayable);
+}
+
+/// Report that a policy stage failed to read the batch. Counted as a module
+/// error, because the policy module failed even though the request succeeds.
+fn reportFailOpen(ctx: *exec.SharedCtx, path: []const u8, stage: []const u8, err: anyerror) void {
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    ctx.bus.warn(PolicyFailedOpen{ .path = path, .stage = stage, .err = @errorName(err) });
+    if (ctx.metrics) |metrics| {
+        metrics.recordRequestError(exec.classifyKnownPath(path, .POST), .module);
+    }
 }
 
 /// Forward the untouched batch after a policy stage failed to read it, and
-/// say so. Counted as a module error, because the policy module failed even
-/// though the request succeeds.
+/// say so.
 fn failOpen(
     ctx: *exec.SharedCtx,
     in: Inbound,
@@ -124,11 +129,7 @@ fn failOpen(
     stage: []const u8,
     err: anyerror,
 ) !void {
-    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-    ctx.bus.warn(PolicyFailedOpen{ .path = in.path, .stage = stage, .err = @errorName(err) });
-    if (ctx.metrics) |metrics| {
-        metrics.recordRequestError(exec.classifyKnownPath(in.path, .POST), .module);
-    }
+    reportFailOpen(ctx, in.path, stage, err);
     return exchange.exchange(ctx, in, sink, pipe.upstream, .{ .bytes = raw_body }, pipe.signal == .log);
 }
 
@@ -140,7 +141,7 @@ pub fn execPipeStream(
     pipe: service_mod.PipeStream,
 ) !void {
     if (!exec.policiesActiveFor(ctx.registry, pipe.signal)) {
-        return forwardInbound(ctx, in, sink, pipe.upstream, body, pipe.signal == .log);
+        return exchange.exchange(ctx, in, sink, pipe.upstream, body, pipe.signal == .log);
     }
     // A probe is a dry run and captures no tap records, and an unchanged
     // batch then skips the real pass entirely — so an armed tap would report
@@ -165,7 +166,6 @@ pub fn execPipeStream(
 
     var probe = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
     probe.probe = true;
-    defer probe.deinit();
     var discard: std.Io.Writer.Discarding = .init(&.{});
     const probe_codecs: pipeline_mod.Codecs = .{ .decoder = decoder, .encoder = null };
     const probe_result = pipeline_mod.run(spec, raw_body, &discard.writer, buffers, probe_codecs, &probe);
@@ -192,7 +192,6 @@ pub fn execPipeStream(
     }
     var output: std.Io.Writer.Allocating = try .initCapacity(in.arena, initial_capacity);
     var record_sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
-    defer record_sink.deinit();
     var encode_spec = spec;
     encode_spec.encode = pipe.codec;
     const pooled = if (pipe.codec != .identity) try thread_bufs.encoder_pool.acquire(ctx.gpa) else null;
@@ -226,21 +225,10 @@ pub fn execPipeBuffered(
     const raw_body = try residentBody(ctx, body);
 
     const processed: exec.BufferedResult = exec.processBuffered(ctx, pipe, in.arena, raw_body) catch |err| blk: {
-        // `BodyTooLarge` is the raw cap: the sender framed a batch we will not
-        // carry, and it can split it. `DecodedBodyTooLarge` is our decode
-        // budget, which the sender cannot see, so refusing it destroys data
-        // the intake would have taken — the agent discards a 413 for good.
-        // Fail open on that one and let the intake judge the payload.
+        // BodyTooLarge is the raw cap, which the sender can act on. Fail open
+        // on any other error; see exchange.errorStatus.
         if (err == error.BodyTooLarge) return err;
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.warn(PolicyFailedOpen{
-            .path = in.path,
-            .stage = "buffered",
-            .err = @errorName(err),
-        });
-        if (ctx.metrics) |metrics| {
-            metrics.recordRequestError(exec.classifyKnownPath(in.path, .POST), .module);
-        }
+        reportFailOpen(ctx, in.path, "buffered", err);
         break :blk .{ .body = raw_body, .all_dropped = false };
     };
 
@@ -298,15 +286,16 @@ pub fn execFetchFiltered(
     };
     const declared = upstream_res.head.content_length;
     var extra_headers: [64]std.http.Header = undefined;
-    const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, in.arena, &extra_headers);
+    const relayed = try exchange.collectUpstreamResponseHeaders(&upstream_res, in.arena, &extra_headers);
     const out = try sink.begin(@intFromEnum(upstream_res.head.status), relayed);
 
     try thread_bufs.growBuffer(ctx.gpa, &bufs.scratch, 14336);
     const scratch = bufs.scratch;
+    const max_in = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes;
     var filter: prom.streaming_filter.PolicyStreamingFilter = .init(.{
         .line_buffer = scratch[0..4096],
         .metadata_buffer = scratch[4096..6144],
-        .max_input_bytes = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes,
+        .max_input_bytes = max_in,
         .max_output_bytes = if (fetch.max_output_bytes == 0) std.math.maxInt(usize) else fetch.max_output_bytes,
         .registry = ctx.registry,
         .bus = ctx.bus,
@@ -319,7 +308,6 @@ pub fn execFetchFiltered(
     });
 
     const upstream_body = upstream_res.reader(bufs.upstream);
-    const max_in = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes;
     const copied = pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in);
     // Socket shutdown can surface as EOF, so a successful copy does not prove
     // the response completed. Never finish a timed-out or short exposition.

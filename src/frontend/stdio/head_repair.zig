@@ -2,10 +2,10 @@
 //! std's head parser refuses.
 //!
 //! `std.http.Server.Request.Head.parse` maps the value through
-//! `http.ContentEncoding.fromString`, an exact-match table of seven spellings
-//! (std/http.zig:283). Anything else fails the whole head with
+//! `http.ContentEncoding.fromString`, an exact-match table of seven spellings.
+//! Anything else fails the whole head with
 //! `HttpTransferEncodingUnsupported`, and `Server.receiveHead` flattens that to
-//! `HttpHeadersInvalid` (std/http/Server.zig:53), so the sender gets 400. Two
+//! `HttpHeadersInvalid`, so the sender gets 400. Two
 //! real senders hit that:
 //!
 //!   * `Content-Encoding: GZIP`. RFC 9110 §8.4.1 makes content codings
@@ -53,7 +53,7 @@ pub const Repaired = struct {
     /// A known coding forwards in the spelling every parser takes, which is
     /// the same coding: case carries no meaning (RFC 9110 §8.4.1). A coding we
     /// cannot name forwards exactly as it arrived, because only the receiver
-    /// can decode it. Points into `head_buffer`.
+    /// can decode it. A known coding points into `head_buffer`.
     forward: []const u8,
     reason: Reason,
 };
@@ -93,13 +93,14 @@ pub fn repair(head: []const u8, arena: std.mem.Allocator) Error!Repaired {
         head[value_span.end..],
     });
     const parsed = Head.parse(rewritten) catch return error.NotRepairable;
+    const encoding = try arena.dupe(u8, original);
     return .{
         .head = parsed,
         .head_buffer = rewritten,
-        .encoding = try arena.dupe(u8, original),
+        .encoding = encoding,
         .forward = switch (reason) {
             .encoding_case => rewritten[value_span.start..][0..replacement.len],
-            .encoding_unknown => try arena.dupe(u8, original),
+            .encoding_unknown => encoding,
         },
         .reason = reason,
     };

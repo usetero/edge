@@ -2,9 +2,8 @@
 //! /v1/traces. Protobuf bodies (the dominant encoding) stream through the
 //! otlp_protobuf framer — each top-level ResourceLogs/Metrics/Spans
 //! submessage is a record. JSON bodies are objects the streaming framers
-//! don't cover yet → buffered batch transform, same semantics as the old
-//! module path. Unknown content types forward raw (fail-open), matching
-//! modules/otlp_module.zig.
+//! do not cover, so they go through the buffered batch transform. Unknown
+//! content types forward raw (fail-open).
 const std = @import("std");
 const service = @import("service.zig");
 const framer_mod = @import("../pipeline/framer.zig");

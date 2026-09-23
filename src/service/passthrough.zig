@@ -1,6 +1,5 @@
 //! Passthrough service: raw bidirectional copy to the default upstream, no
-//! evaluation. The wildcard fallback route. Ported from
-//! modules/passthrough_module.zig.
+//! evaluation. The wildcard fallback route.
 const std = @import("std");
 const service = @import("service.zig");
 

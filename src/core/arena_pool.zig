@@ -70,12 +70,9 @@ pub const ArenaPool = struct {
         }
     }
 
-    /// The largest over-reserve capacity already reported. The condition is a
-    /// property of the deployment's cold paths, not of one request, so a line
-    /// per release buries the log: one benchmark produced 19,306 copies of it.
-    /// A high-water mark instead of a flag, because a worse leak later still
-    /// deserves its line, and an arena grows geometrically, so the lines stay
-    /// few. Static, so it counts once for the process rather than per pool.
+    /// The largest over-reserve capacity already reported, for the whole
+    /// process. A high-water mark, not a flag: a worse leak gets its own line,
+    /// and geometric arena growth keeps the lines few.
     var reported_capacity: std.atomic.Value(usize) = .init(0);
 
     /// Reset-don't-free: retained capacity makes steady-state claims
@@ -89,11 +86,7 @@ pub const ArenaPool = struct {
                 capacity, self.reserve,
             });
         }
-        if (!self.arenas[slot].reset(.retain_capacity)) {
-            // Failed resets leave the arena valid but unpooled-capacity; safe
-            // to continue, worth counting if it ever happens.
-            log.warn("arena reset failed for slot {d}", .{slot});
-        }
+        self.reset(slot);
 
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -105,25 +98,10 @@ pub const ArenaPool = struct {
 
 const testing = std.testing;
 
-fn testLimits() limits_mod.Limits {
-    return .{
-        .max_connections = 2,
-        .max_body_size = 1024,
-        .record_scratch = 256,
-        .recv_buf = 64,
-        .send_buf = 64,
-        .upstream_write_buf = 64,
-        .body_buf = 32,
-        .chunk_buf = 32,
-        .zstd_window_len = 64,
-        .large_body_buffer_count = 1,
-        .large_body_buffer_size = 1024,
-        .conn_arena_reserve = 4096,
-    };
-}
+const test_limits: limits_mod.Limits = .resolve(.{ .max_body_size = 128, .max_connections = 4 });
 
 test "claim, allocate, release retains capacity and leaks nothing" {
-    var pool: ArenaPool = try .init(testing.allocator, testLimits());
+    var pool: ArenaPool = try .init(testing.allocator, test_limits);
     defer pool.deinit(testing.allocator);
     const io = testing.io;
 
@@ -141,7 +119,7 @@ test "claim, allocate, release retains capacity and leaks nothing" {
 }
 
 test "slots are independent" {
-    var pool: ArenaPool = try .init(testing.allocator, testLimits());
+    var pool: ArenaPool = try .init(testing.allocator, test_limits);
     defer pool.deinit(testing.allocator);
     const io = testing.io;
 
