@@ -2,76 +2,9 @@ const std = @import("std");
 
 const log = std.log.scoped(.tail_io);
 
-pub const InputSource = union(enum) {
-    stdin,
-    file: []const u8,
-};
-
 pub const OutputTarget = union(enum) {
     stdout,
     file_append: []const u8,
-};
-
-/// Reader endpoint wrapper for edge-tail.
-///
-/// It exposes a stable `*std.Io.Reader` interface regardless of whether the
-/// source is stdin or a file on disk.
-pub const Input = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    file: std.Io.File,
-    close_on_deinit: bool,
-    read_buf: []u8,
-    file_reader: std.Io.File.Reader,
-
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, source: InputSource, read_buf_size: usize) !Input {
-        return switch (source) {
-            .stdin => initStdin(allocator, io, read_buf_size),
-            .file => |path| initFile(allocator, io, path, read_buf_size),
-        };
-    }
-
-    pub fn initStdin(allocator: std.mem.Allocator, io: std.Io, read_buf_size: usize) !Input {
-        const buf = try allocator.alloc(u8, read_buf_size);
-        const file = std.Io.File.stdin();
-        const fr = file.reader(io, buf);
-        return .{
-            .allocator = allocator,
-            .io = io,
-            .file = file,
-            .close_on_deinit = false,
-            .read_buf = buf,
-            .file_reader = fr,
-        };
-    }
-
-    pub fn initFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, read_buf_size: usize) !Input {
-        const buf = try allocator.alloc(u8, read_buf_size);
-        errdefer allocator.free(buf);
-
-        const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
-        errdefer file.close(io);
-
-        const fr = file.reader(io, buf);
-        return .{
-            .allocator = allocator,
-            .io = io,
-            .file = file,
-            .close_on_deinit = true,
-            .read_buf = buf,
-            .file_reader = fr,
-        };
-    }
-
-    pub fn reader(self: *Input) *std.Io.Reader {
-        return &self.file_reader.interface;
-    }
-
-    pub fn deinit(self: *Input) void {
-        if (self.close_on_deinit) self.file.close(self.io);
-        self.allocator.free(self.read_buf);
-        self.* = undefined;
-    }
 };
 
 /// Writer endpoint wrapper for edge-tail.

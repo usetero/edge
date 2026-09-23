@@ -1,7 +1,6 @@
 const std = @import("std");
 const framer_mod = @import("../framer.zig");
 const watch_mod = @import("../watch.zig");
-const types = @import("../types.zig");
 
 pub fn processBatchScalar(
     io: std.Io,
@@ -42,32 +41,11 @@ pub fn eventKey(evt: watch_mod.Event) u64 {
     return @bitCast(@as(i64, evt.file.handle));
 }
 
-pub fn readTailScalar(
-    io: std.Io,
-    framer: *framer_mod.LineFramer,
-    file: *const std.Io.File,
-    start_offset: u64,
-    end_offset: u64,
-    writer: *std.Io.Writer,
-    filter_ctx: *anyopaque,
-    filter_fn: *const framer_mod.LineFramer.LineFilterFn,
-) !void {
-    var off = start_offset;
-    while (off < end_offset) {
-        const remaining = end_offset - off;
-        const to_read: usize = @intCast(@min(remaining, framer.read_buf.len));
-        const n = try file.readPositionalAll(io, framer.read_buf[0..to_read], off);
-        if (n == 0) break;
-        try framer.ingestChunk(framer.read_buf[0..n], writer, filter_ctx, filter_fn);
-        off += n;
-    }
-}
-
 // ============================== Tests ==============================
 
 const testing = std.testing;
 
-fn keepAll(_: *anyopaque, _: []const u8, _: types.LineMeta) !bool {
+fn keepAll(_: *anyopaque, _: []const u8) !bool {
     return true;
 }
 
@@ -85,7 +63,7 @@ const SeenList = struct {
         self.* = undefined;
     }
 
-    fn filter(ctx: *anyopaque, line: []const u8, _: types.LineMeta) !bool {
+    fn filter(ctx: *anyopaque, line: []const u8) !bool {
         const self: *SeenList = @ptrCast(@alignCast(ctx));
         try self.list.append(self.allocator, try self.allocator.dupe(u8, line));
         return true;
@@ -102,11 +80,7 @@ const Opened = struct {
 };
 
 fn openTmp(io: std.Io, dir: std.Io.Dir, name: []const u8, contents: []const u8) !Opened {
-    {
-        const f = try dir.createFile(io, name, .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, contents);
-    }
+    try dir.writeFile(io, .{ .sub_path = name, .data = contents });
     const path = try dir.realPathFileAlloc(io, name, testing.allocator);
     const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
     return .{ .file = file, .path = path };
@@ -140,9 +114,7 @@ test "processBatchScalar: partial line from one file never merges into another" 
 
     _ = try processBatchScalar(io, &framer, &out.writer, &events, &framer, keepAll);
 
-    // file_a's incomplete "partial" is buffered (not emitted) until its line
-    // completes; file_b's complete lines are emitted independently. The
-    // buggy shared-framer path emits "partialhello" as one merged record.
+    // A's partial line stays buffered. B's lines are emitted alone.
     try testing.expectEqualStrings("line1\nhello\nworld\n", out.written());
     try testing.expect(std.mem.indexOf(u8, out.written(), "partialhello") == null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "partial") == null);
@@ -213,9 +185,7 @@ test "processBatchScalar: fail-open overflow from one file does not contaminate 
         a.file.close(io);
         testing.allocator.free(a.path);
     }
-    // file_b's "hello" fits scratch; with isolation it MUST be evaluated as its
-    // own record. Without isolation, file_a's overflowed flag carries over and
-    // "hello" is copied through fail-open, never reaching the filter.
+    // B's "hello" must be evaluated as its own record.
     var b = try openTmp(io, tmp.dir, "b.log", "hello\n");
     defer {
         b.file.close(io);
@@ -244,9 +214,7 @@ test "processBatchScalar: fail-open overflow from one file does not contaminate 
 }
 
 test "processBatchScalar: single-file cross-batch line continuation is unchanged" {
-    // Regression guard: switching to the same key is a no-op, so a single
-    // file's partial line still carries across batches via the shared
-    // scratch — the per-file isolation must not split it into two records.
+    // Re-selecting the same key keeps one file's partial line across batches.
     const io = std.Options.debug_io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

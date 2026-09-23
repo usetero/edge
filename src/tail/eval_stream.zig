@@ -8,15 +8,12 @@ const parse = @import("eval_parse.zig");
 const FilterDecision = policy.FilterDecision;
 pub const PolicyResult = policy.PolicyResult;
 
-const DisabledEvaluator = struct {};
-
 const ActiveEvaluator = struct {
     registry: *policy.Registry,
     engine: policy.PolicyEngine,
     policy_id_buf: [policy.max_matches_per_scan][]const u8 = undefined,
     arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
-    io: std.Io,
 
     fn deinit(self: *ActiveEvaluator) void {
         self.registry.deinit();
@@ -27,10 +24,9 @@ const ActiveEvaluator = struct {
 };
 
 pub const StreamEvaluator = struct {
-    allocator: std.mem.Allocator,
     input_format: types.InputFormat,
     mode: union(enum) {
-        disabled: DisabledEvaluator,
+        disabled,
         active: ActiveEvaluator,
     },
 
@@ -41,11 +37,7 @@ pub const StreamEvaluator = struct {
         bus: *o11y.EventBus,
     ) !StreamEvaluator {
         if (policy_path == null) {
-            return .{
-                .allocator = allocator,
-                .input_format = input_format,
-                .mode = .{ .disabled = .{} },
-            };
+            return .{ .input_format = input_format, .mode = .disabled };
         }
 
         const registry = try allocator.create(policy.Registry);
@@ -69,7 +61,6 @@ pub const StreamEvaluator = struct {
         try registry.updatePolicies(policies, "tail-policy-file", .file);
 
         return .{
-            .allocator = allocator,
             .input_format = input_format,
             .mode = .{
                 .active = .{
@@ -77,7 +68,6 @@ pub const StreamEvaluator = struct {
                     .engine = policy.PolicyEngine.init(bus, registry),
                     .arena = std.heap.ArenaAllocator.init(allocator),
                     .allocator = allocator,
-                    .io = bus.io,
                 },
             },
         };
@@ -96,10 +86,7 @@ pub const StreamEvaluator = struct {
         return result.decision != FilterDecision.drop;
     }
 
-    /// Evaluate a single line. Transforms wired on the registry's accessor
-    /// always run when a matched policy has transforms configured — the
-    /// engine no longer separates a "filter only" mode from "filter + apply
-    /// transforms," that distinction lives in policy configuration now.
+    /// Evaluate one line. Matched policies apply their transforms.
     pub fn evalLineResult(self: *StreamEvaluator, line: []const u8) !PolicyResult {
         return switch (self.mode) {
             .disabled => PolicyResult.unmatched,

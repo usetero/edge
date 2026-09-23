@@ -20,10 +20,8 @@ fn initEventBus(io: std.Io, environ_map: *const std.process.Environ.Map) o11y.St
 }
 
 // =============================================================================
-// Signal handling: sigwait thread requests structured shutdown through the
-// Lifecycle (PLAN.md §9 Phase 6 — same pattern as runtime/app.zig); the old
-// async-signal handler + polled atomic are gone. Second INT/TERM force-exits.
-// USR1 wakes the waiter for clean teardown.
+// Signal handling: a sigwait thread requests shutdown through the Lifecycle.
+// A second INT or TERM exits the process. USR1 wakes the waiter for teardown.
 // =============================================================================
 
 const SignalWaiterContext = struct {
@@ -92,17 +90,13 @@ fn teardownSignalWaiter(handle: SignalWaiterHandle, shutdown_waiter: *std.atomic
     std.posix.sigprocmask(std.posix.SIG.SETMASK, &handle.previous_mask, null);
 }
 
-/// Runtime scaffold for edge-tail.
-///
-/// This first implementation is intentionally narrow and IO-interface focused:
-/// Reader endpoint -> framer -> Writer endpoint.
-/// Watch/discovery/checkpoint modules will plug in as the next step.
+/// Runtime for edge-tail: input, framer, policy filter, output.
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     environ_map: *const std.process.Environ.Map,
     cfg: types.TailConfig,
-    watch_backend: watch_mod.BackendKind = .poll,
+    watch_backend: watch_mod.BackendKind,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -126,51 +120,13 @@ pub const Runtime = struct {
         };
     }
 
-    fn evalLineFilter(ctx: *anyopaque, line: []const u8, meta: types.LineMeta) anyerror!bool {
-        _ = meta;
+    fn evalLineFilter(ctx: *anyopaque, line: []const u8) anyerror!bool {
         const evaluator: *eval_stream.StreamEvaluator = @ptrCast(@alignCast(ctx));
         return evaluator.evalLine(line);
     }
 
-    pub fn runStream(self: *Runtime, input: *io_mod.Input, output: *io_mod.Output) !void {
-        var stdio_bus = initEventBus(self.io, self.environ_map);
-        var evaluator = try eval_stream.StreamEvaluator.init(
-            self.allocator,
-            self.cfg.input_format,
-            self.cfg.policy_path,
-            stdio_bus.eventBus(),
-        );
-        defer evaluator.deinit();
-
-        var framer = try framer_mod.LineFramer.init(self.allocator, self.cfg.read_buf, self.cfg.max_line);
-        defer framer.deinit();
-
-        try framer.pump(
-            self.allocator,
-            input.reader(),
-            output.writer(),
-            self.cfg.read_buf,
-            &evaluator,
-            evalLineFilter,
-        );
-        try output.flush();
-    }
-
     /// File tail loop using the concrete watcher backend.
     pub fn runFilesLoop(self: *Runtime, inputs: []const []const u8, output: *io_mod.Output) !void {
-        switch (self.watch_backend) {
-            .poll => try self.runFilesLoopBackend(.poll, inputs, output),
-            .uring => try self.runFilesLoopBackend(.uring, inputs, output),
-            .kqueue => try self.runFilesLoopBackend(.kqueue, inputs, output),
-        }
-    }
-
-    fn runFilesLoopBackend(
-        self: *Runtime,
-        comptime backend: watch_mod.BackendKind,
-        inputs: []const []const u8,
-        output: *io_mod.Output,
-    ) !void {
         var stdio_bus = initEventBus(self.io, self.environ_map);
         var framer = try framer_mod.LineFramer.init(self.allocator, self.cfg.read_buf, self.cfg.max_line);
         defer framer.deinit();
@@ -187,7 +143,7 @@ pub const Runtime = struct {
         var watcher = try watch_mod.Watcher.init(
             self.allocator,
             self.io,
-            backend,
+            self.watch_backend,
             inputs,
             self.cfg.output_path,
             self.cfg.read_from,
@@ -212,9 +168,8 @@ pub const Runtime = struct {
         const checkpoint_lane: ?*checkpoint_mod.Lane = if (self.cfg.read_from == .checkpoint) &checkpoint else null;
         if (checkpoint_lane) |lane| watcher.applyCheckpointLane(lane);
 
-        // Both long-lived tasks — the checkpoint lane worker and the poll
-        // loop — run as concurrent tasks in one lifecycle group; shutdown is
-        // a single structured cancel (PLAN.md §9 Phase 6).
+        // The checkpoint worker and the poll loop run in one lifecycle group.
+        // One cancel stops both.
         var lifecycle: lifecycle_mod.Lifecycle = .init;
 
         var signal_count = std.atomic.Value(u32).init(0);
@@ -231,11 +186,8 @@ pub const Runtime = struct {
             },
         }
 
-        // If startup fails after the signal waiter is installed (i.e. before
-        // the lifecycle tasks are running and awaited), shut down the lifecycle
-        // and tear down the waiter before propagating the error so that no
-        // background threads are left pointing at stack-local state and the
-        // signal mask is restored.
+        // If startup fails after this point, stop the lifecycle and the
+        // signal waiter. This restores the signal mask.
         var startup_done = false;
         errdefer if (!startup_done) {
             lifecycle.requestShutdown(self.io);
@@ -274,16 +226,10 @@ pub const Runtime = struct {
         try Runtime.drainFramer(self.cfg.read_from, &framer, output, &evaluator);
         if (loop.failure) |err| return err;
     }
-    /// Emit whatever the framer is still holding in scratch, then flush.
-    ///
-    /// The watcher sizes events to the raw stat size, not to a newline
-    /// boundary, so a trailing record without a `\n` sits in scratch and
-    /// `deinit` would free it silently. Scoped to `.tail`/`.checkpoint`:
-    /// `.head` re-reads the whole file from 0 on restart, so emitting at
-    /// shutdown would duplicate it. `finish` drains the parked per-file
-    /// streams as well as the active one, so a multi-file batch loses
-    /// nothing. Parse errors from a half-record are swallowed so the flush
-    /// still runs; allocation and writer errors propagate.
+    /// Emit the partial records that the framer holds, then flush. Events end
+    /// at the stat size, so a last record without a newline stays in scratch.
+    /// `.head` skips this because it re-reads from 0 on restart. Parse errors
+    /// from a partial record do not stop the flush.
     fn drainFramer(
         read_from: types.ReadFrom,
         framer: *framer_mod.LineFramer,
@@ -300,11 +246,9 @@ pub const Runtime = struct {
     }
 };
 
-/// The poll loop as a lifecycle task: collect → batch-read/filter →
-/// checkpoint → cadenced flush. Cancellation lands as error.Canceled out of
-/// the sleep (or mid-batch through the Io file ops) and unwinds cleanly; a
-/// non-cancel failure is recorded and requests shutdown so the runtime exits
-/// with it — same observable behavior as the old `try`-driven loop.
+/// Poll loop task: collect, read and filter, checkpoint, flush. A cancel
+/// unwinds as error.Canceled. Other errors go to `failure` and request
+/// shutdown.
 const PollLoop = struct {
     runtime: *Runtime,
     framer: *framer_mod.LineFramer,
@@ -354,10 +298,9 @@ const PollLoop = struct {
                     if (evt.identity) |id| {
                         _ = self.checkpoint.enqueue(.{
                             .identity = id,
-                            .byte_offset = evt.end_offset,
-                            .last_seen_size = evt.end_offset,
+                            .offset = evt.end_offset,
                             .last_seen_ns = @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds()),
-                        }) catch false;
+                        });
                     }
                 }
                 buffered_lines += processed;
@@ -376,41 +319,21 @@ const PollLoop = struct {
     }
 };
 
-/// Stdin pump loop as a lifecycle task: the blocking `framer.pumpFileStreaming`
-/// runs on a worker thread so the structured-shutdown signal waiter can cancel
-/// it cooperatively (PLAN.md §9 Phase 6 — analogous to `PollLoop` for file
-/// tailing). `pumpFileStreaming` reads stdin directly via `file.readStreaming`
-/// (one short `readv` per iteration, no reader-side internal-buffer prefetch),
-/// so a cancel interrupts the blocked `readv` and surfaces as `error.Canceled`
-/// (not converted to `ReadFailed` by `File.Reader.readVecStreaming`) and no
-/// prefetched bytes are stranded when the pump unwinds. The main thread then
-/// flushes the residual write buffer after the task joins, so no in-flight
-/// bytes are lost on `SIGINT`/`SIGTERM` — only the unframed tail of a partial
-/// line can be dropped, matching the file loop. A normal stdin EOF completes
-/// the pump and requests shutdown so the main thread's `awaitShutdown` returns
-/// and flushes the residual — the post-EOF flush the old `runStream` did on
-/// the pump thread, now done on the uncanceled main thread.
+/// Stdin pump as a lifecycle task. `pumpFileStreaming` does one short readv
+/// per iteration with no prefetch, so a cancel stops the readv as
+/// error.Canceled and strands no bytes. After the join, the main thread
+/// flushes the write buffer. Stdin EOF requests shutdown.
 ///
-/// Two correctness constraints shape `runStdinToOutput`:
+/// `runStdinToOutput` has two constraints:
 ///
-/// 1. The pump must run on a worker (not the main) thread. The Threaded Io
-///    backend only cancels syscalls on registered worker threads
-///    (`Thread.current` is set solely in `Threaded.worker`), so a blocking
-///    `readv` on the main thread cannot be interrupted by `Group.cancel`.
-///    `lifecycle.spawn` puts the read on a worker where
-///    `signalCanceledSyscall` (`tgkill`/`pthread_kill`) can reach it.
+/// 1. The pump runs on a worker thread. The Threaded Io backend cancels
+///    syscalls only on its worker threads.
 ///
-/// 2. `installSignalWaiter` must run BEFORE the worker is spawned. It blocks
-///    `SIGINT`/`SIGTERM`/`SIGUSR1` in the calling thread; threads created
-///    afterwards inherit that mask. The sigwait thread and the pump worker
-///    therefore both have the signals blocked, so a process-directed
-///    SIGINT/SIGTERM stays pending and is consumed by `sigwait` (requesting
-///    shutdown) instead of landing on the worker with default disposition and
-///    hard-killing the process. Spawning the worker first — as the file loop
-///    does — leaves the worker's mask unblocked and breaks signal handling.
+/// 2. `installSignalWaiter` runs before the spawn. The worker inherits the
+///    blocked mask, so `sigwait` receives INT and TERM.
 const StdinLoop = struct {
     runtime: *Runtime,
-    input: *io_mod.Input,
+    file: std.Io.File,
     output: *io_mod.Output,
     framer: *framer_mod.LineFramer,
     evaluator: *eval_stream.StreamEvaluator,
@@ -420,7 +343,7 @@ const StdinLoop = struct {
     fn run(self: *StdinLoop) std.Io.Cancelable!void {
         self.framer.pumpFileStreaming(
             self.runtime.io,
-            self.input.file,
+            self.file,
             self.output.writer(),
             self.evaluator,
             Runtime.evalLineFilter,
@@ -444,6 +367,10 @@ const StdinLoop = struct {
     }
 };
 
+fn outputTarget(cfg: types.TailConfig) io_mod.OutputTarget {
+    return if (std.mem.eql(u8, cfg.output_path, "-")) .stdout else .{ .file_append = cfg.output_path };
+}
+
 pub fn runStdinToOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -452,15 +379,7 @@ pub fn runStdinToOutput(
 ) !void {
     var runtime = try Runtime.init(allocator, io, environ_map, cfg);
 
-    var input = try io_mod.Input.init(allocator, io, .stdin, cfg.read_buf);
-    defer input.deinit();
-
-    const out_target: io_mod.OutputTarget = if (std.mem.eql(u8, cfg.output_path, "-"))
-        .stdout
-    else
-        .{ .file_append = cfg.output_path };
-
-    var output = try io_mod.Output.init(allocator, io, out_target, cfg.write_buf);
+    var output = try io_mod.Output.init(allocator, io, outputTarget(cfg), cfg.write_buf);
     defer output.deinit();
 
     var stdio_bus = initEventBus(io, environ_map);
@@ -474,25 +393,16 @@ pub fn runStdinToOutput(
     var framer = try framer_mod.LineFramer.init(allocator, cfg.read_buf, cfg.max_line);
     defer framer.deinit();
 
-    // Run the pump as a lifecycle task so the blocking read can be canceled
-    // cooperatively on signal (structured shutdown, PLAN.md §9 Phase 6). The
-    // main thread awaits shutdown, then flushes the residual write buffer on
-    // this (uncanceled) thread.
     var lifecycle: lifecycle_mod.Lifecycle = .init;
     var loop: StdinLoop = .{
         .runtime = &runtime,
-        .input = &input,
+        .file = std.Io.File.stdin(),
         .output = &output,
         .framer = &framer,
         .evaluator = &evaluator,
         .lifecycle = &lifecycle,
     };
 
-    // Block INT/TERM/USR1 and start the sigwait thread BEFORE spawning the
-    // pump worker: the worker inherits the blocked mask, so a
-    // process-directed SIGINT/SIGTERM is consumed by `sigwait` (→
-    // requestShutdown → cooperative cancel) instead of hitting the worker
-    // with default disposition and hard-killing the process.
     var signal_count = std.atomic.Value(u32).init(0);
     var shutdown_waiter = std.atomic.Value(bool).init(false);
     var signal_waiter: ?SignalWaiterHandle = null;
@@ -511,22 +421,14 @@ pub fn runStdinToOutput(
     lifecycle.awaitShutdown(io) catch |err| switch (err) {
         error.Canceled => {},
     };
-    // Cancel (and join) the pump task directly rather than via
-    // `lifecycle.shutdown`, which logs "all tasks drained" on every run —
-    // including a clean stdin EOF, where it would pollute stderr. On EOF the
-    // task is already done (a no-op join); on signal this interrupts the
-    // blocked readv so the pump unwinds with `error.Canceled`. The assert
-    // mirrors the one `shutdown` would have performed.
+    // Cancel the group directly. `lifecycle.shutdown` logs on every run and
+    // pollutes stderr on a clean EOF.
     std.debug.assert(lifecycle.isShuttingDown());
     lifecycle.group.cancel(io);
 
     if (signal_waiter) |waiter| teardownSignalWaiter(waiter, &shutdown_waiter);
 
-    // The canceled task can't reliably do final IO; drain and flush the
-    // residual write buffer on this (uncanceled) thread. This is the fix for
-    // the lost-residual-on-signal bug: without it, up to `write_buf` bytes
-    // (64 KiB default) were lost on SIGINT/SIGTERM because the process was
-    // hard-killed before the only post-EOF `output.flush()` could run.
+    // Flush on this uncanceled thread, so a signal loses no written bytes.
     try output.flush();
     if (loop.failure) |err| return err;
 }
@@ -540,12 +442,7 @@ pub fn runFilesToOutput(
 ) !void {
     var runtime = try Runtime.init(allocator, io, environ_map, cfg);
 
-    const out_target: io_mod.OutputTarget = if (std.mem.eql(u8, cfg.output_path, "-"))
-        .stdout
-    else
-        .{ .file_append = cfg.output_path };
-
-    var output = try io_mod.Output.init(allocator, io, out_target, cfg.write_buf);
+    var output = try io_mod.Output.init(allocator, io, outputTarget(cfg), cfg.write_buf);
     defer output.deinit();
 
     try runtime.runFilesLoop(inputs, &output);
@@ -553,19 +450,16 @@ pub fn runFilesToOutput(
 
 const testing = std.testing;
 
-test "runtime public API: runStream copies framed bytes" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.Options.debug_io;
-    const in_path = "in.log";
+// Runs the StdinLoop coordination without the signal waiter, so the test
+// runner's signal mask stays unchanged. Returns the output bytes.
+fn runStdinLoopForTest(
+    io: std.Io,
+    tmp: *testing.TmpDir,
+    in_path: []const u8,
+    policy_path: ?[]const u8,
+    buf_size: usize,
+) ![]u8 {
     const out_path = "out.log";
-    {
-        const f = try tmp.dir.createFile(io, in_path, .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "a\nb\n");
-    }
-
     const abs_in = try tmp.dir.realPathFileAlloc(io, in_path, testing.allocator);
     defer testing.allocator.free(abs_in);
     const cwd_abs = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
@@ -575,126 +469,16 @@ test "runtime public API: runStream copies framed bytes" {
 
     const cfg: types.TailConfig = .{
         .output_path = abs_out,
-        .read_buf = 16,
+        .policy_path = policy_path,
+        .read_buf = buf_size,
         .max_line = 1024,
-        .write_buf = 16,
+        .write_buf = buf_size,
     };
     var env_map = std.process.Environ.Map.init(testing.allocator);
     defer env_map.deinit();
     var runtime = try Runtime.init(testing.allocator, io, &env_map, cfg);
-
-    var input = try io_mod.Input.init(testing.allocator, io, .{ .file = abs_in }, cfg.read_buf);
-    defer input.deinit();
-    var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out }, cfg.write_buf);
-    defer output.deinit();
-
-    try runtime.runStream(&input, &output);
-
-    const got = try tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
-    defer testing.allocator.free(got);
-    try testing.expectEqualStrings("a\nb\n", got);
-}
-
-test "runtime public API: runStream applies policy drops" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const io = std.Options.debug_io;
-    const in_path = "in.log";
-    const out_path = "out.log";
-    const policy_path = "policies.json";
-    {
-        const f = try tmp.dir.createFile(io, in_path, .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "ok\ndebug line\nnext\n");
-    }
-    {
-        const f = try tmp.dir.createFile(io, policy_path, .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io,
-            \\{
-            \\  "policies": [
-            \\    {
-            \\      "id": "drop-debug",
-            \\      "name": "drop-debug",
-            \\      "log": {
-            \\        "match": [{ "log_field": "body", "regex": "debug" }],
-            \\        "keep": "none"
-            \\      }
-            \\    }
-            \\  ]
-            \\}
-        );
-    }
-
-    const abs_in = try tmp.dir.realPathFileAlloc(io, in_path, testing.allocator);
-    defer testing.allocator.free(abs_in);
-    const abs_policy = try tmp.dir.realPathFileAlloc(io, policy_path, testing.allocator);
-    defer testing.allocator.free(abs_policy);
-    const cwd_abs = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
-    defer testing.allocator.free(cwd_abs);
-    const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
-    defer testing.allocator.free(abs_out);
-
-    const cfg: types.TailConfig = .{
-        .output_path = abs_out,
-        .policy_path = abs_policy,
-        .input_format = .raw,
-        .read_buf = 32,
-        .max_line = 1024,
-        .write_buf = 32,
-    };
-    var env_map = std.process.Environ.Map.init(testing.allocator);
-    defer env_map.deinit();
-    var runtime = try Runtime.init(testing.allocator, io, &env_map, cfg);
-
-    var input = try io_mod.Input.init(testing.allocator, io, .{ .file = abs_in }, cfg.read_buf);
-    defer input.deinit();
-    var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out }, cfg.write_buf);
-    defer output.deinit();
-
-    try runtime.runStream(&input, &output);
-
-    const got = try tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
-    defer testing.allocator.free(got);
-    try testing.expectEqualStrings("ok\nnext\n", got);
-}
-
-test "runtime stdin path: structured StdinLoop task flushes residual on EOF" {
-    // Exercises the structured-shutdown coordination `runStdinToOutput` uses
-    // (spawn pump task → awaitShutdown → cancel/join → flush on the main
-    // thread) without installing the signal waiter, so it doesn't touch the
-    // test runner's process signal mask. The pump task reaches EOF, requests
-    // shutdown, and the main thread flushes the residual write buffer.
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const in_path = "in.log";
-    const out_path = "out.log";
-    {
-        const f = try tmp.dir.createFile(io, in_path, .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "a\nb\n");
-    }
-
-    const abs_in = try tmp.dir.realPathFileAlloc(io, in_path, testing.allocator);
-    defer testing.allocator.free(abs_in);
-    const cwd_abs = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
-    defer testing.allocator.free(cwd_abs);
-    const abs_out = try std.fs.path.join(testing.allocator, &.{ cwd_abs, out_path });
-    defer testing.allocator.free(abs_out);
-
-    const cfg: types.TailConfig = .{
-        .output_path = abs_out,
-        .read_buf = 16,
-        .max_line = 1024,
-        .write_buf = 16,
-    };
-    var env_map = std.process.Environ.Map.init(testing.allocator);
-    defer env_map.deinit();
-    var runtime = try Runtime.init(testing.allocator, io, &env_map, cfg);
-    var input = try io_mod.Input.init(testing.allocator, io, .{ .file = abs_in }, cfg.read_buf);
-    defer input.deinit();
+    const in_file = try std.Io.Dir.cwd().openFile(io, abs_in, .{ .mode = .read_only });
+    defer in_file.close(io);
     var output = try io_mod.Output.init(testing.allocator, io, .{ .file_append = abs_out }, cfg.write_buf);
     defer output.deinit();
 
@@ -712,7 +496,7 @@ test "runtime stdin path: structured StdinLoop task flushes residual on EOF" {
     var lifecycle: lifecycle_mod.Lifecycle = .init;
     var loop: StdinLoop = .{
         .runtime = &runtime,
-        .input = &input,
+        .file = in_file,
         .output = &output,
         .framer = &framer,
         .evaluator = &evaluator,
@@ -723,14 +507,49 @@ test "runtime stdin path: structured StdinLoop task flushes residual on EOF" {
     lifecycle.awaitShutdown(io) catch |err| switch (err) {
         error.Canceled => {},
     };
-    // Mirror `runStdinToOutput`: cancel/join the pump task without the
-    // "all tasks drained" log so a clean EOF keeps stderr quiet.
+    // Cancel the group directly, as `runStdinToOutput` does.
     lifecycle.group.cancel(io);
 
     try output.flush();
     if (loop.failure) |err| return err;
 
-    const got = try tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
+    return tmp.dir.readFileAlloc(io, out_path, testing.allocator, .limited(1024));
+}
+
+test "runtime stdin path: StdinLoop applies policy drops" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.log", .data = "ok\ndebug line\nnext\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "policies.json", .data =
+        \\{
+        \\  "policies": [
+        \\    {
+        \\      "id": "drop-debug",
+        \\      "name": "drop-debug",
+        \\      "log": {
+        \\        "match": [{ "log_field": "body", "regex": "debug" }],
+        \\        "keep": "none"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    });
+    const abs_policy = try tmp.dir.realPathFileAlloc(io, "policies.json", testing.allocator);
+    defer testing.allocator.free(abs_policy);
+
+    const got = try runStdinLoopForTest(io, &tmp, "in.log", abs_policy, 32);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("ok\nnext\n", got);
+}
+
+test "runtime stdin path: structured StdinLoop task flushes residual on EOF" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.log", .data = "a\nb\n" });
+
+    const got = try runStdinLoopForTest(io, &tmp, "in.log", null, 16);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("a\nb\n", got);
 }

@@ -36,18 +36,6 @@ pub fn identityHash(identity: FileIdentity) u64 {
     return hasher.final();
 }
 
-pub fn inodeIdentityHash(identity: FileIdentity) u64 {
-    var hasher = std.hash.Fnv1a_64.init();
-    hasher.update(std.mem.asBytes(&identity.dev));
-    hasher.update(std.mem.asBytes(&identity.inode));
-    return hasher.final();
-}
-
-pub const LineMeta = struct {
-    identity: ?FileIdentity = null,
-    truncated: bool = false,
-};
-
 pub const TailConfig = struct {
     output_path: []const u8 = "-",
     read_from: ReadFrom = .tail,
@@ -127,8 +115,7 @@ test "types public API: validateConfig rejects zero checkpoint cadences" {
     try validateConfig(.{});
 }
 
-test "types public API: identity hash helpers are stable" {
+test "types public API: identity hash is stable" {
     const id: FileIdentity = .{ .dev = 42, .inode = 9, .fingerprint = 1234 };
     try testing.expect(identityHash(id) != 0);
-    try testing.expect(inodeIdentityHash(id) != 0);
 }

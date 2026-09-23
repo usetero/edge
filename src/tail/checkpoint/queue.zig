@@ -5,7 +5,7 @@ pub const UpdateQueue = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     capacity: usize,
-    buf: []checkpoint_types.Update,
+    buf: []checkpoint_types.Value,
     head: usize = 0,
     len: usize = 0,
     mutex: std.Io.Mutex = .init,
@@ -15,7 +15,7 @@ pub const UpdateQueue = struct {
             .allocator = allocator,
             .io = io,
             .capacity = capacity,
-            .buf = try allocator.alloc(checkpoint_types.Update, capacity),
+            .buf = try allocator.alloc(checkpoint_types.Value, capacity),
         };
     }
 
@@ -24,7 +24,7 @@ pub const UpdateQueue = struct {
         self.* = undefined;
     }
 
-    pub fn push(self: *UpdateQueue, update: checkpoint_types.Update) bool {
+    pub fn push(self: *UpdateQueue, update: checkpoint_types.Value) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.len >= self.capacity) return false;
@@ -35,7 +35,7 @@ pub const UpdateQueue = struct {
         return true;
     }
 
-    pub fn pop(self: *UpdateQueue) ?checkpoint_types.Update {
+    pub fn pop(self: *UpdateQueue) ?checkpoint_types.Value {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.len == 0) return null;
@@ -44,12 +44,6 @@ pub const UpdateQueue = struct {
         self.head = (self.head + 1) % self.capacity;
         self.len -= 1;
         return update;
-    }
-
-    pub fn isEmpty(self: *UpdateQueue) bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.len == 0;
     }
 };
 
@@ -61,10 +55,10 @@ test "checkpoint/queue: push/pop is bounded" {
     defer q.deinit();
 
     const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 1, .fingerprint = 1 };
-    try testing.expect(q.push(.{ .identity = id, .byte_offset = 1, .last_seen_size = 1, .last_seen_ns = 1 }));
-    try testing.expect(!q.push(.{ .identity = id, .byte_offset = 2, .last_seen_size = 2, .last_seen_ns = 2 }));
+    try testing.expect(q.push(.{ .identity = id, .offset = 1, .last_seen_ns = 1 }));
+    try testing.expect(!q.push(.{ .identity = id, .offset = 2, .last_seen_ns = 2 }));
 
     const first = q.pop().?;
-    try testing.expectEqual(@as(u64, 1), first.byte_offset);
-    try testing.expectEqual(@as(?checkpoint_types.Update, null), q.pop());
+    try testing.expectEqual(@as(u64, 1), first.offset);
+    try testing.expectEqual(@as(?checkpoint_types.Value, null), q.pop());
 }

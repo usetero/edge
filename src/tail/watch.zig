@@ -76,13 +76,8 @@ pub const Watcher = struct {
         }
         for (inputs) |p| try input_copy.append(allocator, try allocator.dupe(u8, p));
         const out_copy = try allocator.dupe(u8, output_path);
-        // `out_copy` needs no errdefer of its own: it is moved into
-        // `self.output_path` below by a non-errorable struct literal, after
-        // which `errdefer self.deinit()` owns its lifetime. There is no
-        // errorable window between this dupe and that errdefer registration, so
-        // a per-allocation errdefer would only double-free on the
-        // post-`self.deinit()` failure path (e.g. watcher backend registration
-        // errors out of `refreshPaths`).
+        // No errdefer: the literal below moves out_copy into self, and
+        // errdefer self.deinit() frees it.
 
         var self: Watcher = .{
             .allocator = allocator,
@@ -110,11 +105,8 @@ pub const Watcher = struct {
             .next_glob_refresh_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds(),
             .backend_state = .{ .poll = {} },
         };
-        // `self` now owns the backing of `input_copy`/`out_copy`. Detach the
-        // local so the input_copy errdefer above does not double-free what
-        // `self.deinit()` releases on a post-construction failure
-        // (initBackend/refreshPaths errors, incl. watcher backend registration
-        // failures that close a just-committed file handle).
+        // self owns input_copy now. Clear the local so its errdefer does not
+        // free the paths twice.
         input_copy = .empty;
         errdefer self.deinit();
 
@@ -189,11 +181,10 @@ pub const Watcher = struct {
 
         var q: usize = 0;
         while (q < self.dirty_queue.items.len) : (q += 1) {
-            const idx_u32 = self.dirty_queue.items[q];
-            const idx: usize = @intCast(idx_u32);
-            if (idx >= self.paths.items.len) continue;
-            self.dirty.unset(idx_u32);
-            try self.processDirtyIndex(out, idx_u32, read_from, checkpoint_lane);
+            // markDirty rejects bad indexes, and removeTracked clears the queue.
+            const idx = self.dirty_queue.items[q];
+            self.dirty.unset(idx);
+            try self.processDirtyIndex(out, idx, read_from, checkpoint_lane);
         }
         self.dirty_queue.clearRetainingCapacity();
     }
@@ -207,22 +198,20 @@ pub const Watcher = struct {
     }
 
     fn applyCheckpointOffsetOne(self: *Watcher, idx: u32, lane: *checkpoint_mod.Lane) void {
-        if (idx >= self.identities.items.len) return;
-        const i: usize = @intCast(idx);
-        const id = self.identities.items[i] orelse return;
+        const id = self.identities.items[idx] orelse return;
         const off = lane.getOffset(id) orelse return;
-        if (off <= self.offsets.items[i]) return;
+        if (off <= self.offsets.items[idx]) return;
         self.markDirty(idx);
         // An offset above the size means the file shrank while nothing
         // watched it. The prefix seen now cannot vouch for the old bytes, so
         // keep the cursor and re-emit from it (at-least-once).
-        const file = self.files.items[i] orelse return;
+        const file = self.files.items[idx] orelse return;
         const st = fstatHandle(file.handle) catch |err| {
-            log.warn("checkpoint restore skipped for {s}: {s}", .{ self.paths.items[i], @errorName(err) });
+            log.warn("checkpoint restore skipped for {s}: {s}", .{ self.paths.items[idx], @errorName(err) });
             return;
         };
         if (off > st.size) return;
-        self.offsets.items[i] = off;
+        self.offsets.items[idx] = off;
     }
 
     fn collectBackendDirtyCandidates(self: *Watcher) !void {
@@ -249,7 +238,8 @@ pub const Watcher = struct {
         read_from: types.ReadFrom,
         checkpoint_lane: ?*checkpoint_mod.Lane,
     ) !void {
-        if (!(try self.ensureOpenWithCheckpoint(idx, read_from, checkpoint_lane))) return;
+        try self.openTracked(idx, read_from, checkpoint_lane);
+        if (self.files.items[idx] == null) return;
 
         try self.detectPathReplacement(idx);
         const size = self.readActiveSizeOrReset(idx) orelse return;
@@ -258,28 +248,17 @@ pub const Watcher = struct {
         const emitted = try self.emitReadableRange(out, idx, size);
         if (!emitted) {
             try self.maybeSwitchPending(idx, checkpoint_lane);
-            _ = try self.ensureOpenWithCheckpoint(idx, read_from, checkpoint_lane);
+            try self.openTracked(idx, read_from, checkpoint_lane);
         }
     }
 
-    fn ensureOpenWithCheckpoint(
-        self: *Watcher,
-        idx: u32,
-        read_from: types.ReadFrom,
-        checkpoint_lane: ?*checkpoint_mod.Lane,
-    ) !bool {
-        try self.openTracked(idx, read_from, checkpoint_lane);
-        return self.files.items[idx] != null;
-    }
-
     fn readActiveSizeOrReset(self: *Watcher, idx: u32) ?u64 {
-        const i: usize = @intCast(idx);
-        const file = self.files.items[i] orelse return null;
+        const file = self.files.items[idx] orelse return null;
         const st = fstatHandle(file.handle) catch {
             file.close(self.io);
-            self.files.items[i] = null;
-            self.identities.items[i] = null;
-            self.offsets.items[i] = 0;
+            self.files.items[idx] = null;
+            self.identities.items[idx] = null;
+            self.offsets.items[idx] = 0;
             self.clearPending(idx);
             return null;
         };
@@ -287,15 +266,14 @@ pub const Watcher = struct {
     }
 
     fn emitReadableRange(self: *Watcher, out: *std.ArrayList(Event), idx: u32, size: u64) !bool {
-        const i: usize = @intCast(idx);
-        if (size <= self.offsets.items[i]) return false;
+        if (size <= self.offsets.items[idx]) return false;
         try out.append(self.allocator, .{
-            .file = &self.files.items[i].?,
-            .start_offset = self.offsets.items[i],
+            .file = &self.files.items[idx].?,
+            .start_offset = self.offsets.items[idx],
             .end_offset = size,
-            .identity = self.identities.items[i],
+            .identity = self.identities.items[idx],
         });
-        self.offsets.items[i] = size;
+        self.offsets.items[idx] = size;
         return true;
     }
 
@@ -303,15 +281,13 @@ pub const Watcher = struct {
         const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
         for (self.matched.items) |*m| m.* = false;
 
-        var refs: std.ArrayList([]const u8) = .empty;
-        defer refs.deinit(self.allocator);
-        try refs.ensureTotalCapacity(self.allocator, self.inputs.items.len);
-        for (self.inputs.items) |p| refs.appendAssumeCapacity(p);
+        var expanded = try expandPatterns(self.allocator, self.io, self.inputs.items);
+        defer {
+            for (expanded.items) |p| self.allocator.free(p);
+            expanded.deinit(self.allocator);
+        }
 
-        var expanded = try expandPatterns(self.allocator, self.io, refs.items);
-        defer expanded.deinit();
-
-        for (expanded.items.items) |p| {
+        for (expanded.items) |p| {
             if (!shouldTrackPath(self.output_path, p)) continue;
             if (self.findIndexByPath(p)) |idx| {
                 self.markExistingPathMatched(@intCast(idx), now);
@@ -324,10 +300,8 @@ pub const Watcher = struct {
     }
 
     fn markExistingPathMatched(self: *Watcher, idx: u32, now: i128) void {
-        const i: usize = @intCast(idx);
-        if (i >= self.paths.items.len) return;
-        self.matched.items[i] = true;
-        self.last_match_ns.items[i] = now;
+        self.matched.items[idx] = true;
+        self.last_match_ns.items[idx] = now;
         self.markDirty(idx);
     }
 
@@ -382,7 +356,6 @@ pub const Watcher = struct {
     fn removeTracked(self: *Watcher, idx: usize) void {
         if (self.files.items[idx]) |f| f.close(self.io);
         self.clearPending(@intCast(idx));
-        self.backendRemoveTracked(@intCast(idx));
 
         self.allocator.free(self.paths.items[idx]);
         _ = self.paths.swapRemove(idx);
@@ -432,13 +405,7 @@ pub const Watcher = struct {
         };
         self.files.items[idx] = file;
         self.initHeadPrefix(idx, size) catch |err| log.warn("initHeadPrefix on open failed: {}", .{err});
-        self.offsets.items[idx] = if (self.seen_once.items[idx])
-            0
-        else switch (read_from) {
-            .head => 0,
-            .tail => size,
-            .checkpoint => 0,
-        };
+        self.offsets.items[idx] = if (!self.seen_once.items[idx] and read_from == .tail) size else 0;
         self.seen_once.items[idx] = true;
         // Checkpoints initialize a newly opened file; the watcher owns its
         // cursor from then on, including across truncation and regrowth.
@@ -448,13 +415,12 @@ pub const Watcher = struct {
     }
 
     fn detectPathReplacement(self: *Watcher, idx: u32) !void {
-        const i: usize = @intCast(idx);
-        if (self.files.items[i] == null) return;
-        if (self.pending_files.items[i] != null) return;
+        if (self.files.items[idx] == null) return;
+        if (self.pending_files.items[idx] != null) return;
 
         var path_file = std.Io.Dir.cwd().openFile(
             self.io,
-            self.paths.items[i],
+            self.paths.items[idx],
             .{ .mode = .read_only },
         ) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -463,32 +429,27 @@ pub const Watcher = struct {
         errdefer path_file.close(self.io);
 
         const path_st = try fstatHandle(path_file.handle);
-        const cur_st = try fstatHandle(self.files.items[i].?.handle);
+        const cur_st = try fstatHandle(self.files.items[idx].?.handle);
         if (path_st.dev == cur_st.dev and path_st.ino == cur_st.ino) {
             path_file.close(self.io);
             return;
         }
 
-        self.pending_identities.items[i] = .{
+        self.pending_identities.items[idx] = .{
             .dev = @intCast(path_st.dev),
             .inode = @intCast(path_st.ino),
             .fingerprint = try computeFingerprint(self.io, path_file),
         };
-        self.pending_files.items[i] = path_file;
-        self.pending_detected_ns.items[i] = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
+        self.pending_files.items[idx] = path_file;
+        self.pending_detected_ns.items[idx] = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
     }
 
-    /// Recompute the CRC32 fingerprint from the live file after a same-inode
-    /// content rewrite is detected (copytruncate / in-place rewrite). The
-    /// watcher pins `identities.items[i].fingerprint` at open time and never
-    /// refreshes it for the same inode otherwise; without this refresh, every
-    /// post-rotation enqueue is filed under the stale fingerprint, so a
-    /// checkpoint-based restart misses `by_identity` and (without the
-    /// store-level gate) silently resumes from a stale cross-version offset.
+    /// Recompute the fingerprint after a same-inode rewrite. Checkpoints use
+    /// the fingerprint as a key. A stale fingerprint files new offsets under
+    /// the old content.
     fn refreshIdentityFingerprint(self: *Watcher, idx: u32, file: std.Io.File) !void {
-        const i: usize = @intCast(idx);
-        if (self.identities.items[i]) |id| {
-            self.identities.items[i] = .{
+        if (self.identities.items[idx]) |id| {
+            self.identities.items[idx] = .{
                 .dev = id.dev,
                 .inode = id.inode,
                 .fingerprint = try computeFingerprint(self.io, file),
@@ -497,99 +458,74 @@ pub const Watcher = struct {
     }
 
     fn maybeHandleContentRewrite(self: *Watcher, idx: u32, size: u64) !void {
-        const i: usize = @intCast(idx);
-        const file = self.files.items[i] orelse return;
-        if (size == 0) {
-            if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
-            self.head_prefix_lens.items[i] = 0;
-            self.head_prefix_hashes.items[i] = 0;
-            return;
-        }
-
-        var prefix_len: u64 = self.head_prefix_lens.items[i];
-        if (prefix_len == 0) {
-            prefix_len = @min(@as(u64, 64), size);
-            self.head_prefix_lens.items[i] = @intCast(prefix_len);
-            self.head_prefix_hashes.items[i] = try prefixHash(self.io, file, prefix_len);
-            try self.refreshIdentityFingerprint(idx, file);
-            return;
-        }
-
-        if (size < prefix_len) {
-            if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
-            const new_len: u64 = @min(@as(u64, 64), size);
-            self.head_prefix_lens.items[i] = @intCast(new_len);
-            self.head_prefix_hashes.items[i] = try prefixHash(self.io, file, new_len);
-            try self.refreshIdentityFingerprint(idx, file);
+        const file = self.files.items[idx] orelse return;
+        const prefix_len: u64 = self.head_prefix_lens.items[idx];
+        if (prefix_len == 0 or size < prefix_len) {
+            // First observation, empty file, or a shrink below the prefix.
+            if (size == 0 or size < prefix_len) self.offsets.items[idx] = 0;
+            try self.initHeadPrefix(idx, size);
+            if (size > 0) try self.refreshIdentityFingerprint(idx, file);
             return;
         }
 
         const observed = try prefixHash(self.io, file, prefix_len);
-        if (observed == self.head_prefix_hashes.items[i]) {
+        if (observed == self.head_prefix_hashes.items[idx]) {
             // Prefix unchanged: the file may have shrunk. Clamp the offset to
             // the size, so no delivered bytes are re-emitted.
-            if (size < self.offsets.items[i]) self.offsets.items[i] = size;
-            // The identity fingerprint may have been computed on a shorter file
-            // (e.g. after a partially written copytruncate).  Refresh it so that
-            // ongoing checkpoints and a future checkpoint-based restart both use
-            // a fingerprint that covers the current file content rather than the
-            // partial prefix.
-            try self.refreshIdentityFingerprint(idx, file);
-            return;
+            if (size < self.offsets.items[idx]) self.offsets.items[idx] = size;
+        } else {
+            self.offsets.items[idx] = 0;
+            self.head_prefix_hashes.items[idx] = observed;
         }
-
-        if (self.offsets.items[i] > 0) self.offsets.items[i] = 0;
-        self.head_prefix_hashes.items[i] = observed;
+        // The fingerprint can come from a shorter file. Refresh it so
+        // checkpoints cover the current content.
         try self.refreshIdentityFingerprint(idx, file);
     }
 
     fn maybeSwitchPending(self: *Watcher, idx: u32, checkpoint_lane: ?*checkpoint_mod.Lane) !void {
-        const i: usize = @intCast(idx);
-        if (self.pending_files.items[i] == null) return;
+        if (self.pending_files.items[idx] == null) return;
 
-        const cur_file = self.files.items[i] orelse {
-            try self.switchToPending(idx, checkpoint_lane);
-            self.markDirty(idx);
-            return;
-        };
-
-        const cur_st = fstatHandle(cur_file.handle) catch {
+        if (self.files.items[idx]) |cur_file| {
+            if (fstatHandle(cur_file.handle)) |cur_st| {
+                // Drain the old file, and wait for the rotate delay.
+                if (cur_st.size > self.offsets.items[idx]) return;
+                const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
+                if (now - self.pending_detected_ns.items[idx] < self.rotate_wait_ns) return;
+            } else |err| {
+                log.warn("fstat of the rotated file failed for {s}: {s}. Switch now.", .{
+                    self.paths.items[idx],
+                    @errorName(err),
+                });
+            }
             cur_file.close(self.io);
-            try self.switchToPending(idx, checkpoint_lane);
-            self.markDirty(idx);
-            return;
-        };
-        const cur_size: u64 = cur_st.size;
-        if (cur_size > self.offsets.items[i]) return;
-        const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
-        if (now - self.pending_detected_ns.items[i] < self.rotate_wait_ns) return;
-
-        cur_file.close(self.io);
+        }
         try self.switchToPending(idx, checkpoint_lane);
         self.markDirty(idx);
     }
 
+    /// Put the pending file in the slot. The caller closes the old handle.
     fn switchToPending(self: *Watcher, idx: u32, checkpoint_lane: ?*checkpoint_mod.Lane) !void {
-        const i: usize = @intCast(idx);
-        const next_file = self.pending_files.items[i] orelse return;
-        self.files.items[i] = next_file;
-        self.identities.items[i] = self.pending_identities.items[i];
-        self.pending_files.items[i] = null;
-        self.pending_identities.items[i] = null;
-        self.pending_detected_ns.items[i] = 0;
-        self.offsets.items[i] = 0;
+        const next_file = self.pending_files.items[idx] orelse return;
+        // Unregister the old handle, so the backend watches only the new file.
+        self.backendRemoveTracked(idx);
+        self.files.items[idx] = next_file;
+        self.identities.items[idx] = self.pending_identities.items[idx];
+        self.pending_files.items[idx] = null;
+        self.pending_identities.items[idx] = null;
+        self.pending_detected_ns.items[idx] = 0;
+        self.offsets.items[idx] = 0;
 
         const st = try fstatHandle(next_file.handle);
         try self.initHeadPrefix(idx, st.size);
         if (checkpoint_lane) |lane| self.applyCheckpointOffsetOne(idx, lane);
+        try self.backendTrackOpenFile(idx, self.paths.items[idx], next_file.handle);
     }
 
     fn clearPending(self: *Watcher, idx: u32) void {
-        const i: usize = @intCast(idx);
-        if (self.pending_files.items[i]) |f| f.close(self.io);
-        self.pending_files.items[i] = null;
-        self.pending_identities.items[i] = null;
-        self.pending_detected_ns.items[i] = 0;
+        if (self.pending_files.items[idx]) |f| f.close(self.io);
+        self.pending_files.items[idx] = null;
+        self.pending_identities.items[idx] = null;
+        self.pending_detected_ns.items[idx] = 0;
     }
 
     pub fn markDirty(self: *Watcher, idx: u32) void {
@@ -599,13 +535,11 @@ pub const Watcher = struct {
         self.dirty_queue.append(self.allocator, idx) catch |err| log.warn("dirty_queue append failed: {}", .{err});
     }
 
-    pub fn parseInotifyEvents(self: *Watcher, wd_to_idx: *const std.AutoHashMap(i32, u32), buf: []const u8) void {
-        var off: usize = 0;
-        while (off + @sizeOf(std.os.linux.inotify_event) <= buf.len) {
-            const ev_size = @sizeOf(std.os.linux.inotify_event);
-            const ev = std.mem.bytesAsValue(std.os.linux.inotify_event, buf[off .. off + ev_size]);
-            if (wd_to_idx.get(ev.wd)) |idx| self.markDirty(idx);
-            off += @sizeOf(std.os.linux.inotify_event) + ev.len;
+    /// Mark every tracked path in `dir_path` dirty.
+    pub fn markDirDirty(self: *Watcher, dir_path: []const u8) void {
+        for (self.paths.items, 0..) |path, i| {
+            const tracked_dir = std.fs.path.dirname(path) orelse ".";
+            if (std.mem.eql(u8, tracked_dir, dir_path)) self.markDirty(@intCast(i));
         }
     }
 
@@ -642,8 +576,6 @@ pub const Watcher = struct {
     }
 
     fn initHeadPrefix(self: *Watcher, idx: u32, size: u64) !void {
-        if (idx >= self.files.items.len) return;
-        if (self.files.items[idx] == null) return;
         const len: u64 = @min(@as(u64, 64), size);
         self.head_prefix_lens.items[idx] = @intCast(len);
         if (len == 0) {
@@ -715,29 +647,19 @@ fn prefixHash(io: std.Io, file: std.Io.File, len: u64) !u64 {
     return hasher.final();
 }
 
-const ExpandedPaths = struct {
-    allocator: std.mem.Allocator,
-    items: std.ArrayList([]u8),
-
-    fn init(allocator: std.mem.Allocator) ExpandedPaths {
-        return .{ .allocator = allocator, .items = .empty };
+/// The caller frees each path and the list.
+fn expandPatterns(allocator: std.mem.Allocator, io: std.Io, inputs: []const []const u8) !std.ArrayList([]u8) {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| allocator.free(p);
+        out.deinit(allocator);
     }
-    fn deinit(self: *ExpandedPaths) void {
-        for (self.items.items) |p| self.allocator.free(p);
-        self.items.deinit(self.allocator);
-        self.* = undefined;
-    }
-};
-
-fn expandPatterns(allocator: std.mem.Allocator, io: std.Io, inputs: []const []const u8) !ExpandedPaths {
-    var out = ExpandedPaths.init(allocator);
-    errdefer out.deinit();
     for (inputs) |input| {
         if (!isGlobPattern(input)) {
-            try out.items.append(allocator, try allocator.dupe(u8, input));
+            try out.append(allocator, try allocator.dupe(u8, input));
             continue;
         }
-        try expandOnePattern(allocator, io, input, &out.items);
+        try expandOnePattern(allocator, io, input, &out);
     }
     return out;
 }
@@ -799,11 +721,7 @@ test "watch public API: collect emits appended file bytes" {
     defer tmp.cleanup();
 
     const io = std.Options.debug_io;
-    {
-        const f = try tmp.dir.createFile(io, "tail.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "seed\n");
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = "seed\n" });
     const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
@@ -827,40 +745,22 @@ test "watch public API: collect emits appended file bytes" {
 }
 
 test "watch public API: init cleans up cleanly when backend registration fails after slot commit (no double-close)" {
-    // Regression test for the double-close defect: `openTracked` commits the
-    // file handle into `self.files.items[idx]` *before* the final
-    // `try self.backendTrackOpenFile(...)`. Its errdefer must close the file AND
-    // null the slot, otherwise `deinit`'s cleanup loop re-closes the already-
-    // closed handle (Debug: `unreachable` panic on `EBADF`).
-    //
-    // The failure is driven through the Linux io_uring watcher backend, whose
-    // `trackOpenFile` can return `error.OutOfMemory` from hashmap puts / the
-    // dir-path dupe *after* the slot is committed. The `.poll` backend's
-    // `trackOpenFile` is a no-op (never errors), and the macOS `kqueue` backend
-    // is gated to `.macos` (and exercised there via a `--x`-dir AccessDenied).
+    // openTracked stores the handle before backendTrackOpenFile. If that call
+    // fails, the errdefer must close the handle and clear the slot, or deinit
+    // closes it again. This test injects the failure through the uring
+    // backend.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const io = std.Options.debug_io;
-    {
-        const f = try tmp.dir.createFile(io, "tail.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "seed\n");
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = "seed\n" });
     const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
-    // `total_poll` counts every allocation a successful `.poll` construct+destroy
-    // performs. `.poll`'s `initBackend` and `backendTrackOpenFile` are both
-    // no-ops and `uring_backend.init` performs zero *allocator* allocations
-    // (inotify/io_uring setup is syscalls/mmap), so the allocations in
-    // `[total_poll, total_uring)` are exactly the io_uring `backendTrackOpenFile`
-    // allocations — i.e. the ones that run *after* `openTracked` committed the
-    // file handle into `self.files.items[idx]`. Failing just those preserves the
-    // parallel-array consistency established by `appendTracked` and isolates the
-    // post-slot-commit failure window this bug lives in.
+    // Allocations in [total_poll, total_uring) come from the uring
+    // backendTrackOpenFile, after openTracked stores the handle.
     const total_poll: usize = blk: {
         var probe = std.testing.FailingAllocator.init(testing.allocator, .{});
         const pa = probe.allocator();
@@ -877,12 +777,8 @@ test "watch public API: init cleans up cleanly when backend registration fails a
     };
     if (total_uring <= total_poll) return error.SkipZigTest; // no post-commit allocs to exercise
 
-    // For every post-commit `backendTrackOpenFile` allocation, `init` must
-    // either succeed (then deinit cleanly) or return a clean error — never
-    // panic. Without the fix, the failing `fail_index` leaves the file slot
-    // non-null after `openTracked`'s errdefer closed the handle, and `init`'s
-    // `errdefer self.deinit()` re-closes it, tripping `unreachable` in Debug.
-    // `total_uring` itself is the no-failure success case (deinit must be clean).
+    // Each injected failure must return a clean error or succeed. It must
+    // not panic.
     var fail_index: usize = total_poll;
     while (fail_index <= total_uring) : (fail_index += 1) {
         var st = std.testing.FailingAllocator.init(testing.allocator, .{
@@ -904,22 +800,12 @@ test "checkpoint resume after copytruncate emits full new content (no silent ski
     defer tmp.cleanup();
 
     // Phase 1: create file with content A, record identity (FP_A).
-    {
-        const f = try tmp.dir.createFile(io, "tail.log", .{});
-        defer f.close(io);
-        var buf: [8192]u8 = undefined;
-        @memset(buf[0..], 'A');
-        try f.writeStreamingAll(io, buf[0..]);
-    }
+    const content_a: [8192]u8 = @splat('A');
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = &content_a });
     const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
-    const id_a: types.FileIdentity = blk: {
-        const f = try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_only });
-        defer f.close(io);
-        const st = try fstatHandle(f.handle);
-        break :blk .{ .dev = st.dev, .inode = st.ino, .fingerprint = try computeFingerprint(io, f) };
-    };
+    const id_a = try testIdentity(io, tmp.dir, "tail.log");
 
     // Phase 2: durably checkpoint offset N under FP_A via the live lane worker.
     const N: u64 = 4096;
@@ -929,22 +815,11 @@ test "checkpoint resume after copytruncate emits full new content (no silent ski
     const lifecycle_mod = @import("../core/lifecycle.zig");
     {
         var lifecycle: lifecycle_mod.Lifecycle = .init;
-        var lane = try checkpoint_mod.Lane.init(
-            testing.allocator,
-            io,
-            state_dir,
-            16,
-            64,
-            5,
-            72 * 60 * 60 * 1000,
-            64,
-            60_000,
-        );
+        var lane = try checkpoint_mod.Lane.initForTest(io, state_dir);
         try lane.start(&lifecycle);
-        _ = try lane.enqueue(.{
+        _ = lane.enqueue(.{
             .identity = id_a,
-            .byte_offset = N,
-            .last_seen_size = N,
+            .offset = N,
             .last_seen_ns = @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds()),
         });
         var tries: usize = 0;
@@ -970,21 +845,11 @@ test "checkpoint resume after copytruncate emits full new content (no silent ski
     }
 
     // Phase 4: recover lane from durable state (simulates restart).
-    var recovered = try checkpoint_mod.Lane.init(
-        testing.allocator,
-        io,
-        state_dir,
-        16,
-        64,
-        5,
-        72 * 60 * 60 * 1000,
-        64,
-        60_000,
-    );
+    var recovered = try checkpoint_mod.Lane.initForTest(io, state_dir);
     defer recovered.deinit();
 
-    // Phase 5: checkpoint-based restart. The by_inode gate (Change 1) rejects the
-    // stale FP_A offset, so the watcher reads new content from offset 0.
+    // Restart under .checkpoint. The lane has no offset for the new
+    // fingerprint, so the watcher reads from 0.
     var w = try Watcher.init(testing.allocator, io, .poll, &.{abs}, "-", .checkpoint, 1000, 50, 1000);
     defer w.deinit();
     w.applyCheckpointLane(&recovered);
@@ -993,10 +858,18 @@ test "checkpoint resume after copytruncate emits full new content (no silent ski
     defer events.deinit(testing.allocator);
     try w.collect(&events, .checkpoint, &recovered);
 
-    // FIX: full new content [0, 8192) is emitted — NOT the stale [N, 8192).
+    // All new content [0, 8192) is emitted, not [N, 8192).
     try testing.expectEqual(@as(usize, 1), events.items.len);
     try testing.expectEqual(@as(u64, 0), events.items[0].start_offset);
     try testing.expectEqual(@as(u64, 8192), events.items[0].end_offset);
+}
+
+// Read the identity of `name` in `dir` the way the watcher computes it.
+fn testIdentity(io: std.Io, dir: std.Io.Dir, name: []const u8) !types.FileIdentity {
+    const file = try dir.openFile(io, name, .{});
+    defer file.close(io);
+    const st = try fstatHandle(file.handle);
+    return .{ .dev = st.dev, .inode = st.ino, .fingerprint = try computeFingerprint(io, file) };
 }
 
 // Open `name` in `dir` for read/write, returning the handle. Caller closes.
@@ -1023,11 +896,7 @@ test "watch: partial truncation with unchanged prefix emits nothing under .head"
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Options.debug_io;
-    {
-        const f = try tmp.dir.createFile(io, "tail.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "seed...\n"); // 8 bytes
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = "seed...\n" }); // 8 bytes
     const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
@@ -1058,11 +927,8 @@ test "watch: partial truncation with unchanged prefix does not inject stale byte
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Options.debug_io;
-    {
-        const f = try tmp.dir.createFile(io, "tail.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "seed...\n"); // pre-existing 8 bytes (never delivered under .tail)
-    }
+    // Eight bytes exist before start. `.tail` does not deliver them.
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = "seed...\n" });
     const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
@@ -1101,11 +967,7 @@ test "watch: copytruncate to zero then append emits new content from start" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Options.debug_io;
-    {
-        const f = try tmp.dir.createFile(io, "tail.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "seed...\n"); // 8 bytes
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = "seed...\n" }); // 8 bytes
     const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
@@ -1136,11 +998,7 @@ test "watch: checkpoint resume with offset above size re-emits conservatively wi
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.Options.debug_io;
-    {
-        const f = try tmp.dir.createFile(io, "tail.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "seed...\n"); // 8 bytes
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = "seed...\n" }); // 8 bytes
     const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
     defer testing.allocator.free(abs);
 
@@ -1172,17 +1030,7 @@ test "watch: checkpoint resume with offset above size re-emits conservatively wi
         try wal.sync();
         wal.deinit();
     }
-    var lane = try checkpoint_mod.Lane.init(
-        testing.allocator,
-        io,
-        state_dir,
-        16,
-        64,
-        5,
-        72 * 60 * 60 * 1000,
-        64,
-        60_000,
-    );
+    var lane = try checkpoint_mod.Lane.initForTest(io, state_dir);
     defer lane.deinit();
     try testing.expectEqual(@as(?u64, 16), lane.getOffset(id));
 
@@ -1214,10 +1062,9 @@ test "watch: checkpoint resume with offset above size re-emits conservatively wi
     // Drain an acknowledgement from before the truncation after the reset.
     // If the file grows past that old offset before collect, restoring it
     // silently skips the first eight newly appended bytes.
-    try testing.expect(try lane.enqueue(.{
+    try testing.expect(lane.enqueue(.{
         .identity = id,
-        .byte_offset = 16,
-        .last_seen_size = 16,
+        .offset = 16,
         .last_seen_ns = @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds()),
     }));
     lane.finalize();
@@ -1243,18 +1090,12 @@ test "watch: files discovered after startup still resume their checkpoints" {
     defer w.deinit();
     try testing.expectEqual(@as(usize, 0), w.paths.items.len);
 
-    const id: types.FileIdentity = blk: {
-        const file = try tmp.dir.openFile(io, "pending", .{});
-        defer file.close(io);
-        const st = try fstatHandle(file.handle);
-        break :blk .{ .dev = st.dev, .inode = st.ino, .fingerprint = try computeFingerprint(io, file) };
-    };
-    var lane = try checkpoint_mod.Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 60_000, 64, 60_000);
+    const id = try testIdentity(io, tmp.dir, "pending");
+    var lane = try checkpoint_mod.Lane.initForTest(io, state_dir);
     defer lane.deinit();
-    try testing.expect(try lane.enqueue(.{
+    try testing.expect(lane.enqueue(.{
         .identity = id,
-        .byte_offset = 8,
-        .last_seen_size = 16,
+        .offset = 8,
         .last_seen_ns = @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds()),
     }));
     lane.finalize();
@@ -1280,18 +1121,12 @@ test "watch: rotation drains the old file and resumes the replacement checkpoint
     const state_dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
 
-    const replacement_id: types.FileIdentity = blk: {
-        const file = try tmp.dir.openFile(io, "replacement", .{});
-        defer file.close(io);
-        const st = try fstatHandle(file.handle);
-        break :blk .{ .dev = st.dev, .inode = st.ino, .fingerprint = try computeFingerprint(io, file) };
-    };
-    var lane = try checkpoint_mod.Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 60_000, 64, 60_000);
+    const replacement_id = try testIdentity(io, tmp.dir, "replacement");
+    var lane = try checkpoint_mod.Lane.initForTest(io, state_dir);
     defer lane.deinit();
-    try testing.expect(try lane.enqueue(.{
+    try testing.expect(lane.enqueue(.{
         .identity = replacement_id,
-        .byte_offset = 8,
-        .last_seen_size = 16,
+        .offset = 8,
         .last_seen_ns = @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds()),
     }));
     lane.finalize();
@@ -1336,7 +1171,7 @@ test "watch: live partial truncation under a checkpoint lane clamps instead of r
     const state_dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(state_dir);
 
-    var lane = try checkpoint_mod.Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 60_000, 64, 60_000);
+    var lane = try checkpoint_mod.Lane.initForTest(io, state_dir);
     defer lane.deinit();
     var w = try Watcher.init(testing.allocator, io, .poll, &.{abs}, "-", .checkpoint, 1000, 50, 1000);
     defer w.deinit();
@@ -1357,6 +1192,38 @@ test "watch: live partial truncation under a checkpoint lane clamps instead of r
 
     try appendBytes(io, tmp.dir, "tail.log", "next...\n");
     try w.collect(&events, .checkpoint, &lane);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(u64, 8), events.items[0].start_offset);
+    try testing.expectEqual(@as(u64, 16), events.items[0].end_offset);
+}
+
+test "watch: kqueue sees appends to a rotated-in file without a glob refresh" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = "old-one\n" });
+    const abs = try tmp.dir.realPathFileAlloc(io, "tail.log", testing.allocator);
+    defer testing.allocator.free(abs);
+
+    // The long glob interval means only kqueue events mark the file dirty.
+    var w = try Watcher.init(testing.allocator, io, .kqueue, &.{abs}, "-", .head, 60_000, 0, 60_000);
+    defer w.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(testing.allocator);
+    try w.collect(&events, .head, null);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+
+    try tmp.dir.rename("tail.log", tmp.dir, "old.log", io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tail.log", .data = "new-one\n" });
+    try w.collect(&events, .head, null);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    const new_id = try testIdentity(io, tmp.dir, "tail.log");
+    try testing.expectEqual(new_id.inode, events.items[0].identity.?.inode);
+
+    // The switch must register the new handle with kqueue.
+    try appendBytes(io, tmp.dir, "tail.log", "new-two\n");
+    try w.collect(&events, .head, null);
     try testing.expectEqual(@as(usize, 1), events.items.len);
     try testing.expectEqual(@as(u64, 8), events.items[0].start_offset);
     try testing.expectEqual(@as(u64, 16), events.items[0].end_offset);

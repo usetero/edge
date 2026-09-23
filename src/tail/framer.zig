@@ -1,24 +1,16 @@
-//! Line framing for edge-tail, implemented on the pipeline's SIMD newline
-//! framer (PLAN.md §9 Phase 6): `pipeline/frame_ndjson.zig` is the one line
-//! scanner in the tree; this file is a thin adapter that keeps the tail
-//! call-sites' boolean keep/drop filter shape.
-//!
-//! Convergence semantics (changed from the retired tail-local scanner, see
-//! .rewrite/test-exceptions.md):
-//! - Lines longer than `max_line` FAIL OPEN: forwarded verbatim, unevaluated
-//!   (PLAN §6.5.3). The old scanner truncated them — mutating log data — and
-//!   nothing ever consumed the `LineMeta.truncated` flag it set.
-//! - A trailing line without a newline is emitted without one (byte
-//!   fidelity); the old scanner appended a newline.
+//! Line framing for edge-tail: a thin adapter over `pipeline/frame_ndjson.zig`
+//! that keeps the tail keep/drop filter.
+//! - A line longer than `max_line` fails open: it is forwarded unchanged and
+//!   not evaluated.
+//! - A last line without a newline is emitted without one.
 const std = @import("std");
-const types = @import("types.zig");
 const pipeline_framer = @import("../pipeline/framer.zig");
 const frame_ndjson = @import("../pipeline/frame_ndjson.zig");
 
 pub const LineFramer = struct {
     allocator: std.mem.Allocator,
-    /// Reusable read staging for pump/readRange and the read schedulers
-    /// (they size positional reads off `read_buf.len`).
+    /// Reusable read staging for pumpFileStreaming, readRange and the read
+    /// schedulers (they size positional reads off `read_buf.len`).
     read_buf: []u8,
     /// Scratch for chunk-spanning lines, sized to the eval bound: a line must
     /// fit here to be evaluated, otherwise it fails open. Shared by every
@@ -26,21 +18,13 @@ pub const LineFramer = struct {
     /// `selectStream` swaps partials in/out when switching files.
     scratch: []u8,
     inner: frame_ndjson.NdjsonFramer,
-    /// Saved partial-line state for the streams that are not currently active,
-    /// keyed by file identity hash (see `eventKey`). The tail read schedulers
-    /// feed one framer with events for *multiple different files* in a single
-    /// batch (`watch.zig:collect` appends one Event per dirty file); without
-    /// per-stream isolation, a partial line left in `NdjsonFramer.scratch` by
-    /// file A is concatenated onto file B's first bytes and emitted as one
-    /// corrupted cross-file record. The map persists across batches (the
-    /// runtime reuses one framer for the whole loop), so a file's partial line
-    /// is also preserved across batch boundaries — not flushed early, which
-    /// would split a logical line into two records.
+    /// Saved partial lines of inactive streams, keyed by `eventKey`. One batch
+    /// holds events for many files, so each file keeps its own partial line.
+    /// The map lives across batches, so a line split across batches stays one
+    /// record.
     streams: std.AutoHashMapUnmanaged(u64, StreamState) = .{},
-    /// Identity hash of the stream whose partial line currently lives in
-    /// `inner.scratch`, or `null` before the first `selectStream` call.
-    /// Single-stream callers that never switch files (`pump`/`runStream` and
-    /// the unit tests) leave this `null` and pay no isolation overhead.
+    /// Key of the stream whose partial line is in `inner.scratch`. Null before
+    /// the first `selectStream`.
     active_key: ?u64 = null,
 
     /// Saved partial-line state for one inactive stream.
@@ -85,7 +69,8 @@ pub const LineFramer = struct {
     /// stream's partial (if any) under its key, then loads the named stream's
     /// saved partial (if any) into `inner`. Idempotent when `key` is already
     /// active. Callers that feed the framer from one stream at a time
-    /// (`pump`/`readRange` for a single file) need not call this.
+    /// (`pumpFileStreaming`, or `readRange` for a single file) need not call
+    /// this.
     pub fn selectStream(self: *LineFramer, key: u64) !void {
         if (self.active_key) |old_key| {
             if (old_key == key) return;
@@ -157,7 +142,7 @@ pub const LineFramer = struct {
         }
     }
 
-    pub const LineFilterFn = fn (ctx: *anyopaque, line: []const u8, meta: types.LineMeta) anyerror!bool;
+    pub const LineFilterFn = fn (ctx: *anyopaque, line: []const u8) anyerror!bool;
 
     /// Bridges the tail boolean filter onto the pipeline sink contract.
     const FilterSink = struct {
@@ -165,7 +150,7 @@ pub const LineFramer = struct {
         filter_fn: *const LineFilterFn,
 
         pub fn onRecord(self: *const FilterSink, bytes: []const u8) !pipeline_framer.Decision {
-            const keep = try self.filter_fn(self.filter_ctx, bytes, .{});
+            const keep = try self.filter_fn(self.filter_ctx, bytes);
             return if (keep) .keep else .drop;
         }
     };
@@ -213,38 +198,9 @@ pub const LineFramer = struct {
         self.active_key = null;
     }
 
-    /// Pumps from any Reader endpoint into this framer with no per-iteration
-    /// allocations by reading directly into the reusable `read_buf`.
-    pub fn pump(
-        self: *LineFramer,
-        allocator: std.mem.Allocator,
-        reader: *std.Io.Reader,
-        writer: *std.Io.Writer,
-        read_limit: usize,
-        filter_ctx: *anyopaque,
-        filter_fn: *const LineFilterFn,
-    ) !void {
-        _ = allocator;
-        const max_chunk = @min(read_limit, self.read_buf.len);
-        while (true) {
-            const n = try reader.readSliceShort(self.read_buf[0..max_chunk]);
-            if (n == 0) break;
-            try self.ingestChunk(self.read_buf[0..n], writer, filter_ctx, filter_fn);
-        }
-
-        try self.finish(writer, filter_ctx, filter_fn);
-    }
-
-    /// Pumps from a streaming `File` (e.g. stdin) using short `readStreaming`
-    /// reads directly into `read_buf` — one `readv` per iteration with no
-    /// reader-side internal-buffer prefetch and no `File.Reader` `ReadFailed`
-    /// conversion. This matters for cooperative signal shutdown: a cancel
-    /// interrupts the blocking `readv` and surfaces here as `error.Canceled`
-    /// (not converted to `ReadFailed` by `File.Reader.readVecStreaming`), and
-    /// because each iteration reads only what is immediately available, no
-    /// prefetched bytes are stranded when the pump unwinds. The only residual
-    /// at cancel time is the write buffer, which the caller flushes on the
-    /// (uncanceled) main thread — eliminating the lost-residual-on-signal bug.
+    /// Pump a streaming file (stdin) with one short `readStreaming` per
+    /// iteration. A cancel stops the read as error.Canceled, and no prefetched
+    /// bytes are lost. The caller flushes the writer after the join.
     pub fn pumpFileStreaming(
         self: *LineFramer,
         io: std.Io,
@@ -292,7 +248,7 @@ pub const LineFramer = struct {
 
 const testing = std.testing;
 
-fn keepAll(_: *anyopaque, _: []const u8, _: types.LineMeta) !bool {
+fn keepAll(_: *anyopaque, _: []const u8) !bool {
     return true;
 }
 
@@ -312,9 +268,7 @@ test "framer public API: frames lines across chunk boundaries" {
 }
 
 test "framer public API: enforces max line cap" {
-    // Lines over the cap fail OPEN: forwarded verbatim and never evaluated
-    // (PLAN §6.5.3 — the retired tail scanner truncated them instead; see
-    // .rewrite/test-exceptions.md).
+    // Lines over the cap fail open: forwarded unchanged and not evaluated.
     var framer = try LineFramer.init(testing.allocator, 8, 4);
     defer framer.deinit();
 
@@ -322,7 +276,7 @@ test "framer public API: enforces max line cap" {
     defer out.deinit();
 
     const DropAll = struct {
-        fn filter(_: *anyopaque, _: []const u8, _: types.LineMeta) !bool {
+        fn filter(_: *anyopaque, _: []const u8) !bool {
             return false;
         }
     };
@@ -354,11 +308,7 @@ test "framer public API: readRange emits file bytes as lines" {
     defer tmp.cleanup();
 
     const io = std.Options.debug_io;
-    {
-        const f = try tmp.dir.createFile(io, "in.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "x\ny\n");
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.log", .data = "x\ny\n" });
 
     const in_path = try tmp.dir.realPathFileAlloc(io, "in.log", testing.allocator);
     defer testing.allocator.free(in_path);
@@ -383,11 +333,7 @@ test "framer public API: pumpFileStreaming frames bytes across short reads to EO
     defer tmp.cleanup();
 
     const io = std.Options.debug_io;
-    {
-        const f = try tmp.dir.createFile(io, "in.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "a\nbc\ndef\n");
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.log", .data = "a\nbc\ndef\n" });
 
     const in_path = try tmp.dir.realPathFileAlloc(io, "in.log", testing.allocator);
     defer testing.allocator.free(in_path);
@@ -446,8 +392,7 @@ test "framer public API: selectStream isolates per-file partial lines" {
 }
 
 test "framer public API: selectStream no-ops for the active key" {
-    // Re-selecting the active key must not save/drop the buffered partial —
-    // single-file continuation works exactly as before isolation was added.
+    // Re-selecting the active key keeps the buffered partial.
     var framer = try LineFramer.init(testing.allocator, 8, 64);
     defer framer.deinit();
 
@@ -464,12 +409,8 @@ test "framer public API: selectStream no-ops for the active key" {
 }
 
 test "framer public API: selectStream isolates fail-open overflow per file" {
-    // File A's oversized, non-newline-terminated record enters fail-open
-    // streaming (overflowed=true, no scratch bytes). File B's in-bound record
-    // must still be evaluated as its own record — the overflowed flag cannot
-    // carry across files. A recording filter distinguishes the fixed path
-    // (filter sees B's record) from the buggy path (B is copied through
-    // fail-open and never evaluated).
+    // File A overflows without a newline. File B's record must still be
+    // evaluated alone. The overflow flag must not carry across files.
     const Seen = struct {
         const Self = @This();
         seen: std.ArrayList([]u8) = .empty,
@@ -479,7 +420,7 @@ test "framer public API: selectStream isolates fail-open overflow per file" {
             self.seen.deinit(self.allocator);
             self.* = undefined;
         }
-        fn filter(ctx: *anyopaque, line: []const u8, _: types.LineMeta) !bool {
+        fn filter(ctx: *anyopaque, line: []const u8) !bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             try self.seen.append(self.allocator, try self.allocator.dupe(u8, line));
             return true;

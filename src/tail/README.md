@@ -54,13 +54,13 @@ This keeps backend branching centralized and prevents duplicated engine logic.
 
 ## Core Runtime Functions
 
-## `runtime.runStream` (stdin mode)
+## `runtime.runStdinToOutput` (stdin mode)
 
 Used when no file inputs are provided (or input is `-`).
 
 ```mermaid
 flowchart LR
-  A[Input.stdin Reader] --> B[LineFramer.pump]
+  A[stdin File] --> B[LineFramer.pumpFileStreaming]
   B --> C[SIMD newline split in ingestChunk]
   C --> D[StreamEvaluator.evalLine]
   D --> E{keep/drop}

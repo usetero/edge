@@ -19,13 +19,8 @@ const WalRecord = extern struct {
     _pad2: u32 = 0,
 };
 
-pub const ReplayEntry = struct {
-    lsn: u64,
-    value: checkpoint_types.Value,
-};
-
 pub const ReplayResult = struct {
-    entries: std.ArrayList(ReplayEntry),
+    entries: std.ArrayList(checkpoint_types.Value),
     next_lsn: u64,
 
     pub fn deinit(self: *ReplayResult, allocator: std.mem.Allocator) void {
@@ -105,16 +100,13 @@ pub const Wal = struct {
             if (rec.checksum != recordChecksum(rec)) continue;
 
             try out.entries.append(allocator, .{
-                .lsn = rec.lsn,
-                .value = .{
-                    .identity = .{
-                        .dev = rec.dev,
-                        .inode = rec.inode,
-                        .fingerprint = rec.fingerprint,
-                    },
-                    .offset = rec.offset,
-                    .last_seen_ns = rec.last_seen_ns,
+                .identity = .{
+                    .dev = rec.dev,
+                    .inode = rec.inode,
+                    .fingerprint = rec.fingerprint,
                 },
+                .offset = rec.offset,
+                .last_seen_ns = rec.last_seen_ns,
             });
             if (out.next_lsn <= rec.lsn) out.next_lsn = rec.lsn + 1;
         }
