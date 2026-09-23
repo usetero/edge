@@ -26,6 +26,7 @@ const proto = @import("proto");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const otlp_attr = @import("attributes.zig");
+const common = @import("common.zig");
 
 const log = std.log.scoped(.otlp_traces);
 
@@ -33,8 +34,6 @@ const TracesData = proto.trace.TracesData;
 const ResourceSpans = proto.trace.ResourceSpans;
 const ScopeSpans = proto.trace.ScopeSpans;
 const Span = proto.trace.Span;
-const KeyValue = proto.common.KeyValue;
-const AnyValue = proto.common.AnyValue;
 
 const PolicyEngine = policy.PolicyEngine;
 pub const TraceFieldRef = policy.TraceFieldRef;
@@ -44,109 +43,26 @@ const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
 // =============================================================================
-// Observability Events
-// =============================================================================
-
-const TracesProcessingStarted = struct {
-    content_type: []const u8,
-    data_len: usize,
-    format: []const u8,
-};
-
-const TracesProcessingFailed = struct { err: []const u8, contentType: []const u8 };
-
-// =============================================================================
 // Public API
 // =============================================================================
 
-/// Result of processing traces
-pub const ProcessResult = struct {
-    /// Whether any transformations were applied (e.g. tracestate sampling updates)
-    was_transformed: bool = false,
-    /// Number of spans that were dropped by filter policies
-    dropped_count: usize,
-    /// Original number of spans before filtering
-    original_count: usize,
-    /// The processed data (caller owns this slice)
-    data: []u8,
+pub const Format = common.Format;
+pub const StreamProcessResult = common.StreamProcessResult;
 
-    /// Returns true if any spans were dropped or transformed
-    pub fn wasModified(self: ProcessResult) bool {
-        return self.dropped_count > 0 or self.was_transformed;
-    }
-
-    /// Returns true if all spans were dropped
-    pub fn allDropped(self: ProcessResult) bool {
-        return self.original_count > 0 and self.dropped_count == self.original_count;
-    }
-};
-
-pub const StreamProcessResult = struct {
-    was_transformed: bool = false,
-    dropped_count: usize,
-    original_count: usize,
-
-    pub fn wasModified(self: StreamProcessResult) bool {
-        return self.dropped_count > 0 or self.was_transformed;
-    }
-
-    pub fn allDropped(self: StreamProcessResult) bool {
-        return self.original_count > 0 and self.dropped_count == self.original_count;
-    }
-};
-
-/// Content format for OTLP traces
-pub const ContentFormat = enum {
-    json,
-    protobuf,
-    unknown,
-
-    /// Detect format from content-type header
-    pub fn fromContentType(content_type: []const u8) ContentFormat {
-        if (std.mem.indexOf(u8, content_type, "application/json") != null) {
-            return .json;
-        }
-        if (std.mem.indexOf(u8, content_type, "application/x-protobuf") != null) {
-            return .protobuf;
-        }
-        return .unknown;
-    }
-};
-
-/// Process OTLP traces with filter evaluation
-/// Takes decompressed data (JSON or protobuf) and applies filter policies
-/// Returns ProcessResult with data and counts (caller owns the data slice)
+/// Apply trace policies to an OTLP traces body (JSON or protobuf) and write the result to out_writer.
 pub fn processTracesStream(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
     bus: *EventBus,
     in_reader: *std.Io.Reader,
     out_writer: *std.Io.Writer,
-    content_type: []const u8,
+    format: Format,
 ) !StreamProcessResult {
-    const format = ContentFormat.fromContentType(content_type);
+    const data = try stream_io.readAll(allocator, in_reader);
+    defer allocator.free(data);
     return switch (format) {
-        .protobuf => processProtobufTracesStream(allocator, registry, bus, in_reader, out_writer),
-        .json => blk: {
-            const data = try stream_io.readAll(allocator, in_reader);
-            defer allocator.free(data);
-            const result = try processJsonTraces(allocator, registry, bus, data);
-            defer allocator.free(result.data);
-            try out_writer.writeAll(result.data);
-            break :blk .{
-                .was_transformed = result.was_transformed,
-                .dropped_count = result.dropped_count,
-                .original_count = result.original_count,
-            };
-        },
-        .unknown => blk: {
-            try stream_io.streamAll(in_reader, out_writer);
-            break :blk .{
-                .dropped_count = 0,
-                .original_count = 0,
-                .was_transformed = false,
-            };
-        },
+        .json => processJsonTraces(allocator, registry, bus, data, out_writer),
+        .protobuf => processProtobufTraces(allocator, registry, bus, data, out_writer),
     };
 }
 
@@ -160,89 +76,26 @@ pub const OtlpSpanContext = struct {
     resource_spans: *ResourceSpans,
     scope_spans: *ScopeSpans,
     allocator: std.mem.Allocator,
-    /// Whether identifier fields (trace_id/span_id/parent_span_id) are held as
-    /// lowercase-hex strings in memory. Now false on both production paths — JSON
-    /// decode hex-decodes ids to raw bytes (see processJsonTraces), matching the
-    /// protobuf path — so the accessors' hex branch only serves callers that build
-    /// a context from hex ids directly. Governs how `value`/`typed_value`
-    /// normalize ids to raw bytes before matching/sampling.
-    bytes_as_hex: bool,
 };
 
-const getAnyValueString = otlp_attr.getStringValue;
 const findNestedAttribute = otlp_attr.findNestedAttribute;
 
-/// Yields identifier fields (trace_id/span_id/parent_span_id) as RAW bytes for
-/// the string-matcher primitive. Policy authors write these as lowercase hex,
-/// but the engine renders raw bytes to hex itself before matching, so `value`
-/// must return raw bytes: pass through on the protobuf path, hex-decode on the
-/// JSON path. Returns null on empty or malformed hex (hides the id from
-/// exact/contains/regex matchers — fail-safe). Mirrors `idTyped`.
-fn idBytes(span_ctx: *const OtlpSpanContext, id: []const u8) ?[]const u8 {
-    if (id.len == 0) return null;
-    if (!span_ctx.bytes_as_hex) return id;
-    if (id.len % 2 != 0) return null;
-    const out = span_ctx.allocator.alloc(u8, id.len / 2) catch return null;
-    _ = std.fmt.hexToBytes(out, id) catch return null;
-    return out;
-}
-
-/// Convert trace ID bytes to hex string (16 bytes -> 32 chars)
-fn traceIdToHex(trace_id: []const u8, buf: *[32]u8) ?[]const u8 {
-    if (trace_id.len != 16) return null;
-    const hex_chars = "0123456789abcdef";
-    for (trace_id, 0..) |byte, i| {
-        buf[i * 2] = hex_chars[byte >> 4];
-        buf[i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
-    return buf[0..32];
-}
-
-/// Field accessor for OTLP trace format.
-/// Maps `TraceFieldRef` to the appropriate field in the OTLP span structure.
+/// String view of a trace field. `traceTypedValue` reads the identifier and
+/// attribute fields itself, so those arms return null.
 pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
     const span_ctx: *const OtlpSpanContext = @ptrCast(@alignCast(ctx));
 
     return switch (field) {
         .trace_field => |tf| switch (tf) {
-            .TRACE_FIELD_NAME => if (span_ctx.span.name.len > 0) span_ctx.span.name else null,
-            // Identifier bytes are stored raw (protobuf) or hex (JSON); the
-            // engine hex-renders raw bytes before string matching, so return
-            // raw bytes on both paths. See `idBytes`.
-            .TRACE_FIELD_TRACE_ID => idBytes(span_ctx, span_ctx.span.trace_id),
-            .TRACE_FIELD_SPAN_ID => idBytes(span_ctx, span_ctx.span.span_id),
-            .TRACE_FIELD_PARENT_SPAN_ID => idBytes(span_ctx, span_ctx.span.parent_span_id),
-            .TRACE_FIELD_TRACE_STATE => if (span_ctx.span.trace_state.len > 0)
-                span_ctx.span.trace_state
-            else
-                null,
-            .TRACE_FIELD_RESOURCE_SCHEMA_URL => if (span_ctx.resource_spans.schema_url.len > 0)
-                span_ctx.resource_spans.schema_url
-            else
-                null,
-            .TRACE_FIELD_SCOPE_SCHEMA_URL => if (span_ctx.scope_spans.schema_url.len > 0)
-                span_ctx.scope_spans.schema_url
-            else
-                null,
-            .TRACE_FIELD_SCOPE_NAME => if (span_ctx.scope_spans.scope) |scope|
-                (if (scope.name.len > 0) scope.name else null)
-            else
-                null,
-            .TRACE_FIELD_SCOPE_VERSION => if (span_ctx.scope_spans.scope) |scope|
-                (if (scope.version.len > 0) scope.version else null)
-            else
-                null,
+            .TRACE_FIELD_NAME => span_ctx.span.name,
+            .TRACE_FIELD_TRACE_STATE => span_ctx.span.trace_state,
+            .TRACE_FIELD_RESOURCE_SCHEMA_URL => span_ctx.resource_spans.schema_url,
+            .TRACE_FIELD_SCOPE_SCHEMA_URL => span_ctx.scope_spans.schema_url,
+            .TRACE_FIELD_SCOPE_NAME => if (span_ctx.scope_spans.scope) |scope| scope.name else null,
+            .TRACE_FIELD_SCOPE_VERSION => if (span_ctx.scope_spans.scope) |scope| scope.version else null,
             else => null,
         },
-        .span_attribute => |attr_path| findNestedAttribute(span_ctx.span.attributes.items, attr_path.path.items),
-        .resource_attribute => |attr_path| if (span_ctx.resource_spans.resource) |res|
-            findNestedAttribute(res.attributes.items, attr_path.path.items)
-        else
-            null,
-        .scope_attribute => |attr_path| if (span_ctx.scope_spans.scope) |scope|
-            findNestedAttribute(scope.attributes.items, attr_path.path.items)
-        else
-            null,
+        .span_attribute, .resource_attribute, .scope_attribute => null,
         .span_kind => |requested_kind| blk: {
             // Compare by integer value — OTel SpanKind and policy SpanKind share values
             break :blk if (@intFromEnum(span_ctx.span.kind) == @intFromEnum(requested_kind))
@@ -277,31 +130,31 @@ pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
             break :blk null;
         },
         .link_trace_id => blk: {
-            // Check if span has any links - return first linked trace_id as hex
+            // Return the first linked trace_id as lowercase hex.
             if (span_ctx.span.links.items.len == 0) break :blk null;
             const link_id = span_ctx.span.links.items[0].trace_id;
-            // JSON path already holds hex; protobuf path holds raw bytes.
-            if (span_ctx.bytes_as_hex) break :blk if (link_id.len > 0) link_id else null;
+            if (link_id.len != 16) break :blk null;
             const S = struct {
                 threadlocal var buf: [32]u8 = undefined;
             };
-            break :blk traceIdToHex(link_id, &S.buf);
+            S.buf = std.fmt.bytesToHex(link_id[0..16].*, .lower);
+            break :blk &S.buf;
         },
     };
 }
 
-/// Typed-value accessor for the OTLP trace context. The policy engine prefers
-/// this over `traceValue` for typed matchers and probabilistic sampling. The
-/// only fields that must read as non-string are the identifier bytes
-/// (trace_id/span_id/parent_span_id) — everything else falls back to the
-/// string view wrapped as `TypedValue.string`.
+/// Typed-value accessor for the OTLP trace context. The policy engine uses
+/// it for all matchers and for probabilistic sampling. Identifier fields
+/// (trace_id/span_id/parent_span_id) read as raw `TypedValue.bytes`.
+/// Attributes keep their scalar type. All other fields read as non-empty
+/// strings.
 pub fn traceTypedValue(ctx: *const anyopaque, field: TraceFieldRef) ?policy.TypedValue {
     const span_ctx: *const OtlpSpanContext = @ptrCast(@alignCast(ctx));
     return switch (field) {
         .trace_field => |tf| switch (tf) {
-            .TRACE_FIELD_TRACE_ID => idTyped(span_ctx, span_ctx.span.trace_id),
-            .TRACE_FIELD_SPAN_ID => idTyped(span_ctx, span_ctx.span.span_id),
-            .TRACE_FIELD_PARENT_SPAN_ID => idTyped(span_ctx, span_ctx.span.parent_span_id),
+            .TRACE_FIELD_TRACE_ID => otlp_attr.typedBytes(span_ctx.span.trace_id),
+            .TRACE_FIELD_SPAN_ID => otlp_attr.typedBytes(span_ctx.span.span_id),
+            .TRACE_FIELD_PARENT_SPAN_ID => otlp_attr.typedBytes(span_ctx.span.parent_span_id),
             else => otlp_attr.typedStr(traceValue(ctx, field)),
         },
         .span_attribute => |attr_path| otlp_attr.findNestedAttributeTyped(
@@ -318,16 +171,6 @@ pub fn traceTypedValue(ctx: *const anyopaque, field: TraceFieldRef) ?policy.Type
             null,
         else => otlp_attr.typedStr(traceValue(ctx, field)),
     };
-}
-
-/// Decode an identifier field to raw bytes for the sampler: hex-decode on the
-/// JSON path, pass raw bytes through on the protobuf path.
-fn idTyped(span_ctx: *const OtlpSpanContext, id: []const u8) ?policy.TypedValue {
-    if (id.len == 0) return null;
-    return if (span_ctx.bytes_as_hex)
-        otlp_attr.typedHexBytes(span_ctx.allocator, id)
-    else
-        otlp_attr.typedBytes(id);
 }
 
 /// Field setter for OTLP trace format. The engine only writes
@@ -435,7 +278,6 @@ fn filterSpansInPlace(
     traces_data: *TracesData,
     registry: *const PolicyRegistry,
     bus: *EventBus,
-    bytes_as_hex: bool,
 ) FilterCounts {
     const engine = PolicyEngine.init(bus, @constCast(registry));
 
@@ -461,7 +303,6 @@ fn filterSpansInPlace(
                     .resource_spans = resource_spans,
                     .scope_spans = scope_spans,
                     .allocator = allocator,
-                    .bytes_as_hex = bytes_as_hex,
                 };
 
                 const result = engine.evaluate(.trace, &trace_accessor, &ctx, &policy_id_buf, .{ .io = bus.io });
@@ -471,11 +312,7 @@ fn filterSpansInPlace(
                 }
 
                 if (result.decision.shouldContinue()) {
-                    // Keep this span - move to write position if needed
-                    if (write_idx != scope_spans.spans.items.len - 1) {
-                        scope_spans.spans.items[write_idx] = span.*;
-                    }
-
+                    scope_spans.spans.items[write_idx] = span.*;
                     write_idx += 1;
                 } else {
                     dropped_count += 1;
@@ -486,26 +323,10 @@ fn filterSpansInPlace(
             scope_spans.spans.shrinkRetainingCapacity(write_idx);
         }
 
-        // Prune empty scope containers
-        var scope_write_idx: usize = 0;
-        for (resource_spans.scope_spans.items) |scope_spans_item| {
-            if (scope_spans_item.spans.items.len > 0) {
-                resource_spans.scope_spans.items[scope_write_idx] = scope_spans_item;
-                scope_write_idx += 1;
-            }
-        }
-        resource_spans.scope_spans.shrinkRetainingCapacity(scope_write_idx);
+        common.pruneEmpty(&resource_spans.scope_spans, "spans");
     }
 
-    // Prune empty resource containers
-    var resource_write_idx: usize = 0;
-    for (traces_data.resource_spans.items) |resource_spans_item| {
-        if (resource_spans_item.scope_spans.items.len > 0) {
-            traces_data.resource_spans.items[resource_write_idx] = resource_spans_item;
-            resource_write_idx += 1;
-        }
-    }
-    traces_data.resource_spans.shrinkRetainingCapacity(resource_write_idx);
+    common.pruneEmpty(&traces_data.resource_spans, "scope_spans");
 
     return .{
         .original_count = original_count,
@@ -519,34 +340,23 @@ fn processJsonTraces(
     registry: *const PolicyRegistry,
     bus: *EventBus,
     data: []const u8,
-) !ProcessResult {
-    // OTLP/JSON hex-encodes the identifier bytes fields (trace_id/span_id/
-    // parent_span_id); other bytes fields (e.g. AnyValue.bytes_value) stay
-    // base64. jsonDecodeOpts marks only the id fields hex — per-field, so spans
-    // carrying base64 bytes attributes still decode. In memory the ids become
-    // raw bytes, identical to the protobuf wire path.
+    out_writer: *std.Io.Writer,
+) !StreamProcessResult {
+    // OTLP/JSON hex-encodes only the id fields. In memory the ids are raw
+    // bytes, as on the protobuf path.
     var parsed = try TracesData.jsonDecodeOpts(data, .{
         .ignore_unknown_fields = true,
     }, .{ .hex_bytes_fields = otlp_attr.hex_id_fields }, allocator);
     defer parsed.deinit();
 
-    // Filter spans in-place (allocator used for tracestate updates). Identifier
-    // fields are raw bytes in memory now (decoded above), same as protobuf.
-    const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus, false);
+    // Filter spans in-place (allocator used for tracestate updates).
+    const counts = filterSpansInPlace(allocator, &parsed.value, registry, bus);
 
-    // Fast path: if nothing was modified, return original data without re-encoding.
-    // Re-encoding would strip unknown span-level fields the compiled schema doesn't
-    // know about (JSON decode uses ignore_unknown_fields, so unknown fields are
-    // dropped on decode and cannot be re-emitted). Mirrors the OTLP logs path.
+    // Return the input bytes when nothing changed. A re-encode drops fields
+    // the schema does not know.
     if (counts.dropped_count == 0 and !counts.was_transformed) {
-        const result = try allocator.alloc(u8, data.len);
-        @memcpy(result, data);
-        return .{
-            .data = result,
-            .dropped_count = 0,
-            .original_count = counts.original_count,
-            .was_transformed = false,
-        };
+        try out_writer.writeAll(data);
+        return .{ .dropped_count = 0, .original_count = counts.original_count };
     }
 
     // Re-serialize to JSON, hex-encoding the same identifier fields back out.
@@ -554,9 +364,10 @@ fn processJsonTraces(
         .emit_oneof_field_name = false,
         .hex_bytes_fields = otlp_attr.hex_id_fields,
     }, allocator);
+    defer allocator.free(output);
+    try out_writer.writeAll(output);
 
     return .{
-        .data = @constCast(output),
         .dropped_count = counts.dropped_count,
         .original_count = counts.original_count,
         .was_transformed = counts.was_transformed,
@@ -568,7 +379,8 @@ fn processProtobufTraces(
     registry: *const PolicyRegistry,
     bus: *EventBus,
     data: []const u8,
-) !ProcessResult {
+    out_writer: *std.Io.Writer,
+) !StreamProcessResult {
     // Basic validation
     if (data.len == 0) {
         return error.EmptyProtobufData;
@@ -582,14 +394,8 @@ fn processProtobufTraces(
     // Fast path: if no trace policies, skip decode/encode entirely.
     const snapshot = registry.getSnapshot();
     if (snapshot == null or snapshot.?.trace_index.isEmpty()) {
-        const result = try allocator.alloc(u8, data.len);
-        @memcpy(result, data);
-        return .{
-            .data = result,
-            .dropped_count = 0,
-            .original_count = 0,
-            .was_transformed = false,
-        };
+        try out_writer.writeAll(data);
+        return .{ .dropped_count = 0, .original_count = 0 };
     }
 
     // Use an arena for the protobuf decode/filter/encode cycle
@@ -604,65 +410,45 @@ fn processProtobufTraces(
     var traces_data = try TracesData.decode(&reader, arena_alloc);
 
     // Filter spans in-place (arena_alloc used for tracestate updates).
-    // Protobuf identifier fields are raw bytes.
-    const counts = filterSpansInPlace(arena_alloc, &traces_data, registry, bus, false);
+    const counts = filterSpansInPlace(arena_alloc, &traces_data, registry, bus);
 
-    // Fast path: if nothing was modified, return original data without re-encoding.
-    // Re-encoding would strip unknown span-level fields the compiled schema doesn't
-    // know about (the generated Span struct has no _unknown_fields, so unknown fields
-    // are dropped on decode and cannot be re-emitted). Mirrors the OTLP logs path.
+    // Return the input bytes when nothing changed. A re-encode drops fields
+    // the schema does not know.
     if (counts.dropped_count == 0 and !counts.was_transformed) {
-        const result = try allocator.alloc(u8, data.len);
-        @memcpy(result, data);
-        return .{
-            .data = result,
-            .dropped_count = 0,
-            .original_count = counts.original_count,
-            .was_transformed = false,
-        };
+        try out_writer.writeAll(data);
+        return .{ .dropped_count = 0, .original_count = counts.original_count };
     }
 
-    // Re-serialize to protobuf - use main allocator for output since we return it
+    // Encode into a buffer first, so an encode error writes nothing.
     var output_writer = std.Io.Writer.Allocating.init(allocator);
-    errdefer output_writer.deinit();
-
+    defer output_writer.deinit();
     try traces_data.encode(&output_writer.writer, arena_alloc);
-
-    // Transfer ownership of the written data to caller
-    const output = try output_writer.toOwnedSlice();
+    try out_writer.writeAll(output_writer.written());
 
     return .{
-        .data = output,
         .dropped_count = counts.dropped_count,
         .original_count = counts.original_count,
         .was_transformed = counts.was_transformed,
     };
 }
 
-fn processProtobufTracesStream(
-    allocator: std.mem.Allocator,
-    registry: *const PolicyRegistry,
-    bus: *EventBus,
-    in_reader: *std.Io.Reader,
-    out_writer: *std.Io.Writer,
-) !StreamProcessResult {
-    const data = try stream_io.readAll(allocator, in_reader);
-    defer allocator.free(data);
-
-    const result = try processProtobufTraces(allocator, registry, bus, data);
-    defer allocator.free(result.data);
-
-    try out_writer.writeAll(result.data);
-    return .{
-        .was_transformed = result.was_transformed,
-        .dropped_count = result.dropped_count,
-        .original_count = result.original_count,
-    };
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
+
+fn runTraces(
+    allocator: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    input: []const u8,
+    format: Format,
+) !common.TestRun {
+    var in_reader = std.Io.Reader.fixed(input);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const result = try processTracesStream(allocator, registry, bus, &in_reader, &out_writer.writer, format);
+    return .{ .data = try out_writer.toOwnedSlice(), .result = result };
+}
 
 // =============================================================================
 // mergeOtTracestate tests
@@ -840,7 +626,7 @@ test "mergeOtTracestate - ot entry with only th" {
 }
 
 // =============================================================================
-// mergeOtTracestate W3C 32-member limit (see bug in full_report)
+// mergeOtTracestate: W3C 32-member limit
 // =============================================================================
 
 // Build a `count`-member vendor-only tracestate ("v0=x,v1=x,...") into `buf`.
@@ -899,9 +685,7 @@ test "mergeOtTracestate - 31 vendors stays within cap, all preserved" {
     try std.testing.expect(std.mem.indexOf(u8, out, "v30=x") != null);
 }
 
-// The cap must NOT wholesale-drop `ot=` sub-keys (unlike the vendored helper):
-// an `ot=` entry with a non-th sub-key (rv:) plus an over-long vendor list keeps
-// the rv: sub-key while still clamping the total to 32 members.
+// The cap counts list-members only. The rv: sub-key inside ot= must stay.
 test "mergeOtTracestate - ot sub-keys preserved when vendor cap reached" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -914,7 +698,6 @@ test "mergeOtTracestate - ot sub-keys preserved when vendor cap reached" {
 
     const out = try mergeOtTracestate(arena.allocator(), trace_state, "8");
     try std.testing.expectEqual(@as(usize, 32), listMemberCount(out));
-    // rv: survived (NOT wholesale-dropped like the vendored helper would do).
     try std.testing.expect(std.mem.indexOf(u8, out, "ot=rv:abc;th:8") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "v30=x") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "v31=x") == null);
@@ -936,68 +719,33 @@ test "processTraces - parses and re-serializes JSON" {
         "\"spanId\":\"0123456789abcdef\",\"name\":\"test-span\",\"kind\":1," ++
         "\"startTimeUnixNano\":\"1000000000\",\"endTimeUnixNano\":\"2000000000\"}]}]}]}";
 
-    var in_reader = std.Io.Reader.fixed(traces);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processTracesStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runTraces(allocator, &registry, noop_bus.eventBus(), traces, .json);
+    defer allocator.free(run.data);
 
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "test-span") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "resourceSpans") != null);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "test-span") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "resourceSpans") != null);
+    try std.testing.expectEqual(@as(usize, 0), run.result.dropped_count);
 }
 
-test "traceValue: trace_id reads as raw bytes so the engine can hex-render for matching" {
-    // The policy engine now renders raw id bytes to lowercase hex before string
-    // matching (policy-zig #73), so `value` MUST return raw bytes on both paths.
+test "traceTypedValue: trace_id reads as raw bytes so the engine can hex-render for matching" {
     const allocator = std.testing.allocator;
     const raw_id = [16]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
-    const hex_id = "aabbccdd000102030405060708090a0b";
 
     var rs: ResourceSpans = .{};
     var ss: ScopeSpans = .{};
 
-    // Protobuf path: ids already raw in memory -> returned as-is.
     var span_raw: Span = .{ .trace_id = &raw_id };
     var ctx_raw: OtlpSpanContext = .{
         .span = &span_raw,
         .resource_spans = &rs,
         .scope_spans = &ss,
         .allocator = allocator,
-        .bytes_as_hex = false,
     };
-    const raw_got = traceValue(&ctx_raw, .{ .trace_field = .TRACE_FIELD_TRACE_ID }).?;
+    const raw_got = traceTypedValue(&ctx_raw, .{ .trace_field = .TRACE_FIELD_TRACE_ID }).?.bytes;
     try std.testing.expectEqualSlices(u8, &raw_id, raw_got);
-
-    // Hex-in-memory path: value() must hex-decode to the SAME raw bytes, so the
-    // engine's hex rendering reproduces the policy literal either way.
-    var span_hex: Span = .{ .trace_id = hex_id };
-    var ctx_hex: OtlpSpanContext = .{
-        .span = &span_hex,
-        .resource_spans = &rs,
-        .scope_spans = &ss,
-        .allocator = allocator,
-        .bytes_as_hex = true,
-    };
-    const hex_got = traceValue(&ctx_hex, .{ .trace_field = .TRACE_FIELD_TRACE_ID }).?;
-    defer allocator.free(hex_got); // idBytes allocates on the hex path
-    try std.testing.expectEqualSlices(u8, &raw_id, hex_got);
 }
 
-test "processTraces - malformed JSON returns unchanged (fail-open)" {
+test "processTraces - malformed JSON returns an error" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -1006,87 +754,16 @@ test "processTraces - malformed JSON returns unchanged (fail-open)" {
     defer registry.deinit();
 
     const malformed = "{ invalid json }";
-
-    var in_reader = std.Io.Reader.fixed(malformed);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = processTracesStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    ) catch {
-        const copied = try allocator.alloc(u8, malformed.len);
-        @memcpy(copied, malformed);
-        const result: ProcessResult = .{
-            .data = copied,
-            .dropped_count = 0,
-            .original_count = 0,
-            .was_transformed = false,
-        };
-        defer allocator.free(result.data);
-
-        try std.testing.expectEqualStrings(malformed, result.data);
-        try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-        return;
-    };
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqualStrings(malformed, result.data);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-}
-
-test "processTraces - unknown content type returns unchanged" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    const data = "some data";
-
-    var in_reader = std.Io.Reader.fixed(data);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processTracesStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "text/plain",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqualStrings(data, result.data);
+    try std.testing.expect(std.meta.isError(runTraces(allocator, &registry, noop_bus.eventBus(), malformed, .json)));
 }
 
 // =============================================================================
 // processTracesStream: tracestate writeback W3C 32-member limit (E2E)
 // =============================================================================
 
-// Drives a W3C-compliant 32-member vendor-only `traceState` through the full
-// public path (JSON decode -> filterSpansInPlace -> engine.evaluate -> sample
-// -> traceSet -> mergeOtTracestate -> JSON re-encode) under a 100%-keep
-// probabilistic trace policy, which still triggers writeback (threshold "0").
-// Before the fix, the prepended `ot=th:0` made the serialized output 33 members,
-// violating W3C Trace Context 3.3.1.1/3.3.1.2. After the fix, the output is
-// clamped to 32 members.
+// Send a 32-member vendor-only traceState through the JSON path under a
+// 100%-keep policy. The writeback adds ot=th:0. The output must stay at the
+// W3C limit of 32 members.
 test "processTraces - 100%-keep writeback keeps traceState within W3C 32-member limit" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1127,11 +804,8 @@ test "processTraces - 100%-keep writeback keeps traceState within W3C 32-member 
     @memcpy(traces_buf[prefix.len + trace_state_in.len ..][0..suffix.len], suffix);
     const traces = traces_buf[0 .. prefix.len + trace_state_in.len + suffix.len];
 
-    // Route the stream through an arena: the JSON writeback path's merged
-    // trace_state is a standalone allocation that the JSON encoder stores as a
-    // view, so it is reclaimed by the arena (the protobuf path uses the same
-    // arena technique). The arena is parented at std.testing.allocator, so any
-    // true escape is still caught.
+    // Use the arena for the stream. The merged trace_state is a separate
+    // allocation that the JSON encoder only references. The arena frees it.
     var in_reader = std.Io.Reader.fixed(traces);
     var out_writer: std.Io.Writer.Allocating = .init(a);
     const stream_result = try processTracesStream(
@@ -1140,7 +814,7 @@ test "processTraces - 100%-keep writeback keeps traceState within W3C 32-member 
         noop_bus.eventBus(),
         &in_reader,
         &out_writer.writer,
-        "application/json",
+        .json,
     );
     const out = try out_writer.toOwnedSlice();
 
@@ -1189,31 +863,15 @@ test "processJsonTraces preserves unknown span fields when policies don't match"
         "\"startTimeUnixNano\":\"1000000000\",\"endTimeUnixNano\":\"2000000000\"," ++
         "\"futureOtelField\":42}]}]}]}";
 
-    var in_reader = std.Io.Reader.fixed(traces);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processTracesStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runTraces(allocator, &registry, noop_bus.eventBus(), traces, .json);
+    defer allocator.free(run.data);
 
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 1), result.original_count);
-    try std.testing.expect(!result.wasModified());
+    try std.testing.expectEqual(@as(usize, 0), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), run.result.original_count);
+    try std.testing.expect(!run.result.wasModified());
     // Nothing modified → original bytes returned verbatim, unknown field intact.
-    try std.testing.expectEqualStrings(traces, result.data);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "futureOtelField") != null);
+    try std.testing.expectEqualStrings(traces, run.data);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "futureOtelField") != null);
 }
 
 test "processProtobufTraces preserves unknown span fields when policies don't match" {
@@ -1232,15 +890,15 @@ test "processProtobufTraces preserves unknown span fields when policies don't ma
     // original bytes so the unknown field survives.
     const td = [_]u8{ 10, 13, 18, 11, 18, 9, 10, 4, 97, 98, 99, 100, 184, 62, 42 };
 
-    const result = try processProtobufTraces(allocator, &registry, noop_bus.eventBus(), &td);
-    defer allocator.free(result.data);
+    const run = try runTraces(allocator, &registry, noop_bus.eventBus(), &td, .protobuf);
+    defer allocator.free(run.data);
 
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 1), result.original_count);
-    try std.testing.expect(!result.wasModified());
+    try std.testing.expectEqual(@as(usize, 0), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), run.result.original_count);
+    try std.testing.expect(!run.result.wasModified());
     // Nothing modified → original bytes returned verbatim, unknown field intact.
-    try std.testing.expectEqualSlices(u8, &td, result.data);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, &[_]u8{ 184, 62 }) != null);
+    try std.testing.expectEqualSlices(u8, &td, run.data);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, &[_]u8{ 184, 62 }) != null);
 }
 
 test "processJsonTraces still re-encodes and drops when a policy matches" {
@@ -1273,29 +931,13 @@ test "processJsonTraces still re-encodes and drops when a policy matches" {
         "\"name\":\"keep-me\",\"kind\":1,\"startTimeUnixNano\":\"1000000000\"," ++
         "\"endTimeUnixNano\":\"2000000000\"}]}]}]}";
 
-    var in_reader = std.Io.Reader.fixed(traces);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processTracesStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runTraces(allocator, &registry, noop_bus.eventBus(), traces, .json);
+    defer allocator.free(run.data);
 
     // dropped_count > 0 → guard does not fire → re-encode runs.
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(result.wasModified());
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "drop-me") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "keep-me") != null);
+    try std.testing.expectEqual(@as(usize, 1), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), run.result.original_count);
+    try std.testing.expect(run.result.wasModified());
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "drop-me") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "keep-me") != null);
 }

@@ -23,126 +23,50 @@ const proto = @import("proto");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const otlp_attr = @import("attributes.zig");
+const common = @import("common.zig");
 
 const MetricsData = proto.metrics.MetricsData;
 const ResourceMetrics = proto.metrics.ResourceMetrics;
 const ScopeMetrics = proto.metrics.ScopeMetrics;
 const Metric = proto.metrics.Metric;
 const KeyValue = proto.common.KeyValue;
-const AnyValue = proto.common.AnyValue;
 const PolicyEngine = policy.PolicyEngine;
 pub const MetricFieldRef = policy.MetricFieldRef;
-const MetricField = proto.policy.MetricField;
 const MAX_MATCHES_PER_SCAN = policy.max_matches_per_scan;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
 const NoopEventBus = o11y.NoopEventBus;
 
 // =============================================================================
-// Observability Events
-// =============================================================================
-
-const MetricsProcessingStarted = struct {
-    content_type: []const u8,
-    data_len: usize,
-    format: []const u8,
-};
-
-const MetricsProcessingFailed = struct { err: []const u8, contentType: []const u8 };
-
-// =============================================================================
 // Public API
 // =============================================================================
 
-/// Result of processing metrics
-pub const ProcessResult = struct {
-    /// Whether any transformations were applied (not yet supported for metrics)
-    was_transformed: bool = false,
-    /// Number of data points that were dropped by filter policies
-    dropped_count: usize,
-    /// Original number of data points before filtering
-    original_count: usize,
-    /// The processed data (caller owns this slice)
-    data: []u8,
+pub const Format = common.Format;
+pub const StreamProcessResult = common.StreamProcessResult;
 
-    /// Returns true if any metrics were dropped or transformed
-    pub fn wasModified(self: ProcessResult) bool {
-        return self.dropped_count > 0 or self.was_transformed;
-    }
-
-    /// Returns true if all metrics were dropped
-    pub fn allDropped(self: ProcessResult) bool {
-        return self.original_count > 0 and self.dropped_count == self.original_count;
-    }
-};
-
-pub const StreamProcessResult = struct {
-    was_transformed: bool = false,
-    dropped_count: usize,
-    original_count: usize,
-
-    pub fn wasModified(self: StreamProcessResult) bool {
-        return self.dropped_count > 0 or self.was_transformed;
-    }
-
-    pub fn allDropped(self: StreamProcessResult) bool {
-        return self.original_count > 0 and self.dropped_count == self.original_count;
-    }
-};
-
-/// Content format for OTLP metrics
-pub const ContentFormat = enum {
-    json,
-    protobuf,
-    unknown,
-
-    /// Detect format from content-type header
-    pub fn fromContentType(content_type: []const u8) ContentFormat {
-        if (std.mem.indexOf(u8, content_type, "application/json") != null) {
-            return .json;
-        }
-        if (std.mem.indexOf(u8, content_type, "application/x-protobuf") != null) {
-            return .protobuf;
-        }
-        return .unknown;
-    }
-};
-
-/// Process OTLP metrics with filter evaluation
-/// Takes decompressed data (JSON or protobuf) and applies filter policies
-/// Returns ProcessResult with data and counts (caller owns the data slice)
+/// Apply metric policies to an OTLP metrics body (JSON or protobuf) and write the result to out_writer.
 pub fn processMetricsStream(
     allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
     bus: *EventBus,
     in_reader: *std.Io.Reader,
     out_writer: *std.Io.Writer,
-    content_type: []const u8,
+    format: Format,
 ) !StreamProcessResult {
-    const format = ContentFormat.fromContentType(content_type);
-    return switch (format) {
-        .protobuf => processProtobufMetricsStream(allocator, registry, bus, in_reader, out_writer),
-        .json => blk: {
+    switch (format) {
+        .json => {
             const data = try stream_io.readAll(allocator, in_reader);
             defer allocator.free(data);
-            const result = try processJsonMetrics(allocator, registry, bus, data);
-            defer allocator.free(result.data);
-            try out_writer.writeAll(result.data);
-            break :blk .{
-                .was_transformed = result.was_transformed,
-                .dropped_count = result.dropped_count,
-                .original_count = result.original_count,
-            };
+            return processJsonMetrics(allocator, registry, bus, data, out_writer);
         },
-        .unknown => blk: {
-            try stream_io.streamAll(in_reader, out_writer);
-            break :blk .{
-                .dropped_count = 0,
-                .original_count = 0,
-                .was_transformed = false,
-            };
+        .protobuf => {
+            // Read into a page-allocator arena (see processProtobufMetrics).
+            var read_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer read_arena.deinit();
+            const data = try stream_io.readAll(read_arena.allocator(), in_reader);
+            return processProtobufMetrics(registry, bus, data, out_writer);
         },
-    };
+    }
 }
 
 // =============================================================================
@@ -157,50 +81,23 @@ pub const OtlpMetricContext = struct {
     datapoint_attributes: []const KeyValue,
 };
 
-const getAnyValueString = otlp_attr.getStringValue;
-const findAttribute = otlp_attr.findAttribute;
-const findNestedAttribute = otlp_attr.findNestedAttribute;
-
-/// Field accessor for OTLP metric format.
-/// Maps `MetricFieldRef` to the appropriate field in the OTLP metric structure.
+/// String view of a scalar metric field. `metricTypedValue` reads attribute
+/// fields itself, so the attribute arms return null.
 pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
     const metric_ctx: *const OtlpMetricContext = @ptrCast(@alignCast(ctx));
 
     return switch (field) {
         .metric_field => |mf| switch (mf) {
-            .METRIC_FIELD_NAME => if (metric_ctx.metric.name.len > 0) metric_ctx.metric.name else null,
-            .METRIC_FIELD_DESCRIPTION => if (metric_ctx.metric.description.len > 0)
-                metric_ctx.metric.description
-            else
-                null,
-            .METRIC_FIELD_UNIT => if (metric_ctx.metric.unit.len > 0) metric_ctx.metric.unit else null,
-            .METRIC_FIELD_RESOURCE_SCHEMA_URL => if (metric_ctx.resource_metrics.schema_url.len > 0)
-                metric_ctx.resource_metrics.schema_url
-            else
-                null,
-            .METRIC_FIELD_SCOPE_SCHEMA_URL => if (metric_ctx.scope_metrics.schema_url.len > 0)
-                metric_ctx.scope_metrics.schema_url
-            else
-                null,
-            .METRIC_FIELD_SCOPE_NAME => if (metric_ctx.scope_metrics.scope) |scope|
-                (if (scope.name.len > 0) scope.name else null)
-            else
-                null,
-            .METRIC_FIELD_SCOPE_VERSION => if (metric_ctx.scope_metrics.scope) |scope|
-                (if (scope.version.len > 0) scope.version else null)
-            else
-                null,
+            .METRIC_FIELD_NAME => metric_ctx.metric.name,
+            .METRIC_FIELD_DESCRIPTION => metric_ctx.metric.description,
+            .METRIC_FIELD_UNIT => metric_ctx.metric.unit,
+            .METRIC_FIELD_RESOURCE_SCHEMA_URL => metric_ctx.resource_metrics.schema_url,
+            .METRIC_FIELD_SCOPE_SCHEMA_URL => metric_ctx.scope_metrics.schema_url,
+            .METRIC_FIELD_SCOPE_NAME => if (metric_ctx.scope_metrics.scope) |scope| scope.name else null,
+            .METRIC_FIELD_SCOPE_VERSION => if (metric_ctx.scope_metrics.scope) |scope| scope.version else null,
             else => null,
         },
-        .datapoint_attribute => |attr_path| findNestedAttribute(metric_ctx.datapoint_attributes, attr_path.path.items),
-        .resource_attribute => |attr_path| if (metric_ctx.resource_metrics.resource) |res|
-            findNestedAttribute(res.attributes.items, attr_path.path.items)
-        else
-            null,
-        .scope_attribute => |attr_path| if (metric_ctx.scope_metrics.scope) |scope|
-            findNestedAttribute(scope.attributes.items, attr_path.path.items)
-        else
-            null,
+        .datapoint_attribute, .resource_attribute, .scope_attribute => null,
         .metric_type => |requested_type| blk: {
             const data = metric_ctx.metric.data orelse break :blk null;
             const actual_type: @TypeOf(requested_type) = switch (data) {
@@ -233,11 +130,8 @@ fn dataPointCount(metric: *const Metric) usize {
     };
 }
 
-/// Typed read primitive (required since v0.5.0). Attribute fields carry their
-/// native OTLP type (bool/int/double/bytes/string) so the typed matchers
-/// (`equals`/`gt`/`gte`/`lt`/`lte`) fire on non-string values; the scalar
-/// metric fields (name/unit/schema urls, and the enum tag-name pseudo-fields)
-/// are genuinely strings.
+/// Typed read primitive. Attributes keep their OTLP type so typed matchers
+/// work on non-string values. Scalar metric fields are strings.
 pub fn metricTypedValue(ctx: *const anyopaque, field: MetricFieldRef) ?policy.TypedValue {
     const metric_ctx: *const OtlpMetricContext = @ptrCast(@alignCast(ctx));
     return switch (field) {
@@ -291,17 +185,12 @@ fn filterMetricsInPlace(
             // Filter metrics in place by shrinking the list
             var write_idx: usize = 0;
             for (scope_metrics.metrics.items) |*metric| {
-                // Capture the data-point count before per-data-point
-                // filtering. A metric whose `data` oneof is set but carries
-                // zero data points is a valid descriptor and must be
-                // forwarded untouched; only a metric whose data points were
-                // all dropped by policy is pruned (see the prune below).
+                // The data point is the record unit (policy spec v1.7.1).
+                // Evaluate and drop each data point by itself. Remove a metric
+                // only when policy dropped all its data points. Keep a metric
+                // that arrived with no data points.
                 const original_dp = dataPointCount(metric);
 
-                // The data point is the record unit for metrics (policy spec
-                // v1.7.1): each one is evaluated against its own attributes and
-                // dropped individually, and the metric itself goes only once
-                // every data point is gone.
                 if (metric.data) |*metric_data| switch (metric_data.*) {
                     inline else => |*variant| {
                         var d: usize = 0;
@@ -328,8 +217,6 @@ fn filterMetricsInPlace(
                     },
                 };
 
-                // A metric with no data at all is left alone; one whose data
-                // points were all dropped by policy is pruned.
                 if (original_dp > 0 and dataPointCount(metric) == 0) continue;
                 scope_metrics.metrics.items[write_idx] = metric.*;
                 write_idx += 1;
@@ -339,26 +226,10 @@ fn filterMetricsInPlace(
             scope_metrics.metrics.shrinkRetainingCapacity(write_idx);
         }
 
-        // Prune empty scope containers
-        var scope_write_idx: usize = 0;
-        for (resource_metrics.scope_metrics.items) |scope_metrics_item| {
-            if (scope_metrics_item.metrics.items.len > 0) {
-                resource_metrics.scope_metrics.items[scope_write_idx] = scope_metrics_item;
-                scope_write_idx += 1;
-            }
-        }
-        resource_metrics.scope_metrics.shrinkRetainingCapacity(scope_write_idx);
+        common.pruneEmpty(&resource_metrics.scope_metrics, "metrics");
     }
 
-    // Prune empty resource containers
-    var resource_write_idx: usize = 0;
-    for (metrics_data.resource_metrics.items) |resource_metrics_item| {
-        if (resource_metrics_item.scope_metrics.items.len > 0) {
-            metrics_data.resource_metrics.items[resource_write_idx] = resource_metrics_item;
-            resource_write_idx += 1;
-        }
-    }
-    metrics_data.resource_metrics.shrinkRetainingCapacity(resource_write_idx);
+    common.pruneEmpty(&metrics_data.resource_metrics, "scope_metrics");
 
     return .{
         .original_count = original_count,
@@ -371,9 +242,10 @@ fn processJsonMetrics(
     registry: *const PolicyRegistry,
     bus: *EventBus,
     data: []const u8,
-) !ProcessResult {
-    // Parse JSON into MetricsData protobuf struct.
-    // NOTE: bytes-as-hex is temporarily disabled; bytes fields use base64.
+    out_writer: *std.Io.Writer,
+) !StreamProcessResult {
+    // Exemplar trace_id/span_id are not in hex_bytes_fields, so they decode
+    // and encode as base64.
     var parsed = try MetricsData.jsonDecode(data, .{
         .ignore_unknown_fields = true,
     }, allocator);
@@ -382,25 +254,24 @@ fn processJsonMetrics(
     // Filter metrics in-place
     const counts = filterMetricsInPlace(&parsed.value, registry, bus);
 
-    // Re-serialize to JSON. Metrics carry no identifier fields, so all bytes
-    // fields stay base64 (no hex_bytes_fields).
     const output = try parsed.value.jsonEncode(.{}, .{
         .emit_oneof_field_name = false,
     }, allocator);
+    defer allocator.free(output);
+    try out_writer.writeAll(output);
 
     return .{
-        .data = @constCast(output),
         .dropped_count = counts.dropped_count,
         .original_count = counts.original_count,
     };
 }
 
 fn processProtobufMetrics(
-    allocator: std.mem.Allocator,
     registry: *const PolicyRegistry,
     bus: *EventBus,
     data: []const u8,
-) !ProcessResult {
+    out_writer: *std.Io.Writer,
+) !StreamProcessResult {
     // Basic validation
     if (data.len == 0) {
         return error.EmptyProtobufData;
@@ -411,12 +282,9 @@ fn processProtobufMetrics(
         return error.DataLooksLikeJson;
     }
 
-    // Use an arena for the protobuf decode/filter/encode cycle. Back it with the
-    // page allocator rather than the caller's allocator: the arena grows its
-    // nodes via resize, and some caller allocators (e.g. httpz's fixed-buffer
-    // fallback allocator) corrupt memory on the resize-then-free path. Keeping
-    // this transient scratch off the caller's allocator avoids that entirely;
-    // the caller is only touched by the single exact-size dupe at the end.
+    // Back the scratch arena with the page allocator. Some caller allocators
+    // (httpz fixed-buffer fallback) corrupt memory on resize-then-free. This
+    // path does not allocate from the caller allocator.
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
@@ -430,69 +298,62 @@ fn processProtobufMetrics(
     // Filter metrics in-place
     const counts = filterMetricsInPlace(&metrics_data, registry, bus);
 
-    // Fast path: if nothing was modified, return the original data without
-    // re-encoding. Mirrors processProtobufLogs — avoids a destructive
-    // decode -> filter -> re-encode round-trip when no policy matched. This
-    // also preserves metrics whose `data` oneof is set but whose
-    // `data_points` list is empty (valid descriptors with no measurements
-    // this batch): re-encoding would run the prune below and a non-matching
-    // policy must not drop descriptor metadata.
+    // Return the input bytes when no data point was dropped.
     if (counts.dropped_count == 0) {
-        const result = try allocator.alloc(u8, data.len);
-        @memcpy(result, data);
-        return .{
-            .data = result,
-            .dropped_count = 0,
-            .original_count = counts.original_count,
-        };
+        try out_writer.writeAll(data);
+        return .{ .dropped_count = 0, .original_count = counts.original_count };
     }
 
-    // Re-serialize to protobuf into the arena (same reasoning as above).
+    // Encode into the arena.
     var output_writer = std.Io.Writer.Allocating.init(arena_alloc);
-    // No deinit: the backing memory is owned by the arena.
-
     try metrics_data.encode(&output_writer.writer, arena_alloc);
-
-    // Hand the caller a single exact-size allocation it owns.
-    const output = try allocator.dupe(u8, output_writer.written());
+    try out_writer.writeAll(output_writer.written());
 
     return .{
-        .data = output,
         .dropped_count = counts.dropped_count,
         .original_count = counts.original_count,
-    };
-}
-
-fn processProtobufMetricsStream(
-    allocator: std.mem.Allocator,
-    registry: *const PolicyRegistry,
-    bus: *EventBus,
-    in_reader: *std.Io.Reader,
-    out_writer: *std.Io.Writer,
-) !StreamProcessResult {
-    // Read the request body into a scratch arena backed by the page allocator,
-    // not the caller's allocator. readAll grows its buffer incrementally
-    // (resize), which is unsafe on some caller allocators (e.g. httpz's
-    // fixed-buffer fallback allocator). See processProtobufMetrics below.
-    var read_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer read_arena.deinit();
-    const data = try stream_io.readAll(read_arena.allocator(), in_reader);
-
-    const result = try processProtobufMetrics(allocator, registry, bus, data);
-    defer allocator.free(result.data);
-
-    try out_writer.writeAll(result.data);
-
-    return .{
-        .dropped_count = result.dropped_count,
-        .original_count = result.original_count,
-        .was_transformed = false,
     };
 }
 
 // =============================================================================
 // Tests
 // =============================================================================
+
+fn runMetrics(
+    allocator: std.mem.Allocator,
+    registry: *const PolicyRegistry,
+    bus: *EventBus,
+    input: []const u8,
+    format: Format,
+) !common.TestRun {
+    var in_reader = std.Io.Reader.fixed(input);
+    var out_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer out_writer.deinit();
+    const result = try processMetricsStream(allocator, registry, bus, &in_reader, &out_writer.writer, format);
+    return .{ .data = try out_writer.toOwnedSlice(), .result = result };
+}
+
+/// Load a policy that drops each data point whose `field` matches `regex`.
+fn loadMetricDropPolicy(
+    allocator: std.mem.Allocator,
+    registry: *PolicyRegistry,
+    id: []const u8,
+    field: proto.policy.MetricMatcher.field_union,
+    regex: []const u8,
+) !void {
+    var drop_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, id),
+        .name = try allocator.dupe(u8, id),
+        .enabled = true,
+        .target = .{ .metric = .{ .keep = false } },
+    };
+    defer drop_policy.deinit(allocator);
+    try drop_policy.target.?.metric.match.append(allocator, .{
+        .field = field,
+        .match = .{ .regex = try allocator.dupe(u8, regex) },
+    });
+    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+}
 
 test "processMetrics - parses and re-serializes JSON" {
     const allocator = std.testing.allocator;
@@ -512,31 +373,15 @@ test "processMetrics - parses and re-serializes JSON" {
         \\"description":"HTTP request count","unit":"1","sum":{"dataPoints":[{"asInt":"100"}]}}]}]}]}
     ;
 
-    var in_reader = std.Io.Reader.fixed(metrics);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), metrics, .json);
+    defer allocator.free(run.data);
 
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "http.requests") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "resourceMetrics") != null);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "http.requests") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "resourceMetrics") != null);
+    try std.testing.expectEqual(@as(usize, 0), run.result.dropped_count);
 }
 
-test "processMetrics - malformed JSON returns unchanged (fail-open)" {
+test "processMetrics - malformed JSON returns an error" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -545,75 +390,7 @@ test "processMetrics - malformed JSON returns unchanged (fail-open)" {
     defer registry.deinit();
 
     const malformed = "{ not valid json }";
-
-    var in_reader = std.Io.Reader.fixed(malformed);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    ) catch {
-        const copied = try allocator.alloc(u8, malformed.len);
-        @memcpy(copied, malformed);
-        const result: ProcessResult = .{
-            .data = copied,
-            .dropped_count = 0,
-            .original_count = 0,
-            .was_transformed = false,
-        };
-        defer allocator.free(result.data);
-
-        try std.testing.expectEqualStrings(malformed, result.data);
-        try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-        return;
-    };
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqualStrings(malformed, result.data);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-}
-
-test "processMetrics - unknown content type returns unchanged" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    const data = "some unknown data";
-
-    var in_reader = std.Io.Reader.fixed(data);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "text/plain",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqualStrings(data, result.data);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expect(std.meta.isError(runMetrics(allocator, &registry, noop_bus.eventBus(), malformed, .json)));
 }
 
 test "processMetrics - no policies keeps all metrics" {
@@ -632,30 +409,14 @@ test "processMetrics - no policies keeps all metrics" {
         \\{"name":"metric2","sum":{"dataPoints":[{"asInt":"2"}]}}]}]}]}
     ;
 
-    var in_reader = std.Io.Reader.fixed(metrics);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), metrics, .json);
+    defer allocator.free(run.data);
 
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "metric1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "metric2") != null);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(!result.wasModified());
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "metric1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "metric2") != null);
+    try std.testing.expectEqual(@as(usize, 0), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), run.result.original_count);
+    try std.testing.expect(!run.result.wasModified());
 }
 
 test "processMetrics - DROP policy filters metrics by name" {
@@ -667,21 +428,13 @@ test "processMetrics - DROP policy filters metrics by name" {
     defer registry.deinit();
 
     // Create a DROP policy for metrics matching "debug"
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-debug-metrics"),
-        .name = try allocator.dupe(u8, "drop-debug-metrics"),
-        .enabled = true,
-        .target = .{ .metric = .{
-            .keep = false,
-        } },
-    };
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "debug") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(
+        allocator,
+        &registry,
+        "drop-debug-metrics",
+        .{ .metric_field = .METRIC_FIELD_NAME },
+        "debug",
+    );
 
     const metrics =
         \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
@@ -691,31 +444,15 @@ test "processMetrics - DROP policy filters metrics by name" {
         \\{"name":"debug.internal","sum":{"dataPoints":[{"asInt":"2"}]}}]}]}]}
     ;
 
-    var in_reader = std.Io.Reader.fixed(metrics);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), metrics, .json);
+    defer allocator.free(run.data);
 
     // debug metric should be dropped, http.requests should remain
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "debug.internal") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "http.requests") != null);
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(result.wasModified());
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "debug.internal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "http.requests") != null);
+    try std.testing.expectEqual(@as(usize, 1), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), run.result.original_count);
+    try std.testing.expect(run.result.wasModified());
 }
 
 test "processMetrics - DROP policy filters metrics by resource attribute" {
@@ -727,23 +464,15 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
     defer registry.deinit();
 
     // Create a DROP policy for metrics from "test-service"
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-test-service"),
-        .name = try allocator.dupe(u8, "drop-test-service"),
-        .enabled = true,
-        .target = .{ .metric = .{
-            .keep = false,
-        } },
-    };
     var attr_path: proto.policy.AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "service.name"));
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .resource_attribute = attr_path },
-        .match = .{ .regex = try allocator.dupe(u8, "test-service") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(
+        allocator,
+        &registry,
+        "drop-test-service",
+        .{ .resource_attribute = attr_path },
+        "test-service",
+    );
 
     const metrics =
         \\{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name",
@@ -761,30 +490,14 @@ test "processMetrics - DROP policy filters metrics by resource attribute" {
         \\"sum":{"dataPoints":[{"asInt":"2"}]}}]}]}]}
     ;
 
-    var in_reader = std.Io.Reader.fixed(metrics);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), metrics, .json);
+    defer allocator.free(run.data);
 
     // Metrics from test-service should be dropped
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "from.test") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "from.prod") != null);
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "from.test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "from.prod") != null);
+    try std.testing.expectEqual(@as(usize, 1), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), run.result.original_count);
 }
 
 test "processMetrics - all metrics dropped returns empty structure" {
@@ -796,21 +509,7 @@ test "processMetrics - all metrics dropped returns empty structure" {
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-all"),
-        .name = try allocator.dupe(u8, "drop-all"),
-        .enabled = true,
-        .target = .{ .metric = .{
-            .keep = false,
-        } },
-    };
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "metric") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(allocator, &registry, "drop-all", .{ .metric_field = .METRIC_FIELD_NAME }, "metric");
 
     const metrics =
         \\{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},
@@ -820,28 +519,12 @@ test "processMetrics - all metrics dropped returns empty structure" {
         \\{"name":"metric2","sum":{"dataPoints":[{"asInt":"2"}]}}]}]}]}
     ;
 
-    var in_reader = std.Io.Reader.fixed(metrics);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), metrics, .json);
+    defer allocator.free(run.data);
 
-    try std.testing.expectEqual(@as(usize, 2), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(result.allDropped());
+    try std.testing.expectEqual(@as(usize, 2), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), run.result.original_count);
+    try std.testing.expect(run.result.allDropped());
 }
 
 test "processMetrics - DROP policy filters individual data points" {
@@ -852,21 +535,15 @@ test "processMetrics - DROP policy filters individual data points" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-canary-datapoints"),
-        .name = try allocator.dupe(u8, "drop-canary-datapoints"),
-        .enabled = true,
-        .target = .{ .metric = .{ .keep = false } },
-    };
     var attr_path: proto.policy.AttributePath = .{};
     try attr_path.path.append(allocator, try allocator.dupe(u8, "env"));
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .datapoint_attribute = attr_path },
-        .match = .{ .regex = try allocator.dupe(u8, "canary") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(
+        allocator,
+        &registry,
+        "drop-canary-datapoints",
+        .{ .datapoint_attribute = attr_path },
+        "canary",
+    );
 
     // One metric, three data points: only the canary one matches, so the metric
     // survives with the other two intact.
@@ -893,7 +570,7 @@ test "processMetrics - DROP policy filters individual data points" {
         noop_bus.eventBus(),
         &in_reader,
         &out_writer.writer,
-        "application/json",
+        .json,
     );
 
     const data = out_writer.written();
@@ -906,20 +583,11 @@ test "processMetrics - DROP policy filters individual data points" {
     try std.testing.expect(!result.allDropped());
 }
 
-test "ContentFormat.fromContentType" {
-    try std.testing.expectEqual(ContentFormat.json, ContentFormat.fromContentType("application/json"));
-    try std.testing.expectEqual(ContentFormat.json, ContentFormat.fromContentType("application/json; charset=utf-8"));
-    try std.testing.expectEqual(ContentFormat.protobuf, ContentFormat.fromContentType("application/x-protobuf"));
-    try std.testing.expectEqual(ContentFormat.unknown, ContentFormat.fromContentType("text/plain"));
-    try std.testing.expectEqual(ContentFormat.unknown, ContentFormat.fromContentType(""));
-}
-
 // =============================================================================
 // Protobuf Tests
 // =============================================================================
 
 const Gauge = proto.metrics.Gauge;
-const NumberDataPoint = proto.metrics.NumberDataPoint;
 
 /// Helper to create protobuf-encoded MetricsData for testing
 fn createTestProtobufMetrics(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
@@ -956,137 +624,6 @@ fn createTestProtobufMetrics(allocator: std.mem.Allocator, names: []const []cons
     return output_writer.toOwnedSlice();
 }
 
-const benchmark_metrics_pb = @embedFile("otlp_metrics_benchmark_pb");
-
-fn createRepeatedBenchmarkMetricsPayload(allocator: std.mem.Allocator, repetitions: usize) ![]u8 {
-    const payload = try allocator.alloc(u8, benchmark_metrics_pb.len * repetitions);
-    errdefer allocator.free(payload);
-
-    for (0..repetitions) |i| {
-        const start = i * benchmark_metrics_pb.len;
-        @memcpy(payload[start..][0..benchmark_metrics_pb.len], benchmark_metrics_pb);
-    }
-
-    return payload;
-}
-
-// const HttpzFallbackResizeBugAllocator = struct {
-//     fixed: std.heap.FixedBufferAllocator,
-//     fallback: std.mem.Allocator,
-//     fixed_resize_fail_count: usize = 0,
-//     fixed_resize_freed_count: usize = 0,
-
-//     fn init(fixed_buffer: []u8, fallback: std.mem.Allocator) HttpzFallbackResizeBugAllocator {
-//         return .{
-//             .fixed = std.heap.FixedBufferAllocator.init(fixed_buffer),
-//             .fallback = fallback,
-//         };
-//     }
-
-//     fn allocator(self: *HttpzFallbackResizeBugAllocator) std.mem.Allocator {
-//         return .{
-//             .ptr = self,
-//             .vtable = &.{
-//                 .alloc = alloc,
-//                 .resize = resize,
-//                 .free = free,
-//                 .remap = remap,
-//             },
-//         };
-//     }
-
-//     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-//         const self: *HttpzFallbackResizeBugAllocator = @ptrCast(@alignCast(ctx));
-//         const fixed = self.fixed.allocator();
-//         return fixed.rawAlloc(len, alignment, ra) orelse self.fallback.rawAlloc(len, alignment, ra);
-//     }
-
-//     fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
-//         const self: *HttpzFallbackResizeBugAllocator = @ptrCast(@alignCast(ctx));
-//         if (self.fixed.ownsPtr(buf.ptr)) {
-//             const fixed = self.fixed.allocator();
-//             if (fixed.rawResize(buf, alignment, new_len, ra)) {
-//                 return true;
-//             }
-//             self.fixed_resize_fail_count += 1;
-//             const before_end_index = self.fixed.end_index;
-//             fixed.rawFree(buf, alignment, ra);
-//             if (self.fixed.end_index != before_end_index) {
-//                 self.fixed_resize_freed_count += 1;
-//             }
-//             return false;
-//         }
-//         return self.fallback.rawResize(buf, alignment, new_len, ra);
-//     }
-
-//     fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
-//         _ = ctx;
-//         _ = buf;
-//         _ = alignment;
-//         _ = ra;
-//     }
-
-//     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
-//         if (resize(ctx, memory, alignment, new_len, ra)) {
-//             return memory.ptr;
-//         }
-//         return null;
-//     }
-// };
-
-// test "processMetrics - benchmark protobuf exposes nested arena over httpz fallback allocator" {
-//     const allocator = std.testing.allocator;
-
-//     var noop_bus: NoopEventBus = undefined;
-//     noop_bus.init(std.Options.debug_io);
-//     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-//     defer registry.deinit();
-
-//     var keep_index_non_empty: proto.policy.Policy = .{
-//         .id = try allocator.dupe(u8, "drop-never-match"),
-//         .name = try allocator.dupe(u8, "drop-never-match"),
-//         .enabled = true,
-//         .target = .{ .metric = .{
-//             .keep = false,
-//         } },
-//     };
-//     try keep_index_non_empty.target.?.metric.match.append(allocator, .{
-//         .field = .{ .metric_field = .METRIC_FIELD_NAME },
-//         .match = .{ .regex = try allocator.dupe(u8, "does-not-match") },
-//     });
-//     defer keep_index_non_empty.deinit(allocator);
-
-//     try registry.updatePolicies(&.{keep_index_non_empty}, "file-provider", .file);
-
-//     const repetitions = 64;
-//     const proto_data = try createRepeatedBenchmarkMetricsPayload(allocator, repetitions);
-//     defer allocator.free(proto_data);
-
-//     var request_arena = std.heap.ArenaAllocator.init(allocator);
-//     defer request_arena.deinit();
-
-//     var fixed_buffer: [32 * 1024]u8 = undefined;
-//     var httpz_allocator = HttpzFallbackResizeBugAllocator.init(&fixed_buffer, request_arena.allocator());
-
-//     var in_reader = std.Io.Reader.fixed(proto_data);
-//     var out_writer: std.Io.Writer.Allocating = .init(httpz_allocator.allocator());
-//     defer out_writer.deinit();
-
-//     const result = try processMetricsStream(
-//         httpz_allocator.allocator(),
-//         &registry,
-//         noop_bus.eventBus(),
-//         &in_reader,
-//         &out_writer.writer,
-//         "application/x-protobuf",
-//     );
-
-//     try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-//     try std.testing.expectEqual(@as(usize, 5 * repetitions), result.original_count);
-//     try std.testing.expectEqual(@as(usize, 0), httpz_allocator.fixed_resize_fail_count);
-//     try std.testing.expectEqual(@as(usize, 0), httpz_allocator.fixed_resize_freed_count);
-// }
-
 test "processMetrics - protobuf parses and re-serializes" {
     const allocator = std.testing.allocator;
 
@@ -1099,29 +636,13 @@ test "processMetrics - protobuf parses and re-serializes" {
     const proto_data = try createTestProtobufMetrics(allocator, &.{ "cpu.usage", "memory.usage" });
     defer allocator.free(proto_data);
 
-    var in_reader = std.Io.Reader.fixed(proto_data);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/x-protobuf",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), proto_data, .protobuf);
+    defer allocator.free(run.data);
 
     // With no policies, all metrics should be kept
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(!result.wasModified());
+    try std.testing.expectEqual(@as(usize, 0), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), run.result.original_count);
+    try std.testing.expect(!run.result.wasModified());
 }
 
 test "processMetrics - protobuf DROP policy filters metrics" {
@@ -1133,52 +654,22 @@ test "processMetrics - protobuf DROP policy filters metrics" {
     defer registry.deinit();
 
     // Create a DROP policy for metrics containing "debug"
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-debug"),
-        .name = try allocator.dupe(u8, "drop-debug"),
-        .enabled = true,
-        .target = .{ .metric = .{
-            .keep = false,
-        } },
-    };
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "debug") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(allocator, &registry, "drop-debug", .{ .metric_field = .METRIC_FIELD_NAME }, "debug");
 
     // Create protobuf data with one metric containing "debug"
     const proto_data = try createTestProtobufMetrics(allocator, &.{ "http.requests", "debug.internal" });
     defer allocator.free(proto_data);
 
-    var in_reader = std.Io.Reader.fixed(proto_data);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/x-protobuf",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), proto_data, .protobuf);
+    defer allocator.free(run.data);
 
     // One metric should be dropped
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(result.wasModified());
+    try std.testing.expectEqual(@as(usize, 1), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), run.result.original_count);
+    try std.testing.expect(run.result.wasModified());
 
     // Verify the result can be decoded and contains only the http.requests metric
-    var reader = std.Io.Reader.fixed(result.data);
+    var reader = std.Io.Reader.fixed(run.data);
     var decoded = try MetricsData.decode(&reader, allocator);
     defer decoded.deinit(allocator);
 
@@ -1201,52 +692,22 @@ test "processMetrics - protobuf all metrics dropped" {
     defer registry.deinit();
 
     // Create a DROP policy that matches all metrics
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-all"),
-        .name = try allocator.dupe(u8, "drop-all"),
-        .enabled = true,
-        .target = .{ .metric = .{
-            .keep = false,
-        } },
-    };
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "usage") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(allocator, &registry, "drop-all", .{ .metric_field = .METRIC_FIELD_NAME }, "usage");
 
     // Create protobuf data with metrics that all match the pattern
     const proto_data = try createTestProtobufMetrics(allocator, &.{ "cpu.usage", "memory.usage", "disk.usage" });
     defer allocator.free(proto_data);
 
-    var in_reader = std.Io.Reader.fixed(proto_data);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/x-protobuf",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), proto_data, .protobuf);
+    defer allocator.free(run.data);
 
-    try std.testing.expectEqual(@as(usize, 3), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 3), result.original_count);
-    try std.testing.expect(result.allDropped());
+    try std.testing.expectEqual(@as(usize, 3), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 3), run.result.original_count);
+    try std.testing.expect(run.result.allDropped());
 }
 
 // =============================================================================
-// Regression tests: empty metric descriptors (data set, data_points empty)
+// Empty metric descriptors (data set, no data points)
 // =============================================================================
 
 /// Build a protobuf-encoded MetricsData carrying a mix of populated and empty
@@ -1302,7 +763,7 @@ fn collectMetricNames(decoded: *const MetricsData, out: [][]const u8) usize {
     return n;
 }
 
-test "BUG REPRO: empty metric descriptor survives non-matching policy (protobuf)" {
+test "empty metric descriptor survives non-matching policy (protobuf)" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -1312,18 +773,13 @@ test "BUG REPRO: empty metric descriptor survives non-matching policy (protobuf)
 
     // A DROP policy whose regex matches nothing — but it still routes the
     // metric signal through the decode -> filter -> re-encode path.
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "no-match"),
-        .name = try allocator.dupe(u8, "no-match"),
-        .enabled = true,
-        .target = .{ .metric = .{ .keep = false } },
-    };
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "does-not-exist") },
-    });
-    defer drop_policy.deinit(allocator);
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(
+        allocator,
+        &registry,
+        "no-match",
+        .{ .metric_field = .METRIC_FIELD_NAME },
+        "does-not-exist",
+    );
 
     // One populated gauge + one empty gauge (`data` oneof SET, data_points empty).
     const proto_data = try createProtobufMetricsMixed(allocator, &.{
@@ -1332,32 +788,16 @@ test "BUG REPRO: empty metric descriptor survives non-matching policy (protobuf)
     });
     defer allocator.free(proto_data);
 
-    var in_reader = std.Io.Reader.fixed(proto_data);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/x-protobuf",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), proto_data, .protobuf);
+    defer allocator.free(run.data);
 
     // The policy matched nothing — no data points were evaluated/dropped.
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 0), run.result.dropped_count);
     // original_count is a data-point count (1 from the populated gauge).
-    try std.testing.expectEqual(@as(usize, 1), result.original_count);
+    try std.testing.expectEqual(@as(usize, 1), run.result.original_count);
 
-    // Both metrics must survive (regression: empty.gauge was pruned).
-    var reader = std.Io.Reader.fixed(result.data);
+    // Both metrics survive.
+    var reader = std.Io.Reader.fixed(run.data);
     var decoded = try MetricsData.decode(&reader, allocator);
     defer decoded.deinit(allocator);
     var names: [4][]const u8 = undefined;
@@ -1378,18 +818,7 @@ test "filterMetricsInPlace: prunes policy-emptied metric but keeps originally-em
     // DROP by name match "drop": drops every data point of "drop.me", emptying
     // it. The originally-empty "empty.gauge" and the unrelated "keep.me" must
     // survive untouched.
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-by-name"),
-        .name = try allocator.dupe(u8, "drop-by-name"),
-        .enabled = true,
-        .target = .{ .metric = .{ .keep = false } },
-    };
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "drop") },
-    });
-    defer drop_policy.deinit(allocator);
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(allocator, &registry, "drop-by-name", .{ .metric_field = .METRIC_FIELD_NAME }, "drop");
 
     const proto_data = try createProtobufMetricsMixed(allocator, &.{
         .{ .name = "drop.me", .data_points = 1 },
@@ -1398,31 +827,15 @@ test "filterMetricsInPlace: prunes policy-emptied metric but keeps originally-em
     });
     defer allocator.free(proto_data);
 
-    var in_reader = std.Io.Reader.fixed(proto_data);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/x-protobuf",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), proto_data, .protobuf);
+    defer allocator.free(run.data);
 
     // drop.me's single data point was dropped; keep.me and empty.gauge have no
     // data points dropped.
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
+    try std.testing.expectEqual(@as(usize, 1), run.result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), run.result.original_count);
 
-    var reader = std.Io.Reader.fixed(result.data);
+    var reader = std.Io.Reader.fixed(run.data);
     var decoded = try MetricsData.decode(&reader, allocator);
     defer decoded.deinit(allocator);
     var names: [4][]const u8 = undefined;
@@ -1432,7 +845,7 @@ test "filterMetricsInPlace: prunes policy-emptied metric but keeps originally-em
     try std.testing.expectEqualStrings("empty.gauge", names[1]);
 }
 
-test "BUG REPRO: empty metric descriptor survives non-matching policy (JSON)" {
+test "empty metric descriptor survives non-matching policy (JSON)" {
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;
@@ -1440,18 +853,13 @@ test "BUG REPRO: empty metric descriptor survives non-matching policy (JSON)" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "no-match"),
-        .name = try allocator.dupe(u8, "no-match"),
-        .enabled = true,
-        .target = .{ .metric = .{ .keep = false } },
-    };
-    try drop_policy.target.?.metric.match.append(allocator, .{
-        .field = .{ .metric_field = .METRIC_FIELD_NAME },
-        .match = .{ .regex = try allocator.dupe(u8, "does-not-exist") },
-    });
-    defer drop_policy.deinit(allocator);
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+    try loadMetricDropPolicy(
+        allocator,
+        &registry,
+        "no-match",
+        .{ .metric_field = .METRIC_FIELD_NAME },
+        "does-not-exist",
+    );
 
     // Populated gauge (1 data point) + empty gauge (`gauge` set, dataPoints empty).
     const metrics =
@@ -1462,28 +870,12 @@ test "BUG REPRO: empty metric descriptor survives non-matching policy (JSON)" {
         \\{"name":"empty.gauge","gauge":{"dataPoints":[]}}]}]}]}
     ;
 
-    var in_reader = std.Io.Reader.fixed(metrics);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processMetricsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
+    const run = try runMetrics(allocator, &registry, noop_bus.eventBus(), metrics, .json);
+    defer allocator.free(run.data);
 
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
+    try std.testing.expectEqual(@as(usize, 0), run.result.dropped_count);
 
-    // Both metric descriptors survive (regression: empty.gauge was pruned).
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "populated.gauge") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "empty.gauge") != null);
+    // Both metrics survive.
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "populated.gauge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.data, "empty.gauge") != null);
 }

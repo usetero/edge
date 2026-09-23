@@ -271,12 +271,11 @@ pub fn processBuffered(
     // The per-signal StreamProcessResult types are distinct; normalize.
     const in = &decoded_reader;
     const out = &transformed.writer;
-    const ct = "application/json";
     const summary: BatchSummary = switch (pipe.kind) {
         .datadog_metrics_json => .of(try dd_metrics.processMetricsStream(arena, registry, ctx.bus, in, out)),
-        .otlp_logs_json => .of(try otlp_logs.processLogsStream(arena, registry, ctx.bus, in, out, ct)),
-        .otlp_metrics_json => .of(try otlp_metrics.processMetricsStream(arena, registry, ctx.bus, in, out, ct)),
-        .otlp_traces_json => .of(try otlp_traces.processTracesStream(arena, registry, ctx.bus, in, out, ct)),
+        .otlp_logs_json => .of(try otlp_logs.processLogsStream(arena, registry, ctx.bus, in, out, .json)),
+        .otlp_metrics_json => .of(try otlp_metrics.processMetricsStream(arena, registry, ctx.bus, in, out, .json)),
+        .otlp_traces_json => .of(try otlp_traces.processTracesStream(arena, registry, ctx.bus, in, out, .json)),
     };
 
     if (ctx.metrics) |metrics| {
@@ -452,25 +451,14 @@ pub const RecordSink = struct {
         var reader = std.Io.Reader.fixed(wrapped.written());
         var out: std.Io.Writer.Allocating = .init(arena);
         const registry = self.ctx.registry;
-        // The per-signal StreamProcessResult types are distinct; normalize.
         const in = &reader;
         const ow = &out.writer;
-        const ct = "application/x-protobuf";
-        const all_dropped = switch (self.signal) {
-            .log => blk: {
-                const result = try otlp_logs.processLogsStream(arena, registry, self.ctx.bus, in, ow, ct);
-                break :blk result.allDropped();
-            },
-            .metric => blk: {
-                const result = try otlp_metrics.processMetricsStream(arena, registry, self.ctx.bus, in, ow, ct);
-                break :blk result.allDropped();
-            },
-            .trace => blk: {
-                const result = try otlp_traces.processTracesStream(arena, registry, self.ctx.bus, in, ow, ct);
-                break :blk result.allDropped();
-            },
+        const result = try switch (self.signal) {
+            .log => otlp_logs.processLogsStream(arena, registry, self.ctx.bus, in, ow, .protobuf),
+            .metric => otlp_metrics.processMetricsStream(arena, registry, self.ctx.bus, in, ow, .protobuf),
+            .trace => otlp_traces.processTracesStream(arena, registry, self.ctx.bus, in, ow, .protobuf),
         };
-        if (all_dropped) {
+        if (result.allDropped()) {
             self.dropped += 1;
             return .drop;
         }
