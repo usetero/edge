@@ -25,12 +25,7 @@ pub const MetricType = enum {
     unknown,
 
     pub fn fromString(s: []const u8) MetricType {
-        if (std.mem.eql(u8, s, "counter")) return .counter;
-        if (std.mem.eql(u8, s, "gauge")) return .gauge;
-        if (std.mem.eql(u8, s, "histogram")) return .histogram;
-        if (std.mem.eql(u8, s, "summary")) return .summary;
-        if (std.mem.eql(u8, s, "untyped")) return .untyped;
-        return .unknown;
+        return std.meta.stringToEnum(MetricType, s) orelse .unknown;
     }
 };
 
@@ -157,6 +152,9 @@ pub const ParsedLine = union(enum) {
     parse_error: void,
 };
 
+/// The payload of a sample line.
+pub const Sample = @FieldType(ParsedLine, "sample");
+
 /// Parse a single line of Prometheus exposition format.
 /// Returns a ParsedLine union - all slices point into the input buffer.
 /// The input should NOT include the trailing newline.
@@ -178,13 +176,8 @@ pub fn parseLine(line: []const u8) ParsedLine {
 
 /// Parse a comment, HELP, or TYPE line
 fn parseCommentLine(line: []const u8) ParsedLine {
-    // Skip the '#'
-    var pos: usize = 1;
-
-    // Skip whitespace after #
-    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) {
-        pos += 1;
-    }
+    // Skip the '#' and the blanks after it
+    const pos = skipBlank(line, 1);
 
     if (pos >= line.len) {
         return .{ .comment = "" };
@@ -212,100 +205,45 @@ fn parseCommentLine(line: []const u8) ParsedLine {
 
 /// Parse HELP line: "HELP metric_name description text"
 fn parseHelpLine(after_help: []const u8) ParsedLine {
-    var pos: usize = 0;
-
-    // Skip whitespace
-    while (pos < after_help.len and (after_help[pos] == ' ' or after_help[pos] == '\t')) {
-        pos += 1;
-    }
-
-    if (pos >= after_help.len) {
-        return .{ .parse_error = {} };
-    }
-
-    // Parse metric name
-    const name_start = pos;
-    while (pos < after_help.len and isMetricNameChar(after_help[pos])) {
-        pos += 1;
-    }
-
-    const metric_name = after_help[name_start..pos];
-    if (metric_name.len == 0) {
-        return .{ .parse_error = {} };
-    }
-
-    // Skip whitespace before description
-    while (pos < after_help.len and (after_help[pos] == ' ' or after_help[pos] == '\t')) {
-        pos += 1;
-    }
-
+    const name = metadataName(after_help) orelse return .{ .parse_error = {} };
     // Rest is the description (may be empty)
-    const description = if (pos < after_help.len) after_help[pos..] else "";
-
     return .{ .help = .{
-        .metric_name = metric_name,
-        .description = description,
+        .metric_name = name.name,
+        .description = after_help[name.rest_start..],
     } };
 }
 
 /// Parse TYPE line: "TYPE metric_name type"
 fn parseTypeLine(after_type: []const u8) ParsedLine {
-    var pos: usize = 0;
-
-    // Skip whitespace
-    while (pos < after_type.len and (after_type[pos] == ' ' or after_type[pos] == '\t')) {
-        pos += 1;
-    }
-
-    if (pos >= after_type.len) {
+    const name = metadataName(after_type) orelse return .{ .parse_error = {} };
+    if (name.rest_start >= after_type.len) {
         return .{ .parse_error = {} };
     }
-
-    // Parse metric name
-    const name_start = pos;
-    while (pos < after_type.len and isMetricNameChar(after_type[pos])) {
-        pos += 1;
-    }
-
-    const metric_name = after_type[name_start..pos];
-    if (metric_name.len == 0) {
-        return .{ .parse_error = {} };
-    }
-
-    // Skip whitespace before type
-    while (pos < after_type.len and (after_type[pos] == ' ' or after_type[pos] == '\t')) {
-        pos += 1;
-    }
-
-    if (pos >= after_type.len) {
-        return .{ .parse_error = {} };
-    }
-
-    // Parse type name
-    const type_start = pos;
-    while (pos < after_type.len and isMetricNameChar(after_type[pos])) {
-        pos += 1;
-    }
-
-    const type_str = after_type[type_start..pos];
-
+    const type_str = after_type[name.rest_start..scanName(after_type, name.rest_start)];
     return .{ .type_info = .{
-        .metric_name = metric_name,
+        .metric_name = name.name,
         .metric_type = MetricType.fromString(type_str),
     } };
 }
 
+const MetadataName = struct {
+    name: []const u8,
+    /// Index of the first non-blank byte after the name.
+    rest_start: usize,
+};
+
+/// Reads the metric name after HELP or TYPE. Returns null if the name is empty.
+fn metadataName(s: []const u8) ?MetadataName {
+    const start = skipBlank(s, 0);
+    const end = scanName(s, start);
+    if (end == start) return null;
+    return .{ .name = s[start..end], .rest_start = skipBlank(s, end) };
+}
+
 /// Parse a metric sample line: "metric_name{labels} value [timestamp]"
 fn parseSampleLine(line: []const u8) ParsedLine {
-    var pos: usize = 0;
-
-    // Parse metric name
-    const name_start = pos;
-    while (pos < line.len and isMetricNameChar(line[pos])) {
-        pos += 1;
-    }
-
-    const metric_name = line[name_start..pos];
+    var pos = scanName(line, 0);
+    const metric_name = line[0..pos];
     if (metric_name.len == 0) {
         return .{ .parse_error = {} };
     }
@@ -352,40 +290,17 @@ fn parseSampleLine(line: []const u8) ParsedLine {
         pos += 1; // Skip '}'
     }
 
-    // Skip whitespace before value
-    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) {
-        pos += 1;
-    }
-
+    // Parse value (required)
+    pos = skipBlank(line, pos);
     if (pos >= line.len) {
         return .{ .parse_error = {} };
     }
-
-    // Parse value (required)
-    const value_start = pos;
-    while (pos < line.len and line[pos] != ' ' and line[pos] != '\t') {
-        pos += 1;
-    }
-
-    const value = line[value_start..pos];
-    if (value.len == 0) {
-        return .{ .parse_error = {} };
-    }
-
-    // Skip whitespace before optional timestamp
-    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) {
-        pos += 1;
-    }
+    const value_end = tokenEnd(line, pos);
+    const value = line[pos..value_end];
 
     // Parse optional timestamp
-    var timestamp: ?[]const u8 = null;
-    if (pos < line.len) {
-        const ts_start = pos;
-        while (pos < line.len and line[pos] != ' ' and line[pos] != '\t') {
-            pos += 1;
-        }
-        timestamp = line[ts_start..pos];
-    }
+    pos = skipBlank(line, value_end);
+    const timestamp: ?[]const u8 = if (pos < line.len) line[pos..tokenEnd(line, pos)] else null;
 
     return .{ .sample = .{
         .metric_name = metric_name,
@@ -397,10 +312,26 @@ fn parseSampleLine(line: []const u8) ParsedLine {
 
 /// Check if character is valid in a metric/label name
 fn isMetricNameChar(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or
-        (c >= 'A' and c <= 'Z') or
-        (c >= '0' and c <= '9') or
-        c == '_' or c == ':';
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == ':';
+}
+
+/// Returns the index of the first byte at or after pos that is not a space or tab.
+fn skipBlank(s: []const u8, pos: usize) usize {
+    var i = pos;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    return i;
+}
+
+/// Returns the index of the first byte at or after pos that is not a name byte.
+fn scanName(s: []const u8, pos: usize) usize {
+    var i = pos;
+    while (i < s.len and isMetricNameChar(s[i])) i += 1;
+    return i;
+}
+
+/// Returns the index of the first space or tab at or after pos, or s.len.
+fn tokenEnd(s: []const u8, pos: usize) usize {
+    return std.mem.findAnyPos(u8, s, pos, " \t") orelse s.len;
 }
 
 // =============================================================================
@@ -478,8 +409,7 @@ test "parseLine - comments whose first token begins with HELP/TYPE" {
         else => return error.UnexpectedResult,
     }
 
-    // HELP/TYPE as the entire comment (no following token) is still a parse
-    // error because the metric name is missing — same as before the fix.
+    // HELP or TYPE with no metric name is a parse error.
     try std.testing.expectEqual(@as(ParsedLine, .{ .parse_error = {} }), parseLine("# HELP"));
     try std.testing.expectEqual(@as(ParsedLine, .{ .parse_error = {} }), parseLine("# TYPE"));
 }
