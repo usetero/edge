@@ -1,9 +1,5 @@
-//! Writing a zimdjson on-demand value back out as JSON.
-//!
-//! Both record types carry unknown ("extra") fields as `AnyValue`, and both
-//! have to re-emit them verbatim when a policy drops a sibling and forces a
-//! re-serialization. The two had byte-identical copies of this walk; it lives
-//! here so a fix to one is a fix to both.
+//! Write a zimdjson on-demand value back out as JSON. Logs and metric series
+//! use this to re-emit their unknown fields.
 
 const std = @import("std");
 const zimdjson = @import("zimdjson");
@@ -45,9 +41,8 @@ pub fn write(jws: anytype, value: AnyValue) !void {
             .signed => |v| try jws.write(v),
             .double => |v| try jws.write(v),
         },
-        // An unreadable string becomes empty rather than aborting the walk:
-        // the record is the customer's and a half-written object is worse than
-        // a lost field. Kept verbatim from the two copies this replaces.
+        // An unreadable string becomes "". A lost field is better than a
+        // half-written object.
         .string => |v| try jws.write(v.get() catch ""),
         .array => |arr| {
             try jws.beginArray();

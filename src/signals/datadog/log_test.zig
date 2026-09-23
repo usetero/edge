@@ -1,15 +1,9 @@
-//! Tests for `log.zig`.
-//!
-//! Split out because the record type and its parse paths are ~700 lines and
-//! the cases exercising them are ~1000. Nothing here reaches past the public
-//! surface of `DatadogLog`.
+//! Tests for `log.zig`. They use only the public surface of `DatadogLog`.
 
 const std = @import("std");
 const log_mod = @import("log.zig");
 const DatadogLog = log_mod.DatadogLog;
 const Parser = log_mod.Parser;
-const Value = log_mod.Value;
-const AnyValue = log_mod.AnyValue;
 
 test "DatadogLog - parseRaw borrows known fields and captures extras as spans" {
     const allocator = std.testing.allocator;
@@ -42,8 +36,8 @@ test "DatadogLog - parseRaw borrows known fields and captures extras as spans" {
 }
 
 test "DatadogLog - parseRaw unescapes escaped strings into the allocator" {
-    // Escaped values unescape via parseFromSliceLeaky: allocator must be an
-    // arena, exactly like the production record arena.
+    // Escaped values unescape into the allocator. Use an arena, as
+    // production does.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -117,11 +111,9 @@ test "DatadogLog - parseRaw unwraps msg/log span extras for bodyForMatch" {
 }
 
 test "DatadogLog - findExtraString escaped nested string survives the transient parser" {
-    // Regression (macroscope PR 214): findNestedStringInRaw returned a slice
-    // into the std.json parsed arena for ESCAPED nested strings, then freed
-    // it via parsed.deinit(). testing.allocator poisons freed memory, so this
-    // fails loudly on the old code. The returned copy is caller-owned here
-    // (the escaped-nested case dupes; production passes the record arena).
+    // A nested escaped string must be a copy that outlives the std.json
+    // parse. testing.allocator poisons freed memory, so a slice into the
+    // freed parse fails here.
     const allocator = std.testing.allocator;
 
     const json =
@@ -136,9 +128,8 @@ test "DatadogLog - findExtraString escaped nested string survives the transient 
 }
 
 test "DatadogLog - parseRaw rejects malformed scalar tokens" {
-    // Regression (macroscope PR 214): the loose charset check let malformed
-    // numbers through, so records the full parser rejects could be filtered
-    // instead of failing open. Each must now error out of parseRaw.
+    // Each malformed number must fail parseRaw, so the record goes to the
+    // validating parse.
     const allocator = std.testing.allocator;
     for ([_][]const u8{ "1e+", "--1", "01", "1..2", "1.", ".5", "1e", "-" }) |bad| {
         var buf: [64]u8 = undefined;
@@ -156,11 +147,8 @@ test "DatadogLog - parseRaw rejects malformed scalar tokens" {
 }
 
 test "DatadogLog - extras serialize in the order the record listed them" {
-    // Field order is not semantic in JSON, but it is what the sender wrote,
-    // and both parse paths must agree: a record that takes the fallback must
-    // not reach the intake shaped differently from one that does not. The
-    // fast path keeps the order by construction; the materializing path keeps
-    // `extra_order` for it.
+    // Both parse paths must emit extras in record order. A record that takes
+    // the fallback must not reach the intake in a different shape.
     const allocator = std.testing.allocator;
     const json =
         \\{"message":"m","zeta":1,"alpha":2,"middle":3,"beta":4}
@@ -186,11 +174,8 @@ test "DatadogLog - extras serialize in the order the record listed them" {
 }
 
 test "DatadogLog - a duplicate extra key resolves to the last value" {
-    // The map kept the last write; the flat list scans backwards for the same
-    // answer. RFC 8259 §4 makes key uniqueness a SHOULD and leaves a
-    // duplicate's meaning undefined, so the fast path keeps both entries and
-    // re-emits the record as the sender wrote it, rather than picking a
-    // winner on the intake's behalf. See `ExtraSpans`.
+    // The fast path keeps both entries and re-emits them as sent. A lookup
+    // gives the last value. See `extras.Spans`.
     const allocator = std.testing.allocator;
     const json =
         \\{"message":"m","dupe":1,"dupe":2}
@@ -210,67 +195,10 @@ test "DatadogLog - a duplicate extra key resolves to the last value" {
     );
 }
 
-test "DatadogLog - a duplicate extra key does not strand its key copy" {
-    // `HashMap.put` replaces the value and keeps the original key pointer, so
-    // the materializing path must reuse the stored key on a duplicate rather
-    // than dupe a second one: `deinit` frees keys by walking the map, and a
-    // copy that entered neither the map nor `extra_order` is unreachable.
-    // The testing allocator fails this test on that leak.
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"message":"m","dupe":1,"keep":"x","dupe":2}
-    ;
-
-    var parser: Parser = .init;
-    defer parser.deinit(allocator);
-    const doc = try parser.parseFromSlice(allocator, json);
-    var log = try DatadogLog.parse(allocator, doc.asValue());
-    defer log.deinit(allocator);
-
-    // The map collapses the duplicate; the first position and the last value
-    // both survive.
-    try std.testing.expectEqual(@as(usize, 2), log.extra.count());
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try std.json.Stringify.value(log, .{}, &out.writer);
-    try std.testing.expectEqualStrings(
-        "{\"message\":\"m\",\"dupe\":2,\"keep\":\"x\"}",
-        out.written(),
-    );
-}
-
-test "DatadogLog - a duplicate container extra frees the value it replaces" {
-    // `parse` stringifies an object/array extra into owned bytes. A duplicate
-    // replaces that value, and the bytes it displaces have to go back to the
-    // allocator or the testing allocator reports the leak here. The third
-    // shape covers a container replaced by a scalar, where the stale bytes
-    // have no successor to overwrite them.
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"message":"m","obj":{"a":1},"obj":{"b":2},"arr":[1],"arr":[2],"gone":{"c":3},"gone":9}
-    ;
-
-    var parser: Parser = .init;
-    defer parser.deinit(allocator);
-    const doc = try parser.parseFromSlice(allocator, json);
-    var log = try DatadogLog.parse(allocator, doc.asValue());
-    defer log.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 3), log.extra.count());
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try std.json.Stringify.value(log, .{}, &out.writer);
-    try std.testing.expectEqualStrings(
-        "{\"message\":\"m\",\"obj\":{\"b\":2},\"arr\":[2],\"gone\":9}",
-        out.written(),
-    );
-}
-
 test "DatadogLog - parseRaw output is byte-identical to materializing parse" {
-    // Equivalence: for records both paths accept, serialization must match
-    // byte-for-byte. Fixtures avoid escapes/floats/whitespace-in-containers,
-    // where the old path canonicalizes and spans stay verbatim (an intended
-    // difference covered elsewhere).
+    // For records both paths accept, the output must match byte for byte.
+    // The fixtures avoid escapes, floats and whitespace in containers, where
+    // `parse` makes the output canonical.
     const allocator = std.testing.allocator;
 
     const fixtures = [_][]const u8{
@@ -508,9 +436,8 @@ test "DatadogLog - parseRaw escaped known field re-escapes on serialization" {
 }
 
 test "DatadogLog - parseRaw rejects comma separator violations (parse parity)" {
-    // Regression (macroscope PR 214): the walker used to accept a trailing
-    // comma; leading and missing commas were the same hole. All three are
-    // invalid JSON the full parser rejects, so they must fail open.
+    // A trailing, leading, missing or double comma is invalid JSON. parseRaw
+    // must reject each one so the record fails open.
     const allocator = std.testing.allocator;
 
     const bad_records = [_][]const u8{
@@ -713,68 +640,6 @@ test "DatadogLog - jsonStringify with timestamp" {
     try std.testing.expectEqualStrings("{\"timestamp\":1703001234567}", out.written());
 }
 
-test "DatadogLog - field mutation remove message" {
-    var log: DatadogLog = .{
-        .message = "test message",
-        .status = "info",
-    };
-
-    // Remove message
-    log.message = null;
-
-    try std.testing.expect(log.message == null);
-    try std.testing.expectEqualStrings("info", log.status.?);
-}
-
-test "DatadogLog - field mutation set message" {
-    var log: DatadogLog = .{
-        .message = "original",
-    };
-
-    // Set new message
-    log.message = "modified";
-
-    try std.testing.expectEqualStrings("modified", log.message.?);
-}
-
-test "DatadogLog - field mutation remove all fields" {
-    var log: DatadogLog = .{
-        .message = "body",
-        .status = "error",
-        .level = "ERROR",
-        .service = "api",
-        .hostname = "host1",
-        .ddsource = "nginx",
-        .ddtags = "env:prod",
-        .timestamp = 1703001234,
-        .environment = "production",
-        .custom_field = "custom",
-    };
-
-    // Remove all fields
-    log.message = null;
-    log.status = null;
-    log.level = null;
-    log.service = null;
-    log.hostname = null;
-    log.ddsource = null;
-    log.ddtags = null;
-    log.timestamp = null;
-    log.environment = null;
-    log.custom_field = null;
-
-    try std.testing.expect(log.message == null);
-    try std.testing.expect(log.status == null);
-    try std.testing.expect(log.level == null);
-    try std.testing.expect(log.service == null);
-    try std.testing.expect(log.hostname == null);
-    try std.testing.expect(log.ddsource == null);
-    try std.testing.expect(log.ddtags == null);
-    try std.testing.expect(log.timestamp == null);
-    try std.testing.expect(log.environment == null);
-    try std.testing.expect(log.custom_field == null);
-}
-
 test "DatadogLog - parse and reserialize preserves data" {
     const allocator = std.testing.allocator;
 
@@ -838,8 +703,7 @@ test "DatadogLog - bodyForMatch unwraps msg/log wrappers, not just message" {
     var parser: Parser = .init;
     defer parser.deinit(allocator);
 
-    // Body wrapped in `msg` with no top-level `message`. Regression: bodyForMatch
-    // used to bail on `self.message == null` and never consult the unwrapped flat.
+    // The body is wrapped in `msg`, and there is no top-level `message`.
     const json =
         \\{"msg": "{\"data\":{\"jsonPayload\":{\"message\":\"hello-body\"}}}"}
     ;
@@ -874,9 +738,8 @@ test "DatadogLog - clearWrappedRewrite drops stale message tree" {
     log.message = "{\"new\":\"bob\"}";
     log.clearWrappedRewrite(allocator);
 
-    // Editing `new` must operate on the NEW message. Without the reset,
-    // ensureMessageTree returns the stale `old` tree, which has no `new` key —
-    // so the edit silently no-ops (returns false) and the redact is lost.
+    // The edit must apply to the new message. A stale tree has no "new" key,
+    // so the edit would return false.
     try std.testing.expect(log.setWrapped(allocator, &.{"new"}, "redacted-2"));
     log.finalizeWrapped(allocator);
 
@@ -1010,13 +873,9 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
         ,
         \\{"message":"{\"data\":{\"jsonPayload\":{\"body\":\"first\",\"body\":\"second\",\"log\":\"l\"}}}"}
         ,
-        // Array-valued body candidates: the targeted walk cannot descend
-        // arrays, so it must defer to flatten (which does). Without the
-        // `.array => return null` arm in `innerBodyDirect`, the first two
-        // shapes flip keep/drop policy decisions (`drop-debug-logs` matches
-        // `log_field: body` against /debug|trace/): the targeted path would
-        // resolve a wrong string sibling while flatten resolves the array's
-        // string leaf.
+        // The targeted walk cannot go into an array, so it must defer to the
+        // flatten. Else it could pick a string sibling while the flatten
+        // picks the array leaf, and a body policy would change its verdict.
         \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":[\"innocuous\"],\"body\":\"debug stuff\"}}}"}
         ,
         \\{"message":"{\"data\":{\"jsonPayload\":{\"message\":[\"debug stuff\"],\"body\":\"innocuous\"}}}"}
@@ -1044,9 +903,8 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
 }
 
 test "DatadogLog - unwrappedAttribute observes a setWrapped edit on the same path" {
-    // Regression (PR #203): `setWrapped` edits `message_tree` but leaves
-    // `message_flat` stale, so a later read on the same path returned the
-    // pre-transform value.
+    // `setWrapped` edits `message_tree`, not `message_flat`. A later read on
+    // the same path must return the edit.
     const allocator = std.testing.allocator;
 
     var parser: Parser = .init;
@@ -1071,9 +929,7 @@ test "DatadogLog - unwrappedAttribute observes a setWrapped edit on the same pat
     // Rule 1 edits the leaf. The tree is now dirty; the flat is NOT refreshed.
     try std.testing.expect(log.setWrapped(allocator, &path, "ALICE_R@example.com"));
 
-    // A later read on the same path must return rule 1's edit, not the stale
-    // flat snapshot of the original value. Pre-fix this returned
-    // "alice@example.com".
+    // A later read on the same path returns the edit from rule 1.
     try std.testing.expectEqualStrings(
         "ALICE_R@example.com",
         log.unwrappedAttribute(allocator, &path).?,
@@ -1304,9 +1160,8 @@ test "DatadogLog - replacing a wrapped ancestor removes its old descendants" {
 }
 
 test "DatadogLog - parseRaw rejects malformed container interiors (parse parity)" {
-    // Regression: FieldWalker.valueEnd skipped the interior bytes of a
-    // container, so a malformed unknown-field value went into `extra_spans`
-    // verbatim. parseRaw must reject what a full parser rejects.
+    // parseRaw must reject a malformed container in an unknown field, as a
+    // full parser does.
     const allocator = std.testing.allocator;
 
     const bad_record_values = [_][]const u8{

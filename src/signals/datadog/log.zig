@@ -1,12 +1,12 @@
 const std = @import("std");
-const zimdjson = @import("zimdjson");
 const jscan = @import("../json_scan.zig");
 const policy = @import("policy_zig");
 const extras = @import("extras.zig");
+const json_value = @import("json_value.zig");
 
-pub const Parser = zimdjson.ondemand.FullParser(.default);
-pub const Value = Parser.Value;
-pub const AnyValue = Parser.AnyValue;
+pub const Parser = json_value.Parser;
+const Value = json_value.Value;
+const AnyValue = json_value.AnyValue;
 
 /// Datadog log schema for parsing and serialization
 /// Uses zimdjson ondemand parser for efficient deserialization
@@ -24,12 +24,10 @@ pub const DatadogLog = struct {
 
     extra: extras.Materialized = .{},
 
-    /// Unknown fields captured by `parseRaw` as verbatim spans of the input
-    /// record — key and value both borrow the record bytes, so nothing here
-    /// is owned. String values keep their quotes/escapes; `findExtraString`
-    /// unescapes lazily
-    /// only when a policy actually reads the field. Mutually exclusive with
-    /// `extra` (which the materializing `parse` fills).
+    /// Unknown fields from `parseRaw`, as slices of the record. Nothing here
+    /// is owned. String values keep their quotes and escapes;
+    /// `findExtraString` unescapes them only when a policy reads them.
+    /// `parse` fills `extra` instead, and a log uses only one of the two.
     extra_spans: extras.Spans = .{},
 
     /// Lazily-computed unwrapping of a JSON-stringified `message`/`msg`/`log`
@@ -66,19 +64,17 @@ pub const DatadogLog = struct {
     /// Free extra field keys allocated during parsing
     pub fn deinit(self: *DatadogLog, allocator: std.mem.Allocator) void {
         self.extra.deinit(allocator);
-
         self.extra_spans.deinit(allocator);
-        var flat_it = self.message_flat.iterator();
-        while (flat_it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        self.message_flat.deinit(allocator);
-        if (self.message_tree) |*tree| tree.deinit();
-        if (self.message_rewrapped) |s| allocator.free(s);
-        if (self.direct_body) |b| allocator.free(b);
+        self.clearWrappedRewrite(allocator);
         self.* = undefined;
     }
+
+    /// The known top-level fields, in the order `jsonStringify` writes them.
+    /// `timestamp` is the only one that is not a string.
+    const known_fields = [_][]const u8{
+        "message",  "status", "level",     "service",     "hostname",
+        "ddsource", "ddtags", "timestamp", "environment", "custom_field",
+    };
 
     /// Parse a DatadogLog from a zimdjson Value (object)
     pub fn parse(allocator: std.mem.Allocator, value: Value) !DatadogLog {
@@ -87,104 +83,63 @@ pub const DatadogLog = struct {
 
         var obj = try value.asObject();
         var it = obj.iterator();
-        while (try it.next()) |field| {
+        fields: while (try it.next()) |field| {
             const key = try field.key.get();
-
-            if (std.mem.eql(u8, key, "message")) {
-                log.message = try field.value.asString();
-            } else if (std.mem.eql(u8, key, "status")) {
-                log.status = try field.value.asString();
-            } else if (std.mem.eql(u8, key, "level")) {
-                log.level = try field.value.asString();
-            } else if (std.mem.eql(u8, key, "service")) {
-                log.service = try field.value.asString();
-            } else if (std.mem.eql(u8, key, "hostname")) {
-                log.hostname = try field.value.asString();
-            } else if (std.mem.eql(u8, key, "ddsource")) {
-                log.ddsource = try field.value.asString();
-            } else if (std.mem.eql(u8, key, "ddtags")) {
-                log.ddtags = try field.value.asString();
-            } else if (std.mem.eql(u8, key, "timestamp")) {
-                log.timestamp = try field.value.asSigned();
-            } else if (std.mem.eql(u8, key, "environment")) {
-                log.environment = try field.value.asString();
-            } else if (std.mem.eql(u8, key, "custom_field")) {
-                log.custom_field = try field.value.asString();
-            } else {
-                try log.extra.put(allocator, key, try field.value.asAny());
+            inline for (known_fields) |name| {
+                if (std.mem.eql(u8, key, name)) {
+                    @field(log, name) = if (comptime std.mem.eql(u8, name, "timestamp"))
+                        try field.value.asSigned()
+                    else
+                        try field.value.asString();
+                    continue :fields;
+                }
             }
+            try log.extra.put(allocator, key, try field.value.asAny());
         }
 
         return log;
     }
 
-    /// Single-pass zero-copy parse for the per-record eval path — no zimdjson
-    /// involved. The FieldWalker scans the record once, validating structure
-    /// as it goes: known string fields borrow slices of `raw` directly when
-    /// they contain no escapes (the overwhelmingly common case), and unknown
-    /// fields are captured verbatim into `extra_spans` — never materialized,
-    /// never duped; string extras are unescaped lazily on first policy read.
+    /// Parse one record in a single pass, with no copy and no zimdjson. Known
+    /// string fields borrow from `raw` when they have no escapes. Unknown
+    /// fields go into `extra_spans` as slices of `raw`.
     ///
-    /// `raw` must outlive the returned log, and `allocator` must be an
-    /// arena scoped to the record: string fields are borrowed from `raw` or
-    /// unescaped into `allocator` with no ownership distinction, so nothing
-    /// is ever individually freed — `deinit` releases map storage only and
-    /// the arena reset reclaims the rest.
+    /// `raw` must outlive the log. `allocator` must be an arena for the
+    /// record: `deinit` frees only map storage.
     ///
-    /// Anything the walker doesn't like (structural surprises, escaped keys,
-    /// malformed scalar tokens, trailing bytes) errors out; callers retry
-    /// with the zimdjson-validated materializing `parse`, so semantics never
-    /// depend on this path.
+    /// Input the walker does not accept returns an error. The caller then
+    /// uses `parse`, so results never depend on this path.
     pub fn parseRaw(allocator: std.mem.Allocator, raw: []const u8) !DatadogLog {
         var log: DatadogLog = .{};
         errdefer log.deinit(allocator);
 
         var walker = try jscan.FieldWalker.init(raw);
-        while (try walker.nextField()) |field| {
+        fields: while (try walker.nextField()) |field| {
             // Escaped keys are ~nonexistent in log records; the fallback
             // parse handles them rather than paying an unescape here.
             if (std.mem.findScalar(u8, field.key, '\\') != null) return error.Malformed;
             const key = field.key;
-
-            if (std.mem.eql(u8, key, "message")) {
-                log.message = try jscan.stringSpan(allocator, field.value);
-            } else if (std.mem.eql(u8, key, "status")) {
-                log.status = try jscan.stringSpan(allocator, field.value);
-            } else if (std.mem.eql(u8, key, "level")) {
-                log.level = try jscan.stringSpan(allocator, field.value);
-            } else if (std.mem.eql(u8, key, "service")) {
-                log.service = try jscan.stringSpan(allocator, field.value);
-            } else if (std.mem.eql(u8, key, "hostname")) {
-                log.hostname = try jscan.stringSpan(allocator, field.value);
-            } else if (std.mem.eql(u8, key, "ddsource")) {
-                log.ddsource = try jscan.stringSpan(allocator, field.value);
-            } else if (std.mem.eql(u8, key, "ddtags")) {
-                log.ddtags = try jscan.stringSpan(allocator, field.value);
-            } else if (std.mem.eql(u8, key, "timestamp")) {
-                log.timestamp = std.fmt.parseInt(i64, field.value, 10) catch return error.Malformed;
-            } else if (std.mem.eql(u8, key, "environment")) {
-                log.environment = try jscan.stringSpan(allocator, field.value);
-            } else if (std.mem.eql(u8, key, "custom_field")) {
-                log.custom_field = try jscan.stringSpan(allocator, field.value);
-            } else {
-                if (!jscan.validValueSpan(field.value)) return error.Malformed;
-                try log.extra_spans.put(allocator, key, field.value);
+            inline for (known_fields) |name| {
+                if (std.mem.eql(u8, key, name)) {
+                    @field(log, name) = if (comptime std.mem.eql(u8, name, "timestamp"))
+                        std.fmt.parseInt(i64, field.value, 10) catch return error.Malformed
+                    else
+                        try jscan.stringSpan(allocator, field.value);
+                    continue :fields;
+                }
             }
+            if (!jscan.validValueSpan(field.value)) return error.Malformed;
+            try log.extra_spans.put(allocator, key, field.value);
         }
         try walker.finish();
 
         return log;
     }
 
-    /// Native typed view of a single-segment extra attribute, so the typed
-    /// matchers fire on numeric/boolean values. Handles both storage forms:
-    /// the materializing `parse` path fills `extra` (typed `AnyValue`), while
-    /// the fast `parseRaw` path fills `extra_spans` (raw JSON value text, which
-    /// we classify by first byte). Nested/dotted paths and objects/arrays fall
-    /// back to the string primitive at the call site.
+    /// Typed view of a single-segment extra, so typed matchers fire on
+    /// numbers and booleans. Reads `extra` after `parse` and `extra_spans`
+    /// after `parseRaw`.
     pub fn findExtraTyped(self: *const DatadogLog, allocator: std.mem.Allocator, key: []const u8) ?policy.TypedValue {
-        // The two maps are mutually exclusive per parse path (parseRaw fills
-        // `extra_spans`, parse fills `extra`), so probe only the populated one.
         if (self.extra.count() != 0) {
             if (self.extra.get(key)) |v| return extras.anyValueTyped(v);
         } else if (self.extra_spans.get(key)) |span| {
@@ -193,9 +148,9 @@ pub const DatadogLog = struct {
         return null;
     }
 
-    /// Custom JSON serialization for known fields only.
-    /// Note: Extra fields are serialized via AnyValue while parser data is alive.
+    /// Write the known fields, then the extras in record order.
     pub fn jsonStringify(self: *const DatadogLog, jws: *std.json.Stringify) !void {
+        comptime std.debug.assert(std.mem.eql(u8, known_fields[0], "message"));
         try jws.beginObject();
 
         // Prefer the re-serialized wrapper when a transform edited inside it.
@@ -203,46 +158,14 @@ pub const DatadogLog = struct {
             try jws.objectField("message");
             try jws.write(v);
         }
-        if (self.status) |v| {
-            try jws.objectField("status");
-            try jws.write(v);
+        inline for (known_fields[1..]) |name| {
+            if (@field(self, name)) |v| {
+                try jws.objectField(name);
+                try jws.write(v);
+            }
         }
-        if (self.level) |v| {
-            try jws.objectField("level");
-            try jws.write(v);
-        }
-        if (self.service) |v| {
-            try jws.objectField("service");
-            try jws.write(v);
-        }
-        if (self.hostname) |v| {
-            try jws.objectField("hostname");
-            try jws.write(v);
-        }
-        if (self.ddsource) |v| {
-            try jws.objectField("ddsource");
-            try jws.write(v);
-        }
-        if (self.ddtags) |v| {
-            try jws.objectField("ddtags");
-            try jws.write(v);
-        }
-        if (self.timestamp) |v| {
-            try jws.objectField("timestamp");
-            try jws.write(v);
-        }
-        if (self.environment) |v| {
-            try jws.objectField("environment");
-            try jws.write(v);
-        }
-        if (self.custom_field) |v| {
-            try jws.objectField("custom_field");
-            try jws.write(v);
-        }
-        // Extras in the order the record listed them; containers go out as
-        // the bytes captured at parse time.
-        // The validating parse already materialized `extra`, so only the
-        // writer can fail here. Coerce to the `std.json.Stringify` error set.
+        // Only the writer can fail here. Map the error to the
+        // `std.json.Stringify` error set.
         self.extra.write(jws) catch return error.WriteFailed;
         // parseRaw extras: verbatim spans of the input, all value types.
         for (self.extra_spans.items()) |entry| {
@@ -314,8 +237,8 @@ pub const DatadogLog = struct {
         "data.jsonPayload.log",
     };
 
-    /// Return the raw (still-stringified) wrapped log, looking at `message`
-    /// first, then `msg`/`log` extras. `allocator` backs the lazy unescape of
+    /// The raw wrapped log: `message` first, then the `msg` or `log` extra.
+    /// `allocator` holds the unescaped copy of a span extra.
     fn wrappedMessageRaw(self: *const DatadogLog, allocator: std.mem.Allocator) ?[]const u8 {
         if (self.message) |m| return m;
         for ([_][]const u8{ "msg", "log" }) |key| {
@@ -329,12 +252,10 @@ pub const DatadogLog = struct {
         return null;
     }
 
-    /// Lazily unwrap the wrapped `message`/`msg`/`log` field once: parse it
-    /// with zimdjson and flatten its string leaves into `message_flat` (dotted
-    /// keys), so both body and attribute lookups become map hits. No-op when
-    /// the field is absent or not a JSON object. Values are copied into
-    /// span-captured extras (a stringified-JSON wrapper always has escapes).
-    /// `allocator`, so the transient parser is freed immediately.
+    /// Unwrap the `message`, `msg` or `log` field one time. Parse it with
+    /// zimdjson and copy each string leaf into `message_flat` under its
+    /// dotted path. Do nothing when the field is absent or is not a JSON
+    /// object.
     pub fn ensureUnwrapped(self: *DatadogLog, allocator: std.mem.Allocator) void {
         if (self.message_unwrapped) return;
         self.message_unwrapped = true;
@@ -404,22 +325,15 @@ pub const DatadogLog = struct {
         }
     }
 
-    /// Body value for matching. When the message is a JSON-wrapped log, the
-    /// real body lives at `data.jsonPayload.{message|body|log}`; return that.
-    /// Otherwise return the raw message verbatim.
-    /// note: targets the GCP/Cloud Run `data.jsonPayload` shape only; other
-    /// wrappers fall through to the raw message.
+    /// Body value for matching. For a GCP/Cloud Run wrapped log, this is
+    /// `data.jsonPayload.{message|body|log}`. For other input, this is the
+    /// raw message.
     pub fn bodyForMatch(self: *DatadogLog, allocator: std.mem.Allocator) ?[]const u8 {
-        // Honor `msg`/`log` wrappers too, not just top-level `message` —
-        // otherwise body filters silently miss logs wrapped in those extras.
         const raw = self.wrappedMessageRaw(allocator) orelse return null;
 
-        // Body matching wants one of three known paths, but `ensureUnwrapped`
-        // materializes every string leaf in the wrapped document to answer it
-        // — 58% of request CPU on GCP-shaped logs, measured. Navigate straight
-        // to `data.jsonPayload` instead and read only its immediate fields.
-        // Anything the targeted walk cannot account for falls through to the
-        // full flatten, so the answer never depends on which path ran.
+        // The full flatten used 58% of request CPU on GCP-shaped logs. Go
+        // directly to `data.jsonPayload` first. When that walk cannot decide,
+        // use the flatten, so both paths give the same answer.
         if (self.innerBodyDirect(allocator, raw)) |found| return found orelse raw;
 
         self.ensureUnwrapped(allocator);
@@ -467,30 +381,23 @@ pub const DatadogLog = struct {
                 2
             else
                 continue;
-            // First occurrence wins, matching `flattenValue`. A duplicate key
-            // must not change the answer: the two paths have to agree, or a
-            // body policy could be bypassed by appending a benign second
-            // `message`. Skipping the dupe also avoids leaking the loser.
+            // The first occurrence wins, as in `flattenValue`. The two paths
+            // must agree, or a second benign `message` could bypass a body
+            // policy.
             if (hits[slot] != null) continue;
             switch (field.value.asAny() catch continue) {
                 .string => |v| {
                     const text = v.get() catch continue;
                     hits[slot] = allocator.dupe(u8, text) catch return null;
                 },
-                // The targeted walk cannot descend an array body candidate,
-                // but flatten does -- defer to it (return the outer null, not
-                // an inner null) so `bodyForMatch` runs flatten instead of
-                // short-circuiting to `raw`. Otherwise a string sibling could
-                // win here while flatten's array-descent picks the array leaf,
-                // breaking the "both paths agree" invariant and flipping
-                // keep/drop policy decisions.
+                // This walk cannot go into an array, but the flatten can.
+                // Return the outer null so `bodyForMatch` uses the flatten.
                 .array => return null,
                 else => {},
             }
         }
-        // Priority is `inner_body_paths` order, not document order, so release
-        // the candidates that lost. Callers pass an arena, where this is a
-        // no-op; it keeps the leak-checking tests honest.
+        // Priority follows `inner_body_paths`, not document order. Free the
+        // losing candidates.
         var winner: ?[]const u8 = null;
         for (hits) |hit| {
             const body = hit orelse continue;
@@ -643,11 +550,8 @@ pub const DatadogLog = struct {
         }
     }
 
-    /// Drop every cache derived from the previous `message` (e.g. when the
-    /// whole body is replaced). Resets both the write side (rewrite/tree) and
-    /// the read side (flat/unwrapped) so the next access re-derives from the
-    /// new `message`; otherwise a later wrapped edit would serialize the stale
-    /// tree (overwriting the new body) and reads would return stale leaves.
+    /// Drop every cache built from the previous `message`. Call this when the
+    /// whole body changes, or later reads and edits use the old message.
     pub fn clearWrappedRewrite(self: *DatadogLog, allocator: std.mem.Allocator) void {
         if (self.message_rewrapped) |s| allocator.free(s);
         self.message_rewrapped = null;
@@ -670,7 +574,3 @@ pub const DatadogLog = struct {
         self.message_unwrapped = false;
     }
 };
-
-// ============================================================================
-// Tests
-// ============================================================================

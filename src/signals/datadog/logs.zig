@@ -37,35 +37,43 @@ pub fn evalLogRecord(
     record: []const u8,
     sink: ?policy.ExtensionSink,
 ) !RecordVerdict {
-    // Single-pass zero-copy parse; zimdjson never runs on the hot path.
-    // Anything the walker doesn't like — non-object records, escaped keys,
-    // structural surprises — re-parses through the fully validating
-    // materializing path, so semantics never depend on the fast path. Only
-    // when both fail does the record fail open to keep.
-    // Hand the reused parser down so the lazy message unwrap does not build a
-    // fresh structural index per record.
+    // Try the single-pass parse first. When it fails, use the validating
+    // parse. When both fail, keep the record.
     var log_obj = DatadogLog.parseRaw(scratch, record) catch blk: {
         const document = parser.parseFromSlice(parser_gpa, record) catch return .keep;
         const value_type = document.asValue().getType() catch return .keep;
         if (value_type != .object) return .keep;
-        // No `unwrap_parser` on this path. `parse` keeps unknown fields as
-        // lazy AnyValues backed by `document`, which is backed by `parser`'s
-        // structural index; a later body lookup re-parsing the inner wrapper
-        // on that same parser would replace the index under them. The unwrap
-        // falls back to its own local parser instead.
+        // Do not set `unwrap_parser` here. The extras of `parse` read from
+        // `parser`, so a second parse on it would corrupt them.
         break :blk DatadogLog.parse(scratch, document.asValue()) catch return .keep;
     };
-    // Only reached when parseRaw succeeded, so the parser holds no document
-    // this log still reads from. Sharing it saves a structural index per
-    // record on the unwrap path.
+    // `parseRaw` did not use `parser`, so the unwrap can reuse it.
     log_obj.unwrap_parser = parser;
     log_obj.unwrap_parser_gpa = parser_gpa;
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
-    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf, sink);
-    if (!result.keep) return .drop;
-    if (!result.mutated) return .keep;
+    var field_ctx: FieldAccessorContext = .{ .log = &log_obj, .allocator = scratch };
+    const result = engine.evaluate(
+        .log,
+        &log_accessor,
+        &field_ctx,
+        &policy_id_buf,
+        .{
+            .scratch = scratch,
+            .io = engine.bus.io,
+            .extension_sink = sink,
+            // Null: the engine keeps its own state. A shared `ScanState` pays
+            // off only across a batch, and this call handles one record.
+            .scan_state = null,
+        },
+    );
+    // The extension sink runs inside `evaluate`, before transforms, so a dump
+    // holds the record as it arrived. `finalizeWrapped` changes only the
+    // forwarded output. See `datadogLogEncode` in runtime/extensions.zig.
+    log_obj.finalizeWrapped(scratch);
+    if (!result.decision.shouldContinue()) return .drop;
+    if (!result.was_transformed) return .keep;
 
     var out: std.Io.Writer.Allocating = .init(scratch);
     try std.json.Stringify.value(log_obj, .{}, &out.writer);
@@ -84,17 +92,9 @@ pub const FieldAccessorContext = struct {
 /// search the same flat namespace.
 fn lookupLogAttribute(log: *DatadogLog, allocator: std.mem.Allocator, path: []const []const u8) ?[]const u8 {
     if (path.len == 0) return null;
-    const key = path[0];
 
-    // Check known fields (only for single-segment paths)
-    if (path.len == 1) {
-        if (std.mem.eql(u8, key, "service")) return log.service;
-        if (std.mem.eql(u8, key, "hostname")) return log.hostname;
-        if (std.mem.eql(u8, key, "ddsource")) return log.ddsource;
-        if (std.mem.eql(u8, key, "ddtags")) return log.ddtags;
-        if (std.mem.eql(u8, key, "environment")) return log.environment;
-        if (std.mem.eql(u8, key, "custom_field")) return log.custom_field;
-    }
+    // A known field answers even when it is null.
+    if (writableFieldRef(log, path)) |ref| return ref.*;
 
     // Check extra fields (supports nested dotted-key paths)
     if (log.findExtraString(allocator, path)) |found| return found;
@@ -104,14 +104,9 @@ fn lookupLogAttribute(log: *DatadogLog, allocator: std.mem.Allocator, path: []co
     return log.unwrappedAttribute(allocator, path);
 }
 
-/// Field accessor for Datadog JSON log format.
-/// Datadog logs have fields at the root level: message, status/level, ddtags, service, etc.
-/// All attribute types (log, resource, scope) search the same flat namespace since
-/// Datadog has no OTLP-style resource/scope hierarchy.
-/// Typed read primitive (required since v0.5.0). Known top-level fields are
-/// strings, but single-segment attributes carry their native JSON type, so the
-/// typed matchers fire on numeric/bool attributes; everything else (nested
-/// attributes, known fields) falls back to the string primitive.
+/// Typed read for Datadog logs. Single-segment attributes keep their JSON
+/// type; other fields use the string read. Datadog has no resource or scope
+/// level, so all attribute kinds read one flat namespace.
 pub fn logTypedValue(ctx: *const anyopaque, field: FieldRef) ?policy.TypedValue {
     switch (field) {
         .log_attribute, .resource_attribute, .scope_attribute => |attr_path| {
@@ -147,8 +142,7 @@ pub fn logValue(ctx: *const anyopaque, field: FieldRef) ?[]const u8 {
     };
 }
 
-/// Top-level Datadog log fields that policies can mutate. Nested keys (in
-/// `log.extra`) are read-only; rename targets resolve to these fields only.
+/// Top-level fields that policies can change. Extras are read-only.
 const writable_log_fields = [_][]const u8{
     "service",
     "hostname",
@@ -237,58 +231,15 @@ pub fn logDelete(ctx: *anyopaque, field: FieldRef) bool {
     };
 }
 
-/// LogAccessor template for unit tests in this module. Datadog logs don't
-/// support rename, so `move` is left null (policies that require rename are
-/// rejected at snapshot-compile time).
+/// The log accessor that `evalLogRecord` gives to the engine.
+///
+/// Datadog logs do not support rename, so `move` is null. The engine rejects
+/// a policy that needs rename when it compiles the snapshot.
 pub const log_accessor: policy.LogAccessor = .{
     .typed_value = logTypedValue,
     .set = logSet,
     .delete = logDelete,
 };
-
-/// Result of evaluating a single log
-const FilterLogResult = struct {
-    keep: bool,
-    mutated: bool,
-};
-
-/// Evaluate a single log against policies, applying transforms if matched.
-/// Returns whether to keep the log and whether it was mutated.
-fn filterLog(
-    engine: *const PolicyEngine,
-    log: *DatadogLog,
-    allocator: std.mem.Allocator,
-    policy_id_buf: [][]const u8,
-    sink: ?policy.ExtensionSink,
-) FilterLogResult {
-    var field_ctx: FieldAccessorContext = .{ .log = log, .allocator = allocator };
-    const result = engine.evaluate(
-        .log,
-        &log_accessor,
-        &field_ctx,
-        policy_id_buf,
-        .{
-            .scratch = allocator,
-            .io = engine.bus.io,
-            .extension_sink = sink,
-            // Null: the engine keeps its own state. A shared `ScanState` pays
-            // off only across a batch, and this call handles one record.
-            .scan_state = null,
-        },
-    );
-    // The extension sink (s3-dump) fires INSIDE evaluate — after keep, before
-    // transforms — so it snapshots the pre-transform record by design (policy
-    // spec v1.6.0; the flagship `mode: dropped` dumps records discarded
-    // downstream anyway). `finalizeWrapped` below rewrites a transform-mutated
-    // wrapped `message` only for the forwarded output; the dump intentionally
-    // keeps the original message. The dispatch point is owned by the engine,
-    // not us, so pre-transform is the only possible (and correct) ordering.
-    log.finalizeWrapped(allocator);
-    return .{
-        .keep = result.decision.shouldContinue(),
-        .mutated = result.was_transformed,
-    };
-}
 
 // =============================================================================
 // Tests
@@ -296,11 +247,42 @@ fn filterLog(
 
 const proto = @import("proto");
 
-/// Test helper to create an AttributePath from a single key string.
-/// Uses comptime to ensure the array literal has static storage.
-fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
-    const items = @constCast(&[_][]const u8{key});
-    return .{ .path = .{ .items = items, .capacity = items.len } };
+/// Test helper to create an AttributePath from its keys. The keys are
+/// comptime, so the slice has static storage.
+fn testAttrPath(comptime keys: []const []const u8) proto.policy.AttributePath {
+    return .{ .path = .{ .items = @constCast(keys), .capacity = keys.len } };
+}
+
+/// Build a log policy with one regex matcher. The caller owns the policy.
+fn logPolicy(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    keep: []const u8,
+    field: proto.policy.LogMatcher.field_union,
+    regex: []const u8,
+    transform: ?proto.policy.LogTransform,
+) !proto.policy.Policy {
+    var log_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, id),
+        .name = try allocator.dupe(u8, id),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, keep), .transform = transform } },
+    };
+    errdefer log_policy.deinit(allocator);
+    try log_policy.target.?.log.match.append(allocator, .{
+        .field = field,
+        .match = .{ .regex = try allocator.dupe(u8, regex) },
+    });
+    return log_policy;
+}
+
+/// Build a transform that removes the single-key attribute `key`.
+fn removeAttr(allocator: std.mem.Allocator, key: []const u8) !proto.policy.LogTransform {
+    var path: proto.policy.AttributePath = .{};
+    try path.path.append(allocator, try allocator.dupe(u8, key));
+    var transform: proto.policy.LogTransform = .{};
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = path } });
+    return transform;
 }
 
 /// Test helper: wrap `inner` JSON into a `{"message":"<escaped inner>"}` log,
@@ -348,7 +330,7 @@ test "datadogFieldAccessor - extra field lookup" {
     try std.testing.expectEqualStrings("test", message_val.?);
 
     // Test extra field - this is the critical test
-    const trace_val = logValue(&field_ctx, .{ .log_attribute = testAttrPath("trace_id") });
+    const trace_val = logValue(&field_ctx, .{ .log_attribute = testAttrPath(&.{"trace_id"}) });
     try std.testing.expect(trace_val != null);
     try std.testing.expectEqualStrings("abc123-def456", trace_val.?);
 }
@@ -374,16 +356,16 @@ test "datadogFieldAccessor - typed attributes are numeric/bool, not string" {
 
         var ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
-        const duration = logTypedValue(&ctx, .{ .log_attribute = testAttrPath("duration") });
+        const duration = logTypedValue(&ctx, .{ .log_attribute = testAttrPath(&.{"duration"}) });
         try std.testing.expectEqual(@as(i64, 1234), duration.?.int);
 
-        const ratio = logTypedValue(&ctx, .{ .log_attribute = testAttrPath("ratio") });
+        const ratio = logTypedValue(&ctx, .{ .log_attribute = testAttrPath(&.{"ratio"}) });
         try std.testing.expectEqual(@as(f64, 0.5), ratio.?.double);
 
-        const ok = logTypedValue(&ctx, .{ .log_attribute = testAttrPath("ok") });
+        const ok = logTypedValue(&ctx, .{ .log_attribute = testAttrPath(&.{"ok"}) });
         try std.testing.expectEqual(true, ok.?.bool);
 
-        const name = logTypedValue(&ctx, .{ .log_attribute = testAttrPath("name") });
+        const name = logTypedValue(&ctx, .{ .log_attribute = testAttrPath(&.{"name"}) });
         try std.testing.expectEqualStrings("svc", name.?.string);
 
         // Known top-level fields stay string.
@@ -422,17 +404,13 @@ test "datadogFieldAccessor - unwraps JSON-stringified message for body and attri
     try std.testing.expectEqualStrings("evidence skipped", body.?);
 
     // Attribute fallback walks the path inside the unwrapped message.
-    const event_type_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "data", "jsonPayload", "event_type" }), .capacity = 3 },
-    };
+    const event_type_path = testAttrPath(&.{ "data", "jsonPayload", "event_type" });
     const event_type = logValue(&field_ctx, .{ .log_attribute = event_type_path });
     try std.testing.expect(event_type != null);
     try std.testing.expectEqualStrings("EvidenceSkipped", event_type.?);
 
     // A path absent from the unwrapped message still returns null.
-    const missing_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "data", "jsonPayload", "nope" }), .capacity = 3 },
-    };
+    const missing_path = testAttrPath(&.{ "data", "jsonPayload", "nope" });
     try std.testing.expect(logValue(&field_ctx, .{ .log_attribute = missing_path }) == null);
 }
 
@@ -473,12 +451,12 @@ test "datadogFieldAccessor - resource_attribute searches log attributes" {
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // resource_attribute should find known fields
-    const svc_val = logValue(&field_ctx, .{ .resource_attribute = testAttrPath("service") });
+    const svc_val = logValue(&field_ctx, .{ .resource_attribute = testAttrPath(&.{"service"}) });
     try std.testing.expect(svc_val != null);
     try std.testing.expectEqualStrings("my-svc", svc_val.?);
 
     // resource_attribute should find extra fields
-    const trace_val = logValue(&field_ctx, .{ .resource_attribute = testAttrPath("trace_id") });
+    const trace_val = logValue(&field_ctx, .{ .resource_attribute = testAttrPath(&.{"trace_id"}) });
     try std.testing.expect(trace_val != null);
     try std.testing.expectEqualStrings("abc123", trace_val.?);
 }
@@ -500,7 +478,7 @@ test "datadogFieldAccessor - scope_attribute searches log attributes" {
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // scope_attribute should find known fields
-    const host_val = logValue(&field_ctx, .{ .scope_attribute = testAttrPath("hostname") });
+    const host_val = logValue(&field_ctx, .{ .scope_attribute = testAttrPath(&.{"hostname"}) });
     try std.testing.expect(host_val != null);
     try std.testing.expectEqualStrings("web-01", host_val.?);
 }
@@ -523,9 +501,7 @@ test "datadogFieldAccessor - nested extra field access via dotted key" {
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Two-segment path should be joined with '.' to match dotted key
-    const method_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }), .capacity = 2 },
-    };
+    const method_path = testAttrPath(&.{ "http", "method" });
     const method_val = logValue(&field_ctx, .{ .log_attribute = method_path });
     try std.testing.expect(method_val != null);
     try std.testing.expectEqualStrings("GET", method_val.?);
@@ -548,9 +524,7 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Path to non-existent dotted key
-    const missing_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "nonexistent" }), .capacity = 2 },
-    };
+    const missing_path = testAttrPath(&.{ "http", "nonexistent" });
     const val = logValue(&field_ctx, .{ .log_attribute = missing_path });
     try std.testing.expect(val == null);
 }
@@ -575,16 +549,12 @@ test "datadogFieldAccessor - nested object fallback via path segments" {
 
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
-    const status_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "status_code" }), .capacity = 2 },
-    };
+    const status_path = testAttrPath(&.{ "http", "status_code" });
     const status_val = logValue(&field_ctx, .{ .log_attribute = status_path });
     try std.testing.expect(status_val != null);
     try std.testing.expectEqualStrings("200", status_val.?);
 
-    const region_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "meta", "region" }), .capacity = 3 },
-    };
+    const region_path = testAttrPath(&.{ "http", "meta", "region" });
     const region_val = logValue(&field_ctx, .{ .log_attribute = region_path });
     try std.testing.expect(region_val != null);
     try std.testing.expectEqualStrings("us-east-1", region_val.?);
@@ -607,9 +577,7 @@ test "datadogFieldAccessor - multi-segment path with no matching dotted key retu
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Multi-segment path that doesn't match any dotted key
-    const bad_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "flat_field", "nested" }), .capacity = 2 },
-    };
+    const bad_path = testAttrPath(&.{ "flat_field", "nested" });
     const val = logValue(&field_ctx, .{ .log_attribute = bad_path });
     try std.testing.expect(val == null);
 }
@@ -648,16 +616,14 @@ test "evalLogRecord - drop policy drops, non-matching keeps" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-debug"),
-        .name = try allocator.dupe(u8, "drop-debug"),
-        .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
-    };
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
-        .match = .{ .regex = try allocator.dupe(u8, "debug") },
-    });
+    var drop_policy = try logPolicy(
+        allocator,
+        "drop-debug",
+        "none",
+        .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
+        "debug",
+        null,
+    );
     defer drop_policy.deinit(allocator);
     try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
 
@@ -700,25 +666,14 @@ test "evalLogRecord - transform yields replace with serialized record" {
     var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
     defer registry.deinit();
 
-    var transform: proto.policy.LogTransform = .{};
-    var remove_attr_path: proto.policy.AttributePath = .{};
-    try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
-    try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = remove_attr_path },
-    });
-    var test_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "remove-service"),
-        .name = try allocator.dupe(u8, "remove-service"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "all"),
-            .transform = transform,
-        } },
-    };
-    try test_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "test") },
-    });
+    var test_policy = try logPolicy(
+        allocator,
+        "remove-service",
+        "all",
+        .{ .log_field = .LOG_FIELD_BODY },
+        "test",
+        try removeAttr(allocator, "service"),
+    );
     defer test_policy.deinit(allocator);
     try registry.updatePolicies(&.{test_policy}, "test", .file);
 
@@ -744,9 +699,8 @@ test "evalLogRecord - transform yields replace with serialized record" {
 }
 
 test "evalLogRecord - malformed unknown-field container fails open to keep under matching policy" {
-    // Regression: FieldWalker.valueEnd accepted malformed containers in
-    // unknown fields, so the verdict depended on the fast path. Now both
-    // parsers reject them and the record fails open to `.keep`.
+    // A malformed container in an unknown field must fail open to `.keep` on
+    // both parse paths.
     const allocator = std.testing.allocator;
 
     var parser: Parser = .init;
@@ -766,38 +720,47 @@ test "evalLogRecord - malformed unknown-field container fails open to keep under
         "{1:2}", // non-string object key
         "[\"a\",,]", // missing value in array
     };
+    const expectAllKeep = struct {
+        fn run(
+            gpa: std.mem.Allocator,
+            p: *Parser,
+            registry: *const PolicyRegistry,
+            b: *EventBus,
+            values: []const []const u8,
+        ) !void {
+            for (values) |val| {
+                var buf: [128]u8 = undefined;
+                const record = std.fmt.bufPrint(
+                    &buf,
+                    "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
+                    .{val},
+                ) catch unreachable;
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                try std.testing.expectEqual(
+                    RecordVerdict.keep,
+                    try evalLogRecord(arena.allocator(), p, gpa, registry, b, record, null),
+                );
+            }
+        }
+    }.run;
 
     // --- Drop policy (keep = "none"), matched on LOG_FIELD_BODY regex "matched".
     {
         var registry = PolicyRegistry.init(allocator, bus);
         defer registry.deinit();
-        var drop_policy: proto.policy.Policy = .{
-            .id = try allocator.dupe(u8, "drop-matched"),
-            .name = try allocator.dupe(u8, "drop-matched"),
-            .enabled = true,
-            .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
-        };
-        try drop_policy.target.?.log.match.append(allocator, .{
-            .field = .{ .log_field = .LOG_FIELD_BODY },
-            .match = .{ .regex = try allocator.dupe(u8, "matched") },
-        });
+        var drop_policy = try logPolicy(
+            allocator,
+            "drop-matched",
+            "none",
+            .{ .log_field = .LOG_FIELD_BODY },
+            "matched",
+            null,
+        );
         defer drop_policy.deinit(allocator);
         try registry.updatePolicies(&.{drop_policy}, "drop", .file);
 
-        for (malformed_values) |val| {
-            var buf: [128]u8 = undefined;
-            const record = std.fmt.bufPrint(
-                &buf,
-                "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
-                .{val},
-            ) catch unreachable;
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            defer arena.deinit();
-            try std.testing.expectEqual(
-                RecordVerdict.keep,
-                try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, record, null),
-            );
-        }
+        try expectAllKeep(allocator, &parser, &registry, bus, &malformed_values);
 
         // A well-formed matching record is still dropped.
         const good = "{\"message\":\"matched\",\"service\":\"s\",\"x\":[1,2]}";
@@ -813,42 +776,18 @@ test "evalLogRecord - malformed unknown-field container fails open to keep under
     {
         var registry = PolicyRegistry.init(allocator, bus);
         defer registry.deinit();
-        var transform: proto.policy.LogTransform = .{};
-        var remove_attr_path: proto.policy.AttributePath = .{};
-        try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
-        try transform.remove.append(allocator, .{
-            .field = .{ .log_attribute = remove_attr_path },
-        });
-        var mutate_policy: proto.policy.Policy = .{
-            .id = try allocator.dupe(u8, "remove-service"),
-            .name = try allocator.dupe(u8, "remove-service"),
-            .enabled = true,
-            .target = .{ .log = .{
-                .keep = try allocator.dupe(u8, "all"),
-                .transform = transform,
-            } },
-        };
-        try mutate_policy.target.?.log.match.append(allocator, .{
-            .field = .{ .log_field = .LOG_FIELD_BODY },
-            .match = .{ .regex = try allocator.dupe(u8, "matched") },
-        });
+        var mutate_policy = try logPolicy(
+            allocator,
+            "remove-service",
+            "all",
+            .{ .log_field = .LOG_FIELD_BODY },
+            "matched",
+            try removeAttr(allocator, "service"),
+        );
         defer mutate_policy.deinit(allocator);
         try registry.updatePolicies(&.{mutate_policy}, "mutate", .file);
 
-        for (malformed_values) |val| {
-            var buf: [128]u8 = undefined;
-            const record = std.fmt.bufPrint(
-                &buf,
-                "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
-                .{val},
-            ) catch unreachable;
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            defer arena.deinit();
-            try std.testing.expectEqual(
-                RecordVerdict.keep,
-                try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, record, null),
-            );
-        }
+        try expectAllKeep(allocator, &parser, &registry, bus, &malformed_values);
 
         // A well-formed matching record is still replaced.
         const good = "{\"message\":\"matched\",\"service\":\"s\",\"x\":[1,2]}";
@@ -861,9 +800,8 @@ test "evalLogRecord - malformed unknown-field container fails open to keep under
 }
 
 test "evalLogRecord - two regex redacts on the same wrapped path compose" {
-    // Regression (PR #203): the engine re-reads the field before each
-    // transform. `unwrappedAttribute` served a stale `message_flat`, so rule 2
-    // overwrote rule 1.
+    // The engine reads the field again before each transform, so the second
+    // redact must apply on top of the first.
     const allocator = std.testing.allocator;
 
     var noop_bus: NoopEventBus = undefined;

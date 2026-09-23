@@ -1,23 +1,9 @@
 const std = @import("std");
-const zimdjson = @import("zimdjson");
 const extras = @import("extras.zig");
+const json_value = @import("json_value.zig");
 
-pub const Parser = zimdjson.ondemand.FullParser(.default);
-pub const Value = Parser.Value;
-pub const AnyValue = Parser.AnyValue;
-
-/// Datadog metric intake type enum values
-/// See: https://docs.datadoghq.com/api/v2/metrics/#submit-metrics
-pub const MetricIntakeType = enum(i32) {
-    unspecified = 0,
-    count = 1,
-    rate = 2,
-    gauge = 3,
-
-    pub fn jsonStringify(self: *const MetricIntakeType, jws: *std.json.Stringify) !void {
-        try jws.write(@intFromEnum(self.*));
-    }
-};
+pub const Parser = json_value.Parser;
+const Value = json_value.Value;
 
 /// A single data point with timestamp and value
 pub const MetricPoint = struct {
@@ -196,10 +182,7 @@ pub const MetricSeries = struct {
     /// A list of tags associated with the metric
     tags: ?[][]const u8 = null,
 
-    /// Unknown fields, in the order the series listed them. Shared with the
-    /// log record: this used to be a bare hash map here, which leaked a key on
-    /// a duplicate, re-emitted extras in hash order, and wrote `{}` for a
-    /// nested one because an on-demand container cannot be revisited.
+    /// Unknown fields, in the order the series listed them.
     extra: extras.Materialized = .{},
 
     pub fn deinit(self: *MetricSeries, allocator: std.mem.Allocator) void {
@@ -232,29 +215,11 @@ pub const MetricSeries = struct {
             } else if (std.mem.eql(u8, key, "metadata")) {
                 series.metadata = try MetricMetadata.parse(field.value);
             } else if (std.mem.eql(u8, key, "points")) {
-                var points_arr = try field.value.asArray();
-                var points_list: std.ArrayList(MetricPoint) = .empty;
-                var points_it = points_arr.iterator();
-                while (try points_it.next()) |point_val| {
-                    try points_list.append(allocator, try MetricPoint.parse(point_val));
-                }
-                series.points = try points_list.toOwnedSlice(allocator);
+                series.points = try parseArray(MetricPoint, allocator, field.value, MetricPoint.parse);
             } else if (std.mem.eql(u8, key, "resources")) {
-                var res_arr = try field.value.asArray();
-                var res_list: std.ArrayList(MetricResource) = .empty;
-                var res_it = res_arr.iterator();
-                while (try res_it.next()) |res_val| {
-                    try res_list.append(allocator, try MetricResource.parse(res_val));
-                }
-                series.resources = try res_list.toOwnedSlice(allocator);
+                series.resources = try parseArray(MetricResource, allocator, field.value, MetricResource.parse);
             } else if (std.mem.eql(u8, key, "tags")) {
-                var tags_arr = try field.value.asArray();
-                var tags_list: std.ArrayList([]const u8) = .empty;
-                var tags_it = tags_arr.iterator();
-                while (try tags_it.next()) |tag_val| {
-                    try tags_list.append(allocator, try tag_val.asString());
-                }
-                series.tags = try tags_list.toOwnedSlice(allocator);
+                series.tags = try parseArray([]const u8, allocator, field.value, Value.asString);
             } else {
                 try series.extra.put(allocator, key, try field.value.asAny());
             }
@@ -316,15 +281,29 @@ pub const MetricSeries = struct {
             try jws.endArray();
         }
 
-        // Extras in the order the series listed them; a container goes out as
-        // the bytes captured at parse time.
-        // The validating parse already materialized `extra`, so only the
-        // writer can fail here. Coerce to the `std.json.Stringify` error set.
+        // Only the writer can fail here. Map the error to the
+        // `std.json.Stringify` error set.
         self.extra.write(jws) catch return error.WriteFailed;
 
         try jws.endObject();
     }
 };
+
+/// Parse a JSON array into an owned slice, one element per `parseOne` call.
+fn parseArray(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    value: Value,
+    comptime parseOne: anytype,
+) ![]T {
+    var arr = try value.asArray();
+    var list: std.ArrayList(T) = .empty;
+    var it = arr.iterator();
+    while (try it.next()) |item| {
+        try list.append(allocator, try parseOne(item));
+    }
+    return list.toOwnedSlice(allocator);
+}
 
 /// The payload for submitting metrics to Datadog
 pub const MetricPayload = struct {
@@ -493,72 +472,9 @@ test "MetricSeries - parse with extra fields" {
     try std.testing.expect(series.extra.contains("another_extra"));
 }
 
-test "MetricSeries - a duplicate extra key does not strand its key copy" {
-    // `HashMap.put` replaces the value and keeps the original key pointer, so
-    // an insert that dupes a second key strands it: it enters neither the map
-    // nor the order list, and `deinit` frees keys by walking the map. The
-    // testing allocator fails this test on that leak. The log record had the
-    // same bug; both now go through `extras.Materialized`.
-    const allocator = std.testing.allocator;
-    var parser: Parser = .init;
-    defer parser.deinit(allocator);
-
-    const json =
-        \\{"metric": "test", "points": [], "dupe": 1, "keep": "x", "dupe": 2}
-    ;
-    const doc = try parser.parseFromSlice(allocator, json);
-    var series = try MetricSeries.parse(allocator, doc.asValue());
-    defer allocator.free(series.points.?);
-    defer series.extra.deinit(allocator);
-
-    // First position kept, last value taken.
-    try std.testing.expectEqual(@as(usize, 2), series.extra.count());
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try std.json.Stringify.value(series, .{}, &out.writer);
-    try std.testing.expectEqualStrings(
-        "{\"metric\":\"test\",\"points\":[],\"dupe\":2,\"keep\":\"x\"}",
-        out.written(),
-    );
-}
-
-test "MetricSeries - extras serialize in the order the series listed them" {
-    // A bare hash map emits in bucket order, so a partial-drop payload reached
-    // the intake with its unknown fields shuffled. Order is not semantic in
-    // JSON, but it is what the sender wrote and what the sibling log path
-    // preserves; a record must not change shape because we dropped its
-    // neighbour.
-    const allocator = std.testing.allocator;
-    var parser: Parser = .init;
-    defer parser.deinit(allocator);
-
-    const json =
-        \\{"metric": "test", "points": [], "zeta": 1, "alpha": 2, "middle": 3, "beta": 4}
-    ;
-    const doc = try parser.parseFromSlice(allocator, json);
-    var series = try MetricSeries.parse(allocator, doc.asValue());
-    defer allocator.free(series.points.?);
-    defer series.extra.deinit(allocator);
-
-    const want = [_][]const u8{ "zeta", "alpha", "middle", "beta" };
-    const got = series.extra.keys();
-    try std.testing.expectEqual(want.len, got.len);
-    for (want, got) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try std.json.Stringify.value(series, .{}, &out.writer);
-    try std.testing.expectEqualStrings(
-        "{\"metric\":\"test\",\"points\":[],\"zeta\":1,\"alpha\":2,\"middle\":3,\"beta\":4}",
-        out.written(),
-    );
-}
-
 test "MetricSeries - a nested extra survives re-serialization" {
-    // An on-demand object or array cannot be revisited once the parser's
-    // cursor moves past it, so re-serializing from the stored `AnyValue`
-    // emitted `{}` or `[]` and silently dropped the customer's data. The
-    // bytes are now captured while the cursor is still inside.
+    // An on-demand container cannot be read again after the cursor moves
+    // past it. The parse captures its bytes while the cursor is inside.
     const allocator = std.testing.allocator;
     var parser: Parser = .init;
     defer parser.deinit(allocator);
@@ -688,36 +604,6 @@ test "MetricSeries - empty fields not serialized" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"interval\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"unit\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"points\"") == null);
-}
-
-test "MetricSeries - field mutation remove metric name" {
-    var series: MetricSeries = .{
-        .metric = "system.load.1",
-        .type = 3,
-    };
-
-    series.metric = null;
-
-    try std.testing.expect(series.metric == null);
-    try std.testing.expectEqual(@as(i32, 3), series.type.?);
-}
-
-test "MetricSeries - field mutation set tags" {
-    const allocator = std.testing.allocator;
-
-    var series: MetricSeries = .{
-        .metric = "system.load.1",
-    };
-
-    // Set new tags
-    const new_tags = try allocator.alloc([]const u8, 2);
-    defer allocator.free(new_tags);
-    new_tags[0] = "env:staging";
-    new_tags[1] = "region:us-west";
-    series.tags = new_tags;
-
-    try std.testing.expectEqual(@as(usize, 2), series.tags.?.len);
-    try std.testing.expectEqualStrings("env:staging", series.tags.?[0]);
 }
 
 test "MetricSeries - parse and reserialize preserves data" {

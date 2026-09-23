@@ -385,7 +385,7 @@ pub fn processBuffered(
     const out = &transformed.writer;
     const ct = "application/json";
     const summary: BatchSummary = switch (pipe.kind) {
-        .datadog_metrics_json => .of(try dd_metrics.processMetricsStream(arena, registry, ctx.bus, in, out, ct)),
+        .datadog_metrics_json => .of(try dd_metrics.processMetricsStream(arena, registry, ctx.bus, in, out)),
         .otlp_logs_json => .of(try otlp_logs.processLogsStream(arena, registry, ctx.bus, in, out, ct)),
         .otlp_metrics_json => .of(try otlp_metrics.processMetricsStream(arena, registry, ctx.bus, in, out, ct)),
         .otlp_traces_json => .of(try otlp_traces.processTracesStream(arena, registry, ctx.bus, in, out, ct)),
