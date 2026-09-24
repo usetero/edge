@@ -58,11 +58,15 @@ pub const Inbound = struct {
 // finishes the body. Each frontend has a small adapter.
 
 /// What goes upstream: a slice the frontend already buffered, or a body still
-/// on the inbound socket with its declared length. A stream is consumed by the
-/// first send and is never retried.
+/// on the inbound socket with its declared length. A `chunked` source is an
+/// unknown-length stream forwarded as chunked transfer-encoding, pumped
+/// socket->upstream through the thread's pump buffer so nothing body-sized is
+/// resident. A stream/chunked source is consumed by the first send and is
+/// never retried.
 pub const BodySource = union(enum) {
     bytes: []const u8,
     stream: struct { reader: *std.Io.Reader, len: usize },
+    chunked: struct { reader: *std.Io.Reader, max_bytes: usize },
 };
 
 /// Upper bound on forwarded request headers; excess is an error, not a
@@ -168,7 +172,7 @@ pub fn exchange(
     replayable: bool,
 ) !void {
     const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
-    if (body == .stream) _ = try bufs.ensurePump(ctx.gpa);
+    if (body == .stream or body == .chunked) _ = try bufs.ensurePump(ctx.gpa);
     const retry = body == .bytes and (replayable or in.method == .GET or in.method == .HEAD);
     const attempts: usize = if (retry) 2 else 1;
     for (0..attempts) |attempt| {
@@ -280,8 +284,12 @@ fn sendAndReceiveHead(
     return request.receiveHead(&.{});
 }
 
-/// Exact content-length send. A stream pumps client socket -> upstream socket
-/// through the thread's pump buffer; nothing body-sized is ever resident.
+/// Send the request body upstream. A buffered slice goes out as an exact
+/// content-length; a `stream` (declared length) and a `chunked` (unknown
+/// length) source pump client socket -> upstream socket through the thread's
+/// pump buffer (sized by `exchange` before the send), so nothing body-sized is
+/// ever resident. The chunked pump honours `max_bytes` so the `max_body_size`
+/// cap the frontend would otherwise have pre-checked is enforced mid-stream.
 fn sendBody(
     upstream_req: *std.http.Client.Request,
     method: std.http.Method,
@@ -289,22 +297,33 @@ fn sendBody(
     bufs: *ThreadBufs,
 ) !void {
     if (!method.requestHasBody()) return upstream_req.sendBodiless();
-    const len = switch (body) {
-        .bytes => |b| b.len,
-        .stream => |st| st.len,
-    };
-    upstream_req.transfer_encoding = .{ .content_length = len };
+    // `stream` and `chunked` read into the thread's pump buffer; `bytes` reuses
+    // the upstream write buffer (the body is already resident).
     const write_buf = switch (body) {
         .bytes => bufs.upstream,
-        .stream => bufs.pump, // sized by exchange() before the send
+        .stream, .chunked => bufs.pump,
     };
     std.debug.assert(write_buf.len > 0);
-    var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
     switch (body) {
-        .bytes => |b| try body_writer.writer.writeAll(b),
-        .stream => |st| try st.reader.streamExact(&body_writer.writer, st.len),
+        .bytes => |b| {
+            upstream_req.transfer_encoding = .{ .content_length = b.len };
+            var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
+            try body_writer.writer.writeAll(b);
+            try body_writer.end();
+        },
+        .stream => |st| {
+            upstream_req.transfer_encoding = .{ .content_length = st.len };
+            var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
+            try st.reader.streamExact(&body_writer.writer, st.len);
+            try body_writer.end();
+        },
+        .chunked => |ch| {
+            upstream_req.transfer_encoding = .chunked;
+            var body_writer = try upstream_req.sendBodyUnflushed(write_buf);
+            _ = try pipeline_mod.streamReaderToWriter(ch.reader, &body_writer.writer, ch.max_bytes);
+            try body_writer.end();
+        },
     }
-    try body_writer.end();
     try upstream_req.connection.?.flush();
 }
 

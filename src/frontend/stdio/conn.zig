@@ -399,7 +399,7 @@ fn dispatch(
         .headers = try collectRequestHeaders(request, arena, headers_buf, env.encoding_override),
         .arena = arena,
     };
-    const body = try inboundBodyOf(request, ctx.limits, env.slab.bodyBuf(conn_id), arena);
+    const body = try inboundBodyOf(request, ctx.limits, env.slab.bodyBuf(conn_id));
     switch (outcome) {
         .respond => unreachable,
         .forward_raw => |fwd| try paths.execForwardRaw(ctx, in, sink, body, fwd),
@@ -465,22 +465,21 @@ fn queryParam(target: []const u8, name: []const u8) ?[]const u8 {
 }
 
 /// Classify the body and enforce max_body_size before the shared path sees
-/// it. A Content-Length body stays on the socket as `.lazy`; the shared path
-/// streams or drains it. A chunked body has no declared length, so it is
-/// drained into the arena here. Invalidates the head strings.
+/// it. A Content-Length body stays on the socket as `.lazy`; a chunked body
+/// (no declared length) stays on the socket as `.streamed` and is pumped
+/// socket->upstream by the shared path, so no body-sized buffer lands in the
+/// reset-retained per-connection arena. `max_body_size` is stamped onto the
+/// streamed body and enforced during that pump. Invalidates the head strings.
 fn inboundBodyOf(
     request: *std.http.Server.Request,
     limits: limits_mod.Limits,
     buffer: []u8,
-    arena: std.mem.Allocator,
 ) !InboundBody {
     const head = request.head;
     if (!head.method.requestHasBody()) return .{ .bytes = "" };
     if (head.transfer_encoding == .chunked) {
         const reader = try request.readerExpectContinue(buffer);
-        var capture: std.Io.Writer.Allocating = .init(arena);
-        _ = try pipeline_mod.streamReaderToWriter(reader, &capture.writer, limits.max_body_size);
-        return .{ .bytes = capture.written() };
+        return .{ .streamed = .{ .reader = reader, .max_bytes = limits.max_body_size } };
     }
     const len = head.content_length orelse 0;
     if (len == 0) return .{ .bytes = "" };
@@ -647,4 +646,164 @@ test "query parameters are read from the target" {
     try testing.expectEqual(@as(?[]const u8, null), queryParam("/_edge/tap/pre", "n"));
     try testing.expectEqualStrings("/a/b", pathOf("/a/b?c=d"));
     try testing.expectEqualStrings("/a/b", pathOf("/a/b"));
+}
+
+/// Test `Limits` small enough to build inline; mirrors the helper in
+/// arena_pool.zig/conn_slab.zig. Only the fields `inboundBodyOf` reads
+/// (`max_body_size`) matter here.
+fn testLimits() limits_mod.Limits {
+    return .{
+        .max_connections = 2,
+        .max_body_size = 128,
+        .record_scratch = 256,
+        .recv_buf = 64,
+        .send_buf = 64,
+        .upstream_write_buf = 64,
+        .decode_buf = 128,
+        .encode_buf = 128,
+        .body_buf = 256,
+        .chunk_buf = 32,
+        .zstd_window_len = 64,
+        .large_body_buffer_count = 1,
+        .large_body_buffer_size = 128,
+        .conn_arena_reserve = 4096,
+    };
+}
+
+/// Drives a `std.http.Server` from an in-memory raw request (no networking):
+/// `Reader.fixed` backs `receiveHead`, and a discarding writer absorbs the
+/// optional "100 Continue" (never sent for an absent `Expect` header).
+/// Self-referential (server points at in_reader/discard; request points at
+/// server), so it must be constructed in place via `parseRequestInto`, never
+/// returned by value (the move would dangle the internal pointers).
+const Parsed = struct {
+    in_reader: std.Io.Reader,
+    discard_buf: [16]u8 = undefined,
+    discard: std.Io.Writer.Discarding,
+    server: std.http.Server,
+    request: std.http.Server.Request,
+};
+
+fn parseRequestInto(p: *Parsed, raw: []const u8) !void {
+    p.in_reader = std.Io.Reader.fixed(raw);
+    p.discard = std.Io.Writer.Discarding.init(&p.discard_buf);
+    p.server = std.http.Server.init(&p.in_reader, &p.discard.writer);
+    p.request = try p.server.receiveHead();
+}
+
+test "inboundBodyOf: chunked body stays on the socket as .streamed (no arena capture)" {
+    // Regression: pre-fix this branch drained the whole chunked body into the
+    // per-connection arena as `.bytes`; the arena's `reset(.retain_capacity)`
+    // then pinned body-sized capacity for the connection's life. The fix
+    // returns `.streamed` so the shared path pumps socket->upstream.
+    const raw =
+        "POST /forward HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\nhello\r\n" ++
+        "6\r\n world\r\n" ++
+        "0\r\n\r\n";
+    var p: Parsed = undefined;
+    try parseRequestInto(&p, raw);
+    var body_buf: [256]u8 = undefined;
+    const limits = testLimits();
+    const arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cap_before = arena.queryCapacity();
+
+    const body = try inboundBodyOf(&p.request, limits, &body_buf);
+
+    // The body must NOT be arena-buffered (.bytes); it must stay on the socket
+    // as a streaming reader carrying the max_body_size cap.
+    try testing.expect(body == .streamed);
+    try testing.expectEqual(@as(usize, limits.max_body_size), body.streamed.max_bytes);
+    // `inboundBodyOf` no longer touches an arena, so the caller's arena capacity
+    // is unchanged — the regression's whole point: zero body-sized retention.
+    try testing.expectEqual(cap_before, arena.queryCapacity());
+
+    // Draining the streamed reader through the bounded pump yields the exact
+    // decoded body (what `exchange.sendBody` pumps to the upstream).
+    var out_buf: [64]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out_buf);
+    const n = try pipeline_mod.streamReaderToWriter(body.streamed.reader, &out_writer, limits.max_body_size);
+    try testing.expectEqual(@as(usize, 11), n);
+    try testing.expectEqualStrings("hello world", out_buf[0..n]);
+}
+
+test "inboundBodyOf: chunked body over max_body_size is rejected mid-stream" {
+    // The cap c33e387 added is preserved: a chunked body larger than
+    // max_body_size fails with BodyTooLarge during the upstream pump, rather
+    // than being streamed unbounded (the pre-c33e387 vector).
+    const raw =
+        "POST /forward HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "80\r\n" ++ "a" ** 128 ++ "\r\n" ++ // 128 == max_body_size: this fits exactly
+        "10\r\n" ++ "0123456789abcdef\r\n" ++ // 16 more bytes -> over cap
+        "0\r\n\r\n";
+    var p: Parsed = undefined;
+    try parseRequestInto(&p, raw);
+    var body_buf: [256]u8 = undefined;
+    const limits = testLimits();
+
+    const body = try inboundBodyOf(&p.request, limits, &body_buf);
+    try testing.expect(body == .streamed);
+
+    // Pumping through the cap (as `exchange.sendBody` does) rejects the over-cap
+    // body instead of silently truncating it.
+    var sink: std.Io.Writer.Discarding = .init(&body_buf);
+    try testing.expectError(
+        error.BodyTooLarge,
+        pipeline_mod.streamReaderToWriter(body.streamed.reader, &sink.writer, body.streamed.max_bytes),
+    );
+}
+
+test "inboundBodyOf: Content-Length body stays .lazy on the socket" {
+    // No regression for the Content-Length path: it remains a lazy reader with
+    // a pre-checked length, never arena-buffered, never chunked.
+    const raw =
+        "POST /forward HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "Content-Length: 11\r\n" ++
+        "\r\n" ++
+        "hello world";
+    var p: Parsed = undefined;
+    try parseRequestInto(&p, raw);
+    var body_buf: [256]u8 = undefined;
+    const limits = testLimits();
+
+    const body = try inboundBodyOf(&p.request, limits, &body_buf);
+    try testing.expect(body == .lazy);
+    try testing.expectEqual(@as(usize, 11), body.lazy.len);
+}
+
+test "inboundBodyOf: bodiless method yields empty .bytes" {
+    const raw = "GET /forward HTTP/1.1\r\nHost: x\r\n\r\n";
+    var p: Parsed = undefined;
+    try parseRequestInto(&p, raw);
+    var body_buf: [256]u8 = undefined;
+    const limits = testLimits();
+
+    const body = try inboundBodyOf(&p.request, limits, &body_buf);
+    try testing.expect(body == .bytes);
+    try testing.expectEqual(@as(usize, 0), body.bytes.len);
+}
+
+test "inboundBodyOf: Content-Length over max_body_size is rejected up front" {
+    const raw =
+        "POST /forward HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "Content-Length: 4096\r\n" ++
+        "\r\n" ++ "a" ** 4096;
+    var p: Parsed = undefined;
+    try parseRequestInto(&p, raw);
+    var body_buf: [256]u8 = undefined;
+    const limits = testLimits();
+
+    try testing.expectError(
+        error.BodyTooLarge,
+        inboundBodyOf(&p.request, limits, &body_buf),
+    );
 }
