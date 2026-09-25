@@ -14,7 +14,8 @@ const o11y = @import("o11y");
 const service_mod = @import("../service/service.zig");
 const router_mod = @import("../service/router.zig");
 const upstream_mod = @import("upstream.zig");
-const encoding_mod = @import("../pipeline/encoding.zig");
+const codec = @import("../codec/root.zig");
+const thread_bufs = @import("thread_bufs.zig");
 const framer_mod = @import("../pipeline/framer.zig");
 const tap_mod = @import("../pipeline/tap.zig");
 const limits_mod = @import("../core/limits.zig");
@@ -374,13 +375,7 @@ pub fn processBuffered(
     if (!policiesActiveFor(ctx.registry, pipe.signal)) {
         return .{ .body = raw_body, .all_dropped = false };
     }
-    const decoded = try encoding_mod.decodeResident(
-        pipe.codec,
-        arena,
-        raw_body,
-        ctx.limits.max_decoded_bytes,
-        ctx.limits.zstd_window_len,
-    );
+    const decoded = try decodeWhole(ctx, pipe.codec, arena, raw_body);
 
     var decoded_reader = std.Io.Reader.fixed(decoded);
     var transformed: std.Io.Writer.Allocating = try .initCapacity(arena, 4096);
@@ -403,13 +398,38 @@ pub fn processBuffered(
 
     // Re-encode in the original codec so the forwarded content-encoding
     // header stays truthful.
+    const which = pipe.codec.codec() orelse return .{ .body = transformed.written(), .all_dropped = false };
     var encoded: std.Io.Writer.Allocating = try .initCapacity(arena, 4096);
-    const encode_buf = try arena.alloc(u8, pipe.codec.encoderBufferLen());
-    var encoder: encoding_mod.Encoder = try .init(pipe.codec, &encoded.writer, encode_buf);
-    defer encoder.deinit();
-    try encoder.writer().writeAll(transformed.written());
-    try encoder.finish();
+    const pooled = try thread_bufs.encoder_pool.acquire(ctx.gpa);
+    defer thread_bufs.encoder_pool.release(ctx.gpa, pooled);
+    try pooled.encoder.begin(which, &encoded.writer);
+    try pooled.encoder.writer.writeAll(transformed.written());
+    try pooled.encoder.finish();
     return .{ .body = encoded.written(), .all_dropped = false };
+}
+
+/// The whole of a complete body, decoded into `arena` with this thread's
+/// decoder. Output past `max_decoded_bytes` is `DecodedBodyTooLarge`, which
+/// the caller fails open on, as it does on every other decode error.
+fn decodeWhole(
+    ctx: *SharedCtx,
+    encoding: codec.ContentEncoding,
+    arena: std.mem.Allocator,
+    raw_body: []const u8,
+) ![]const u8 {
+    const which = encoding.codec() orelse return raw_body;
+    const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
+    const decoder = try bufs.ensureDecoder(ctx.gpa);
+    try decoder.begin(which, raw_body, .{
+        .max_output = ctx.limits.max_decoded_bytes,
+        .window_len = ctx.limits.zstd_window_len,
+    });
+    var out: std.ArrayList(u8) = .empty;
+    decoder.readAll(arena, &out) catch |err| return switch (err) {
+        error.OutputTooLarge => error.DecodedBodyTooLarge,
+        else => |e| e,
+    };
+    return out.items;
 }
 
 /// Long-lived scratch for the per-record path: zimdjson's structural buffers
@@ -681,21 +701,21 @@ test "classifyKnownPath matches core routes" {
 
 test "contentEncodingName round-trips through the codec layer" {
     try testing.expectEqual(
-        encoding_mod.ContentEncoding.identity,
-        encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.identity)).?,
+        codec.ContentEncoding.identity,
+        codec.ContentEncoding.fromHeader(contentEncodingName(.identity)).?,
     );
     try testing.expectEqual(
-        encoding_mod.ContentEncoding.gzip,
-        encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.gzip)).?,
+        codec.ContentEncoding.gzip,
+        codec.ContentEncoding.fromHeader(contentEncodingName(.gzip)).?,
     );
     try testing.expectEqual(
-        encoding_mod.ContentEncoding.zstd,
-        encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.zstd)).?,
+        codec.ContentEncoding.zstd,
+        codec.ContentEncoding.fromHeader(contentEncodingName(.zstd)).?,
     );
     // deflate/compress are unsupported by the codec layer: plan() fail-opens.
     try testing.expectEqual(
-        @as(?encoding_mod.ContentEncoding, null),
-        encoding_mod.ContentEncoding.fromHeader(contentEncodingName(.deflate)),
+        @as(?codec.ContentEncoding, null),
+        codec.ContentEncoding.fromHeader(contentEncodingName(.deflate)),
     );
 }
 

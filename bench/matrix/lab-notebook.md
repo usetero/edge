@@ -650,6 +650,130 @@ Master has the same code. There is no matrix case yet.
   and check their statuses themselves. A counter for retryable 4xx answers
   would let the invariant tell them apart.
 
+## Codec rewrite (`src/codec/`)
+
+The first-principles plan from the review of the decode fixes: one small
+module, one reference library per format in both directions (zlib for gzip,
+libzstd for zstd), and library state reused between bodies. It is built
+beside the old code first, then compared with zbench. Wiring it into the
+request path, and one body intake rule for both frontends, is the next phase.
+
+- [x] `codec/root.zig`: the API, `Codec`, `DecodeError`, `DecodeLimits`.
+- [x] `Decoder`: pulls decoded bytes from a complete body. gzip and zstd,
+      several members and frames, an exact output cap, a zstd window cap.
+      A read with no progress is `Truncated` or `Corrupt`, never a loop.
+- [x] `Encoder`: a `std.Io.Writer` that compresses straight into the free
+      space of another writer.
+- [x] Tests (`codec_test.zig`): every property from
+      `decode_safety_test.zig`, std's decoders as an independent oracle,
+      output chunk sizes from 1 byte to the whole body, one decoder across
+      thousands of good, bad and abandoned bodies, several gzip members,
+      header CRC fields, encoder round trips over four write patterns and
+      four staging sizes, a full output writer, agreement with the old decode
+      path, and fuzz tests.
+- [x] Build: the tests run in `zig build test`, and
+      `zig build codec-bench -Doptimize=ReleaseFast` runs the benchmark.
+- [x] Benchmark with zbench, below.
+- [x] Results recorded.
+
+The caller owns the library state. A zstd compression context holds about
+3.5 MiB at level 3, so one for each of 128 handler threads costs about
+450 MiB. The wiring phase must pool encoders, as `CctxCache` does today.
+
+### Benchmark: old against new
+
+`zig build codec-bench -Doptimize=ReleaseFast`, Apple M-series, JSON log
+batches shaped like agent output, decode read in 4 KiB chunks as the
+pipeline reads them. Two runs agreed to within a few percent; run 1 is shown.
+
+| Operation | Size | Old | New | New is |
+|---|---|---|---|---|
+| gzip decode | 16 KiB | 49.2 us | 7.0 us | 7.0x faster |
+| gzip decode | 256 KiB | 728 us | 83 us | 8.8x faster |
+| gzip decode | 2 MiB | 5.90 ms | 0.90 ms | 6.6x faster |
+| zstd decode | 16 KiB | 5.9 us | 5.6 us | same |
+| zstd decode | 256 KiB | 65 us | 69 us | same |
+| zstd decode | 2 MiB | 543 us | 602 us (549 us, no size) | same |
+| gzip encode | 16 KiB | 94.9 us | 43.1 us | 2.2x faster |
+| gzip encode | 256 KiB | 1.66 ms | 1.28 ms | 1.3x faster |
+| gzip encode | 2 MiB | 14.2 ms | 12.9 ms | 1.1x faster |
+| zstd encode | 16 KiB | 16.8 us | 13.3 us | 1.3x faster |
+| zstd encode | 256 KiB | 197 us | 194 us | same |
+| zstd encode | 2 MiB | 2.14 ms | 2.12 ms | same |
+
+- Old gzip decode is std flate with the checkpoint guards: `residentReader`,
+  the CRC, `verifyEnd`. New is zlib.
+- Old zstd decode is the checkpoint path: libzstd into a buffer that holds
+  the whole decoded body, then read in chunks. The speed is the same, but new
+  holds 4 KiB of output, not the whole body (2 MiB at the largest size).
+- The streamed std zstd decoder, which the edge used before the checkpoint,
+  took 75.7 us, 1.01 ms and 6.46 ms: 10 to 14 times slower than libzstd.
+- zlib at level 6 writes gzip 3% to 6% smaller than std flate at level 6:
+  2,141 against 2,207 bytes at 16 KiB, and 234,806 against 250,818 bytes at
+  2 MiB. zstd sizes are the same, because both paths use libzstd.
+
+### Verification
+
+- `zig build test`: 659 of 661 pass, 2 skipped. The codec and decode safety
+  tests add about 1 s at the default scale.
+- Deep run on Linux (Alpine, musl, aarch64), ReleaseSafe,
+  `-Ddecode-test-scale=50`: 660 of 661 pass, 1 skipped, in 5 minutes. Docker
+  must run with `--security-opt seccomp=unconfined`, or the tail tests fail
+  on io_uring with `PermissionDenied`.
+- `zig build codec-bench` in ReleaseSafe: every path decodes and encodes
+  with no safety check tripped.
+
+### Facts found while testing
+
+- A zstd frame keeps its checksum flag in the frame header, so a corruption
+  can turn the check off, and libzstd then decodes changed data with no
+  error. The format allows this. The tests check exact output only for
+  changes after the header of a checksum frame.
+- libzstd decodes a frame that declares its size straight into an output
+  buffer large enough for it. It then needs no window and skips the window
+  cap. The window cap matters only for frames with no declared size.
+- A one-shot zstd compressor that knows the input size shrinks the window to
+  fit, even when it does not write the size. Only a streaming compressor
+  declares a large window for a small input.
+- `zig build test --fuzz` does not build in Zig 0.16.0: the test runner
+  fails to compile with `-ffuzz` (`test_runner.zig:566`, `*builtin.StackTrace`
+  where `*const debug.StackTrace` is expected). The fuzz tests still run
+  their corpus in a normal `zig build test`. The seeded random cases carry
+  the deep search: `-Ddecode-test-scale=50`.
+
+## Wire the codec in, and delete the old path
+
+- [x] `codec.ContentEncoding` (identity, gzip, zstd) replaces
+      `encoding.ContentEncoding` in the service plans.
+- [x] `codec.EncoderPool`: a bounded pool, so idle zstd contexts cost at most
+      the pool size times 3.5 MiB, as `CctxCache` did.
+- [x] `pipeline.run` takes the complete body as a slice, decodes with a
+      `codec.Decoder`, and encodes with a `codec.Encoder`.
+- [x] One `codec.Decoder` per handler thread, in `ThreadBufs`. The decode and
+      encode buffers go.
+- [x] `execPipeStream` and `processBuffered` use the new pipeline. The zstd
+      split goes.
+- [x] Body intake: a decoder only ever sees a complete body, in both
+      frontends. `pipeline.run` takes a slice, so it cannot start before the
+      body exists. A short lazy body is `InboundBodyTruncated` in both
+      frontends, and stdio checks std's `.ready` state after a chunked body.
+      httpz hands over a resident body only once it holds all of it.
+- [x] Delete `pipeline/encoding.zig`, `pipeline/compress_buffered.zig` and
+      `pipeline/decode_safety_test.zig`. Test fixtures move to
+      `codec/fixtures.zig`, and the crash corpus to `codec/testdata/`.
+- [x] `codec-bench` keeps the new paths as a regression benchmark.
+- [x] a51: two gzip members are now decoded and filtered, not failed open.
+- [x] Unit tests, lint, the full matrix, and a chaos run pass. 625 of 627
+      unit tests pass (2 skipped). The full matrix, slow cases included:
+      103 cases, 0 failures, the same 11 declared defects. The 399-cut repro
+      answers 408 at every cut on the Linux build, ReleaseFast and
+      ReleaseSafe. Chaos traffic for 600 s: 505,831 requests (ReleaseFast)
+      and 476,891 (ReleaseSafe), and the edge stayed up.
+- [x] `latest`: tag it only for an app release, never for a chart release or
+      a manual run. `release.yaml` now builds nothing for a chart release,
+      and moves `latest` only when the release is the newest `v*` tag, so a
+      patch to an older line cannot move it back. `actionlint` passes.
+
 ## Findings
 
 ### Fixed

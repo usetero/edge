@@ -480,6 +480,9 @@ fn inboundBodyOf(
         const reader = try request.readerExpectContinue(buffer);
         var capture: std.Io.Writer.Allocating = .init(arena);
         _ = try pipeline_mod.streamReaderToWriter(reader, &capture.writer, limits.max_body_size);
+        // std reads a chunked body to its end only after the last chunk. Check
+        // that state, so a body is never taken as whole on an error's absence.
+        if (request.server.reader.state != .ready) return error.InboundBodyTruncated;
         return .{ .bytes = capture.written() };
     }
     const len = head.content_length orelse {

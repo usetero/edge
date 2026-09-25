@@ -8,7 +8,7 @@
 //! per-service state is plain data.
 const std = @import("std");
 const framer_mod = @import("../pipeline/framer.zig");
-const encoding = @import("../pipeline/encoding.zig");
+const codec_mod = @import("../codec/root.zig");
 
 pub const health = @import("health.zig");
 pub const passthrough = @import("passthrough.zig");
@@ -169,14 +169,14 @@ pub const PipeStream = struct {
     signal: Signal,
     upstream: UpstreamChoice,
     /// Request body Content-Encoding; output is re-encoded the same way.
-    codec: encoding.ContentEncoding,
+    codec: codec_mod.ContentEncoding,
 };
 
 pub const PipeBuffered = struct {
     kind: BufferedKind,
     signal: Signal,
     upstream: UpstreamChoice,
-    codec: encoding.ContentEncoding,
+    codec: codec_mod.ContentEncoding,
 };
 
 pub const Forward = struct {
@@ -240,8 +240,8 @@ pub const Service = union(ServiceKind) {
 /// Resolves a Content-Encoding header to a codec, or null when the encoding
 /// is unsupported — the caller forwards the body opaque/unfiltered rather
 /// than failing the request (PLAN §6.5 fail-open posture).
-pub fn resolveCodec(content_encoding: []const u8) ?encoding.ContentEncoding {
-    return encoding.ContentEncoding.fromHeader(content_encoding);
+pub fn resolveCodec(content_encoding: []const u8) ?codec_mod.ContentEncoding {
+    return codec_mod.ContentEncoding.fromHeader(content_encoding);
 }
 
 test {

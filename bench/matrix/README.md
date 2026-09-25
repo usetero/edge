@@ -140,7 +140,7 @@ with its note.
 | a47b | Gzip batch that decodes, but its CRC32 does not match | Forwarded as sent, so the intake can reject it | |
 | a49 | Valid gzip and zstd batches on the buffered path (metrics JSON, OTLP JSON) | 202, and the intake receives them | |
 | a50 | Header value with a bare LF | Refused, or forwarded with no CR or LF in any value | |
-| a51 | Two gzip members; two zstd frames; a zstd window above the cap | Members forwarded as sent; both frames filtered; the wide window fails open | |
+| a51 | Two gzip members; two zstd frames; a zstd window above the cap | Both members filtered; both frames filtered; the wide window fails open | |
 
 ### `b*` — the edge to the intake
 

@@ -9,7 +9,7 @@
 const std = @import("std");
 const service = @import("service.zig");
 const framer_mod = @import("../pipeline/framer.zig");
-const encoding = @import("../pipeline/encoding.zig");
+const codec_mod = @import("../codec/root.zig");
 
 pub const logs_routes = [_]service.RoutePattern{
     .exact("/api/v2/logs", .{ .post = true }),
@@ -67,7 +67,7 @@ test "logs: json body pipes through the json_array framer to the logs upstream" 
     try testing.expectEqual(service.Signal.log, outcome.pipe_stream.signal);
     try testing.expectEqual(service.UpstreamChoice.logs, outcome.pipe_stream.upstream);
     try testing.expectEqual(framer_mod.WireFormat.json_array, outcome.pipe_stream.format);
-    try testing.expectEqual(encoding.ContentEncoding.gzip, outcome.pipe_stream.codec);
+    try testing.expectEqual(codec_mod.ContentEncoding.gzip, outcome.pipe_stream.codec);
 }
 
 test "logs: non-json content type forwards raw (fail-open)" {
