@@ -36,14 +36,14 @@ BINARIES = {
 }
 
 
-def build(frontends: list[str]) -> None:
+def build(frontends: list[str], optimize: str) -> None:
     zig = os.path.join(REPO_ROOT, "bin", "zig")
     print("building: echo server with fault injection")
     subprocess.run([zig, "build", "echo-server", "-Doptimize=ReleaseFast"], cwd=REPO_ROOT, check=True)
     for frontend in frontends:
         print("building: %s frontend" % frontend)
         subprocess.run(
-            [zig, "build", "-Dfrontend=%s" % frontend, "-Doptimize=ReleaseFast",
+            [zig, "build", "-Dfrontend=%s" % frontend, "-Doptimize=%s" % optimize,
              "--prefix", "zig-out-%s" % frontend],
             cwd=REPO_ROOT,
             check=True,
@@ -96,6 +96,13 @@ class Progress(unittest.TextTestResult):
         super().__init__(*args)
         self.frontend = frontend
         self.started_at = 0.0
+        # A case can fail in its body and again in tearDown. Keep the first
+        # cause in time order, because the later one is usually its effect.
+        self.first_failure: dict[str, str] = {}
+
+    def _record(self, test, err):
+        cause = first_cause(self._exc_info_to_string(err, test))
+        self.first_failure.setdefault(short_id(test.id()), cause)
 
     def startTest(self, test):
         self.started_at = time.monotonic()
@@ -111,10 +118,12 @@ class Progress(unittest.TextTestResult):
 
     def addFailure(self, test, err):
         super().addFailure(test, err)
+        self._record(test, err)
         self._note(test, "FAIL")
 
     def addError(self, test, err):
         super().addError(test, err)
+        self._record(test, err)
         self._note(test, "ERROR")
 
     def addSkip(self, test, reason):
@@ -154,8 +163,8 @@ def run_one(frontend: str, pattern: str | None, fast: bool) -> dict[str, tuple[s
     elapsed = time.monotonic() - started
 
     outcomes: dict[str, tuple[str, str]] = {name: ("pass", "") for name in names}
-    for case, trace in result.failures + result.errors:
-        outcomes[short_id(case.id())] = ("FAIL", first_cause(trace))
+    for name, cause in result.first_failure.items():
+        outcomes[name] = ("FAIL", cause)
     for case, reason in result.skipped:
         outcomes[short_id(case.id())] = ("skip", reason[:200])
     for case, note in result.expectedFailures:
@@ -172,12 +181,16 @@ def main() -> int:
     parser.add_argument("--frontend", choices=("stdio", "httpz", "both"), default="both")
     parser.add_argument("--fast", action="store_true", help="skip the cases that wait for a 30 s deadline")
     parser.add_argument("--skip-build", action="store_true")
+    # ReleaseSafe by default: safety checks turn undefined behaviour into a
+    # panic, and the "edge died" invariant reports it. ReleaseFast can hide it
+    # as a hang or as damaged memory that fails later.
+    parser.add_argument("--optimize", choices=("ReleaseSafe", "ReleaseFast", "Debug"), default="ReleaseSafe")
     parser.add_argument("-k", dest="pattern", help="substring filter on the case id")
     args = parser.parse_args()
 
     frontends = ["stdio", "httpz"] if args.frontend == "both" else [args.frontend]
     if not args.skip_build:
-        build(frontends)
+        build(frontends, args.optimize)
 
     results = {frontend: run_one(frontend, args.pattern, args.fast) for frontend in frontends}
 
