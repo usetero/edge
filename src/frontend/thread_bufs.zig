@@ -9,7 +9,7 @@
 //! grew with connections instead of threads.
 const std = @import("std");
 const exec = @import("exec.zig");
-const encoding_mod = @import("../pipeline/encoding.zig");
+const codec = @import("../codec/root.zig");
 const limits_mod = @import("../core/limits.zig");
 
 const log = std.log.scoped(.httpz_server);
@@ -33,9 +33,10 @@ pub const watchdog_interval_ms: u64 = 100;
 pub const pump_buffer_bytes: usize = 512 * 1024;
 
 pub const ThreadBufs = struct {
-    /// Codec and record workspaces, grown on demand by `prepare`.
-    decode: []u8 = &.{},
-    encode: []u8 = &.{},
+    /// Decodes this thread's bodies. It keeps its zlib and libzstd state
+    /// between bodies, up to one zstd window (`zstd_window_len`).
+    decoder: ?codec.Decoder = null,
+    /// Record workspaces, grown on demand by `prepare`.
     scratch: []u8 = &.{},
     chunk: []u8 = &.{},
     /// Upstream write buffer; also the response read buffer.
@@ -63,20 +64,21 @@ pub const ThreadBufs = struct {
         return self.body;
     }
 
-    pub fn prepare(
-        self: *ThreadBufs,
-        allocator: std.mem.Allocator,
-        limits: limits_mod.Limits,
-        codec: encoding_mod.ContentEncoding,
-    ) !void {
-        try growBuffer(allocator, &self.decode, codec.decoderBufferLen(limits.zstd_window_len));
-        try growBuffer(allocator, &self.encode, codec.encoderBufferLen());
+    pub fn ensureDecoder(self: *ThreadBufs, allocator: std.mem.Allocator) !*codec.Decoder {
+        if (self.decoder == null) self.decoder = try .init(allocator);
+        return &self.decoder.?;
+    }
+
+    pub fn prepare(self: *ThreadBufs, allocator: std.mem.Allocator, limits: limits_mod.Limits) !void {
         try growBuffer(allocator, &self.scratch, limits.record_scratch);
         try growBuffer(allocator, &self.chunk, limits.chunk_buf);
     }
 };
 
 threadlocal var tl_bufs: ?*ThreadBufs = null;
+/// Encoders for every thread. A zstd context is too large to keep one per
+/// thread; see `codec.EncoderPool`.
+pub var encoder_pool: codec.EncoderPool = .{};
 var registry_mutex: std.Io.Mutex = .init;
 var registry: std.ArrayList(*ThreadBufs) = .empty;
 
@@ -105,8 +107,7 @@ pub fn freeAll(io: std.Io, allocator: std.mem.Allocator) void {
     registry_mutex.lockUncancelable(io);
     defer registry_mutex.unlock(io);
     for (registry.items) |bufs| {
-        allocator.free(bufs.decode);
-        allocator.free(bufs.encode);
+        if (bufs.decoder) |*decoder| decoder.deinit(allocator);
         allocator.free(bufs.scratch);
         allocator.free(bufs.chunk);
         allocator.free(bufs.upstream);
@@ -117,6 +118,7 @@ pub fn freeAll(io: std.Io, allocator: std.mem.Allocator) void {
     }
     registry.deinit(allocator);
     registry = .empty;
+    encoder_pool.freeIdle(allocator);
     tl_bufs = null;
 }
 

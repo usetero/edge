@@ -1,5 +1,11 @@
 const std = @import("std");
 const zonfig = @import("zonfig/root.zig");
+const crash = @import("runtime/crash.zig");
+
+// ReleaseFast turns std's crash handler off. Keep it on, so a crash prints
+// the fault and a stack unwound from it. See runtime/crash.zig.
+pub const std_options: std.Options = .{ .enable_segfault_handler = true };
+pub const debug = crash.debug;
 const tail_mod = @import("tail/mod.zig");
 
 const RuntimeTailConfig = tail_mod.types.TailConfig;
@@ -266,6 +272,7 @@ fn validate(opts: CliOptions, cfg: RuntimeTailConfig) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    crash.setDistribution("tail");
     const allocator = init.gpa;
     const io = init.io;
 

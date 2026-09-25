@@ -19,10 +19,9 @@ pub const core_arena_pool = @import("core/arena_pool.zig");
 pub const core_lifecycle = @import("core/lifecycle.zig");
 
 // Streaming record pipeline (0.16 rewrite, PLAN.md §6)
+pub const codec = @import("codec/root.zig");
 pub const pipeline = @import("pipeline/pipeline.zig");
-pub const pipeline_encoding = @import("pipeline/encoding.zig");
 pub const pipeline_framer = @import("pipeline/framer.zig");
-pub const pipeline_compress_buffered = @import("pipeline/compress_buffered.zig");
 
 // HTTP frontends (PLAN.md §9, PLAN-FRONTEND-SWAP.md): exec is the
 // transport-neutral outcome executor shared by every frontend.
@@ -84,8 +83,7 @@ test {
     _ = @import("core/conn_slab.zig");
     _ = @import("core/arena_pool.zig");
     _ = @import("core/lifecycle.zig");
-    _ = @import("pipeline/compress_buffered.zig");
-    _ = @import("pipeline/encoding.zig");
+    _ = @import("codec/root.zig");
     _ = @import("pipeline/framer.zig");
     _ = @import("pipeline/pipeline.zig");
     _ = @import("pipeline/tap.zig");

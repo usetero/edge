@@ -42,6 +42,8 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import random
+import socket
 import tempfile
 import time
 import unittest
@@ -212,6 +214,45 @@ class MatrixCase(unittest.TestCase):
 
     def gzipped(self, body=None) -> bytes:
         return gzip.compress(json.dumps(LOG_PAYLOAD if body is None else body).encode())
+
+    def log_batch(self, approx_bytes: int, level: str = "INFO") -> bytes:
+        """A JSON log batch of about `approx_bytes`, shaped like agent output."""
+        # Seeded noise keeps the compressed stream near its real size, so a
+        # cut lands inside the deflate blocks and not only in the header.
+        rng = random.Random(approx_bytes)
+        records, size, n = [], 0, 0
+        while size < approx_bytes:
+            noise = "%032x" % rng.getrandbits(128)
+            message = "%s matrix record %d %s %s" % (level, n, noise, "x" * 160)
+            records.append({"message": message, "ddsource": "matrix", "service": "suite"})
+            size += len(message) + 60
+            n += 1
+        return json.dumps(records).encode()
+
+    def abandon(
+        self,
+        body: bytes,
+        cut: int,
+        path: str = "/api/v2/logs",
+        extra: str = "",
+        half_close: bool = True,
+        timeout: float = 15.0,
+    ):
+        """Declares all of `body`, sends `cut` bytes of it, then gives up.
+
+        With `half_close`, the sender shuts down its write side and still
+        reads, so an answer is visible. Without it, the sender closes the
+        socket, as an agent does when its own timeout fires.
+        """
+        client = self.raw(timeout=timeout)
+        try:
+            client.send(self.head(path=path, body_len=len(body), extra=extra) + body[:cut])
+            if not half_close:
+                return None
+            client.sock.shutdown(socket.SHUT_WR)
+            return client.read_response()
+        finally:
+            client.close()
 
     def raw(self, timeout: float = 60.0) -> RawClient:
         return RawClient(self.edge.port, timeout=timeout)

@@ -18,6 +18,10 @@ class ShedAtCapacity(MatrixCase):
     EXPECT_LOGS_FOR = {"stdio": ["connection.shed"]}
     EDGE_CONFIG = {"max_connections": 8}
     EXPECT_SHED = True
+    # The held senders declare a body and close without it, which answers the
+    # retryable 408. The metrics carry only the status class, so the invariant
+    # would read it as a drop.
+    EXPECT_PERMANENT_DROP = True
 
     def test_excess_connections_are_shed_with_a_status(self):
         held = []

@@ -44,7 +44,11 @@ pub const InboundBody = union(enum) {
 fn bufferLazyBody(reader: *std.Io.Reader, dst: []u8, len: usize) ![]const u8 {
     std.debug.assert(len <= dst.len);
     var fixed: std.Io.Writer = .fixed(dst[0..len]);
-    try reader.streamExact(&fixed, len);
+    reader.streamExact(&fixed, len) catch |err| return switch (err) {
+        // The sender closed before `len` bytes arrived.
+        error.EndOfStream => error.InboundBodyTruncated,
+        error.ReadFailed, error.WriteFailed => |e| e,
+    };
     return dst[0..len];
 }
 
@@ -127,9 +131,10 @@ pub fn execPipeStream(
     // a second, so the extra pass costs nothing real.
     const tap_armed = if (ctx.tap) |tap| tap.isArmed() else false;
     const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
+    // The whole body, before anything decodes it.
     const raw_body = try residentBody(ctx, body);
-    try bufs.prepare(ctx.gpa, ctx.limits, pipe.codec);
-    var body_reader = std.Io.Reader.fixed(raw_body);
+    try bufs.prepare(ctx.gpa, ctx.limits);
+    const decoder = try bufs.ensureDecoder(ctx.gpa);
     const initial_capacity = @max(@min(raw_body.len, limits_mod.LARGE_BODY_BUFFER_BYTES), 64);
     const spec: pipeline_mod.PipelineSpec = .{
         .decode = pipe.codec,
@@ -138,18 +143,14 @@ pub fn execPipeStream(
         .max_decoded_bytes = ctx.limits.max_decoded_bytes,
         .zstd_window_len = ctx.limits.zstd_window_len,
     };
-    const buffers: pipeline_mod.Buffers = .{
-        .decoder = bufs.decode,
-        .encoder = bufs.encode,
-        .scratch = bufs.scratch,
-        .chunk = bufs.chunk,
-    };
+    const buffers: pipeline_mod.Buffers = .{ .scratch = bufs.scratch, .chunk = bufs.chunk };
 
     var probe = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
     probe.probe = true;
     defer probe.deinit();
     var discard: std.Io.Writer.Discarding = .init(&.{});
-    const probe_result = pipeline_mod.run(spec, &body_reader, &discard.writer, buffers, &probe);
+    const probe_codecs: pipeline_mod.Codecs = .{ .decoder = decoder, .encoder = null };
+    const probe_result = pipeline_mod.run(spec, raw_body, &discard.writer, buffers, probe_codecs, &probe);
     const changed = if (probe_result) |probe_stats| blk: {
         break :blk probe_stats.dropped > 0 or probe_stats.replaced > 0;
     } else |err| switch (err) {
@@ -157,7 +158,11 @@ pub fn execPipeStream(
         // A body we cannot read is still the customer's data. Forward it and
         // let the intake judge it, exactly as execPipeBuffered does.
         // A decode budget the sender cannot see must not destroy the batch.
-        error.ReadFailed, error.DecodedBodyTooLarge => return failOpen(ctx, in, sink, pipe, raw_body, "probe", err),
+        error.Corrupt,
+        error.Truncated,
+        error.WindowTooLarge,
+        error.DecodedBodyTooLarge,
+        => return failOpen(ctx, in, sink, pipe, raw_body, "probe", err),
         else => return err,
     };
 
@@ -167,15 +172,21 @@ pub fn execPipeStream(
         }
         return exchange.exchange(ctx, in, sink, pipe.upstream, .{ .bytes = raw_body }, pipe.signal == .log);
     }
-    body_reader = .fixed(raw_body);
     var output: std.Io.Writer.Allocating = try .initCapacity(in.arena, initial_capacity);
     var record_sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
     defer record_sink.deinit();
     var encode_spec = spec;
     encode_spec.encode = pipe.codec;
-    const encoded = pipeline_mod.run(encode_spec, &body_reader, &output.writer, buffers, &record_sink);
+    const pooled = if (pipe.codec != .identity) try thread_bufs.encoder_pool.acquire(ctx.gpa) else null;
+    defer if (pooled) |p| thread_bufs.encoder_pool.release(ctx.gpa, p);
+    const codecs: pipeline_mod.Codecs = .{ .decoder = decoder, .encoder = if (pooled) |p| &p.encoder else null };
+    const encoded = pipeline_mod.run(encode_spec, raw_body, &output.writer, buffers, codecs, &record_sink);
     const stats = encoded catch |err| switch (err) {
-        error.ReadFailed, error.DecodedBodyTooLarge => return failOpen(ctx, in, sink, pipe, raw_body, "encode", err),
+        error.Corrupt,
+        error.Truncated,
+        error.WindowTooLarge,
+        error.DecodedBodyTooLarge,
+        => return failOpen(ctx, in, sink, pipe, raw_body, "encode", err),
         else => return err,
     };
     if (ctx.metrics) |metrics| {

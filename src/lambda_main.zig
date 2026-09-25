@@ -19,6 +19,7 @@ const build_options = @import("build_options");
 const edge = @import("root.zig");
 const runtime_metrics_mod = @import("runtime/runtime_metrics.zig");
 const app = @import("runtime/app.zig");
+const crash = @import("runtime/crash.zig");
 const ext_rt = @import("runtime/extensions.zig");
 const config_types = @import("config/types.zig");
 const policy = edge.policy;
@@ -136,7 +137,9 @@ pub const LambdaConfig = struct {
 pub const std_options: std.Options = .{
     .log_level = .debug,
     .logFn = StdLogAdapter.logFn,
+    .enable_segfault_handler = true,
 };
+pub const debug = crash.debug;
 
 // =============================================================================
 // Observability Events
@@ -169,6 +172,7 @@ var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(fal
 // =============================================================================
 
 pub fn main(init: std.process.Init) !void {
+    crash.setDistribution("lambda");
     const allocator = init.gpa;
     const io = init.io;
 

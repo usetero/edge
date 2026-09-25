@@ -32,7 +32,16 @@ pub fn build(b: *std.Build) void {
         "Inbound HTTP frontend (stdio = std.Io-native, httpz = event loop + worker pool)",
     ) orelse .stdio;
 
+    // Multiplies the work in src/codec/codec_test.zig. 1 keeps
+    // `zig build test` fast; a deep run uses 20 or more.
+    const decode_test_scale = b.option(
+        u32,
+        "decode-test-scale",
+        "Work multiplier for the decode safety tests",
+    ) orelse 1;
+
     const build_options = b.addOptions();
+    build_options.addOption(u32, "decode_test_scale", decode_test_scale);
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "commit", commit);
     build_options.addOption(Frontend, "frontend", frontend);
@@ -348,6 +357,25 @@ pub fn build(b: *std.Build) void {
     const json_framer_bench_step = b.step("json-framer-bench", "Run the JSON-array framer benchmark");
     const run_json_framer_bench = b.addRunArtifact(json_framer_bench);
     json_framer_bench_step.dependOn(&run_json_framer_bench.step);
+
+    // gzip and zstd, old codec path against src/codec (zbench).
+    const codec_bench = b.addExecutable(.{
+        .name = "codec-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/codec_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "edge", .module = mod },
+                .{ .name = "zbench", .module = zbench_dep.module("zbench") },
+            },
+        }),
+    });
+    codec_bench.root_module.link_libc = true;
+    codec_bench.root_module.linkSystemLibrary("z", .{});
+    codec_bench.root_module.linkSystemLibrary("zstd", .{});
+    const codec_bench_step = b.step("codec-bench", "Run the gzip/zstd codec benchmark, old against new");
+    codec_bench_step.dependOn(&b.addRunArtifact(codec_bench).step);
 
     const run_echo_step = b.step("run-echo-server", "Run the echo server");
     const run_echo_cmd = b.addRunArtifact(echo_server);

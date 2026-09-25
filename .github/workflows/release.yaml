@@ -6,6 +6,11 @@
 # - Standalone binaries (linux-amd64, linux-arm64, darwin-arm64)
 #
 # Triggered by release-please or manually.
+#
+# release-please also publishes a GitHub release for the Helm chart
+# (tero-edge-chart-v*). Only app releases (v*) and manual runs build here, and
+# only the newest app release moves `latest`. A chart release or a manual run
+# once moved `latest` to an untagged commit build.
 name: release
 
 on:
@@ -43,6 +48,7 @@ concurrency:
 
 jobs:
   binary-build-linux:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +117,7 @@ jobs:
           retention-days: 1
 
   binary-build-darwin:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
     strategy:
       fail-fast: false
       matrix:
@@ -169,7 +176,7 @@ jobs:
   upload-binaries:
     runs-on: ubuntu-latest
     needs: [binary-build-linux, binary-build-darwin]
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')
     timeout-minutes: 10
     steps:
       - name: Download all artifacts
@@ -202,6 +209,7 @@ jobs:
   # =============================================================================
 
   docker-build:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
     strategy:
       fail-fast: false
       matrix:
@@ -277,6 +285,7 @@ jobs:
   docker-merge:
     runs-on: ubuntu-latest
     needs: docker-build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -308,16 +317,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Checkout tags
+        if: github.event_name == 'release'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # `latest` is the newest app release. A manual run builds a branch, and a
+      # patch to an older line (1.31.1 after 1.32.0) must not move it back.
+      - name: Decide latest
+        id: latest
+        run: |
+          enable=false
+          if [ "${{ github.event_name }}" = "release" ]; then
+            newest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+            if [ "$newest" = "${{ github.event.release.tag_name }}" ]; then enable=true; fi
+            echo "newest app tag: $newest, this release: ${{ github.event.release.tag_name }}"
+          fi
+          echo "enable=$enable" >> "$GITHUB_OUTPUT"
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.REGISTRY_IMAGE }}
+          flavor: |
+            latest=false
           tags: |
             type=sha
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.latest.outputs.enable }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
