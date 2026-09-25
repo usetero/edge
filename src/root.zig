@@ -1,78 +1,11 @@
-//! By convention, root.zig is the root source file when making a library.
-const policy_zig = @import("policy_zig");
+//! Root of the `edge` library module. The zbench harnesses and lambda_main import it.
 
-// =============================================================================
-// Public module exports for distributions
-// =============================================================================
-
-// Policy package (from policy-zig external dependency)
-pub const policy = policy_zig;
-
-// Config modules (non-policy configuration)
-pub const config_types = @import("config/types.zig");
-
-// Core runtime substrate (0.16 rewrite, PLAN.md §5)
+pub const policy = @import("policy_zig");
 pub const core_limits = @import("core/limits.zig");
-pub const core_io_select = @import("core/io_select.zig");
-pub const core_conn_slab = @import("core/conn_slab.zig");
-pub const core_arena_pool = @import("core/arena_pool.zig");
-pub const core_lifecycle = @import("core/lifecycle.zig");
-
-// Streaming record pipeline (0.16 rewrite, PLAN.md §6)
 pub const codec = @import("codec/root.zig");
-pub const pipeline = @import("pipeline/pipeline.zig");
 pub const pipeline_framer = @import("pipeline/framer.zig");
-
-// HTTP frontends (PLAN.md §9, PLAN-FRONTEND-SWAP.md): exec is the
-// transport-neutral outcome executor shared by every frontend.
-pub const frontend_exec = @import("frontend/exec.zig");
-pub const frontend_upstream = @import("frontend/upstream.zig");
-pub const frontend_select = @import("frontend/select.zig");
-pub const frontend_stdio_server = @import("frontend/stdio/server.zig");
-pub const frontend_stdio_conn = @import("frontend/stdio/conn.zig");
-pub const frontend_stdio_deadline_reader = @import("frontend/stdio/deadline_reader.zig");
-pub const frontend_stdio_head_repair = @import("frontend/stdio/head_repair.zig");
-pub const frontend_httpz_server = @import("frontend/httpz/server.zig");
-pub const frontend_exchange = @import("frontend/exchange.zig");
-pub const frontend_paths = @import("frontend/paths.zig");
-pub const frontend_endpoints = @import("frontend/endpoints.zig");
-pub const frontend_thread_bufs = @import("frontend/thread_bufs.zig");
-pub const service_router = @import("service/router.zig");
-
-// Services + distro composition (PLAN.md §8)
-pub const service = @import("service/service.zig");
-pub const distro = @import("runtime/distro.zig");
-
-// Prometheus signal codecs
-pub const prometheus = @import("signals/prometheus/root.zig");
-
-// Shared single-pass JSON span scanning for signal parsers
-pub const signals_json_scan = @import("signals/json_scan.zig");
-
-// Datadog log search/filter (exposed for benchmarking)
 pub const signals_datadog_logs = @import("signals/datadog/logs.zig");
-
-// =============================================================================
-// Distribution entry points
-// =============================================================================
-
-/// Datadog distribution - focused edge proxy for Datadog log ingestion
-pub const datadog_distribution = @import("datadog_main.zig");
-
-/// OTLP distribution - focused edge proxy for OpenTelemetry log ingestion
-pub const otlp_distribution = @import("otlp_main.zig");
-
-/// Prometheus distribution - focused edge proxy for Prometheus metrics scraping
-pub const prometheus_distribution = @import("prometheus_main.zig");
-
-/// Tail distribution - focused file log tailing
-pub const tail_distribution = @import("edge_tail_main.zig");
-pub const tail = @import("tail/mod.zig");
-
-/// Lambda module - for Lambda extension distribution
-pub const lambda = @import("lambda/root.zig");
-
-/// Zonfig - comptime configuration with environment overrides
+pub const distro = @import("runtime/distro.zig");
 pub const zonfig = @import("zonfig/root.zig");
 
 // Import modules to include their tests
@@ -112,7 +45,6 @@ test {
     _ = @import("frontend/paths.zig");
     _ = @import("frontend/endpoints.zig");
     _ = @import("frontend/thread_bufs.zig");
-    _ = @import("runtime/mode.zig");
     _ = @import("runtime/distro.zig");
     _ = @import("runtime/extensions.zig");
     _ = @import("signals/prometheus/root.zig");

@@ -18,22 +18,21 @@ pub const MetricFieldRef = policy.MetricFieldRef;
 const MetricField = proto.policy.MetricField;
 const AttributePath = proto.policy.AttributePath;
 
-/// Typed read primitive (required since v0.5.0). Prometheus labels and metadata
-/// are strings, but the synthetic `value` and `timestamp` datapoint attributes
-/// are numeric — return them as `.double`/`.int` so the typed matchers
-/// (`equals`/`gt`/`gte`/`lt`/`lte`) work (e.g. `datapoint_attribute("value") > 0.5`).
+/// Typed read for the policy engine. Labels and metadata are strings. The
+/// synthetic value and timestamp attributes are numeric, so numeric matchers
+/// (gt, lt, equals) work on them.
 pub fn metricTypedValue(ctx: *const anyopaque, field: MetricFieldRef) ?policy.TypedValue {
     switch (field) {
         .datapoint_attribute => |attr_path| {
             const key = if (attr_path.path.items.len > 0) attr_path.path.items[0] else return null;
             const prom_ctx: *const PrometheusFieldContext = @ptrCast(@alignCast(ctx));
             if (std.mem.eql(u8, key, "value")) {
-                const s = prom_ctx.getValue() orelse return null;
+                const s = prom_ctx.sample.value;
                 // NaN/±Inf parse via parseFloat; anything else falls back to string.
                 return if (std.fmt.parseFloat(f64, s)) |f| .{ .double = f } else |_| .{ .string = s };
             }
             if (std.mem.eql(u8, key, "timestamp")) {
-                const s = prom_ctx.getTimestamp() orelse return null;
+                const s = prom_ctx.sample.timestamp orelse return null;
                 return if (std.fmt.parseInt(i64, s, 10)) |n| .{ .int = n } else |_| .{ .string = s };
             }
             // Labels and the "labels" pseudo-field are strings.
@@ -50,12 +49,10 @@ pub const metric_accessor: policy.MetricAccessor = .{
 };
 
 /// Context for Prometheus field access.
-/// Contains the parsed line and a labels cache for efficient lookups.
+/// Contains the parsed sample and a labels cache for efficient lookups.
 pub const PrometheusFieldContext = struct {
-    /// The parsed Prometheus line (must be a sample)
-    parsed: line_parser.ParsedLine,
-    /// The original line buffer (labels point into this)
-    line_buffer: []const u8,
+    /// The parsed Prometheus sample
+    sample: line_parser.Sample,
     /// Cached concatenated labels for pattern matching (optional)
     /// Format: "key1=value1,key2=value2,..."
     labels_cache: ?[]const u8 = null,
@@ -63,57 +60,6 @@ pub const PrometheusFieldContext = struct {
     description: ?[]const u8 = null,
     /// Metric type from TYPE metadata (if available)
     metric_type: ?[]const u8 = null,
-
-    /// Create a context from a parsed sample line
-    pub fn fromSample(parsed: line_parser.ParsedLine, line_buffer: []const u8) ?PrometheusFieldContext {
-        return switch (parsed) {
-            .sample => .{
-                .parsed = parsed,
-                .line_buffer = line_buffer,
-            },
-            else => null,
-        };
-    }
-
-    /// Get the metric name from the context
-    pub fn getMetricName(self: *const PrometheusFieldContext) ?[]const u8 {
-        return switch (self.parsed) {
-            .sample => |s| if (s.metric_name.len > 0) s.metric_name else null,
-            else => null,
-        };
-    }
-
-    /// Get the sample value from the context
-    pub fn getValue(self: *const PrometheusFieldContext) ?[]const u8 {
-        return switch (self.parsed) {
-            .sample => |s| if (s.value.len > 0) s.value else null,
-            else => null,
-        };
-    }
-
-    /// Get the timestamp from the context (if present)
-    pub fn getTimestamp(self: *const PrometheusFieldContext) ?[]const u8 {
-        return switch (self.parsed) {
-            .sample => |s| s.timestamp,
-            else => null,
-        };
-    }
-
-    /// Get a label value by name
-    pub fn getLabelValue(self: *const PrometheusFieldContext, label_name: []const u8) ?[]const u8 {
-        return switch (self.parsed) {
-            .sample => |s| {
-                var iter = s.labels;
-                while (iter.next()) |label| {
-                    if (std.mem.eql(u8, label.name, label_name)) {
-                        return label.value;
-                    }
-                }
-                return null;
-            },
-            else => null,
-        };
-    }
 };
 
 /// Field accessor function for Prometheus metrics.
@@ -123,7 +69,7 @@ pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
 
     return switch (field) {
         .metric_field => |mf| switch (mf) {
-            .METRIC_FIELD_NAME => prom_ctx.getMetricName(),
+            .METRIC_FIELD_NAME => prom_ctx.sample.metric_name,
             .METRIC_FIELD_DESCRIPTION => prom_ctx.description,
             // Prometheus doesn't have these fields directly
             .METRIC_FIELD_UNIT,
@@ -146,14 +92,15 @@ pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
             }
             // Special case: "value" returns the sample value
             if (std.mem.eql(u8, key, "value")) {
-                return prom_ctx.getValue();
+                return prom_ctx.sample.value;
             }
             // Special case: "timestamp" returns the sample timestamp
             if (std.mem.eql(u8, key, "timestamp")) {
-                return prom_ctx.getTimestamp();
+                return prom_ctx.sample.timestamp;
             }
             // Otherwise, look up the label by key
-            return prom_ctx.getLabelValue(key);
+            var labels = prom_ctx.sample.labels;
+            return labels.find(key);
         },
         // Prometheus doesn't have resource/scope attributes
         .resource_attribute => null,
@@ -167,12 +114,7 @@ pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
 /// Build a labels cache string for pattern matching.
 /// Format: "key1=value1,key2=value2,..."
 /// Caller owns the returned memory.
-pub fn buildLabelsCache(allocator: std.mem.Allocator, parsed: line_parser.ParsedLine) !?[]u8 {
-    const sample = switch (parsed) {
-        .sample => |s| s,
-        else => return null,
-    };
-
+pub fn buildLabelsCache(allocator: std.mem.Allocator, sample: line_parser.Sample) !?[]u8 {
     // Count total size needed
     var total_len: usize = 0;
     var label_count: usize = 0;
@@ -226,7 +168,7 @@ test "prometheusFieldAccessor - metric name" {
     const line = "http_requests_total{method=\"get\"} 100";
     const parsed = line_parser.parseLine(line);
 
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
 
     const name = metricValue(&ctx, .{ .metric_field = .METRIC_FIELD_NAME });
     try std.testing.expect(name != null);
@@ -237,7 +179,7 @@ test "prometheusFieldAccessor - label lookup" {
     const line = "http_requests_total{method=\"get\",status=\"200\"} 100";
     const parsed = line_parser.parseLine(line);
 
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
 
     // Lookup existing label
     const method = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("method") });
@@ -257,7 +199,7 @@ test "prometheusFieldAccessor - value access" {
     const line = "cpu_usage 0.75";
     const parsed = line_parser.parseLine(line);
 
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
 
     const value = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("value") });
     try std.testing.expect(value != null);
@@ -267,7 +209,7 @@ test "prometheusFieldAccessor - value access" {
 test "prometheusFieldAccessor - typed value/timestamp are numeric, labels are string" {
     const line = "cpu_usage{host=\"a\"} 0.75 1234567890";
     const parsed = line_parser.parseLine(line);
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
 
     // The sample value must be a double so numeric matchers (gt/lt/equals) fire.
     const value = metricTypedValue(&ctx, .{ .datapoint_attribute = testAttrPath("value") });
@@ -289,7 +231,7 @@ test "prometheusFieldAccessor - timestamp access" {
     const line = "cpu_usage 0.75 1234567890";
     const parsed = line_parser.parseLine(line);
 
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
 
     const ts = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("timestamp") });
     try std.testing.expect(ts != null);
@@ -300,7 +242,7 @@ test "prometheusFieldAccessor - unsupported fields return null" {
     const line = "metric_name 1";
     const parsed = line_parser.parseLine(line);
 
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
 
     // Description null when not provided
     const desc = metricValue(&ctx, .{ .metric_field = .METRIC_FIELD_DESCRIPTION });
@@ -319,7 +261,7 @@ test "prometheusFieldAccessor - description from metadata" {
     const line = "http_requests_total{method=\"get\"} 100";
     const parsed = line_parser.parseLine(line);
 
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
     ctx.description = "Total number of HTTP requests";
 
     const desc = metricValue(&ctx, .{ .metric_field = .METRIC_FIELD_DESCRIPTION });
@@ -331,7 +273,7 @@ test "prometheusFieldAccessor - metric type from metadata" {
     const line = "http_requests_total{method=\"get\"} 100";
     const parsed = line_parser.parseLine(line);
 
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
     ctx.metric_type = "counter";
 
     const mt = metricValue(&ctx, .{ .metric_type = .METRIC_TYPE_UNSPECIFIED });
@@ -345,10 +287,10 @@ test "prometheusFieldAccessor - labels cache" {
     const line = "metric{a=\"1\",b=\"2\",c=\"3\"} 100";
     const parsed = line_parser.parseLine(line);
 
-    const labels_cache = try buildLabelsCache(allocator, parsed);
+    const labels_cache = try buildLabelsCache(allocator, parsed.sample);
     defer if (labels_cache) |lc| allocator.free(lc);
 
-    var ctx = PrometheusFieldContext.fromSample(parsed, line).?;
+    var ctx: PrometheusFieldContext = .{ .sample = parsed.sample };
     ctx.labels_cache = labels_cache;
 
     const labels = metricValue(&ctx, .{ .datapoint_attribute = testAttrPath("labels") });
@@ -362,16 +304,6 @@ test "buildLabelsCache - no labels" {
     const line = "metric_without_labels 42";
     const parsed = line_parser.parseLine(line);
 
-    const labels_cache = try buildLabelsCache(allocator, parsed);
-    try std.testing.expect(labels_cache == null);
-}
-
-test "buildLabelsCache - non-sample line" {
-    const allocator = std.testing.allocator;
-
-    const line = "# HELP http_requests_total Total requests";
-    const parsed = line_parser.parseLine(line);
-
-    const labels_cache = try buildLabelsCache(allocator, parsed);
+    const labels_cache = try buildLabelsCache(allocator, parsed.sample);
     try std.testing.expect(labels_cache == null);
 }

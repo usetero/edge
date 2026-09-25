@@ -1,11 +1,10 @@
 //! Datadog intake services. Logs bodies are top-level JSON arrays → the
 //! streaming json_array framer. Series (metrics) bodies are JSON OBJECTS
-//! ({"series":[...]}) the streaming framers don't cover yet → buffered
-//! batch transform, same semantics as the old module path.
+//! ({"series":[...]}) the streaming framers do not cover, so they go through
+//! the buffered batch transform.
 //!
-//! Fail-open posture ported from modules/datadog_module.zig +
-//! signals/datadog/logs.zig: non-JSON content types and unsupported
-//! content encodings forward raw, unevaluated — never rejected.
+//! Fail open: non-JSON content types and unsupported content encodings
+//! forward raw and unevaluated. They are never rejected.
 const std = @import("std");
 const service = @import("service.zig");
 const framer_mod = @import("../pipeline/framer.zig");
@@ -21,7 +20,7 @@ pub const metrics_routes = [_]service.RoutePattern{
 
 pub const Logs = struct {
     pub fn plan(_: *const Logs, req: service.PlanRequest) service.Outcome {
-        // Same gate as the old processLogsStream: only JSON is evaluated.
+        // Only JSON is evaluated.
         if (std.mem.indexOf(u8, req.content_type, "application/json") == null) {
             return .{ .forward_raw = .{ .upstream = .logs, .replayable = true } };
         }

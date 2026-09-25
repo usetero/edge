@@ -211,11 +211,8 @@ pub const JsonArrayFramer = struct {
         self.overflowed = true;
     }
 
-    /// Finalizes the element ending at `end` (exclusive) in `chunk`: evaluates
-    /// it through the sink and emits the verdict. Zero-copy when the whole
-    /// element lives in this chunk; falls back to scratch across chunk
-    /// boundaries; forwards verbatim (unevaluated) when it exceeds the scratch
-    /// bound, matching the byte-at-a-time fail-open behavior it replaces.
+    /// Sends the element that ends at `end` in `chunk` to the sink and writes the verdict. An element
+    /// in one chunk is a chunk slice; else it goes through scratch. An element larger than scratch goes out verbatim.
     fn emitElement(
         self: *JsonArrayFramer,
         chunk: []const u8,
@@ -329,50 +326,18 @@ pub const JsonArrayFramer = struct {
 
 const testing = std.testing;
 
-const TestSink = struct {
-    seen: std.ArrayList([]u8) = .empty,
-    allocator: std.mem.Allocator,
-    replacement: []const u8 = "{\"swapped\":true}",
-
-    fn deinit(self: *TestSink) void {
-        for (self.seen.items) |record| self.allocator.free(record);
-        self.seen.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    pub fn onRecord(self: *TestSink, bytes: []const u8) !framer_mod.Decision {
-        try self.seen.append(self.allocator, try self.allocator.dupe(u8, bytes));
-        if (std.mem.indexOf(u8, bytes, "drop") != null) return .drop;
-        if (std.mem.indexOf(u8, bytes, "swap") != null) return .{ .replace = self.replacement };
-        return .keep;
-    }
-};
-
-fn runChunked(input: []const u8, chunk_len: usize, scratch_len: usize, sink: *TestSink) ![]u8 {
-    const scratch = try testing.allocator.alloc(u8, scratch_len);
-    defer testing.allocator.free(scratch);
-    var framer: JsonArrayFramer = .init(scratch);
-
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    errdefer out.deinit();
-
-    var offset: usize = 0;
-    while (offset < input.len) {
-        const end = @min(offset + chunk_len, input.len);
-        try framer.ingest(input[offset..end], &out.writer, sink);
-        offset = end;
-    }
-    try framer.finish(&out.writer, sink);
-    return out.toOwnedSlice();
-}
+const frame_testing = @import("frame_testing.zig");
+const TestSink = frame_testing.TestSink;
+const runChunked = frame_testing.runChunked;
+const sink_replacement = "{\"swapped\":true}";
 
 test "keep-all re-emits canonical array across chunk sizes" {
     const input = "[ {\"a\":1} ,\n  {\"b\":[1,2,{\"c\":3}]} , \"plain\" , 42 ]";
     const expected = "[{\"a\":1},{\"b\":[1,2,{\"c\":3}]},\"plain\",42]";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 128, &sink);
+        const got = try runChunked(JsonArrayFramer, input, chunk, 128, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(expected, got);
         try testing.expectEqual(@as(usize, 4), sink.seen.items.len);
@@ -383,9 +348,9 @@ test "brackets and escapes inside strings do not break framing" {
     const input =
         \\[{"msg":"a ] b , c [ d"},{"esc":"quote \" and slash \\"}]
     ;
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 3, 128, &sink);
+    const got = try runChunked(JsonArrayFramer, input, 3, 128, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(input, got);
     try testing.expectEqual(@as(usize, 2), sink.seen.items.len);
@@ -394,9 +359,9 @@ test "brackets and escapes inside strings do not break framing" {
 test "drop removes element and separator" {
     const input = "[{\"k\":1},{\"x\":\"drop\"},{\"k\":2}]";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 128, &sink);
+        const got = try runChunked(JsonArrayFramer, input, chunk, 128, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("[{\"k\":1},{\"k\":2}]", got);
     }
@@ -404,34 +369,34 @@ test "drop removes element and separator" {
 
 test "dropping every element yields empty array" {
     const input = "[{\"x\":\"drop\"},{\"y\":\"drop\"}]";
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 7, 128, &sink);
+    const got = try runChunked(JsonArrayFramer, input, 7, 128, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("[]", got);
 }
 
 test "replace substitutes element" {
     const input = "[1,{\"x\":\"swap\"},3]";
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 5, 128, &sink);
+    const got = try runChunked(JsonArrayFramer, input, 5, 128, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("[1,{\"swapped\":true},3]", got);
 }
 
 test "empty array and whitespace-only inputs" {
     {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked("[]", 1, 16, &sink);
+        const got = try runChunked(JsonArrayFramer, "[]", 1, 16, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("[]", got);
     }
     {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked("  \n ", 1, 16, &sink);
+        const got = try runChunked(JsonArrayFramer, "  \n ", 1, 16, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("", got);
     }
@@ -442,9 +407,9 @@ test "oversized element fails open without evaluation" {
     const big = "{\"pad\":\"" ++ "p" ** 64 ++ "drop\"}";
     const input = "[{\"a\":1}," ++ big ++ ",{\"b\":2}]";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 32, &sink);
+        const got = try runChunked(JsonArrayFramer, input, chunk, 32, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(input, got);
         try testing.expectEqual(@as(usize, 2), sink.seen.items.len);
@@ -453,9 +418,9 @@ test "oversized element fails open without evaluation" {
 
 test "non-array body desyncs to verbatim copy" {
     const input = "{\"single\":\"object with drop\"}";
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 7, 64, &sink);
+    const got = try runChunked(JsonArrayFramer, input, 7, 64, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(input, got);
     try testing.expectEqual(@as(usize, 0), sink.seen.items.len);
@@ -463,25 +428,25 @@ test "non-array body desyncs to verbatim copy" {
 
 test "truncated input flushes buffered bytes and closes best-effort" {
     const input = "[{\"a\":1},{\"b\":"; // cut mid-element
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 4, 64, &sink);
+    const got = try runChunked(JsonArrayFramer, input, 4, 64, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("[{\"a\":1},{\"b\":]", got);
 }
 
 test "trailing junk after complete array keeps closing brackets" {
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked("[1]extra", chunk, 64, &sink);
+        const got = try runChunked(JsonArrayFramer, "[1]extra", chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("[1]extra", got);
     }
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked("[](", chunk, 64, &sink);
+        const got = try runChunked(JsonArrayFramer, "[](", chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("[](", got);
     }
@@ -489,7 +454,7 @@ test "trailing junk after complete array keeps closing brackets" {
 
 test "stats are accounted" {
     const input = "[1,\"drop\",\"swap\",2]";
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
     const scratch = try testing.allocator.alloc(u8, 64);
     defer testing.allocator.free(scratch);

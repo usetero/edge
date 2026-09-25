@@ -9,27 +9,12 @@
 //!   * a chunked body on `pipe_stream` and `pipe_buffered` round-trips with
 //!     policies active
 //!
-//! Mirrors src/bench/upstream_pool_harness.zig's process model (bind mock,
-//! spawn edge, poll /_health) but adds a recording mock and chunked sending.
+//! The process model (bind mock, spawn edge, poll /_health) is in harness_common.zig.
 const std = @import("std");
+const common = @import("harness_common.zig");
 
-const edge_bin = "zig-out/bin/edge";
 const config_path = "zig-out/chunked_harness.config.json";
 const policies_path = "zig-out/chunked_harness.policies.json";
-
-/// keep-all policies so the .log and .metric signals actually run the pipeline
-/// (otherwise they short-circuit to forward_raw); identical to the pool harness.
-const policies_json =
-    \\{
-    \\  "policies": [
-    \\    { "id": "keep-logs", "name": "keep-logs",
-    \\      "log": { "match": [{ "log_field": "body", "regex": ".*" }], "keep": "all" } },
-    \\    { "id": "keep-metrics", "name": "keep-metrics",
-    \\      "metric": { "match": [{ "metric_field": "name", "regex": ".*" }], "keep": true } }
-    \\  ]
-    \\}
-    \\
-;
 
 /// One connection's recorded view: which framing the upstream saw, body bytes.
 const Recorded = struct {
@@ -156,101 +141,12 @@ fn sendChunkedRetry(client: *std.http.Client, uri: std.Uri, content_type: []cons
     return sendChunked(client, uri, content_type, body);
 }
 
-fn readFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    var fr = file.reader(io, &.{});
-    return fr.interface.allocRemaining(gpa, .limited(8 * 1024 * 1024));
-}
-
-fn get(client: *std.http.Client, gpa: std.mem.Allocator, uri: std.Uri) ?[]u8 {
-    var req = client.request(.GET, uri, .{}) catch return null;
-    defer req.deinit();
-    req.sendBodiless() catch return null;
-    var res = req.receiveHead(&.{}) catch return null;
-    if (res.head.status != .ok) return null;
-    var buf: [1024]u8 = undefined;
-    return res.reader(&buf).allocRemaining(gpa, .limited(64 * 1024)) catch null;
-}
-
-fn waitFor(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    port: u16,
-    path: []const u8,
-    probe: *const fn ([]const u8) bool,
-) !void {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-    var buf: [96]u8 = undefined;
-    const uri = try std.Uri.parse(try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}{s}", .{ port, path }));
-    var waited_ms: u32 = 0;
-    while (waited_ms < 8000) : (waited_ms += 50) {
-        if (get(&client, gpa, uri)) |body| {
-            defer gpa.free(body);
-            if (probe(body)) return;
-        }
-        // ziglint-ignore: Z026 (best-effort poll pacing; a missed sleep is harmless)
-        io.sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
-    }
-    return error.NotReady;
-}
-
-fn healthOk(body: []const u8) bool {
-    return std.mem.indexOf(u8, body, "ok") != null;
-}
-fn policiesActive(body: []const u8) bool {
-    return std.mem.indexOf(u8, body, "(log=1 metric=1") != null;
-}
-
-fn freePort(io: std.Io, start: u16) !u16 {
-    var port = start;
-    while (port < start + 200) : (port += 1) {
-        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
-        var server = addr.listen(io, .{ .reuse_address = true }) catch continue;
-        server.deinit(io);
-        return port;
-    }
-    return error.NoFreePort;
-}
-
-fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [256]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    try fw.interface.writeAll(contents);
-    try fw.interface.flush();
-}
-
-fn writeConfig(io: std.Io, edge_port: u16, mock_port: u16) !void {
-    var buf: [640]u8 = undefined;
-    const contents = try std.fmt.bufPrint(&buf,
-        \\{{
-        \\  "listen_address": "127.0.0.1",
-        \\  "listen_port": {d},
-        \\  "upstream_url": "http://127.0.0.1:{d}",
-        \\  "log_level": "err",
-        \\  "max_body_size": 2097152,
-        \\  "policy_providers": [{{ "id": "file", "type": "file", "path": "{s}" }}]
-        \\}}
-        \\
-    , .{ edge_port, mock_port, policies_path });
-    try writeFile(io, config_path, contents);
-}
-
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
 
-    var mock_port: u16 = 15000;
-    const server = while (mock_port < 15200) : (mock_port += 1) {
-        const addr = std.Io.net.IpAddress.parse("127.0.0.1", mock_port) catch continue;
-        break addr.listen(io, .{ .reuse_address = true }) catch continue;
-    } else {
-        std.debug.print("could not bind a loopback port for the mock upstream\n", .{});
-        return error.NoFreePort;
-    };
+    const server = try common.bindLoopback(io, 15000);
+    const mock_port = server.socket.address.getPort();
 
     var body_store: [4 * 1024 * 1024]u8 = undefined; // 4 MiB recording buffer
     var group: std.Io.Group = .init;
@@ -259,32 +155,20 @@ pub fn main(init: std.process.Init) !void {
     defer mock.server.deinit(io);
     try group.concurrent(io, Mock.serve, .{&mock});
 
-    const edge_port = try freePort(io, 19080);
-    try writeFile(io, policies_path, policies_json);
+    const edge_port = try common.freePort(io, 19080);
+    try common.writeFile(io, policies_path, common.policies_json);
     defer std.Io.Dir.cwd().deleteFile(io, policies_path) catch {};
-    try writeConfig(io, edge_port, mock_port);
+    try common.writeConfig(io, config_path, policies_path, edge_port, mock_port);
     defer std.Io.Dir.cwd().deleteFile(io, config_path) catch {};
 
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ edge_bin, config_path },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
+    var child = try common.startEdge(io, gpa, config_path, edge_port);
     defer child.kill(io);
-
-    try waitFor(io, gpa, edge_port, "/_health", healthOk);
-    waitFor(io, gpa, edge_port, "/_edge/policies", policiesActive) catch {
-        std.debug.print("policies never became active — pipe paths would fall back to forward_raw\n", .{});
-        return error.PoliciesNotLoaded;
-    };
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var passes: u32 = 0;
     var fails: u32 = 0;
-    var checks: u32 = 0;
 
     // --- Scenario 1: chunked passthrough reaches upstream chunked, byte-exact ---
     {
@@ -297,7 +181,6 @@ pub fn main(init: std.process.Init) !void {
         // ziglint-ignore: Z026 (best-effort pacing; a missed sleep is harmless)
         io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
 
-        checks += 3;
         const ok_status = status == 200;
         const rec = mock.snapshot();
         const ok_chunked = rec.saw_chunked_te and !rec.saw_content_length and rec.clean;
@@ -331,7 +214,6 @@ pub fn main(init: std.process.Init) !void {
         );
         const status = sendChunked(&client, uri, "text/plain", big);
 
-        checks += 1;
         // The cap answers 413. A 200 is the regression; a 502 means the edge
         // failed on the upstream before the cap tripped, which is not the cap.
         const ok = status == 413;
@@ -344,7 +226,7 @@ pub fn main(init: std.process.Init) !void {
 
     // --- Scenario 3: chunked pipe_stream (replayable logs) round-trips ---
     {
-        const body = try readFile(io, gpa, "bench/perf/payloads/datadog-1mb.json");
+        const body = try common.readFile(io, gpa, "bench/perf/payloads/datadog-1mb.json");
         defer gpa.free(body);
         var uri_buf: [96]u8 = undefined;
         const uri = try std.Uri.parse(
@@ -354,7 +236,6 @@ pub fn main(init: std.process.Init) !void {
         // ziglint-ignore: Z026
         io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
 
-        checks += 2;
         const ok_status = status == 200;
         const got = mock.snapshot().body_len;
         const ok_body = got == body.len;
@@ -368,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
 
     // --- Scenario 4: chunked pipe_buffered (metrics) round-trips ---
     {
-        const body = try readFile(io, gpa, "bench/scaling/payloads/datadog-metrics.json");
+        const body = try common.readFile(io, gpa, "bench/scaling/payloads/datadog-metrics.json");
         defer gpa.free(body);
         var uri_buf: [96]u8 = undefined;
         const uri = try std.Uri.parse(
@@ -378,7 +259,6 @@ pub fn main(init: std.process.Init) !void {
         // ziglint-ignore: Z026
         io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch {};
 
-        checks += 2;
         const ok_status = status == 200;
         const got = mock.snapshot().body_len;
         const ok_body = got == body.len;
@@ -390,7 +270,7 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    std.debug.print("\n=== chunked stdio harness: {d}/{d} checks passed ===\n", .{ passes, checks });
+    std.debug.print("\n=== chunked stdio harness: {d}/{d} checks passed ===\n", .{ passes, passes + fails });
     if (fails == 0) {
         std.debug.print(
             "PASS: chunked forward_raw streams upstream chunked (byte-exact), over-cap rejected," ++

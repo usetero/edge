@@ -1,5 +1,5 @@
 //! Connection driver for the std.Io-native frontend: owns one accepted TCP
-//! connection end-to-end (PLAN.md §9). Spawned as a concurrent task per
+//! connection end-to-end. Spawned as a concurrent task per
 //! connection; written as straight blocking code against std.Io, so the
 //! concurrency model is whatever Io implementation the composition root
 //! selected.
@@ -24,7 +24,6 @@ const pipeline_mod = @import("../../pipeline/pipeline.zig");
 const conn_slab_mod = @import("../../core/conn_slab.zig");
 const arena_pool_mod = @import("../../core/arena_pool.zig");
 const limits_mod = @import("../../core/limits.zig");
-const runtime_metrics = @import("../../runtime/runtime_metrics.zig");
 const exchange = @import("../exchange.zig");
 const paths = @import("../paths.zig");
 const endpoints = @import("../endpoints.zig");
@@ -39,10 +38,6 @@ const log = std.log.scoped(.conn);
 // Named event payloads: the type name is the telemetry event name.
 /// A request threw out of dispatch and was mapped to a bounded error response.
 const RequestFailed = struct { method: []const u8, path: []const u8, err: []const u8 };
-/// Per-request trace at debug level.
-const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
-/// Same shape at warn level, for a request that held its connection task.
-const RequestSlow = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 /// A connection refused before it carried a request, with the status sent.
 const ConnectionShed = struct { reason: []const u8, answered: u16 };
 /// An inbound read hit its deadline. `idle` is a keep-alive wait with no
@@ -62,10 +57,6 @@ const RequestRejected = struct { reason: []const u8, answered: u16 };
 const ResponseTruncated = struct { path: []const u8, status: u16, err: []const u8 };
 /// Even the fixed error response failed to reach the client.
 const ResponseUndeliverable = struct { answered: u16, err: []const u8 };
-
-/// Warn past this, matching the httpz frontend: `RequestCompleted` is debug
-/// level, which production turns off.
-const slow_request_seconds: f64 = 5;
 
 /// Per-connection environment: the frontend-neutral shared context plus the
 /// stdio frontend's own state (slab slot buffers, arena pool).
@@ -289,7 +280,7 @@ fn handleRequest(
 
     var sink: Sink = .{ .request = request, .buffer = env.slab.bodyBuf(conn_id) };
     var failed: ?anyerror = null;
-    dispatch(env, conn_id, arena, request, target, &sink) catch |raw_err| {
+    dispatch(env, conn_id, arena, request, target, path, method, &sink) catch |raw_err| {
         // The shared path reports a stalled read as a generic read failure.
         // Only this frontend knows the deadline fired, so name it here: the
         // sender stalled, the upstream did not.
@@ -320,8 +311,7 @@ fn handleRequest(
                 .status = sink.status,
                 .err = @errorName(err),
             });
-        }
-        if (sink.status == 0) {
+        } else {
             sink.status = exchange.errorStatus(err);
             request.respond("", .{
                 .status = @enumFromInt(sink.status),
@@ -332,29 +322,7 @@ fn handleRequest(
         }
     };
 
-    const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
-    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-    if (ctx.metrics) |metrics| {
-        metrics.recordRequestDuration(known_path, elapsed_s);
-        metrics.recordResponse(known_path, runtime_metrics.statusClass(sink.status));
-    }
-    if (elapsed_s >= slow_request_seconds) {
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.warn(RequestSlow{
-            .method = @tagName(request.head.method),
-            .path = path,
-            .status = sink.status,
-            .duration_ms = elapsed_s * std.time.ms_per_s,
-        });
-    } else {
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.debug(RequestCompleted{
-            .method = @tagName(request.head.method),
-            .path = path,
-            .status = sink.status,
-            .duration_ms = elapsed_s * std.time.ms_per_s,
-        });
-    }
+    paths.finishRequest(ctx, @tagName(request.head.method), path, known_path, sink.status, start_ns);
     if (failed) |err| return err;
 }
 
@@ -364,28 +332,27 @@ fn dispatch(
     arena: std.mem.Allocator,
     request: *std.http.Server.Request,
     target: []const u8,
+    path: []const u8,
+    method: service_mod.HttpMethod,
     sink: *Sink,
 ) !void {
     const ctx = env.shared;
-    const path = pathOf(target);
-    const method = service_mod.HttpMethod.fromStd(request.head.method);
 
-    // Claim the whole namespace whatever the method. Matching only GET let
-    // `POST /_edge/metrics` fall through to the wildcard passthrough and
-    // travel to the intake, the same way `POST /_health` did.
+    // Claim the whole `/_edge/` namespace for every method, so no control
+    // path falls through to the passthrough and reaches the intake.
     if (std.mem.startsWith(u8, path, "/_edge/") and request.head.method != .GET) {
         sink.status = 405;
         return request.respond("", .{ .status = .method_not_allowed });
     }
-    if (request.head.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
+    if (std.mem.eql(u8, path, "/_edge/metrics")) {
         // std.http.Server keeps no counters of its own.
         return endpoints.metrics(ctx, sink, null);
     }
-    if (request.head.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) {
+    if (std.mem.eql(u8, path, "/_edge/policies")) {
         const json = std.mem.eql(u8, queryParam(target, "format") orelse "", "json");
         return endpoints.policies(ctx, sink, json);
     }
-    if (request.head.method == .GET and std.mem.startsWith(u8, path, "/_edge/tap/")) {
+    if (std.mem.startsWith(u8, path, "/_edge/tap/")) {
         const stage: exec.TapState.Stage = if (std.mem.eql(u8, path, "/_edge/tap/pre"))
             .pre
         else if (std.mem.eql(u8, path, "/_edge/tap/post"))
@@ -423,7 +390,7 @@ fn dispatch(
         });
     }
 
-    const headers_buf = try arena.alloc(std.http.Header, 64);
+    const headers_buf = try arena.alloc(std.http.Header, limits_mod.MAX_FORWARD_HEADERS);
     const in: Inbound = .{
         .method = request.head.method,
         .target = target,
@@ -467,13 +434,9 @@ fn isControlPath(path: []const u8) bool {
     return std.mem.eql(u8, path, "/_health") or std.mem.startsWith(u8, path, "/_edge/");
 }
 
-/// The origin-form of a request target.
-///
-/// A sender configured with a proxy sends the absolute-form
-/// (`GET http://host/path HTTP/1.1`), which RFC 9112 §3.2.2 requires a server
-/// to accept. Treating the whole URL as a path routed it to the wildcard
-/// passthrough and shipped a mangled target upstream, so `/_health` behind a
-/// proxy setting became intake traffic.
+/// The origin-form of a request target. A sender behind a proxy setting
+/// sends the absolute-form (`GET http://host/path HTTP/1.1`), and RFC 9112
+/// §3.2.2 requires a server to accept it. Routing uses the path only.
 fn originForm(target: []const u8) []const u8 {
     for ([_][]const u8{ "http://", "https://" }) |scheme| {
         if (!std.ascii.startsWithIgnoreCase(target, scheme)) continue;
@@ -525,18 +488,11 @@ fn inboundBodyOf(
     if (len == 0) return .{ .bytes = "" };
     if (len > limits.max_body_size) return error.BodyTooLarge;
     const reader = try request.readerExpectContinue(buffer);
-    // A streamed body is consumed by its first send and can never be
-    // replayed, so a transport failure mid-exchange ends the batch with a
-    // 502. Bodies below the streaming threshold stay resident and can be
-    // dialed again; httpz draws the same line at `lazy_read_size`.
-    //
-    // Above the threshold the batch is not replayable, which is deliberate.
-    // The Datadog agent retries a 5xx with exponential backoff, so the cost
-    // is a delayed batch and a duplicate risk rather than lost data. Raising
-    // the line to `max_body_size` would make every batch replayable, at the
-    // price of one `max_body_size` buffer per concurrent request: the memory
-    // a policy deployment already pays through `residentBody`, and a
-    // passthrough deployment does not. See bench/matrix a30.
+    // A body at or below `large_body_buffer_size` stays resident, so a
+    // transport failure can dial again. A larger body streams, is consumed by
+    // its first send, and fails with 502 on a transport error; the Datadog
+    // agent then retries it. A higher line costs one body-sized buffer per
+    // concurrent request. httpz uses the same line (`lazy_read_size`).
     if (len <= limits.large_body_buffer_size) {
         var capture: std.Io.Writer.Allocating = try .initCapacity(arena, @intCast(len));
         // std reports a sender that closes before `len` bytes as the end of
@@ -550,11 +506,9 @@ fn inboundBodyOf(
     return .{ .lazy = .{ .reader = reader, .len = @intCast(len) } };
 }
 
-/// Collected, arena-duped request headers. Must run BEFORE the body reader
-/// is created: readerExpectNone invalidates the head strings.
-/// Copies the headers to forward out of the head, which the body read
-/// overwrites. `encoding` replaces the `content-encoding` value where the head
-/// was repaired and carries `identity` instead of what the sender sent.
+/// Arena copies of the headers to forward. Call before the body reader
+/// exists: the body read overwrites the head. Where the head was repaired,
+/// `encoding` replaces the `content-encoding` value.
 fn collectRequestHeaders(
     request: *std.http.Server.Request,
     arena: std.mem.Allocator,
@@ -665,7 +619,7 @@ fn reportReadEnd(
 /// machine can answer (load shed, malformed head, read deadline). A failure
 /// here means the client never learned the status, which is the one drop we
 /// cannot back-propagate, so it is logged rather than ignored.
-fn writeRawResponse(
+pub fn writeRawResponse(
     shared: *exec.SharedCtx,
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -698,11 +652,9 @@ test "query parameters are read from the target" {
 
 var test_chunked: ChunkedBody = .{};
 
-/// Small test `Limits`, as in arena_pool.zig. Only `max_body_size` and
-/// `large_body_buffer_size` matter here.
-fn testLimits() limits_mod.Limits {
-    return .resolve(.{ .max_body_size = 128, .max_connections = 2 });
-}
+/// Only `max_body_size` and `large_body_buffer_size` matter here. `resolve`
+/// sets `large_body_buffer_size` to min(max_body_size, 64 KiB), so both are 128.
+const test_limits: limits_mod.Limits = .resolve(.{ .max_body_size = 128, .max_connections = 4 });
 
 /// Drives a `std.http.Server` from an in-memory raw request. The struct is
 /// self-referential, so build it in place with `parseRequestInto` and never
@@ -723,8 +675,6 @@ fn parseRequestInto(p: *Parsed, raw: []const u8) !void {
 }
 
 test "inboundBodyOf: chunked body stays on the socket as .streamed (no arena capture)" {
-    // Regression: this branch drained the chunked body into the arena, which
-    // retained body-sized capacity for the connection's life.
     const raw =
         "POST /forward HTTP/1.1\r\n" ++
         "Host: x\r\n" ++
@@ -736,7 +686,7 @@ test "inboundBodyOf: chunked body stays on the socket as .streamed (no arena cap
     var p: Parsed = undefined;
     try parseRequestInto(&p, raw);
     var body_buf: [256]u8 = undefined;
-    const limits = testLimits();
+    const limits = test_limits;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -772,7 +722,7 @@ test "inboundBodyOf: chunked body over max_body_size is rejected mid-stream" {
     var p: Parsed = undefined;
     try parseRequestInto(&p, raw);
     var body_buf: [256]u8 = undefined;
-    const limits = testLimits();
+    const limits = test_limits;
 
     const body = try inboundBodyOf(&p.request, limits, &body_buf, testing.allocator, &test_chunked);
     try testing.expect(body == .streamed);
@@ -798,7 +748,7 @@ test "inboundBodyOf: a Content-Length body is never .streamed" {
     var p: Parsed = undefined;
     try parseRequestInto(&p, raw);
     var body_buf: [256]u8 = undefined;
-    const limits = testLimits();
+    const limits = test_limits;
 
     // The resident capture allocates, so the test owns an arena.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -825,7 +775,7 @@ test "inboundBodyOf: bodiless method yields empty .bytes" {
     var p: Parsed = undefined;
     try parseRequestInto(&p, raw);
     var body_buf: [256]u8 = undefined;
-    const limits = testLimits();
+    const limits = test_limits;
 
     const body = try inboundBodyOf(&p.request, limits, &body_buf, testing.allocator, &test_chunked);
     try testing.expect(body == .bytes);
@@ -841,7 +791,7 @@ test "inboundBodyOf: Content-Length over max_body_size is rejected up front" {
     var p: Parsed = undefined;
     try parseRequestInto(&p, raw);
     var body_buf: [256]u8 = undefined;
-    const limits = testLimits();
+    const limits = test_limits;
 
     try testing.expectError(
         error.BodyTooLarge,
@@ -853,11 +803,11 @@ fn pumpCutChunked(raw: []const u8, chunked: *ChunkedBody) !usize {
     var p: Parsed = undefined;
     try parseRequestInto(&p, raw);
     var body_buf: [256]u8 = undefined;
-    const body = try inboundBodyOf(&p.request, testLimits(), &body_buf, testing.allocator, chunked);
+    const body = try inboundBodyOf(&p.request, test_limits, &body_buf, testing.allocator, chunked);
     try testing.expect(body == .streamed);
     var out_buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&out_buf);
-    return pipeline_mod.streamReaderToWriter(body.streamed.reader, &out, testLimits().max_body_size);
+    return pipeline_mod.streamReaderToWriter(body.streamed.reader, &out, test_limits.max_body_size);
 }
 
 const cut_head = "POST /forward HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";

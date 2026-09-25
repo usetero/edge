@@ -1,17 +1,13 @@
-//! Storage and typed reads for a record's unknown ("extra") fields.
+//! Storage and typed reads for the unknown ("extra") fields of a record.
 //!
-//! Shared by logs and metric series. Both carry unknown fields, both must
-//! re-emit them verbatim when a policy drops a sibling and forces a
-//! re-serialization, and both used to do it with their own copy of the
-//! bookkeeping. The metric copy had drifted: it leaked a key on a duplicate,
-//! it re-emitted extras in hash order rather than the order the sender wrote
-//! them, and it emitted `{}` for a nested one.
+//! Logs and metric series both use this. Both must re-emit their extras
+//! unchanged when a policy removes a sibling field.
 //!
-//! Two shapes, mutually exclusive per record. `Materialized` is what a
-//! zimdjson parse produces: typed `AnyValue`s, plus owned JSON bytes for the
-//! containers an on-demand cursor cannot revisit. `Spans` is what the fast
-//! byte-scanning path produces: verbatim slices of the record, nothing owned,
-//! nothing unescaped until a policy actually reads the field.
+//! A record uses one of two shapes. `Materialized` holds a zimdjson parse:
+//! typed `AnyValue`s, plus owned bytes for each container, because an
+//! on-demand cursor cannot go back. `Spans` holds slices of the record from
+//! the fast scan. It owns nothing and unescapes a string only when a policy
+//! reads it.
 
 const std = @import("std");
 const jscan = @import("../json_scan.zig");
@@ -21,27 +17,17 @@ const json_value = @import("json_value.zig");
 pub const AnyValue = json_value.AnyValue;
 pub const Parser = json_value.Parser;
 
-/// Unknown fields of one record, in the order the record listed them.
+/// Unknown fields of one record, in record order.
 ///
-/// A flat list, not a hash map. A record carries a handful of extras and a
-/// policy reads one or two of them, so hashing and growing a map per record
-/// costs more than a linear scan over short keys. Measured with
-/// `zig build datadog-log-bench`, per record, against an ordered map
-/// (`std.StringArrayHashMapUnmanaged`) built to replace this: scalar extras
-/// cost 94 ns here against 127 ns there, and a record with no extras at all
-/// ran 176 ns against 191 ns. Nested extras were the one win for the map,
-/// 139 ns against 151 ns, because it folds the container-JSON lookup into the
-/// value. Do not swap this for a map without re-running that comparison.
+/// A flat list, not a hash map: a record has few extras, so a linear scan
+/// costs less than a map per record. Measured with
+/// `zig build datadog-log-bench` against `std.StringArrayHashMapUnmanaged`:
+/// scalar 94 ns against 127 ns, none 176 ns against 191 ns, nested 151 ns
+/// against 139 ns. Run that comparison again before you change this to a map.
 ///
-/// `get` scans backwards, so a duplicate key resolves to the last one, as a
-/// map's last-write-wins would. The list keeps both entries and re-emits both,
-/// which a map cannot: RFC 8259 §4 makes key uniqueness a SHOULD and leaves a
-/// duplicate's meaning undefined, so the conservative reading is that the
-/// bytes are the sender's and only the intake may judge them. Nothing in the
-/// fleet emits duplicates (the Datadog agent marshals a Go struct, the OTel
-/// collector builds from pdata), but Fluent Bit can: msgpack maps admit
-/// duplicate keys and its JSON encoder does not deduplicate, so a filter chain
-/// could produce one.
+/// `get` scans backwards, so a duplicate key gives the last value. The list
+/// keeps and re-emits both entries: RFC 8259 §4 does not define a duplicate's
+/// meaning, so the bytes stay as sent. Fluent Bit can send duplicates.
 pub const Spans = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
@@ -155,13 +141,8 @@ pub fn findNestedStringInRaw(
     };
 }
 
-/// Unknown fields from a materializing (zimdjson) parse, in the order the
-/// record listed them.
-///
-/// Three pieces of state that have to move together, which is why they live
-/// behind one type: the typed values, the owned JSON bytes for container
-/// values, and the insertion order. Separating them is how the metric copy
-/// came to reorder its extras.
+/// Unknown fields from a zimdjson parse, in record order. The typed values,
+/// the container bytes and the key order must change together.
 pub const Materialized = struct {
     values: std.StringHashMapUnmanaged(AnyValue) = .empty,
     /// Object/array values, serialized while the parser's cursor was still
@@ -187,47 +168,30 @@ pub const Materialized = struct {
 
     /// Record one unknown field. `key` may borrow the parser buffer.
     ///
-    /// A duplicate key keeps the position it first took and takes the last
-    /// value. Reuse the key the map already owns: `HashMap.put` replaces the
-    /// value and keeps the original key pointer, so duping again strands the
-    /// copy — it enters neither the map nor `order`, and `deinit` frees keys
-    /// by walking the map.
-    pub fn put(
-        self: *Materialized,
-        allocator: std.mem.Allocator,
-        key: []const u8,
-        any: AnyValue,
-    ) !void {
-        if (self.values.getEntry(key)) |existing| {
-            // A container value being replaced owns bytes.
-            if (self.raw_json.fetchRemove(existing.key_ptr.*)) |stale| {
-                allocator.free(stale.value);
-            }
+    /// A duplicate key keeps its first position and takes the last value.
+    /// Reuse the key that the map owns: `HashMap.put` keeps the original key
+    /// pointer, so a second copy enters neither the map nor `order`, and
+    /// `deinit` frees keys through the map.
+    pub fn put(self: *Materialized, allocator: std.mem.Allocator, key: []const u8, any: AnyValue) !void {
+        const stored_key = if (self.values.getEntry(key)) |existing| blk: {
+            if (self.raw_json.fetchRemove(existing.key_ptr.*)) |stale| allocator.free(stale.value);
             existing.value_ptr.* = any;
-            switch (any) {
-                .object, .array => try self.raw_json.put(
-                    allocator,
-                    existing.key_ptr.*,
-                    try json_value.stringify(allocator, any),
-                ),
-                else => {},
+            break :blk existing.key_ptr.*;
+        } else blk: {
+            const key_copy = try allocator.dupe(u8, key);
+            {
+                errdefer allocator.free(key_copy);
+                try self.values.put(allocator, key_copy, any);
             }
-            return;
-        }
-
-        const key_copy = try allocator.dupe(u8, key);
-        {
-            // Until the map owns it, this scope owns it.
-            errdefer allocator.free(key_copy);
-            try self.values.put(allocator, key_copy, any);
-        }
-        try self.order.append(allocator, key_copy);
+            try self.order.append(allocator, key_copy);
+            break :blk key_copy;
+        };
         switch (any) {
-            .object, .array => try self.raw_json.put(
-                allocator,
-                key_copy,
-                try json_value.stringify(allocator, any),
-            ),
+            .object, .array => {
+                const raw = try json_value.stringify(allocator, any);
+                errdefer allocator.free(raw);
+                try self.raw_json.put(allocator, stored_key, raw);
+            },
             else => {},
         }
     }

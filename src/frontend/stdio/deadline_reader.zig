@@ -1,16 +1,8 @@
-//! Inbound socket reads with a deadline, in std.Io terms.
-//!
-//! `std.Io.net.Stream.Reader` reads through `netRead`, which never times out.
-//! A client that connects and sends nothing therefore holds its connection
-//! slab slot until the process exits. Measured against 300 idle sockets and
-//! `max_connections` 256: the stdio frontend never answered `/_health` again,
-//! while httpz reclaimed every slot within 15 s through its request timeout.
-//!
-//! Reads here go through the `net_receive` operation under
-//! `Io.operateTimeout`, which on POSIX is a non-blocking `recvmsg` followed by
-//! `poll` with the deadline. That costs no extra task and no unit of
-//! concurrency, and it keeps `std.posix` out of the frontend (only
-//! core/io_select.zig may name a backend).
+//! Inbound socket reads with a deadline. `std.Io.net.Stream.Reader` never
+//! times out, so a client that connects and sends nothing holds its slab slot
+//! until the process exits. Reads use `net_receive` under `Io.operateTimeout`:
+//! on POSIX, a non-blocking `recvmsg` and a `poll` with the deadline. That
+//! costs no extra task and keeps `std.posix` out of the frontend.
 //!
 //! Two deadlines, so both stalls are bounded:
 //!
@@ -64,11 +56,6 @@ pub const DeadlineReader = struct {
         self.request_deadline = null;
         self.expired = null;
         self.err = null;
-    }
-
-    /// True when the last failure was this reader's own deadline.
-    pub fn timedOut(self: *const DeadlineReader) bool {
-        return self.expired != null;
     }
 
     fn currentTimeout(self: *const DeadlineReader) std.Io.Timeout {
@@ -157,7 +144,7 @@ test "an idle peer hits the idle deadline instead of blocking forever" {
     try testing.expectError(error.ReadFailed, reader.interface.takeByte());
     try testing.expectEqual(@as(?anyerror, error.Timeout), reader.err);
     try testing.expectEqual(@as(?Phase, .idle), reader.expired);
-    try testing.expect(reader.timedOut());
+    try testing.expect(reader.expired != null);
 }
 
 test "a request that never finishes hits the request deadline" {
@@ -201,5 +188,5 @@ test "a peer that closes reports end of stream, not a timeout" {
     reader.idle = .{ .raw = .fromMilliseconds(500), .clock = .awake };
 
     try testing.expectError(error.EndOfStream, reader.interface.takeByte());
-    try testing.expect(!reader.timedOut());
+    try testing.expect(reader.expired == null);
 }

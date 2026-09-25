@@ -9,10 +9,7 @@ pub const read_scheduler = @import("read_scheduler.zig");
 pub const checkpoint = @import("checkpoint/mod.zig");
 pub const runtime = @import("runtime.zig");
 
-// Without this block the whole tail subtree's tests are dark — root.zig's
-// `_ = @import("tail/mod.zig")` only reaches tests that are re-referenced
-// here (discovered during Phase 6; the checkpoint/lane tests had bit-rotted
-// unnoticed).
+// Reference each file so the test runner finds its tests.
 test {
     _ = types;
     _ = io;

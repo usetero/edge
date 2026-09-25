@@ -9,7 +9,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-const mode = @import("mode.zig");
 const distro = @import("distro.zig");
 const runtime_metrics_mod = @import("runtime_metrics.zig");
 const config_types = @import("../config/types.zig");
@@ -74,30 +73,7 @@ const ShutdownSignalReceived = struct { signal: []const u8, count: u32 };
 const ShutdownForceExit = struct { signal: []const u8, count: u32 };
 const SignalHandlingNotSupported = struct { platform: []const u8 };
 
-fn supportedStagesFor(distribution: mode.Distribution) []const policy.proto.policy.PolicyStage {
-    return switch (distribution) {
-        .edge => &.{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-            .POLICY_STAGE_TRACE_SAMPLING,
-        },
-        .datadog => &.{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-        },
-        .otlp => &.{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-            .POLICY_STAGE_TRACE_SAMPLING,
-        },
-        .prometheus => &.{.POLICY_STAGE_METRIC_FILTER},
-    };
-}
-
-fn distributionLabel(distribution: mode.Distribution) runtime_metrics_mod.DistributionLabel {
+fn distributionLabel(distribution: distro.Distribution) runtime_metrics_mod.DistributionLabel {
     return switch (distribution) {
         .edge => .edge,
         .datadog => .datadog,
@@ -107,9 +83,8 @@ fn distributionLabel(distribution: mode.Distribution) runtime_metrics_mod.Distri
 }
 
 // =============================================================================
-// Signal handling: sigwait thread; first INT/TERM requests structured
-// shutdown, second force-exits. USR1 wakes the waiter for clean teardown.
-// Ported from the pre-rewrite app.zig.
+// Signal handling: a sigwait thread. The first INT/TERM requests a structured shutdown.
+// The second INT/TERM force-exits. USR1 wakes the waiter for teardown.
 // =============================================================================
 
 const SignalWaiterContext = struct {
@@ -245,19 +220,9 @@ pub const Engine = struct {
         errdefer self.upstreams.deinit();
         const max_body = options.max_body_size;
         const upstream_ids: exec_mod.UpstreamIds = .{
-            .default = try self.upstreams.createUpstream(options.upstream_url, 2048, max_body, max_body),
-            .logs = try self.upstreams.createUpstream(
-                options.logs_url orelse options.upstream_url,
-                2048,
-                max_body,
-                max_body,
-            ),
-            .metrics = try self.upstreams.createUpstream(
-                options.metrics_url orelse options.upstream_url,
-                2048,
-                max_body,
-                max_body,
-            ),
+            .default = try self.upstreams.createUpstream(options.upstream_url, max_body),
+            .logs = try self.upstreams.createUpstream(options.logs_url orelse options.upstream_url, max_body),
+            .metrics = try self.upstreams.createUpstream(options.metrics_url orelse options.upstream_url, max_body),
         };
 
         std.debug.assert(kinds.len <= self.services_buf.len);
@@ -336,12 +301,6 @@ pub const Engine = struct {
     }
 };
 
-pub fn serviceKindsFor(distribution: mode.Distribution) []const distro.ServiceKind {
-    return switch (distribution) {
-        inline else => |d| comptime distro.servicesFor(d),
-    };
-}
-
 // =============================================================================
 // run
 // =============================================================================
@@ -363,7 +322,7 @@ fn raiseOpenFileLimit() void {
         log.warn("could not raise RLIMIT_NOFILE to {d}: {s}", .{ want, @errorName(err) });
 }
 
-pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
+pub fn run(init: std.process.Init, comptime distribution: distro.Distribution) !void {
     crash.setDistribution(@tagName(distribution));
     raiseOpenFileLimit();
     const allocator = init.gpa;
@@ -403,38 +362,28 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     defer zonfig.deinit(ProxyConfig, allocator, config);
 
     // Reset the bus level from config now that JSON + env (TERO_LOG_LEVEL) are merged.
-    bus.setLevel(switch (config.log_level) {
-        .debug => .debug,
-        .info => .info,
-        .warn => .warn,
-        .err => .err,
-    });
+    bus.setLevel(config.log_level);
 
     var instance_id_buf: [64]u8 = undefined;
     const instance_id = try std.fmt.bufPrint(&instance_id_buf, "edge-{d}-{d}", .{
         std.Io.Timestamp.now(io, .real).toMilliseconds(),
         std.Thread.getCurrentId(),
     });
-    const instance_id_copy = try allocator.dupe(u8, instance_id);
-    defer allocator.free(instance_id_copy);
 
     const service_metadata: policy.ServiceMetadata = .{
         .name = config.service.name,
         .namespace = config.service.namespace,
         .version = config.service.version,
-        .instance_id = instance_id_copy,
-        .supported_stages = supportedStagesFor(distribution),
+        .instance_id = instance_id,
+        .supported_stages = distro.supportedStagesFor(distribution),
     };
 
     logStartupConfig(bus, config, service_metadata);
 
     var registry = policy.Registry.init(allocator, bus);
     defer registry.deinit();
-    // How many threads may scan at once, which here is how many connections we
-    // admit: the frontend runs a task per connection, so nothing else bounds
-    // it. Undeclared, the library sizes its scratch pool from a default that
-    // has to guess. Set before the loader starts, so the first index build
-    // sees it rather than the one after the first policy sync.
+    // Scan concurrency equals admitted connections: the frontend runs one task per connection.
+    // Set it before the loader starts, so the first index build uses it.
     registry.setScanConcurrency(config.max_connections);
 
     // s3-dump extension: wired before the loader subscribes providers so the
@@ -457,7 +406,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     defer loader.deinit();
     try loader.startAsync(io);
 
-    const kinds = serviceKindsFor(distribution);
+    const kinds = distro.servicesFor(distribution);
     const engine = try Engine.create(allocator, io, bus, &registry, &runtime_metrics, kinds, .{
         .listen_address = config.listen_address,
         .listen_port = config.listen_port,
@@ -531,11 +480,9 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         ext_rt.reportFlush(exts.flush(io, .{ .force = true }), &runtime_metrics, bus);
     }
 
-    // Flush final policy stats to the control plane before teardown (io still
-    // live). The sync provider only reports on its poll interval, so a clean
-    // shutdown/redeploy otherwise drops everything accrued since the last tick —
-    // which Cloud Run's frequent scale-to-zero and rollouts make routine. The
-    // deferred `loader.deinit` won't re-sync. Best-effort: never block shutdown.
+    // Send final policy stats while io is live. The provider reports only on its poll interval,
+    // so without this a clean shutdown loses the stats since the last poll. deinit does not sync.
+    // A failure must not block shutdown.
     loader.close() catch |err| log.warn("final policy stats sync failed: {}", .{err});
 
     if (signal_waiter) |waiter| {

@@ -207,9 +207,8 @@ const InternalMetrics = struct {
     const RequestDurationSeconds = m.HistogramVec(
         f64,
         DurationLabels,
-        // Eleven boundaries, a decade-ish step from 100 us to 30 s. Eighteen
-        // made this metric half of the whole series budget (18 buckets x 9
-        // paths), and no alert or dashboard reads a finer grade.
+        // Eleven boundaries from 100 us to 30 s. Each bucket adds 9 series (one per path).
+        // No alert reads a finer grade.
         &.{ 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30 },
     );
     const ResponsesTotal = m.CounterVec(u64, ResponseLabels);
@@ -391,17 +390,7 @@ pub const RuntimeMetrics = struct {
             try self.internal.edge_policies_loaded.set(.{ .signal = signal }, 0);
         }
 
-        // The two drop signals. Both were left unseeded, and production shows
-        // what that costs: a 24-hour scrape of the fleet carries
-        // `edge_inbound_timeouts_total{phase="idle"}` and no `phase="request"`
-        // series at all, and no `edge_connections_shed_total` in any form.
-        // These are the series an operator alerts on, so the alert binds to
-        // nothing and a dashboard reads "no data" where it should read zero —
-        // the same silence the shed path was added to break.
-        //
-        // "Time series that are not present until something happens are
-        // difficult to deal with ... export a default value such as 0 for any
-        // time series you know may exist in advance."
+        // Seed the drop signals at zero. An alert needs the series to exist before the first drop.
         // https://prometheus.io/docs/practices/instrumentation/
         inline for (std.meta.tags(ShedReasonLabel)) |reason| {
             try self.internal.edge_connections_shed_total.incrBy(.{ .reason = reason }, 0);
@@ -574,15 +563,7 @@ pub fn statusClass(status: u16) StatusClassLabel {
 const testing = std.testing;
 
 test "drop-path series are present at zero before anything drops" {
-    // A counter that only appears once it fires is the failure this whole
-    // metric set exists to prevent: the alert binds to no series and the
-    // dashboard reads "no data" rather than zero. Production proved it -- a
-    // 24-hour scrape of the fleet carried `edge_inbound_timeouts_total` for
-    // the `idle` phase only, and no `edge_connections_shed_total` at all,
-    // because neither had ever been incremented.
-    //
-    // Prometheus is explicit: "export a default value such as 0 for any time
-    // series you know may exist in advance."
+    // Each drop-path series must exist at zero before the first drop. Else an alert has no series to bind to.
     var metrics: RuntimeMetrics = try .init(testing.allocator, testing.io, .datadog);
     defer metrics.deinit();
 

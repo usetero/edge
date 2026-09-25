@@ -1,12 +1,6 @@
-//! Transport-neutral outcome execution (PLAN-FRONTEND-SWAP.md §3).
-//!
-//! Everything here speaks `*std.Io.Reader` / `*std.Io.Writer` / arena
-//! allocators and the shared upstream client — never an inbound server type.
-//! Frontends (stdio's std.http.Server driver, httpz) own connection state,
-//! body acquisition, and response writing; they call into this module for
-//! routing, planning, upstream opening, batch transforms, and per-record
-//! policy evaluation so filter semantics are identical regardless of which
-//! frontend the binary was composed with.
+//! Frontend-neutral request logic: routing, planning, batch transforms, and
+//! per-record policy evaluation. Both frontends call this module, so filter
+//! semantics do not depend on the frontend.
 const std = @import("std");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
@@ -26,15 +20,10 @@ const otlp_logs = @import("../signals/otlp/logs.zig");
 const otlp_metrics = @import("../signals/otlp/metrics.zig");
 const otlp_traces = @import("../signals/otlp/traces.zig");
 
-const log = std.log.scoped(.exec);
-
 const EventBus = o11y.EventBus;
 
-// Named event payloads: the type name is the telemetry event name.
-const UpstreamConnectionError = struct { err: []const u8, phase: []const u8 };
-
-/// Resolved upstream table; built once at startup from config URLs
-/// (logs_url/metrics_url orelse upstream_url, per the old app.zig wiring).
+/// Upstream table, built once at startup. `logs` and `metrics` fall back to
+/// the default URL.
 pub const UpstreamIds = struct {
     default: upstream_mod.UpstreamId,
     logs: upstream_mod.UpstreamId,
@@ -52,13 +41,12 @@ pub const UpstreamIds = struct {
 /// Debug tap (`/_edge/tap/{pre,post}`), defined in the pipeline layer.
 pub const TapState = tap_mod.TapState;
 
-/// Shared, read-only state for every connection, regardless of frontend.
-/// Frontend-specific state (the stdio conn slab and arena pool) lives in the
-/// frontend's own server struct, NOT here — see PLAN-FRONTEND-SWAP.md §2.
-/// Policies in the snapshot that the matcher refused to compile. Named type,
-/// so the event carries the name `policies.rejected`.
+/// Policies in the snapshot that the matcher refused to compile. The type
+/// name sets the event name.
 const PoliciesRejected = struct { count: usize };
 
+/// Shared, read-only state for every connection, for both frontends.
+/// Frontend state (the stdio slab and arena pool) stays in the frontend.
 pub const SharedCtx = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -98,19 +86,18 @@ pub fn planRequest(
     content_type: []const u8,
     content_encoding: []const u8,
 ) ?service_mod.Outcome {
-    const match = ctx.router.route(path, method) orelse return null;
+    const service = ctx.router.route(path, method) orelse return null;
     const plan_request: service_mod.PlanRequest = .{
         .method = method,
         .path = path,
         .content_type = content_type,
         .content_encoding = content_encoding,
     };
-    const svc = &ctx.services[@intFromEnum(match.service)];
+    const svc = &ctx.services[@intFromEnum(service)];
     return svc.plan(plan_request);
 }
 
-/// Known-path classification for low-cardinality request metrics. Ported
-/// verbatim from the old proxy/server.zig classifyKnownPath.
+/// Low-cardinality path label for request metrics.
 pub fn classifyKnownPath(path: []const u8, method: service_mod.HttpMethod) runtime_metrics_mod.KnownPathLabel {
     if (method == .POST and std.mem.eql(u8, path, "/api/v2/logs")) return .api_v2_logs;
     if (method == .POST and std.mem.eql(u8, path, "/api/v2/series")) return .api_v2_series;
@@ -142,113 +129,15 @@ pub fn methodLabel(method: service_mod.HttpMethod) runtime_metrics_mod.MethodLab
 }
 
 /// Maps std's parsed Content-Encoding back to the header string our codec
-/// layer understands. identity covers the absent-header case.
+/// layer understands. `identity` covers an absent header. The codec layer
+/// does not support deflate or compress, so plan() fails open to forward_raw.
 pub fn contentEncodingName(ce: std.http.ContentEncoding) []const u8 {
-    return switch (ce) {
-        .identity => "",
-        .gzip => "gzip",
-        .zstd => "zstd",
-        // Not supported by the codec layer: plan() fail-opens to forward_raw.
-        .deflate => "deflate",
-        .compress => "compress",
-    };
+    return if (ce == .identity) "" else @tagName(ce);
 }
 
-/// Opens a request against the configured upstream. `headers` must already
-/// be hop-by-hop-filtered and remain valid for the request lifetime; `target`
-/// is the verbatim request target.
-pub fn openUpstream(
-    ctx: *SharedCtx,
-    arena: std.mem.Allocator,
-    method: std.http.Method,
-    target: []const u8,
-    headers: []const std.http.Header,
-    choice: service_mod.UpstreamChoice,
-) !std.http.Client.Request {
-    return openUpstreamWithClient(ctx, arena, method, target, headers, choice, ctx.upstreams.getHttpClient());
-}
-
-/// Retry callers select the dedicated client with no idle connections.
-pub fn openUpstreamWithClient(
-    ctx: *SharedCtx,
-    arena: std.mem.Allocator,
-    method: std.http.Method,
-    target: []const u8,
-    headers: []const std.http.Header,
-    choice: service_mod.UpstreamChoice,
-    client: *std.http.Client,
-) !std.http.Client.Request {
-    const query_start = std.mem.findScalar(u8, target, '?');
-    const path = if (query_start) |i| target[0..i] else target;
-    const query = if (query_start) |i| target[i + 1 ..] else "";
-
-    const upstream_id = ctx.upstream_ids.resolve(choice);
-    const uri_str = try ctx.upstreams.buildUpstreamUri(arena, upstream_id, path, query);
-    const uri = try std.Uri.parse(uri_str);
-
-    return client.request(method, uri, .{
-        .extra_headers = headers,
-        .redirect_behavior = .unhandled,
-        .headers = .{ .accept_encoding = .omit },
-    }) catch |err| {
-        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        ctx.bus.err(UpstreamConnectionError{ .err = @errorName(err), .phase = "connect" });
-        return err;
-    };
-}
-
-/// Collects the upstream response headers a frontend should relay to the
-/// client: hop-by-hop and transport-owned headers skipped, values arena-duped
-/// (head strings die when the response body reader is created).
-pub fn collectUpstreamResponseHeaders(
-    upstream_res: *std.http.Client.Response,
-    arena: std.mem.Allocator,
-    buffer: []std.http.Header,
-) ![]std.http.Header {
-    // RFC 7230 §6.1: headers listed in the Connection field are hop-by-hop
-    // and must not be forwarded.  Collect all Connection-option tokens first.
-    var conn_opts: std.ArrayList([]const u8) = .empty;
-    {
-        var it = upstream_res.head.iterateHeaders();
-        while (it.next()) |header| {
-            if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
-            var tok_it = std.mem.tokenizeScalar(u8, header.value, ',');
-            while (tok_it.next()) |tok| {
-                const name = std.mem.trim(u8, tok, " \t");
-                if (name.len > 0) try conn_opts.append(arena, name);
-            }
-        }
-    }
-
-    var count: usize = 0;
-    var it = upstream_res.head.iterateHeaders();
-    while (it.next()) |header| {
-        if (upstream_mod.shouldSkipResponseHeader(header.name)) continue;
-        // Also skip any header nominated as hop-by-hop via Connection.
-        var skip = false;
-        for (conn_opts.items) |opt| {
-            if (std.ascii.eqlIgnoreCase(header.name, opt)) {
-                skip = true;
-                break;
-            }
-        }
-        if (skip) continue;
-        if (count >= buffer.len) break;
-        buffer[count] = .{
-            .name = try arena.dupe(u8, header.name),
-            .value = try arena.dupe(u8, header.value),
-        };
-        count += 1;
-    }
-    return buffer[0..count];
-}
-
-/// One atomic snapshot load per request: when no loaded policy targets the
-/// signal, both execution paths forward records verbatim instead of paying
-/// the decode → evaluate → re-encode round-trip. Same observable output —
-/// zero policies transform nothing — minus all the per-record work. (The
-/// old stack's prefilter went further and short-circuited per record even
-/// with policies loaded; that port is tracked in TODO.md.)
+/// True when a loaded policy targets `signal`. When false, both paths
+/// forward records verbatim and skip decode, evaluate and re-encode. The
+/// output is the same: zero policies transform nothing.
 pub fn policiesActiveFor(registry: *policy.Registry, signal: service_mod.Signal) bool {
     const snapshot = registry.getSnapshot() orelse return false;
     return switch (signal) {
@@ -364,8 +253,7 @@ const BatchSummary = struct {
     }
 };
 
-/// Decode → batch transform → re-encode, all arena-bounded. The batch fns
-/// are the same code the old modules ran, so filter semantics are identical.
+/// Decode, batch transform, re-encode. All memory comes from `arena`.
 pub fn processBuffered(
     ctx: *SharedCtx,
     pipe: service_mod.PipeBuffered,
@@ -383,12 +271,11 @@ pub fn processBuffered(
     // The per-signal StreamProcessResult types are distinct; normalize.
     const in = &decoded_reader;
     const out = &transformed.writer;
-    const ct = "application/json";
     const summary: BatchSummary = switch (pipe.kind) {
-        .datadog_metrics_json => .of(try dd_metrics.processMetricsStream(arena, registry, ctx.bus, in, out, ct)),
-        .otlp_logs_json => .of(try otlp_logs.processLogsStream(arena, registry, ctx.bus, in, out, ct)),
-        .otlp_metrics_json => .of(try otlp_metrics.processMetricsStream(arena, registry, ctx.bus, in, out, ct)),
-        .otlp_traces_json => .of(try otlp_traces.processTracesStream(arena, registry, ctx.bus, in, out, ct)),
+        .datadog_metrics_json => .of(try dd_metrics.processMetricsStream(arena, registry, ctx.bus, in, out)),
+        .otlp_logs_json => .of(try otlp_logs.processLogsStream(arena, registry, ctx.bus, in, out, .json)),
+        .otlp_metrics_json => .of(try otlp_metrics.processMetricsStream(arena, registry, ctx.bus, in, out, .json)),
+        .otlp_traces_json => .of(try otlp_traces.processTracesStream(arena, registry, ctx.bus, in, out, .json)),
     };
 
     if (ctx.metrics) |metrics| {
@@ -432,12 +319,10 @@ fn decodeWhole(
     return out.items;
 }
 
-/// Long-lived scratch for the per-record path: zimdjson's structural buffers
-/// and the record arena. Owned by the frontend and reused across requests
-/// (thread-local in the httpz frontend), so steady-state request handling
-/// pays zero setup allocations. The arena's retained capacity is bounded by
-/// the largest single record evaluated (records themselves are bounded by
-/// limits.record_scratch).
+/// Scratch for the per-record path: zimdjson buffers and the record arena.
+/// One per thread (thread_bufs.zig), reused across requests, so steady-state
+/// requests allocate nothing here. The arena retains at most the largest
+/// record.
 pub const RecordScratch = struct {
     gpa: std.mem.Allocator,
     parser: dd_logs.Parser,
@@ -490,11 +375,6 @@ pub const RecordSink = struct {
             .scratch = scratch,
             .active = policiesActiveFor(ctx.registry, signal),
         };
-    }
-
-    pub fn deinit(self: *RecordSink) void {
-        // The scratch outlives the sink (frontend-owned); nothing to free.
-        self.* = undefined;
     }
 
     pub fn onRecord(self: *RecordSink, bytes: []const u8) !framer_mod.Decision {
@@ -571,25 +451,14 @@ pub const RecordSink = struct {
         var reader = std.Io.Reader.fixed(wrapped.written());
         var out: std.Io.Writer.Allocating = .init(arena);
         const registry = self.ctx.registry;
-        // The per-signal StreamProcessResult types are distinct; normalize.
         const in = &reader;
         const ow = &out.writer;
-        const ct = "application/x-protobuf";
-        const all_dropped = switch (self.signal) {
-            .log => blk: {
-                const result = try otlp_logs.processLogsStream(arena, registry, self.ctx.bus, in, ow, ct);
-                break :blk result.allDropped();
-            },
-            .metric => blk: {
-                const result = try otlp_metrics.processMetricsStream(arena, registry, self.ctx.bus, in, ow, ct);
-                break :blk result.allDropped();
-            },
-            .trace => blk: {
-                const result = try otlp_traces.processTracesStream(arena, registry, self.ctx.bus, in, ow, ct);
-                break :blk result.allDropped();
-            },
+        const result = try switch (self.signal) {
+            .log => otlp_logs.processLogsStream(arena, registry, self.ctx.bus, in, ow, .protobuf),
+            .metric => otlp_metrics.processMetricsStream(arena, registry, self.ctx.bus, in, ow, .protobuf),
+            .trace => otlp_traces.processTracesStream(arena, registry, self.ctx.bus, in, ow, .protobuf),
         };
-        if (all_dropped) {
+        if (result.allDropped()) {
             self.dropped += 1;
             return .drop;
         }
@@ -689,7 +558,6 @@ test "policiesActiveFor is false on an empty registry" {
 }
 
 test "classifyKnownPath matches core routes" {
-    // Parity with the old classifyRoute/classifyKnownPath tests.
     try testing.expectEqual(runtime_metrics_mod.KnownPathLabel.api_v2_logs, classifyKnownPath("/api/v2/logs", .POST));
     const series = classifyKnownPath("/api/v2/series", .POST);
     try testing.expectEqual(runtime_metrics_mod.KnownPathLabel.api_v2_series, series);
@@ -717,84 +585,4 @@ test "contentEncodingName round-trips through the codec layer" {
         @as(?codec.ContentEncoding, null),
         codec.ContentEncoding.fromHeader(contentEncodingName(.deflate)),
     );
-}
-
-test "collectUpstreamResponseHeaders strips hop-by-hop Connection and transport headers" {
-    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
-        "content-type: application/json\r\n" ++
-        "connection: close\r\n" ++
-        "x-foo: bar\r\n" ++
-        "content-length: 42\r\n" ++
-        "transfer-encoding: chunked\r\n\r\n";
-
-    const head = try std.http.Client.Response.Head.parse(response_bytes);
-    var upstream_res: std.http.Client.Response = .{ .request = undefined, .head = head };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    var buffer: [16]std.http.Header = undefined;
-    const relayed = try collectUpstreamResponseHeaders(&upstream_res, arena.allocator(), &buffer);
-
-    // Exactly the two end-to-end headers survive; hop-by-hop Connection and
-    // transport-owned content-length/transfer-encoding are dropped.
-    try testing.expectEqual(@as(usize, 2), relayed.len);
-
-    var saw_content_type = false;
-    var saw_x_foo = false;
-    for (relayed) |header| {
-        try testing.expect(!upstream_mod.shouldSkipResponseHeader(header.name));
-        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
-            try testing.expectEqualStrings("application/json", header.value);
-            saw_content_type = true;
-        } else if (std.ascii.eqlIgnoreCase(header.name, "x-foo")) {
-            try testing.expectEqualStrings("bar", header.value);
-            saw_x_foo = true;
-        } else {
-            return error.UnexpectedRelayedHeader;
-        }
-    }
-    try testing.expect(saw_content_type);
-    try testing.expect(saw_x_foo);
-}
-
-test "collectUpstreamResponseHeaders strips Connection-nominated hop-by-hop headers" {
-    // An upstream that uses Connection: X-Upstream-State to mark a
-    // per-connection field.  That field must not be relayed downstream.
-    const response_bytes = "HTTP/1.1 200 OK\r\n" ++
-        "content-type: text/plain\r\n" ++
-        "connection: X-Upstream-State, Keep-Alive\r\n" ++
-        "x-upstream-state: active\r\n" ++
-        "keep-alive: timeout=5\r\n" ++
-        "x-end-to-end: ok\r\n" ++
-        "content-length: 5\r\n\r\n";
-
-    const head = try std.http.Client.Response.Head.parse(response_bytes);
-    var upstream_res: std.http.Client.Response = .{ .request = undefined, .head = head };
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    var buffer: [16]std.http.Header = undefined;
-    const relayed = try collectUpstreamResponseHeaders(&upstream_res, arena.allocator(), &buffer);
-
-    // Only the two genuine end-to-end headers should survive.
-    // content-length, connection, x-upstream-state, and keep-alive are all dropped.
-    try testing.expectEqual(@as(usize, 2), relayed.len);
-
-    var saw_content_type = false;
-    var saw_x_end_to_end = false;
-    for (relayed) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
-            try testing.expectEqualStrings("text/plain", header.value);
-            saw_content_type = true;
-        } else if (std.ascii.eqlIgnoreCase(header.name, "x-end-to-end")) {
-            try testing.expectEqualStrings("ok", header.value);
-            saw_x_end_to_end = true;
-        } else {
-            return error.UnexpectedRelayedHeader;
-        }
-    }
-    try testing.expect(saw_content_type);
-    try testing.expect(saw_x_end_to_end);
 }

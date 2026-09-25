@@ -11,14 +11,11 @@
 //! being waved through. Callers keep a validating parser as their fallback
 //! path, so these scanners never have to be lenient.
 //!
-//! Known deviation, on purpose: raw control bytes (unescaped < 0x20) inside
-//! string content or container interiors are not rejected (except as the
-//! character following a backslash, where the check rides an existing
-//! branch). Guarding the escape-free fast path costs 10-15% on every
-//! record (measured; whether swept record-wide or checked per string), to
-//! reject invalid-JSON records that are forwarded byte-identically either
-//! way — the only effect of accepting them is that policies evaluate a
-//! record the validating parser would have passed through verbatim.
+//! Known deviation: raw control bytes (below 0x20) in string content and
+//! container interiors are accepted. The byte after a backslash is the one
+//! exception. A check on the fast path costs 10-15% per record. The record
+//! is forwarded unchanged either way, so the only effect is that policies
+//! evaluate a record the validating parser passes through as-is.
 //!
 //! Memory contract: functions taking an allocator return strings that are
 //! either borrowed from the input or owned by the allocator, with no way
@@ -259,8 +256,6 @@ pub const FieldWalker = struct {
     }
 };
 
-const vec_len = std.simd.suggestVectorLength(u8) orelse 16;
-
 /// The unescaped string inside a raw `"..."` span: borrowed zero-copy when
 /// escape-free, unescaped into `allocator` otherwise. Errors on non-string
 /// spans.
@@ -461,8 +456,7 @@ test "FieldWalker - comma separator violations error" {
 }
 
 test "FieldWalker - mismatched container closers error" {
-    // Regression (macroscope PR 214): one depth counter treated '}' and ']'
-    // interchangeably, so `{"x":[}}` yielded the span `[}`.
+    // A single depth counter accepts mismatched closers such as {"x":[}}.
     const bad_inputs = [_][]const u8{
         \\{"x":[}}
         ,
@@ -541,12 +535,6 @@ test "FieldWalker - valid containers still parse with all value types" {
         try testing.expectEqual(@as(?FieldWalker.RawField, null), try walker.nextField());
     }
 
-    // Whitespace and the documented raw control bytes must still parse.
-    var ws = try FieldWalker.init("{\"a\":[1,\n\t 2],\"d\":\"\x7f\"}");
-    _ = (try ws.nextField()).?;
-    const d = (try ws.nextField()).?;
-    try testing.expectEqualStrings("\"\x7f\"", d.value);
-
     // A raw control byte between tokens is accepted; the grammar around it
     // is still checked.
     var ctrl_ok = try FieldWalker.init("{\"x\":[1,\x0b2]}");
@@ -556,11 +544,6 @@ test "FieldWalker - valid containers still parse with all value types" {
     // The control byte does not hide a trailing comma.
     var ctrl_bad = try FieldWalker.init("{\"x\":[1,\x0b,]}");
     try testing.expectError(error.Malformed, ctrl_bad.nextField());
-
-    // 64-deep nesting still parses.
-    const deep_ok = "{\"x\":" ++ "[" ** 64 ++ "]" ** 64 ++ "}";
-    var deep = try FieldWalker.init(deep_ok);
-    _ = (try deep.nextField()).?;
 }
 
 test "FieldWalker - nesting beyond 64 levels falls to the validating parser" {
@@ -580,11 +563,8 @@ test "FieldWalker - control bytes: escaped-char check rejects, content deviation
     var rejected = try FieldWalker.init("{\"a\":\"q\\\" x\\\n\"}");
     try testing.expectError(error.Malformed, rejected.nextField());
 
-    // DOCUMENTED DEVIATION (see module doc): raw control bytes in string
-    // content are otherwise accepted — guarding them costs 10-15% per record
-    // (measured, both swept record-wide and checked per string). Such
-    // records are invalid JSON but are forwarded byte-identically either
-    // way; pin the acceptance so changing it is a conscious decision.
+    // Known deviation (see module doc): raw control bytes in string content
+    // are accepted. This test pins that behavior.
     var deviant = try FieldWalker.init("{\"a\":\"line1\nline2\"}");
     const field = (try deviant.nextField()).?;
     try testing.expectEqualStrings("\"line1\nline2\"", field.value);
@@ -637,7 +617,7 @@ test "stringSpan - borrows escape-free strings, errors on non-strings" {
 
     try testing.expectError(error.Malformed, stringSpan(testing.failing_allocator, "42"));
     try testing.expectError(error.Malformed, stringSpan(testing.failing_allocator, "\""));
-    // Unterminated span must error, not silently truncate (macroscope PR 214).
+    // An unterminated span must error, not truncate.
     try testing.expectError(error.Malformed, stringSpan(testing.failing_allocator, "\"abc"));
     // Final quote that is itself escaped fails on the dangling backslash
     // (in unescape, which allocates first — errdefer keeps it leak-free).

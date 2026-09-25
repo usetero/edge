@@ -1,21 +1,12 @@
-//! Reading a request body to the end, for the signal processors.
-//!
-//! Five copies of these two functions existed, byte-identical, one per
-//! signal module. They are here so the next fix lands once.
+//! Reads a request body to the end, for the signal processors.
 
 const std = @import("std");
 
-/// Copy `reader` into `writer` until end of stream.
+/// Copies reader into writer until end of stream.
 ///
-/// **Only `error.EndOfStream` ends the loop.** The five copies this replaces
-/// also stopped on a `0` return, which the `std.Io.Reader` vtable contract
-/// says does not mean end of stream: std's gzip and zstd decompressors pick
-/// an indirect vtable whenever they are given a decode buffer, and that
-/// vtable decodes a block into the reader's own buffer and returns `0`, with
-/// the bytes arriving on the next call. Treating that as EOF truncates the
-/// body to nothing. Today every caller passes a reader over already-decoded
-/// bytes, so the old copies were wrong but dormant; this keeps them from
-/// waking up.
+/// Only error.EndOfStream stops the loop. A 0 return does not mean end of
+/// stream: std decompressors with a decode buffer decode into their own
+/// buffer, return 0, and give the bytes on the next call.
 pub fn streamAll(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     while (true) {
         _ = reader.stream(writer, .unlimited) catch |err| switch (err) {
@@ -36,9 +27,7 @@ pub fn readAll(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
 const testing = std.testing;
 
 test "streamAll does not treat a 0 return as end of stream" {
-    // A reader whose vtable returns 0 before it returns any bytes, the shape
-    // std's decompressors take. The copies this replaces stopped here and
-    // returned an empty body.
+    // The vtable returns 0 before it returns bytes, as std decompressors do.
     const Stalling = struct {
         interface: std.Io.Reader,
         payload: []const u8,

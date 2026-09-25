@@ -62,7 +62,7 @@ pub const EngineScheduler = union(SchedulerEngine) {
 
 const testing = std.testing;
 
-fn keepAll(_: *anyopaque, _: []const u8, _: types.LineMeta) !bool {
+fn keepAll(_: *anyopaque, _: []const u8) !bool {
     return true;
 }
 
@@ -71,11 +71,7 @@ test "read scheduler public API: processes event batch" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    {
-        const f = try tmp.dir.createFile(io, "s.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "a\n");
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "s.log", .data = "a\n" });
     const abs = try tmp.dir.realPathFileAlloc(io, "s.log", testing.allocator);
     defer testing.allocator.free(abs);
     const file = try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_only });
@@ -96,15 +92,9 @@ test "read scheduler public API: processes event batch" {
     try testing.expectEqualStrings("a\n", out.written());
 }
 
-/// Test allocator that forces every grow to relocate (`resize`/`remap`
-/// refuse) and retains "freed" allocations so the memory stays mapped. Against
-/// the `Scheduler` non-fixed uring path this deterministically reproduces the
-/// a32652c failure mode: a per-event `scratch` grow relocates the backing
-/// buffer after earlier SQEs already pinned their slot pointers in
-/// `sqe.addr`, so the kernel reads file bytes into the freed-but-mapped old
-/// allocation while the completion handler slices the relocated `scratch`.
-/// Pre-sizing `scratch` once (the fix) keeps every slot live until its CQE is
-/// reaped, so output is byte-exact regardless of how the allocator moves.
+/// Test allocator that refuses resize and remap and keeps freed memory
+/// mapped. Each grow moves the buffer. The non-fixed uring path must size
+/// `scratch` once per batch, or a kernel read targets the old buffer.
 const MovingAllocator = struct {
     backing: std.mem.Allocator,
     tracked: std.ArrayList(Allocation),
@@ -167,7 +157,7 @@ const MovingAllocator = struct {
     };
 };
 
-test "read scheduler uring non-fixed path: multi-event batch keeps read buffers stable (a32652c)" {
+test "read scheduler uring non-fixed path: multi-event batch keeps read buffers stable" {
     if (builtin.os.tag == .linux) {
         const io = std.Options.debug_io;
         const event_count: usize = 16;
@@ -237,11 +227,8 @@ test "read scheduler uring non-fixed path: multi-event batch keeps read buffers 
 
         const n = try scheduler.processBatch(&framer, &out.writer, events, &framer, keepAll);
         try framer.finish(&out.writer, &framer, keepAll);
-        // Verify the io_uring submission-and-completion path was actually
-        // exercised: `cqes` is populated only after `submit_and_wait` and
-        // `copy_cqes` succeed (scalar fallbacks return before that resize).
-        // A zero count means every event fell back to the scalar path, so
-        // the buffer-lifetime fix was not exercised at all.
+        // `cqes` fills only after submit_and_wait. A lower count means the
+        // scalar fallback ran.
         try testing.expect(scheduler.cqes.items.len == event_count);
         try testing.expectEqual(@as(usize, event_count), n);
         try testing.expectEqualStrings(expected.items, out.written());
@@ -249,24 +236,14 @@ test "read scheduler uring non-fixed path: multi-event batch keeps read buffers 
 }
 
 test "read scheduler public API: isolates partial lines across files in one batch" {
-    // Exercises the real scheduler (io_uring fast path on Linux, poll
-    // elsewhere) with two files in one batch where file A has no trailing
-    // newline. The bug: A's partial line was completed with B's first line,
-    // emitting one corrupted cross-file record through the shared framer.
+    // File A has no trailing newline. Its partial line must not join file
+    // B's first line.
     const io = std.Options.debug_io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    {
-        const f = try tmp.dir.createFile(io, "a.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "line1\npartial");
-    }
-    {
-        const f = try tmp.dir.createFile(io, "b.log", .{});
-        defer f.close(io);
-        try f.writeStreamingAll(io, "hello\nworld\n");
-    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.log", .data = "line1\npartial" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.log", .data = "hello\nworld\n" });
     const abs_a = try tmp.dir.realPathFileAlloc(io, "a.log", testing.allocator);
     defer testing.allocator.free(abs_a);
     const abs_b = try tmp.dir.realPathFileAlloc(io, "b.log", testing.allocator);

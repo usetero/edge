@@ -15,9 +15,8 @@ const Op = struct {
 
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
-    /// The raw ring owns reads (registered buffers + fixed files are beyond
-    /// std's PoC uring Io); `io` drives the scalar fallbacks through the
-    /// shared framer so both paths emit identically (PLAN.md §9).
+    /// The raw ring does the reads. `io` drives the scalar fallback through
+    /// the same framer.
     io: std.Io,
     ring: std.os.linux.IoUring,
     ops: std.ArrayList(Op) = .empty,
@@ -75,20 +74,11 @@ pub const Scheduler = struct {
         const use_fixed = self.fixed_enabled and self.fixed_buffers_registered and self.fixed_files_registered;
         if (!use_fixed) {
             self.scratch.clearRetainingCapacity();
-            // Size `scratch` once for the whole batch BEFORE preparing any
-            // SQEs. `self.ring.read` below pins each event's slot pointer into
-            // `sqe.addr`, but the kernel does not run those reads until
-            // `submit_and_wait` fires after this loop. Growing `scratch` per
-            // event could relocate (and free) the backing buffer that earlier
-            // SQEs already captured, dangling their `sqe.addr` so the kernel
-            // reads file bytes into freed memory while the completion handler
-            // slices the relocated `scratch` — silent wrong output (regressed
-            // in a32652c). Reserve capacity for the sum of every dispatched
-            // event's read up front so the `addManyAsSliceAssumeCapacity`
-            // slots below never move. The preview must mirror the dispatch
-            // loop's skip/cap logic exactly (both bounded by
-            // `fixed_slot_count`); `addManyAsSliceAssumeCapacity` asserts the
-            // capacity in Debug, guarding that agreement.
+            // Reserve `scratch` for the whole batch before any SQE. Each SQE
+            // pins a slot pointer, and the kernel reads after submit_and_wait.
+            // A grow would move the buffer under those pointers. The preview
+            // must match the dispatch loop's skip and cap rules.
+            // addManyAsSliceAssumeCapacity asserts this in Debug.
             var scratch_total: usize = 0;
             var preview_idx: usize = 0;
             for (events) |evt| {
@@ -203,9 +193,8 @@ pub const Scheduler = struct {
 
             const next_off: u64 = op.event.start_offset + n;
             if (next_off < op.event.end_offset) {
-                try common.readTailScalar(
+                try framer.readRange(
                     self.io,
-                    framer,
                     op.event.file,
                     next_off,
                     op.event.end_offset,

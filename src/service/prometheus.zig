@@ -1,8 +1,7 @@
 //! Prometheus scrape service: the request has no meaningful body — the
 //! upstream RESPONSE is the data plane. The driver fetches from the metrics
 //! upstream and filters the text exposition line-by-line through policy
-//! (signals/prometheus/streaming_filter.zig binds the semantics in Phase 5).
-//! Ported from modules/prometheus_module.zig wiring.
+//! (signals/prometheus/streaming_filter.zig).
 const std = @import("std");
 const service = @import("service.zig");
 

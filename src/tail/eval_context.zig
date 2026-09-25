@@ -86,10 +86,8 @@ pub const TailLineContext = struct {
     }
 
     fn getAttr(self: *const TailLineContext, key: []const u8) ?[]const u8 {
-        for (self.attrs.items) |attr| {
-            if (std.mem.eql(u8, attr.key, key)) return attr.value;
-        }
-        return null;
+        const idx = self.getAttrIndex(key) orelse return null;
+        return self.attrs.items[idx].value;
     }
 
     fn getAttrIndex(self: *const TailLineContext, key: []const u8) ?usize {

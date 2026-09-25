@@ -1,5 +1,5 @@
 //! Service layer: pure decision logic mapping a matched request to a
-//! declarative Outcome that the connection driver executes (PLAN.md §8).
+//! declarative Outcome that the connection driver executes.
 //!
 //! Services never perform IO. `plan()` looks at method, path, and headers
 //! and returns WHAT should happen — respond statically, copy raw, run the
@@ -86,11 +86,9 @@ pub const MethodBitmask = packed struct(u8) {
     }
 };
 
-/// Route pattern, ported from modules/module_types.zig (same matching
-/// semantics so router behavior is unchanged by the rewrite).
+/// Route pattern. The router matches on `pattern_type` and `pattern`.
 pub const RoutePattern = struct {
     pattern_type: PatternType,
-    hash: u64,
     pattern: []const u8,
     methods: MethodBitmask,
 
@@ -104,7 +102,6 @@ pub const RoutePattern = struct {
     pub fn exact(path: []const u8, methods: MethodBitmask) RoutePattern {
         return .{
             .pattern_type = .exact,
-            .hash = std.hash.Wyhash.hash(0, path),
             .pattern = path,
             .methods = methods,
         };
@@ -113,7 +110,6 @@ pub const RoutePattern = struct {
     pub fn prefix(path_prefix: []const u8, methods: MethodBitmask) RoutePattern {
         return .{
             .pattern_type = .prefix,
-            .hash = 0,
             .pattern = path_prefix,
             .methods = methods,
         };
@@ -122,7 +118,6 @@ pub const RoutePattern = struct {
     pub fn suffix(path_suffix: []const u8, methods: MethodBitmask) RoutePattern {
         return .{
             .pattern_type = .suffix,
-            .hash = 0,
             .pattern = path_suffix,
             .methods = methods,
         };
@@ -131,7 +126,6 @@ pub const RoutePattern = struct {
     pub fn any(methods: MethodBitmask) RoutePattern {
         return .{
             .pattern_type = .any,
-            .hash = 0,
             .pattern = "/*",
             .methods = methods,
         };
@@ -142,15 +136,14 @@ pub const RoutePattern = struct {
 /// record sink binding in the connection driver.
 pub const Signal = enum { log, metric, trace };
 
-/// Which configured upstream the outcome targets. Resolved to a concrete
-/// upstream at startup by the distro wiring (logs_url / metrics_url fall
-/// back to upstream_url, per app.zig:409-410 semantics).
+/// Which configured upstream the outcome targets. The distro wiring resolves
+/// it to a concrete upstream at startup. `logs_url` and `metrics_url` fall
+/// back to `upstream_url`.
 pub const UpstreamChoice = enum { default, logs, metrics };
 
-/// Whole-body batch transforms for shapes the streaming framers do not
-/// cover yet: JSON OBJECT bodies ({"series":[...]}, OTLP/JSON). The driver
-/// decodes fully (bounded by max_body_size), calls the signal batch fn,
-/// re-encodes. Same semantics as the old modules.
+/// Whole-body transforms for JSON object bodies that the streaming framers
+/// do not cover. The driver decodes the body (bounded by
+/// `max_decoded_bytes`), runs the batch function, and re-encodes.
 pub const BufferedKind = enum {
     datadog_metrics_json,
     otlp_logs_json,
@@ -192,8 +185,8 @@ pub const FetchFiltered = struct {
     max_output_bytes: usize,
 };
 
-/// What the connection driver should do for a matched request. Pure data —
-/// produced without IO, executed by http/conn.zig.
+/// What the frontend does for a matched request. Pure data, produced without
+/// IO.
 pub const Outcome = union(enum) {
     respond: StaticResponse,
     forward_raw: Forward,
@@ -238,8 +231,8 @@ pub const Service = union(ServiceKind) {
 };
 
 /// Resolves a Content-Encoding header to a codec, or null when the encoding
-/// is unsupported — the caller forwards the body opaque/unfiltered rather
-/// than failing the request (PLAN §6.5 fail-open posture).
+/// is unsupported. The caller then forwards the body unfiltered and does not
+/// fail the request (fail open).
 pub fn resolveCodec(content_encoding: []const u8) ?codec_mod.ContentEncoding {
     return codec_mod.ContentEncoding.fromHeader(content_encoding);
 }
@@ -267,12 +260,10 @@ test "MethodBitmask.matches" {
 test "RoutePattern.exact" {
     const route = RoutePattern.exact("/api/v2/logs", .{ .post = true });
     try std.testing.expectEqual(RoutePattern.PatternType.exact, route.pattern_type);
-    try std.testing.expectEqual(std.hash.Wyhash.hash(0, "/api/v2/logs"), route.hash);
     try std.testing.expectEqualStrings("/api/v2/logs", route.pattern);
 }
 
 test "HttpMethod.fromStd" {
-    // Parity with the old proxy/server.zig toHttpMethod test.
     try std.testing.expectEqual(HttpMethod.GET, HttpMethod.fromStd(.GET));
     try std.testing.expectEqual(HttpMethod.POST, HttpMethod.fromStd(.POST));
     try std.testing.expectEqual(HttpMethod.DELETE, HttpMethod.fromStd(.DELETE));

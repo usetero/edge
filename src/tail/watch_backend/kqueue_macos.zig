@@ -27,6 +27,19 @@ fn kevent(kq: std.posix.fd_t, changes: []const Kevent, out: []Kevent, timeout: ?
     );
 }
 
+/// Register a VNODE watch for `fd` on `kq_fd`. Returns the kevent result.
+fn addVnodeWatch(kq_fd: std.posix.fd_t, fd: std.posix.fd_t) c_int {
+    const changes = [_]Kevent{.{
+        .ident = @intCast(fd),
+        .filter = KQUEUE_FILTER_VNODE,
+        .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
+        .fflags = KQUEUE_VNODE_MASK,
+        .data = 0,
+        .udata = 0,
+    }};
+    return kevent(kq_fd, &changes, &.{}, null);
+}
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -82,7 +95,7 @@ pub fn collectDirty(self: anytype) !void {
             continue;
         }
         if (directoryPathForFd(kq, fd)) |dir_path| {
-            markTrackedInDirDirty(self, dir_path);
+            self.markDirDirty(dir_path);
         }
     }
 }
@@ -91,15 +104,7 @@ pub fn trackOpenFile(self: anytype, idx: u32, path: []const u8, fd: std.posix.fd
     if (comptime builtin.os.tag != .macos) return;
     const kq = &self.backend_state.kqueue;
     try ensureDirectoryWatch(kq, path);
-    var changes = [_]Kevent{.{
-        .ident = @intCast(fd),
-        .filter = KQUEUE_FILTER_VNODE,
-        .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
-        .fflags = KQUEUE_VNODE_MASK,
-        .data = 0,
-        .udata = 0,
-    }};
-    _ = kevent(kq.fd, changes[0..], &.{}, null);
+    _ = addVnodeWatch(kq.fd, fd);
     try kq.fd_to_idx.put(fd, idx);
 }
 
@@ -123,15 +128,7 @@ pub fn rebuildIndexes(self: anytype) void {
     var i: usize = 0;
     while (i < self.paths.items.len) : (i += 1) {
         const file = self.files.items[i] orelse continue;
-        var changes = [_]Kevent{.{
-            .ident = @intCast(file.handle),
-            .filter = KQUEUE_FILTER_VNODE,
-            .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
-            .fflags = KQUEUE_VNODE_MASK,
-            .data = 0,
-            .udata = 0,
-        }};
-        _ = kevent(kq.fd, changes[0..], &.{}, null);
+        _ = addVnodeWatch(kq.fd, file.handle);
         kq.fd_to_idx.put(file.handle, @intCast(i)) catch |err| log.warn("rebuild fd_to_idx put failed: {}", .{err});
     }
 
@@ -163,15 +160,7 @@ fn ensureDirectoryWatch(kq: *State, path: []const u8) !void {
     const dir_fd = dir.handle;
     errdefer closeFd(dir_fd);
 
-    var changes = [_]Kevent{.{
-        .ident = @intCast(dir_fd),
-        .filter = KQUEUE_FILTER_VNODE,
-        .flags = KQUEUE_EV_ADD | KQUEUE_EV_CLEAR | KQUEUE_EV_ENABLE,
-        .fflags = KQUEUE_VNODE_MASK,
-        .data = 0,
-        .udata = 0,
-    }};
-    if (kevent(kq.fd, changes[0..], &.{}, null) < 0) {
+    if (addVnodeWatch(kq.fd, dir_fd) < 0) {
         closeFd(dir_fd);
         kq.allocator.free(owned_dir_path);
         return;
@@ -191,16 +180,6 @@ fn directoryPathForFd(kq: *const State, fd: std.posix.fd_t) ?[]const u8 {
         if (dw.fd == fd) return dw.path;
     }
     return null;
-}
-
-fn markTrackedInDirDirty(self: anytype, dir_path: []const u8) void {
-    var i: usize = 0;
-    while (i < self.paths.items.len) : (i += 1) {
-        const tracked_dir = std.fs.path.dirname(self.paths.items[i]) orelse ".";
-        if (std.mem.eql(u8, tracked_dir, dir_path)) {
-            self.markDirty(@intCast(i));
-        }
-    }
 }
 
 const testing = std.testing;

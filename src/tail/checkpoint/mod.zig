@@ -5,5 +5,4 @@ pub const wal = @import("wal.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const lane = @import("lane.zig");
 
-pub const Update = lane.Update;
 pub const Lane = lane.Lane;

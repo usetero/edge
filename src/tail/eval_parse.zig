@@ -27,29 +27,39 @@ pub fn parseLine(
     return ctx;
 }
 
-pub fn parseLogfmtAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
+/// Copy `key` and `value` into the line arena and append them as an attribute.
+/// Returns the owned value.
+fn appendAttr(ctx: *context.TailLineContext, key: []const u8, value: []const u8) ![]const u8 {
+    const owned_key = try ctx.allocator.dupe(u8, key);
+    const owned_value = try ctx.allocator.dupe(u8, value);
+    try ctx.attrs.append(ctx.allocator, .{ .key = owned_key, .value = owned_value });
+    return owned_value;
+}
+
+/// Use the first message or severity key as the line message or severity.
+fn noteWellKnown(ctx: *context.TailLineContext, key: []const u8, owned_value: []const u8) void {
+    if (ctx.message == null and (std.mem.eql(u8, key, "message") or std.mem.eql(u8, key, "body"))) {
+        ctx.message = owned_value;
+    }
+    const is_severity_key = std.mem.eql(u8, key, "severity_text") or
+        std.mem.eql(u8, key, "severity") or
+        std.mem.eql(u8, key, "level");
+    if (ctx.severity == null and is_severity_key) {
+        ctx.severity = owned_value;
+    }
+}
+
+fn parseLogfmtAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
     var it = std.mem.tokenizeAny(u8, line, " \t");
     while (it.next()) |part| {
         const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
         const key = part[0..eq];
-        var value = part[eq + 1 ..];
-        value = std.mem.trim(u8, value, "\"");
-        const owned_key = try ctx.allocator.dupe(u8, key);
-        const owned_value = try ctx.allocator.dupe(u8, value);
-        try ctx.attrs.append(ctx.allocator, .{ .key = owned_key, .value = owned_value });
-        if (ctx.message == null and (std.mem.eql(u8, key, "message") or std.mem.eql(u8, key, "body"))) {
-            ctx.message = owned_value;
-        }
-        const is_severity_key = std.mem.eql(u8, key, "severity_text") or
-            std.mem.eql(u8, key, "severity") or
-            std.mem.eql(u8, key, "level");
-        if (ctx.severity == null and is_severity_key) {
-            ctx.severity = owned_value;
-        }
+        const value = std.mem.trim(u8, part[eq + 1 ..], "\"");
+        noteWellKnown(ctx, key, try appendAttr(ctx, key, value));
     }
 }
 
-pub fn parseJsonAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
+fn parseJsonAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, line, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return,
@@ -60,28 +70,13 @@ pub fn parseJsonAttrs(ctx: *context.TailLineContext, line: []const u8) !void {
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         switch (entry.value_ptr.*) {
-            .string => |s| {
-                const owned_key = try ctx.allocator.dupe(u8, key);
-                const owned_value = try ctx.allocator.dupe(u8, s);
-                try ctx.attrs.append(ctx.allocator, .{ .key = owned_key, .value = owned_value });
-                if (ctx.message == null and (std.mem.eql(u8, key, "message") or std.mem.eql(u8, key, "body"))) {
-                    ctx.message = owned_value;
-                }
-                const is_severity_key = std.mem.eql(u8, key, "severity_text") or
-                    std.mem.eql(u8, key, "severity") or
-                    std.mem.eql(u8, key, "level");
-                if (ctx.severity == null and is_severity_key) {
-                    ctx.severity = owned_value;
-                }
-            },
+            .string => |s| noteWellKnown(ctx, key, try appendAttr(ctx, key, s)),
             .object => |obj| {
                 if (std.mem.eql(u8, key, "attributes")) {
                     var attr_it = obj.iterator();
                     while (attr_it.next()) |attr_entry| {
                         if (attr_entry.value_ptr.* != .string) continue;
-                        const owned_key = try ctx.allocator.dupe(u8, attr_entry.key_ptr.*);
-                        const owned_value = try ctx.allocator.dupe(u8, attr_entry.value_ptr.*.string);
-                        try ctx.attrs.append(ctx.allocator, .{ .key = owned_key, .value = owned_value });
+                        _ = try appendAttr(ctx, attr_entry.key_ptr.*, attr_entry.value_ptr.*.string);
                     }
                 }
             },

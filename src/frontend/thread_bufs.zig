@@ -1,18 +1,12 @@
 //! Per-thread scratch for both frontends, and the watchdog that interrupts a
-//! stalled upstream exchange.
-//!
-//! One `ThreadBufs` per thread that runs requests (an httpz handler thread, a
-//! stdio connection task's pool thread), created on first use and retained
-//! for the thread's life. Everything body-sized lives here on purpose: draining a
-//! lazy body into the per-connection request arena freed correctly, but the
-//! production allocator is libc malloc, which kept the nodes mapped, and RSS
-//! grew with connections instead of threads.
+//! stalled upstream exchange. One `ThreadBufs` per request thread, created on
+//! first use and kept for the thread's life. All body-sized memory lives
+//! here, so RSS grows with threads, not with connections: libc malloc keeps
+//! freed arena pages mapped.
 const std = @import("std");
 const exec = @import("exec.zig");
 const codec = @import("../codec/root.zig");
 const limits_mod = @import("../core/limits.zig");
-
-const log = std.log.scoped(.httpz_server);
 
 // Named event payloads: the type name is the telemetry event name.
 /// The watchdog reached an upstream past its deadline and could not shut the

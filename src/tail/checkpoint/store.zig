@@ -2,8 +2,6 @@ const std = @import("std");
 const tail_types = @import("../types.zig");
 const checkpoint_types = @import("types.zig");
 
-const log = std.log.scoped(.checkpoint_store);
-
 const Oldest = struct {
     key: u64,
     last_seen_ns: i64,
@@ -16,7 +14,6 @@ pub const Store = struct {
     ttl_ns: i128,
     mutex: std.Io.Mutex = .init,
     by_identity: std.AutoHashMap(u64, checkpoint_types.Value),
-    by_inode: std.AutoHashMap(u64, checkpoint_types.Value),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, max_slots: usize, ttl_ns: i128) Store {
         return .{
@@ -25,44 +22,29 @@ pub const Store = struct {
             .max_slots = max_slots,
             .ttl_ns = ttl_ns,
             .by_identity = std.AutoHashMap(u64, checkpoint_types.Value).init(allocator),
-            .by_inode = std.AutoHashMap(u64, checkpoint_types.Value).init(allocator),
         };
     }
 
     pub fn deinit(self: *Store) void {
         self.by_identity.deinit();
-        self.by_inode.deinit();
         self.* = undefined;
     }
 
     pub fn upsert(self: *Store, value: checkpoint_types.Value) !void {
-        const keys = checkpoint_types.keysFor(value.identity);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-
-        if (!self.by_identity.contains(keys.identity) and self.by_identity.count() >= self.max_slots) {
-            self.evictOldestLocked();
-        }
-
-        try self.by_identity.put(keys.identity, value);
-        self.by_inode.put(keys.inode, value) catch |err| log.warn("by_inode put failed (upsert): {}", .{err});
+        try self.putLocked(value);
     }
 
     pub fn getOffset(self: *Store, identity: tail_types.FileIdentity) ?u64 {
-        const keys = checkpoint_types.keysFor(identity);
         const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        if (self.by_identity.get(keys.identity)) |value| {
-            if (!checkpoint_types.isExpired(value, self.ttl_ns, now)) return value.offset;
-        }
-        if (self.by_inode.get(keys.inode)) |value| {
-            if (value.identity.fingerprint == identity.fingerprint and
-                !checkpoint_types.isExpired(value, self.ttl_ns, now)) return value.offset;
-        }
-        return null;
+        const value = self.by_identity.get(tail_types.identityHash(identity)) orelse return null;
+        if (checkpoint_types.isExpired(value, self.ttl_ns, now)) return null;
+        return value.offset;
     }
 
     pub fn evictExpired(self: *Store, now_ns: i128) void {
@@ -78,11 +60,7 @@ pub const Store = struct {
             expired_keys.append(self.allocator, entry.key_ptr.*) catch return;
         }
 
-        for (expired_keys.items) |identity_key| {
-            if (self.by_identity.fetchRemove(identity_key)) |removed| {
-                self.removeInodeAliasLocked(removed.value);
-            }
-        }
+        for (expired_keys.items) |identity_key| _ = self.by_identity.remove(identity_key);
     }
 
     pub fn collectValues(self: *Store) !std.ArrayList(checkpoint_types.Value) {
@@ -102,16 +80,15 @@ pub const Store = struct {
         defer self.mutex.unlock(self.io);
 
         self.by_identity.clearRetainingCapacity();
-        self.by_inode.clearRetainingCapacity();
+        for (values) |value| try self.putLocked(value);
+    }
 
-        for (values) |value| {
-            const keys = checkpoint_types.keysFor(value.identity);
-            if (!self.by_identity.contains(keys.identity) and self.by_identity.count() >= self.max_slots) {
-                self.evictOldestLocked();
-            }
-            try self.by_identity.put(keys.identity, value);
-            self.by_inode.put(keys.inode, value) catch |err| log.warn("by_inode put failed (loadValues): {}", .{err});
+    fn putLocked(self: *Store, value: checkpoint_types.Value) !void {
+        const key = tail_types.identityHash(value.identity);
+        if (!self.by_identity.contains(key) and self.by_identity.count() >= self.max_slots) {
+            self.evictOldestLocked();
         }
+        try self.by_identity.put(key, value);
     }
 
     fn evictOldestLocked(self: *Store) void {
@@ -123,21 +100,7 @@ pub const Store = struct {
         }
 
         const victim = oldest orelse return;
-        if (self.by_identity.fetchRemove(victim.key)) |removed| {
-            self.removeInodeAliasLocked(removed.value);
-        }
-    }
-
-    fn removeInodeAliasLocked(self: *Store, value: checkpoint_types.Value) void {
-        const inode_key = checkpoint_types.keysFor(value.identity).inode;
-        if (self.by_inode.get(inode_key)) |existing| {
-            if (existing.identity.dev == value.identity.dev and
-                existing.identity.inode == value.identity.inode and
-                existing.identity.fingerprint == value.identity.fingerprint)
-            {
-                _ = self.by_inode.remove(inode_key);
-            }
-        }
+        _ = self.by_identity.remove(victim.key);
     }
 };
 
@@ -147,7 +110,7 @@ fn freshStore(ttl_ns: i128) Store {
     return Store.init(testing.allocator, testing.io, 256, ttl_ns);
 }
 
-test "store: by_inode fallback returns null when stored fingerprint differs" {
+test "store: getOffset returns null when stored fingerprint differs" {
     var store = freshStore(72 * 60 * 60 * std.time.ns_per_s);
     defer store.deinit();
 
@@ -157,12 +120,12 @@ test "store: by_inode fallback returns null when stored fingerprint differs" {
     try store.upsert(.{ .identity = id_a, .offset = 4096, .last_seen_ns = @intCast(now) });
 
     // by_identity misses (different fingerprint key).
-    try testing.expect(store.by_identity.get(checkpoint_types.keysFor(id_b).identity) == null);
-    // by_inode gate must reject the cross-version offset.
+    try testing.expect(store.by_identity.get(tail_types.identityHash(id_b)) == null);
+    // The lookup must reject the cross-version offset.
     try testing.expect(store.getOffset(id_b) == null);
 }
 
-test "store: by_inode fallback returns offset when fingerprint matches and by_identity misses" {
+test "store: getOffset keeps one offset per fingerprint of one inode" {
     var store = freshStore(72 * 60 * 60 * std.time.ns_per_s);
     defer store.deinit();
 
@@ -178,7 +141,7 @@ test "store: by_inode fallback returns offset when fingerprint matches and by_id
     try testing.expectEqual(@as(?u64, 222), store.getOffset(id_b));
 }
 
-test "store: by_inode fallback returns null for expired entry with matching fingerprint" {
+test "store: getOffset returns null for an expired entry" {
     const ttl_ns: i128 = 1 * std.time.ns_per_s;
     var store = freshStore(ttl_ns);
     defer store.deinit();

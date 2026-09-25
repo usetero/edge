@@ -9,8 +9,6 @@ const lifecycle_mod = @import("../../core/lifecycle.zig");
 
 const log = std.log.scoped(.checkpoint_lane);
 
-pub const Update = checkpoint_types.Update;
-
 pub const Lane = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -21,16 +19,15 @@ pub const Lane = struct {
     started: bool = false,
 
     interval_ns: u64,
-    ttl_ns: i128,
     sync_batch: u32,
     next_lsn: u64 = 1,
     pending_unsynced: u32 = 0,
     last_sync_ns: i128 = 0,
 
     gc_interval_ns: i128,
-    next_gc_ns: i128,
+    next_gc_ns: i128 = 0,
     snapshot_interval_ns: i128,
-    next_snapshot_ns: i128,
+    next_snapshot_ns: i128 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -53,26 +50,29 @@ pub const Lane = struct {
         const interval_ns = interval_ms * std.time.ns_per_ms;
         const ttl_ns = @as(i128, @intCast(ttl_ms)) * std.time.ns_per_ms;
 
-        var lane: Lane = .{
-            .allocator = allocator,
-            .io = io,
-            .queue = try queue_mod.UpdateQueue.init(allocator, io, capacity),
-            .store = store_mod.Store.init(allocator, io, max_slots, ttl_ns),
-            .wal = try wal_mod.Wal.init(allocator, io, state_dir),
-            .snapshot = try snapshot_mod.Snapshot.init(allocator, io, state_dir),
-            .interval_ns = interval_ns,
-            .ttl_ns = ttl_ns,
-            .sync_batch = sync_batch,
-            .gc_interval_ns = @max(@as(i128, interval_ns), 500 * std.time.ns_per_ms),
-            .next_gc_ns = 0,
-            .snapshot_interval_ns = @as(i128, @intCast(snapshot_interval_ms)) * std.time.ns_per_ms,
-            .next_snapshot_ns = 0,
-            .pending_unsynced = 0,
+        // Each resource gets its own errdefer until the struct owns it.
+        var lane: Lane = blk: {
+            var queue = try queue_mod.UpdateQueue.init(allocator, io, capacity);
+            errdefer queue.deinit();
+            var store = store_mod.Store.init(allocator, io, max_slots, ttl_ns);
+            errdefer store.deinit();
+            var wal = try wal_mod.Wal.init(allocator, io, state_dir);
+            errdefer wal.deinit();
+            const snapshot = try snapshot_mod.Snapshot.init(allocator, io, state_dir);
+            break :blk .{
+                .allocator = allocator,
+                .io = io,
+                .queue = queue,
+                .store = store,
+                .wal = wal,
+                .snapshot = snapshot,
+                .interval_ns = interval_ns,
+                .sync_batch = sync_batch,
+                .gc_interval_ns = @max(@as(i128, interval_ns), 500 * std.time.ns_per_ms),
+                .snapshot_interval_ns = @as(i128, @intCast(snapshot_interval_ms)) * std.time.ns_per_ms,
+            };
         };
-        errdefer lane.queue.deinit();
-        errdefer lane.store.deinit();
-        errdefer lane.wal.deinit();
-        errdefer lane.snapshot.deinit();
+        errdefer lane.deinit();
 
         try lane.recover();
         const now = std.Io.Timestamp.now(io, .awake).toNanoseconds();
@@ -81,6 +81,11 @@ pub const Lane = struct {
         lane.next_snapshot_ns = now + lane.snapshot_interval_ns;
 
         return lane;
+    }
+
+    /// Test helper: `init` with the test allocator and default tunables.
+    pub fn initForTest(io: std.Io, state_dir: []const u8) !Lane {
+        return init(std.testing.allocator, io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
     }
 
     /// Resource teardown only. When `start` was used, the owning runtime
@@ -94,9 +99,8 @@ pub const Lane = struct {
         self.* = undefined;
     }
 
-    /// Spawns the worker as a concurrent task in the caller's lifecycle
-    /// group (PLAN.md §9 Phase 6): shutdown is the group's collective
-    /// cancel, not a Lane-owned thread join.
+    /// Spawn the worker in the caller's lifecycle group. Shutdown is the group
+    /// cancel.
     pub fn start(self: *Lane, lifecycle: *lifecycle_mod.Lifecycle) !void {
         if (self.started) return;
         try lifecycle.spawn(self.io, workerMain, .{self});
@@ -113,7 +117,7 @@ pub const Lane = struct {
         self.runMaintenance(true) catch |err| log.warn("runMaintenance (final) failed: {}", .{err});
     }
 
-    pub fn enqueue(self: *Lane, update: Update) !bool {
+    pub fn enqueue(self: *Lane, update: checkpoint_types.Value) bool {
         return self.queue.push(update);
     }
 
@@ -128,23 +132,15 @@ pub const Lane = struct {
 
         var replay = try self.wal.replay(self.allocator);
         defer replay.deinit(self.allocator);
-        for (replay.entries.items) |entry| {
-            try self.store.upsert(entry.value);
-        }
+        for (replay.entries.items) |entry| try self.store.upsert(entry);
         self.next_lsn = replay.next_lsn;
 
         try self.persistSnapshotAndResetWal();
     }
 
-    /// Concurrent task in the runtime's lifecycle group. Cancellation lands
-    /// here as error.Canceled out of any file-IO operation (wal.append/sync,
-    /// snapshot writes) or the cadence sleep — every cancellation point must
-    /// propagate so `Group.cancel`'s join completes and `finalize` can run
-    /// the durable drain on the (uncanceled) shutdown thread. Mirrors
-    /// `PollLoop.run` in `src/tail/runtime.zig`: swallow ordinary file-IO
-    /// failures with a log warning, but never the one-shot `error.Canceled`
-    /// latch — swallowing it suppresses every later cancellation point
-    /// (the acknowledged latch is one-shot per task) and hangs shutdown.
+    /// Worker task. Every error.Canceled must propagate, so `Group.cancel` can
+    /// join and `finalize` can run. Log other IO errors. The cancel latch fires
+    /// once per task: if the worker swallows it, shutdown hangs.
     fn workerMain(self: *Lane) std.Io.Cancelable!void {
         while (true) {
             if (self.queue.pop()) |update| {
@@ -168,8 +164,7 @@ pub const Lane = struct {
         }
     }
 
-    fn applyUpdate(self: *Lane, update: Update) !void {
-        const value = checkpoint_types.valueFromUpdate(update);
+    fn applyUpdate(self: *Lane, value: checkpoint_types.Value) !void {
         try self.store.upsert(value);
         try self.wal.append(self.next_lsn, value);
         self.next_lsn += 1;
@@ -250,16 +245,15 @@ test "checkpoint/lane: enqueue and observe offset" {
     defer testing.allocator.free(state_dir);
 
     var lifecycle: lifecycle_mod.Lifecycle = .init;
-    var lane = try Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var lane = try Lane.initForTest(testing.io, state_dir);
     defer lane.deinit();
     try lane.start(&lifecycle);
     defer shutdownLane(&lane, &lifecycle, io);
 
     const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 2, .fingerprint = 3 };
-    try testing.expect(try lane.enqueue(.{
+    try testing.expect(lane.enqueue(.{
         .identity = id,
-        .byte_offset = 99,
-        .last_seen_size = 99,
+        .offset = 99,
         .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
     }));
     try waitForOffset(&lane, id, 99, 100);
@@ -275,11 +269,10 @@ test "checkpoint/lane: queue is bounded" {
     defer lane.deinit();
 
     const id: tail_types.FileIdentity = .{ .dev = 1, .inode = 1, .fingerprint = 1 };
-    try testing.expect(try lane.enqueue(.{ .identity = id, .byte_offset = 1, .last_seen_size = 1, .last_seen_ns = 1 }));
-    try testing.expect(!(try lane.enqueue(.{
+    try testing.expect(lane.enqueue(.{ .identity = id, .offset = 1, .last_seen_ns = 1 }));
+    try testing.expect(!(lane.enqueue(.{
         .identity = id,
-        .byte_offset = 2,
-        .last_seen_size = 2,
+        .offset = 2,
         .last_seen_ns = 2,
     })));
 }
@@ -294,40 +287,27 @@ test "checkpoint/lane: recovers from wal and snapshot" {
     {
         const io = testing.io;
         var lifecycle: lifecycle_mod.Lifecycle = .init;
-        var lane = try Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+        var lane = try Lane.initForTest(testing.io, state_dir);
         defer lane.deinit();
         try lane.start(&lifecycle);
         defer shutdownLane(&lane, &lifecycle, io);
-        _ = try lane.enqueue(.{
+        _ = lane.enqueue(.{
             .identity = id,
-            .byte_offset = 1234,
-            .last_seen_size = 1234,
+            .offset = 1234,
             .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
         });
         try waitForOffset(&lane, id, 1234, 100);
     }
 
-    var recovered = try Lane.init(testing.allocator, testing.io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var recovered = try Lane.initForTest(testing.io, state_dir);
     defer recovered.deinit();
     try testing.expectEqual(@as(?u64, 1234), recovered.getOffset(id));
 }
 
-// Regression guard for the shutdown hang: `workerMain` must propagate
-// `error.Canceled` out of `applyUpdate`/`runMaintenance` (cancelable WAL +
-// snapshot file IO), not swallow it. With `sync_batch = 1` the worker spends
-// the bulk of this test inside `fsync` (a live cancellation point) rather
-// than the cadence sleep, so cancellation is delivered mid-file-IO exactly
-// when the bug bites. If `error.Canceled` were swallowed the one-shot latch
-// would be consumed, every later cancellation point (including the only
-// propagating `try self.io.sleep`) would be suppressed, and
-// `lifecycle.shutdown` (which joins the worker) would hang forever — the
-// test would never reach the recovery assertion and would time out.
+// workerMain must propagate error.Canceled from file IO. With sync_batch = 1
+// the cancel lands during fsync. A swallowed cancel hangs lifecycle.shutdown.
 //
-// Recovery must see a consistent state: the checkpoint may lag the last
-// enqueued offset by at most one record (the in-flight `wal.append` that
-// caught `error.Canceled` is skipped and re-tailed by the caller on
-// restart — at-least-once, never corruption), so the last persisted offset
-// is `n` or `n - 1`.
+// Recovery can lag by one record (at-least-once), so the offset is n or n - 1.
 test "checkpoint/lane: canceling worker mid-file-IO unwinds instead of hanging" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -350,10 +330,9 @@ test "checkpoint/lane: canceling worker mid-file-IO unwinds instead of hanging" 
         // append+fsync burst. `sync_batch = 1` makes every update a fsync.
         var i: u64 = 1;
         while (i <= n) : (i += 1) {
-            try testing.expect(try lane.enqueue(.{
+            try testing.expect(lane.enqueue(.{
                 .identity = id,
-                .byte_offset = i,
-                .last_seen_size = i,
+                .offset = i,
                 .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
             }));
         }
@@ -378,14 +357,13 @@ test "checkpoint/lane: corrupted wal is tolerated" {
     {
         const io = testing.io;
         var lifecycle: lifecycle_mod.Lifecycle = .init;
-        var lane = try Lane.init(testing.allocator, io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+        var lane = try Lane.initForTest(testing.io, state_dir);
         defer lane.deinit();
         try lane.start(&lifecycle);
         defer shutdownLane(&lane, &lifecycle, io);
-        _ = try lane.enqueue(.{
+        _ = lane.enqueue(.{
             .identity = id,
-            .byte_offset = 55,
-            .last_seen_size = 55,
+            .offset = 55,
             .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
         });
         try waitForOffset(&lane, id, 55, 100);
@@ -400,7 +378,7 @@ test "checkpoint/lane: corrupted wal is tolerated" {
     try wal_file.writePositionalAll(testing.io, &junk, 0);
     try wal_file.sync(testing.io);
 
-    var recovered = try Lane.init(testing.allocator, testing.io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var recovered = try Lane.initForTest(testing.io, state_dir);
     defer recovered.deinit();
     try testing.expectEqual(@as(?u64, 55), recovered.getOffset(id));
 }
@@ -432,7 +410,7 @@ test "checkpoint/lane: corrupted snapshot falls back to wal replay" {
     try wal.append(1, value);
     try wal.sync();
 
-    var recovered = try Lane.init(testing.allocator, testing.io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var recovered = try Lane.initForTest(testing.io, state_dir);
     defer recovered.deinit();
     try testing.expectEqual(@as(?u64, 777), recovered.getOffset(id));
 }
@@ -464,7 +442,7 @@ test "checkpoint/lane: corrupted snapshot count degrades to wal replay" {
     try wal.append(1, value);
     try wal.sync();
 
-    var recovered = try Lane.init(testing.allocator, testing.io, state_dir, 16, 64, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    var recovered = try Lane.initForTest(testing.io, state_dir);
     defer recovered.deinit();
     try testing.expectEqual(@as(?u64, 888), recovered.getOffset(id));
 }
@@ -498,48 +476,55 @@ test "checkpoint/lane: rejects zero checkpoint tunables" {
 
     // Mirrors the validateConfig guards as a defense-in-depth layer: a
     // caller that constructs a Lane directly must still be rejected.
-    try testing.expectError(error.InvalidCheckpointSlots, Lane.init(
-        testing.allocator,
-        testing.io,
-        state_dir,
-        8,
-        0,
-        5,
-        72 * 60 * 60 * 1000,
-        64,
-        60_000,
-    ));
-    try testing.expectError(error.InvalidCheckpointInterval, Lane.init(
-        testing.allocator,
-        testing.io,
-        state_dir,
-        8,
-        8,
-        0,
-        72 * 60 * 60 * 1000,
-        64,
-        60_000,
-    ));
-    try testing.expectError(error.InvalidCheckpointSyncBatch, Lane.init(
-        testing.allocator,
-        testing.io,
-        state_dir,
-        8,
-        8,
-        5,
-        72 * 60 * 60 * 1000,
-        0,
-        60_000,
-    ));
-    try testing.expectError(error.InvalidCheckpointSnapshotInterval, Lane.init(
-        testing.allocator,
-        testing.io,
-        state_dir,
-        8,
-        8,
-        5,
-        72 * 60 * 60 * 1000,
-        64,
-        0,
-    ));
+    const Case = struct {
+        err: anyerror,
+        max_slots: usize = 8,
+        interval_ms: u64 = 5,
+        sync_batch: u32 = 64,
+        snapshot_interval_ms: u64 = 60_000,
+    };
+    const cases = [_]Case{
+        .{ .err = error.InvalidCheckpointSlots, .max_slots = 0 },
+        .{ .err = error.InvalidCheckpointInterval, .interval_ms = 0 },
+        .{ .err = error.InvalidCheckpointSyncBatch, .sync_batch = 0 },
+        .{ .err = error.InvalidCheckpointSnapshotInterval, .snapshot_interval_ms = 0 },
+    };
+    for (cases) |case| {
+        try testing.expectError(case.err, Lane.init(
+            testing.allocator,
+            testing.io,
+            state_dir,
+            8,
+            case.max_slots,
+            case.interval_ms,
+            72 * 60 * 60 * 1000,
+            case.sync_batch,
+            case.snapshot_interval_ms,
+        ));
+    }
+}
+
+fn initAndDeinitLane(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8) !void {
+    var lane = try Lane.init(allocator, io, state_dir, 8, 8, 5, 72 * 60 * 60 * 1000, 64, 60_000);
+    lane.deinit();
+}
+
+test "checkpoint/lane: init frees its resources when an allocation fails" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(state_dir);
+
+    // Seed one entry, so recovery allocates during the snapshot load.
+    {
+        var snap = try snapshot_mod.Snapshot.init(testing.allocator, testing.io, state_dir);
+        defer snap.deinit();
+        const value: checkpoint_types.Value = .{
+            .identity = .{ .dev = 1, .inode = 2, .fingerprint = 3 },
+            .offset = 4,
+            .last_seen_ns = @intCast(std.Io.Timestamp.now(testing.io, .awake).toNanoseconds()),
+        };
+        try snap.write(&.{value});
+    }
+    try testing.checkAllAllocationFailures(testing.allocator, initAndDeinitLane, .{ testing.io, state_dir });
 }

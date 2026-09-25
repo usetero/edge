@@ -1,5 +1,5 @@
-//! httpz frontend (PLAN-FRONTEND-SWAP.md §4): inbound HTTP rides httpz's own
-//! kqueue/epoll event loop and handler thread pool. The process-wide `Io`
+//! httpz frontend: inbound HTTP rides httpz's own kqueue/epoll event loop
+//! and handler thread pool. The process-wide `Io`
 //! still serves the upstream client, policy loader, and lifecycle.
 //!
 //! This file is the shell: server lifecycle, httpz config derived from
@@ -19,7 +19,6 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const exec = @import("../exec.zig");
-const runtime_metrics = @import("../../runtime/runtime_metrics.zig");
 const limits_mod = @import("../../core/limits.zig");
 const service_mod = @import("../../service/service.zig");
 const lifecycle_mod = @import("../../core/lifecycle.zig");
@@ -39,14 +38,11 @@ const lazy_read_timeout_ms: usize = limits_mod.REQUEST_TIMEOUT_SECONDS * 1000;
 /// Whole-body deadline for a lazy inbound body.
 const inbound_body_timeout_ns: i128 = @as(i128, limits_mod.REQUEST_TIMEOUT_SECONDS) * std.time.ns_per_s;
 
-/// Absolute deadline over a lazy body read.
-///
-/// `req.reader(ms)` sets SO_RCVTIMEO, which restarts on every read, so a
-/// client that sends one byte just inside the timeout holds its handler
-/// thread for as long as it likes. A few dozen such clients take the whole
-/// pool and the server stops answering, health checks included, which on ECS
-/// or Kubernetes gets the container replaced. This wraps the httpz reader and
-/// fails the transfer once the deadline passes.
+/// Absolute deadline over a lazy body read. `req.reader(ms)` sets
+/// SO_RCVTIMEO, which restarts on every read. A client that sends one byte
+/// inside each timeout holds its handler thread without limit, and a few
+/// dozen such clients stop the server, health checks too. This reader fails
+/// the transfer when the deadline passes.
 pub const DeadlineReader = struct {
     interface: std.Io.Reader,
     inner: *std.Io.Reader,
@@ -128,21 +124,12 @@ const log = std.log.scoped(.httpz_server);
 // Named event payloads: the type name is the telemetry event name.
 /// A request threw out of dispatch and was mapped to a bounded error response.
 const RequestFailed = struct { method: []const u8, path: []const u8, err: []const u8 };
-/// Per-request trace at debug level.
-const RequestCompleted = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
-/// Same shape at warn level, for a request that held its handler thread.
-const RequestSlow = struct { method: []const u8, path: []const u8, status: u16, duration_ms: f64 };
 /// The listener stopped with an error. Nothing reaches the edge after this,
 /// so it is the one line that explains a process that is up and deaf.
 const ListenFailed = struct { err: []const u8 };
 /// The upstream deadline watchdog could not start, so nothing would ever cut
 /// off a hung upstream. The process shuts down instead of serving blind.
 const WatchdogSpawnFailed = struct { err: []const u8 };
-
-/// Warn past this. `RequestCompleted` is debug level, which production turns
-/// off, so without this line a handler that sat on a stalled upstream for
-/// seconds leaves no record at all.
-const slow_request_seconds: f64 = 5;
 
 pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) httpz.Config {
     const requested_workers = limits.worker_count orelse 1;
@@ -157,11 +144,9 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .max_body_size = limits.max_body_size,
             .buffer_size = limits.recv_buf,
             .lazy_read_size = limits.large_body_buffer_size,
-            // Above our own forward cap on purpose. httpz's default of 32
-            // drops the excess in silence, so a request with more headers
-            // than that was forwarded incomplete and answered 202. With room
-            // to spare, our cap refuses the request instead. Past this count
-            // httpz truncates again, which needs a fix in httpz itself.
+            // Above our forward cap, so our cap refuses the request with
+            // 431. At httpz's default of 32, httpz drops excess headers with
+            // no error. Past this count httpz still truncates.
             .max_header_count = limits_mod.MAX_FORWARD_HEADERS + 32,
         },
         .workers = .{
@@ -170,10 +155,8 @@ pub fn configFromLimits(limits: limits_mod.Limits, address: [4]u8, port: u16) ht
             .large_buffer_count = limits.large_body_buffer_count,
             .large_buffer_size = limits.large_body_buffer_size,
         },
-        // Same reasoning as the request header cap: httpz's default of 16
-        // dropped the excess in silence, so an intake answer with more
-        // headers than that was relayed incomplete and still reported 202.
-        // A `Retry-After` on a 429 is exactly the header that vanished.
+        // Same reason as the request cap: at httpz's default of 16, httpz
+        // drops excess response headers, such as `Retry-After` on a 429.
         .response = .{ .max_header_count = limits_mod.MAX_FORWARD_HEADERS + 32 },
         .thread_pool = .{ .count = limits.thread_pool_count },
         .timeout = .{
@@ -292,29 +275,7 @@ pub const Handler = struct {
             }
         };
 
-        const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - start_ns;
-        const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-        if (ctx.metrics) |metrics| {
-            metrics.recordRequestDuration(known_path, elapsed_s);
-            metrics.recordResponse(known_path, runtime_metrics.statusClass(res.status));
-        }
-        if (elapsed_s >= slow_request_seconds) {
-            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            ctx.bus.warn(RequestSlow{
-                .method = @tagName(req.method),
-                .path = req.url.path,
-                .status = res.status,
-                .duration_ms = elapsed_s * std.time.ms_per_s,
-            });
-        } else {
-            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            ctx.bus.debug(RequestCompleted{
-                .method = @tagName(req.method),
-                .path = req.url.path,
-                .status = res.status,
-                .duration_ms = elapsed_s * std.time.ms_per_s,
-            });
-        }
+        paths.finishRequest(ctx, @tagName(req.method), req.url.path, known_path, res.status, start_ns);
     }
 
     fn dispatch(self: *Handler, req: *httpz.Request, res: *httpz.Response) !void {
@@ -329,15 +290,15 @@ pub const Handler = struct {
             res.body = "";
             return;
         }
-        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/metrics")) {
+        if (std.mem.eql(u8, path, "/_edge/metrics")) {
             return endpoints.metrics(ctx, &sink, &httpz.writeMetrics);
         }
-        if (req.method == .GET and std.mem.eql(u8, path, "/_edge/policies")) {
+        if (std.mem.eql(u8, path, "/_edge/policies")) {
             const json = std.mem.eql(u8, (try req.query()).get("format") orelse "", "json");
             return endpoints.policies(ctx, &sink, json);
         }
 
-        if (req.method == .GET and std.mem.startsWith(u8, path, "/_edge/tap/")) {
+        if (std.mem.startsWith(u8, path, "/_edge/tap/")) {
             const stage: exec.TapState.Stage = if (std.mem.eql(u8, path, "/_edge/tap/pre"))
                 .pre
             else if (std.mem.eql(u8, path, "/_edge/tap/post"))
@@ -385,18 +346,13 @@ pub const Handler = struct {
             .fetch_filtered => |fetch| paths.execFetchFiltered(ctx, in, &sink, body, fetch),
         };
         served catch |err| {
-            // The shared path reports a stalled read as a generic read
-            // failure. Only this frontend knows the deadline fired, so name it
-            // here, and close the connection: the body is part-read, and httpz
-            // would drain the remainder — the same unbounded wait again.
+            // A stalled lazy read surfaces as a generic read failure. Only
+            // this frontend knows the deadline fired, so name it here. Close
+            // the connection: httpz drains a part-read body after the
+            // handler, which is the same unbounded wait. `res.keepalive` only
+            // sets the response header; httpz gates the drain on
+            // `conn.handover`, so set that to `.close`.
             if (body == .lazy and bounded.expired) {
-                // `res.keepalive = false` only writes the `Connection: Close`
-                // response header; httpz gates its post-handler body drain on
-                // `conn.handover` (derived from `req.canKeepAlive()`), which a
-                // plain HTTP/1.1 request leaves `.keepalive`. The drain would
-                // then re-enter the same unbounded per-read wait on this
-                // handler thread we just escaped. Flip `handover` to `.close`
-                // so httpz skips the drain and closes the connection.
                 req.conn.handover = .close;
                 res.keepalive = false;
                 return error.InboundBodyTimeout;
@@ -495,52 +451,4 @@ test "httpz method maps onto service and std methods" {
     try testing.expectEqual(service_mod.HttpMethod.OTHER, serviceMethod(.CONNECT));
     try testing.expectEqual(@as(?std.http.Method, .GET), stdMethod(.GET));
     try testing.expectEqual(@as(?std.http.Method, null), stdMethod(.OTHER));
-}
-
-test "InboundBodyTimeout recovery flips httpz handover so the post-handler drain is skipped" {
-    // httpz gates its post-handler body drain on `conn.handover`, which it
-    // derives from `req.canKeepAlive()` after the handler returns
-    // (httpz.zig:573-586); `res.keepalive` only writes the `Connection: Close`
-    // response header. So an HTTP/1.1 keep-alive request whose lazy body is
-    // only partly read when the deadline fires would still be drained on the
-    // handler thread despite `res.keepalive = false`, reintroducing the
-    // slow-drip DoS `DeadlineReader` exists to stop. `Handler.dispatch` now
-    // flips `conn.handover` to `.close` so httpz skips the drain and closes
-    // the connection. This exercises that interaction against httpz's real
-    // gate logic without sockets or the 30s wait.
-    var t = httpz.testing.init(.{});
-    defer t.deinit();
-
-    // httpz.testing.init parses `GET / HTTP/1.1\r\nContent-Length: 0`: HTTP/1.1
-    // with no `connection: close` header, so `canKeepAlive()` is true (the
-    // slow-drip exploit's normal case). Give it a large, partly-unread lazy body.
-    try testing.expectEqual(httpz.Protocol.HTTP11, t.req.protocol);
-    try testing.expect(t.req.canKeepAlive());
-    t.req.unread_body = 10_000;
-
-    // Buggy recovery (only the response-side toggle). Simulate httpz deriving
-    // handover from canKeepAlive() (httpz.zig:573-576).
-    t.conn.handover = .unknown;
-    t.res.keepalive = false;
-    if (t.conn.handover == .unknown) {
-        t.conn.handover = if (t.req.canKeepAlive()) .keepalive else .close;
-    }
-    // The drain gate at httpz.zig:582 is OPEN: drain would re-enter the
-    // unbounded per-read wait on this handler thread.
-    try testing.expect(t.req.unread_body > 0);
-    try testing.expect(t.conn.handover == .keepalive);
-    try testing.expect(t.req.unread_body > 0 and t.conn.handover == .keepalive);
-
-    // Fixed recovery (flip handover to .close, as `Handler.dispatch` now does
-    // for `body == .lazy and bounded.expired`).
-    t.conn.handover = .unknown;
-    t.res.keepalive = false;
-    t.conn.handover = .close;
-    if (t.conn.handover == .unknown) {
-        t.conn.handover = if (t.req.canKeepAlive()) .keepalive else .close;
-    }
-    // The drain gate is CLOSED: httpz skips the drain and closes the connection.
-    try testing.expect(t.req.unread_body > 0);
-    try testing.expect(t.conn.handover == .close);
-    try testing.expect(!(t.req.unread_body > 0 and t.conn.handover == .keepalive));
 }

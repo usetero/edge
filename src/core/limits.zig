@@ -1,7 +1,6 @@
-//! Single source of truth for every buffer size and bound in the data plane.
-//! No other file in src/core, src/http, src/pipeline, or src/service may
-//! define a size constant; importing from here keeps the steady-state memory
-//! budget a closed-form function of configuration (see `Limits.steadyStateBytes`).
+//! The source of every buffer size and bound in the data plane. Other files
+//! import sizes from here, so the steady-state memory budget is a closed-form
+//! function of configuration (`Limits.steadyStateBytes`).
 const std = @import("std");
 
 const log = std.log.scoped(.limits);
@@ -14,7 +13,7 @@ pub const SEND_BUF_BYTES: usize = 20 * 1024;
 pub const UPSTREAM_WRITE_BUF_BYTES: usize = 20 * 1024;
 
 /// One framed record (a Datadog log, an OTLP ResourceLogs submessage, …) must
-/// fit here for policy evaluation; larger records fail open per PLAN §6.5.
+/// fit here for policy evaluation; larger records fail open.
 pub const RECORD_SCRATCH_BYTES: usize = 256 * 1024;
 
 /// HTTP body reader staging (chunked-decoding side, std.http.Server).
@@ -193,18 +192,16 @@ pub const Limits = struct {
         return self.recv_buf + self.send_buf + self.body_buf;
     }
 
-    /// Closed-form steady-state budget for the stdio data plane. Excludes cold,
-    /// config-proportional state (router tables, policy snapshots) and
-    /// libzstd contexts, which are bounded separately and logged by their
-    /// owners.
-    /// Slots the frontend actually allocates: the operator's connection cap
-    /// plus the control reserve. The reserve sits on top of `max_connections`
-    /// rather than inside it, so a deployment that sizes the cap to its sender
-    /// count is not shedding two of them.
+    /// Slots the frontend allocates: the connection cap plus the control
+    /// reserve. The reserve is on top of `max_connections`, so a cap sized to
+    /// the sender count sheds no sender.
     pub fn connectionSlots(self: Limits) usize {
         return self.max_connections + CONTROL_RESERVE_SLOTS;
     }
 
+    /// Steady-state budget for the stdio data plane. Excludes cold state
+    /// (router tables, policy snapshots) and libzstd contexts; their owners
+    /// bound and log them.
     pub fn steadyStateBytes(self: Limits) usize {
         return self.connectionSlots() * (self.perConnBytes() + self.conn_arena_reserve);
     }

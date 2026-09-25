@@ -1,8 +1,5 @@
-//! Upstream HTTP client manager: pre-parsed upstream URL components in a
-//! MultiArrayList (SoA) plus one shared std.http.Client whose connection
-//! pool is mutex-protected and rides entirely on std.Io. Ported from
-//! proxy/upstream_client.zig; ModuleId became UpstreamId (index into this
-//! manager, resolved from service UpstreamChoice at startup).
+//! Upstream HTTP client manager: pre-parsed upstream URL parts in a
+//! MultiArrayList, and the shared std.http.Client pools.
 const std = @import("std");
 
 /// Index of one configured upstream in this manager.
@@ -19,8 +16,7 @@ const UpstreamData = struct {
     port: u16,
     base_path: []const u8,
 
-    /// Maximum request/response sizes
-    max_request_body: u32,
+    /// Maximum response size
     max_response_body: u32,
 };
 
@@ -49,28 +45,26 @@ pub const UpstreamManager = struct {
     pub fn init(io: std.Io, allocator: std.mem.Allocator, pool_size: usize) UpstreamManager {
         return .{
             .upstreams = .{},
-            .http_client = .{
-                .allocator = allocator,
-                .io = io,
-                // TLS requires buffers of at least max_ciphertext_record_len for read/write
-                .tls_buffer_size = tls_min_buffer,
-                .read_buffer_size = tls_min_buffer,
-                .write_buffer_size = tls_min_buffer,
-                // std's default keeps only 32 idle connections; with one
-                // in-flight upstream request per downstream connection,
-                // anything smaller than max_connections forces fresh dials
-                // under load and exhausts ephemeral ports (AddressUnavailable).
-                .connection_pool = .{ .free_size = pool_size },
-            },
-            .retry_client = .{
-                .allocator = allocator,
-                .io = io,
-                .tls_buffer_size = tls_min_buffer,
-                .read_buffer_size = tls_min_buffer,
-                .write_buffer_size = tls_min_buffer,
-                .connection_pool = .{ .free_size = 0 },
-            },
+            // std's default keeps only 32 idle connections; with one
+            // in-flight upstream request per downstream connection,
+            // anything smaller than max_connections forces fresh dials
+            // under load and exhausts ephemeral ports (AddressUnavailable).
+            .http_client = httpClient(io, allocator, pool_size),
+            .retry_client = httpClient(io, allocator, 0),
             .allocator = allocator,
+        };
+    }
+
+    /// A client that keeps at most `free_size` idle connections.
+    fn httpClient(io: std.Io, allocator: std.mem.Allocator, free_size: usize) std.http.Client {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            // TLS requires buffers of at least max_ciphertext_record_len for read/write
+            .tls_buffer_size = tls_min_buffer,
+            .read_buffer_size = tls_min_buffer,
+            .write_buffer_size = tls_min_buffer,
+            .connection_pool = .{ .free_size = free_size },
         };
     }
 
@@ -92,24 +86,13 @@ pub const UpstreamManager = struct {
         self.* = undefined;
     }
 
-    /// Get the shared HTTP client for making upstream requests.
-    /// The client is thread-safe for creating requests.
-    /// Individual Request objects returned by client.request() must be used
-    /// by a single thread only.
-    pub fn getHttpClient(self: *UpstreamManager) *std.http.Client {
-        return &self.http_client;
-    }
-
     /// Create an upstream configuration from a URL
     /// Returns the UpstreamId used to reference this upstream
     pub fn createUpstream(
         self: *UpstreamManager,
         upstream_url: []const u8,
-        max_path_length: u32,
-        max_request_body: u32,
         max_response_body: u32,
     ) !UpstreamId {
-        _ = max_path_length;
         const uri = try std.Uri.parse(upstream_url);
 
         const scheme = try self.allocator.dupe(u8, uri.scheme);
@@ -120,10 +103,7 @@ pub const UpstreamManager = struct {
         const host = try self.allocator.dupe(u8, host_str);
         errdefer self.allocator.free(host);
 
-        const base_path = if (uri.path.percent_encoded.len > 0)
-            try self.allocator.dupe(u8, uri.path.percent_encoded)
-        else
-            try self.allocator.dupe(u8, "");
+        const base_path = try self.allocator.dupe(u8, uri.path.percent_encoded);
         errdefer self.allocator.free(base_path);
 
         const port = uri.port orelse if (std.mem.eql(u8, scheme, "https")) @as(u16, 443) else @as(u16, 80);
@@ -133,7 +113,6 @@ pub const UpstreamManager = struct {
             .host = host,
             .port = port,
             .base_path = base_path,
-            .max_request_body = max_request_body,
             .max_response_body = max_response_body,
         };
 
@@ -222,8 +201,6 @@ test "UpstreamManager buildUpstreamUri" {
 
     const upstream_id = try manager.createUpstream(
         "https://api.example.com/v2",
-        2048,
-        1024,
         1024,
     );
 
@@ -251,8 +228,6 @@ test "UpstreamManager buildUpstreamUri with non-standard port" {
 
     const upstream_id = try manager.createUpstream(
         "http://localhost:9999",
-        2048,
-        1024,
         1024,
     );
 
@@ -267,8 +242,6 @@ test "UpstreamManager buildUpstreamUri collapse boundary slashes" {
     defer manager.deinit();
     const upstream_id = try manager.createUpstream(
         "https://internal-gateway.corp/datadog/",
-        2048,
-        1024,
         1024,
     );
 
@@ -309,7 +282,7 @@ test "UpstreamManager buildUpstreamUri join boundary combinations" {
     defer manager.deinit();
 
     // base_path == "" (path-less upstream URL)
-    const empty_id = try manager.createUpstream("https://host.example.com", 2048, 1024, 1024);
+    const empty_id = try manager.createUpstream("https://host.example.com", 1024);
     const e1 = try manager.buildUpstreamUri(allocator, empty_id, "/api/v2/logs", "");
     defer allocator.free(e1);
     try std.testing.expectEqualStrings("https://host.example.com/api/v2/logs", e1);
@@ -317,14 +290,14 @@ test "UpstreamManager buildUpstreamUri join boundary combinations" {
     defer allocator.free(e2);
     try std.testing.expectEqualStrings("https://host.example.com", e2);
 
-    // base_path == "/" (root) is collapsed to nothing by the line-205 guard.
-    const root_id = try manager.createUpstream("https://host.example.com/", 2048, 1024, 1024);
+    // base_path == "/" (root) is collapsed to nothing by the base-path guard.
+    const root_id = try manager.createUpstream("https://host.example.com/", 1024);
     const r1 = try manager.buildUpstreamUri(allocator, root_id, "/api/v2/logs", "");
     defer allocator.free(r1);
     try std.testing.expectEqualStrings("https://host.example.com/api/v2/logs", r1);
 
     // base_path without trailing '/' + leading-slash request: single '/'.
-    const plain_id = try manager.createUpstream("https://host.example.com/v2", 2048, 1024, 1024);
+    const plain_id = try manager.createUpstream("https://host.example.com/v2", 1024);
     const p1 = try manager.buildUpstreamUri(allocator, plain_id, "/logs", "");
     defer allocator.free(p1);
     try std.testing.expectEqualStrings("https://host.example.com/v2/logs", p1);
@@ -334,7 +307,7 @@ test "UpstreamManager buildUpstreamUri join boundary combinations" {
     try std.testing.expectEqualStrings("https://host.example.com/v2/logs", p2);
 
     // base_path with trailing '/' + leading-slash request: collapses to single '/'.
-    const slash_id = try manager.createUpstream("https://host.example.com/v2/", 2048, 1024, 1024);
+    const slash_id = try manager.createUpstream("https://host.example.com/v2/", 1024);
     const s1 = try manager.buildUpstreamUri(allocator, slash_id, "/logs", "");
     defer allocator.free(s1);
     try std.testing.expectEqualStrings("https://host.example.com/v2/logs", s1);
@@ -350,12 +323,11 @@ test "UpstreamManager multiple upstreams" {
     var manager = UpstreamManager.init(std.Options.debug_io, allocator, 8);
     defer manager.deinit();
 
-    const id0 = try manager.createUpstream("https://api1.example.com", 2048, 1024, 1024);
-    const id1 = try manager.createUpstream("https://api2.example.com", 2048, 1024, 1024);
+    const id0 = try manager.createUpstream("https://api1.example.com", 1024);
+    const id1 = try manager.createUpstream("https://api2.example.com", 1024);
 
-    // Asserted through the live API: `getUpstreamConfig` was the dead
-    // accessor this test used to read, and `buildUpstreamUri` is what
-    // production actually calls to reach a host.
+    // Asserted through `buildUpstreamUri`, which production calls to reach a
+    // host.
     const uri0 = try manager.buildUpstreamUri(allocator, id0, "/x", "");
     defer allocator.free(uri0);
     const uri1 = try manager.buildUpstreamUri(allocator, id1, "/x", "");
@@ -366,7 +338,7 @@ test "UpstreamManager multiple upstreams" {
 }
 
 // =============================================================================
-// Header filtering, ported from io/transport.zig
+// Header filtering
 // =============================================================================
 
 pub fn shouldSkipRequestHeader(name: []const u8) bool {
@@ -380,13 +352,6 @@ pub fn shouldSkipResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
         std.ascii.eqlIgnoreCase(name, "connection");
-}
-
-test "header skip helpers" {
-    try std.testing.expect(shouldSkipRequestHeader("Host"));
-    try std.testing.expect(shouldSkipResponseHeader("Transfer-Encoding"));
-    try std.testing.expect(!shouldSkipRequestHeader("Content-Type"));
-    try std.testing.expect(!shouldSkipResponseHeader("X-Test"));
 }
 
 test "shouldSkipRequestHeader" {

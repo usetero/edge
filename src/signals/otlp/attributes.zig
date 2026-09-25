@@ -28,12 +28,20 @@ pub fn getStringValue(value: ?AnyValue) ?[]const u8 {
     };
 }
 
-/// Find a top-level attribute by key and return its string value.
-pub fn findAttribute(attributes: []const KeyValue, key: []const u8) ?[]const u8 {
+/// Walk `path` into nested kvlist values. Stop at the first key match.
+/// Return null when a segment is missing, when an intermediate value is not a
+/// kvlist, or when the path is empty.
+fn findNestedValue(attributes: []const KeyValue, path: []const []const u8) ?AnyValue {
+    if (path.len == 0) return null;
     for (attributes) |kv| {
-        if (std.mem.eql(u8, kv.key, key)) {
-            return getStringValue(kv.value);
-        }
+        if (!std.mem.eql(u8, kv.key, path[0])) continue;
+        if (path.len == 1) return kv.value;
+        const val = kv.value orelse return null;
+        const inner = val.value orelse return null;
+        return switch (inner) {
+            .kvlist_value => |kvlist| findNestedValue(kvlist.values.items, path[1..]),
+            else => null,
+        };
     }
     return null;
 }
@@ -42,49 +50,21 @@ pub fn findAttribute(attributes: []const KeyValue, key: []const u8) ?[]const u8 
 /// nodes.  Returns the string value at the leaf, or null if any segment
 /// is missing or the leaf is not a string.
 pub fn findNestedAttribute(attributes: []const KeyValue, path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return null;
-
-    for (attributes) |kv| {
-        if (std.mem.eql(u8, kv.key, path[0])) {
-            if (path.len == 1) {
-                return getStringValue(kv.value);
-            }
-            const val = kv.value orelse return null;
-            const inner = val.value orelse return null;
-            switch (inner) {
-                .kvlist_value => |kvlist| {
-                    return findNestedAttribute(kvlist.values.items, path[1..]);
-                },
-                else => return null,
-            }
-        }
-    }
-    return null;
+    return getStringValue(findNestedValue(attributes, path));
 }
 
 // =============================================================================
 // Typed read helpers (equals/gt/gte/lt/lte matchers + probabilistic sampling)
 // =============================================================================
 //
-// The policy engine prefers `accessor.typed_value` so non-string fields match
-// by type, and so the sampler gets identifier bytes (trace_id/span_id) as raw
-// `TypedValue.bytes` rather than their string form. See policy_zig's
-// probabilistic_sampler: it reads the last 7 bytes of a 16-byte trace_id, so a
-// hex-string trace_id MUST be decoded to bytes first or sampling is wrong.
+// Typed reads. The engine reads fields through typed_value, so non-string
+// fields match by type. Identifier fields read as raw bytes because the
+// sampler hashes the last 7 bytes of a 16-byte trace_id.
 
 /// Wrap a non-empty string as a TypedValue, or null when empty/absent.
 pub fn typedStr(s: ?[]const u8) ?TypedValue {
     const v = s orelse return null;
     return if (v.len == 0) null else TypedValue{ .string = v };
-}
-
-/// Decode a lowercase-hex identifier (trace_id/span_id from OTLP/JSON) to raw
-/// bytes in `allocator`. Returns null for empty/odd-length/non-hex input.
-pub fn typedHexBytes(allocator: std.mem.Allocator, hex_str: []const u8) ?TypedValue {
-    if (hex_str.len == 0 or hex_str.len % 2 != 0) return null;
-    const out = allocator.alloc(u8, hex_str.len / 2) catch return null;
-    _ = std.fmt.hexToBytes(out, hex_str) catch return null;
-    return .{ .bytes = out };
 }
 
 /// Wrap raw identifier bytes (16/8-byte trace_id/span_id from protobuf) as
@@ -93,11 +73,8 @@ pub fn typedBytes(b: []const u8) ?TypedValue {
     return if (b.len == 0) null else TypedValue{ .bytes = b };
 }
 
-/// OTLP/JSON hex-encodes only the identifier `bytes` fields; every other bytes
-/// field (e.g. `AnyValue.bytes_value`) stays base64. Pass this to the protobuf
-/// json codec's `hex_bytes_fields` for both decode and encode so ids round-trip
-/// as hex while other bytes fields are left untouched. In memory the decoded
-/// ids are always raw bytes (identical to the binary wire path).
+/// Identifier fields that OTLP/JSON encodes as hex. All other bytes fields
+/// stay base64. Pass to the JSON codec hex_bytes_fields on decode and encode.
 pub const hex_id_fields: []const []const u8 = &.{ "trace_id", "span_id", "parent_span_id" };
 
 /// Typed view of an AnyValue: maps each scalar OTLP variant to its TypedValue.
@@ -118,18 +95,7 @@ pub fn anyValueTyped(value: ?AnyValue) ?TypedValue {
 /// Typed counterpart to `findNestedAttribute`: walks `path` into nested kvlists
 /// and returns the leaf's typed value.
 pub fn findNestedAttributeTyped(attributes: []const KeyValue, path: []const []const u8) ?TypedValue {
-    if (path.len == 0) return null;
-    for (attributes) |kv| {
-        if (!std.mem.eql(u8, kv.key, path[0])) continue;
-        if (path.len == 1) return anyValueTyped(kv.value);
-        const val = kv.value orelse return null;
-        const inner = val.value orelse return null;
-        switch (inner) {
-            .kvlist_value => |kvlist| return findNestedAttributeTyped(kvlist.values.items, path[1..]),
-            else => return null,
-        }
-    }
-    return null;
+    return anyValueTyped(findNestedValue(attributes, path));
 }
 
 /// Return the index of the first attribute whose key matches, or null.
@@ -146,13 +112,9 @@ pub fn findAttrIndex(attrs: []const KeyValue, key: []const u8) ?usize {
 
 /// Remove the first attribute matching `key`.  Returns true if found.
 pub fn removeAttribute(attributes: *std.ArrayList(KeyValue), key: []const u8) bool {
-    for (attributes.items, 0..) |kv, i| {
-        if (std.mem.eql(u8, kv.key, key)) {
-            _ = attributes.orderedRemove(i);
-            return true;
-        }
-    }
-    return false;
+    const i = findAttrIndex(attributes.items, key) orelse return false;
+    _ = attributes.orderedRemove(i);
+    return true;
 }
 
 /// Remove by path — currently only supports top-level keys.
@@ -169,11 +131,9 @@ pub fn setAttribute(
     key: []const u8,
     value: []const u8,
 ) bool {
-    for (attributes.items) |*kv| {
-        if (std.mem.eql(u8, kv.key, key)) {
-            kv.value = .{ .value = .{ .string_value = value } };
-            return true;
-        }
+    if (findAttrIndex(attributes.items, key)) |i| {
+        attributes.items[i].value = .{ .value = .{ .string_value = value } };
+        return true;
     }
     attributes.append(allocator, .{
         .key = key,
@@ -196,13 +156,6 @@ pub fn setAttributeByPath(
 // =============================================================================
 // Datadog helpers
 // =============================================================================
-
-/// Return the first path segment, or null for empty paths.
-/// Datadog uses flat attributes so only the first segment is meaningful.
-pub fn getFirstPathSegment(path: []const []const u8) ?[]const u8 {
-    if (path.len == 0) return null;
-    return path[0];
-}
 
 /// zimdjson AnyValue type used by Datadog log/metric extra fields.
 pub const ZimdjsonAnyValue = zimdjson.ondemand.FullParser(.default).AnyValue;
@@ -330,9 +283,6 @@ test "getStringValue - empty string" {
 }
 
 // ── anyValueTyped / findNestedAttributeTyped ──────────
-// These back the typed read primitive for all three OTLP signals (logs,
-// traces, metrics), so the typed matchers (equals/gt/gte/lt/lte) fire on
-// non-string attribute values instead of silently missing them.
 
 test "anyValueTyped - each variant maps to its native type" {
     try std.testing.expectEqual(@as(i64, 42), anyValueTyped(.{ .value = .{ .int_value = 42 } }).?.int);
@@ -358,44 +308,6 @@ test "findNestedAttributeTyped - typed leaf and nested walk" {
         .values = .{ .items = inner, .capacity = inner.len },
     } } } }};
     try std.testing.expectEqual(@as(i64, 404), findNestedAttributeTyped(&nested, &.{ "http", "status" }).?.int);
-}
-
-// ── findAttribute ──────────
-
-test "findAttribute - found" {
-    const attrs = [_]KeyValue{
-        makeKv("host", "server-1"),
-        makeKv("region", "us-east"),
-    };
-    try std.testing.expectEqualStrings("us-east", findAttribute(&attrs, "region").?);
-}
-
-test "findAttribute - not found" {
-    const attrs = [_]KeyValue{makeKv("host", "server-1")};
-    try std.testing.expectEqual(@as(?[]const u8, null), findAttribute(&attrs, "missing"));
-}
-
-test "findAttribute - empty list" {
-    const attrs: [0]KeyValue = .{};
-    try std.testing.expectEqual(@as(?[]const u8, null), findAttribute(&attrs, "any"));
-}
-
-test "findAttribute - first match wins" {
-    const attrs = [_]KeyValue{
-        makeKv("key", "first"),
-        makeKv("key", "second"),
-    };
-    try std.testing.expectEqualStrings("first", findAttribute(&attrs, "key").?);
-}
-
-test "findAttribute - non-string value returns null" {
-    const attrs = [_]KeyValue{makeIntKv("count", 42)};
-    try std.testing.expectEqual(@as(?[]const u8, null), findAttribute(&attrs, "count"));
-}
-
-test "findAttribute - null value returns null" {
-    const attrs = [_]KeyValue{makeNullKv("empty")};
-    try std.testing.expectEqual(@as(?[]const u8, null), findAttribute(&attrs, "empty"));
 }
 
 // ── findNestedAttribute ──────────
@@ -678,23 +590,6 @@ test "setAttributeByPath - multi-segment uses first" {
     try std.testing.expect(setAttributeByPath(alloc, &list, &path, "GET"));
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
     try std.testing.expectEqualStrings("http", list.items[0].key);
-}
-
-// ── getFirstPathSegment ──────────
-
-test "getFirstPathSegment - non-empty" {
-    const path = [_][]const u8{ "first", "second" };
-    try std.testing.expectEqualStrings("first", getFirstPathSegment(&path).?);
-}
-
-test "getFirstPathSegment - single element" {
-    const path = [_][]const u8{"only"};
-    try std.testing.expectEqualStrings("only", getFirstPathSegment(&path).?);
-}
-
-test "getFirstPathSegment - empty" {
-    const path: [0][]const u8 = .{};
-    try std.testing.expectEqual(@as(?[]const u8, null), getFirstPathSegment(&path));
 }
 
 // ── findExtraField ──────────

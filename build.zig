@@ -7,6 +7,33 @@ fn keepProfilingSymbols(m: *std.Build.Module) void {
     m.strip = false;
 }
 
+const EdgeExeOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    imports: []const std.Build.Module.Import,
+    build_options: *std.Build.Step.Options,
+    profiling: bool,
+};
+
+/// Adds one edge executable with the shared imports, build options, and libc + zstd.
+fn addEdgeExe(b: *std.Build, name: []const u8, source: []const u8, options: EdgeExeOptions) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = options.imports,
+        }),
+    });
+    exe.root_module.addOptions("build_options", options.build_options);
+    exe.root_module.link_libc = true;
+    exe.root_module.linkSystemLibrary("z", .{});
+    exe.root_module.linkSystemLibrary("zstd", .{});
+    if (options.profiling) keepProfilingSymbols(exe.root_module);
+    return exe;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -18,14 +45,9 @@ pub fn build(b: *std.Build) void {
     const profiling = b.option(bool, "profiling", "Keep frame pointers and symbols for profilers") orelse false;
     const version = b.option([]const u8, "version", "Build version exposed in metrics") orelse "dev";
     const commit = b.option([]const u8, "commit", "Build commit exposed in metrics") orelse "unknown";
-    // stdio is the default. httpz hands a batch of up to 16 requests to one
-    // pool thread, so one slow intake response parks the rest of that batch,
-    // and a health probe behind them times out — the ECS incident this suite
-    // reproduces (bench/matrix: c02, c05). stdio runs a task per connection,
-    // and measures 2 to 2.8 times the throughput of httpz once the intake is
-    // slow, with a p99.9 within 50 ms of its p50 instead of ten times it.
-    // httpz stays buildable and tested: bench/matrix runs every case against
-    // both.
+    // stdio is the default. httpz gives one pool thread a batch of up to 16 requests, so one slow
+    // intake response blocks the batch, health probes included (bench/matrix c02, c05).
+    // bench/matrix runs every case against both frontends.
     const frontend = b.option(
         Frontend,
         "frontend",
@@ -114,31 +136,23 @@ pub fn build(b: *std.Build) void {
     // Main Executable
     // ==========================================================================
 
-    const exe = b.addExecutable(.{
-        .name = "edge",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "edge", .module = mod },
-            },
-        }),
-    });
-    exe.root_module.addImport("proto", proto_mod);
-    exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
-    exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
-    exe.root_module.addImport("o11y", o11y_mod);
-    exe.root_module.addImport("extensions", ext_mod);
-    exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
-    exe.root_module.addImport("httpz", httpz_mod);
-    exe.root_module.addOptions("build_options", build_options);
-    exe.root_module.link_libc = true;
-    exe.root_module.linkSystemLibrary("z", .{});
-    exe.root_module.linkSystemLibrary("zstd", .{});
+    const exe_options: EdgeExeOptions = .{
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "proto", .module = proto_mod },
+            .{ .name = "zimdjson", .module = zimdjson.module("zimdjson") },
+            .{ .name = "policy_zig", .module = policy_dep.module("policy_zig") },
+            .{ .name = "o11y", .module = o11y_mod },
+            .{ .name = "extensions", .module = ext_mod },
+            .{ .name = "metrics_zig", .module = metrics_dep.module("metrics") },
+            .{ .name = "httpz", .module = httpz_mod },
+        },
+        .build_options = build_options,
+        .profiling = profiling,
+    };
 
-    if (profiling) keepProfilingSymbols(exe.root_module);
-
+    const exe = addEdgeExe(b, "edge", "src/main.zig", exe_options);
     b.installArtifact(exe);
 
     // ==========================================================================
@@ -159,27 +173,7 @@ pub fn build(b: *std.Build) void {
         const source = dist[1];
         const desc = dist[2];
 
-        const dist_exe = b.addExecutable(.{
-            .name = "edge-" ++ name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(source),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        dist_exe.root_module.addImport("proto", proto_mod);
-        dist_exe.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
-        dist_exe.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
-        dist_exe.root_module.addImport("o11y", o11y_mod);
-        dist_exe.root_module.addImport("extensions", ext_mod);
-        dist_exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
-        dist_exe.root_module.addImport("httpz", httpz_mod);
-        dist_exe.root_module.addOptions("build_options", build_options);
-        dist_exe.root_module.link_libc = true;
-        dist_exe.root_module.linkSystemLibrary("z", .{});
-        dist_exe.root_module.linkSystemLibrary("zstd", .{});
-
-        if (profiling) keepProfilingSymbols(dist_exe.root_module);
+        const dist_exe = addEdgeExe(b, "edge-" ++ name, source, exe_options);
 
         const dist_step = b.step(name, "Build the " ++ name ++ " distribution (" ++ desc ++ ")");
         dist_step.dependOn(&b.addInstallArtifact(dist_exe, .{}).step);
@@ -212,17 +206,10 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    // Only tests use zlib: compress_buffered.zig is the test oracle.
     mod_tests.root_module.link_libc = true;
     mod_tests.root_module.linkSystemLibrary("z", .{});
     mod_tests.root_module.linkSystemLibrary("zstd", .{});
-    mod_tests.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
-    mod_tests.root_module.addOptions("build_options", build_options);
-    // Benchmark fixture embedded by test-only code in src/signals/otlp/metrics.zig.
-    // It lives under bench/ (outside the src package), so @embedFile needs it wired
-    // in as a named module import rather than a relative path.
-    mod_tests.root_module.addAnonymousImport("otlp_metrics_benchmark_pb", .{
-        .root_source_file = b.path("bench/scaling/payloads/otlp-metrics.pb"),
-    });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
@@ -232,18 +219,20 @@ pub fn build(b: *std.Build) void {
     // package), so its tests need their own artifact or they never run. The
     // matrix trusts this binary to behave like an intake, which makes its
     // parsing and its `/stats` output worth a check.
-    const echo_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/echo_server.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    echo_tests.root_module.addImport("head_repair", b.createModule(.{
-        .root_source_file = b.path("src/frontend/stdio/head_repair.zig"),
+    //
+    // The fake intake must take the heads a real intake takes, so it shares
+    // the frontend's head repair rather than keeping its own copy.
+    const echo_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/echo_server.zig"),
         .target = target,
         .optimize = optimize,
-    }));
+        .imports = &.{.{ .name = "head_repair", .module = b.createModule(.{
+            .root_source_file = b.path("src/frontend/stdio/head_repair.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) }},
+    });
+    const echo_tests = b.addTest(.{ .root_module = echo_mod });
     test_step.dependOn(&b.addRunArtifact(echo_tests).step);
 
     // Real-storage smoke test for the s3-dump extension, filtered to the MinIO
@@ -254,14 +243,6 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
         .filters = &.{"e2e minio"},
     });
-    s3_e2e_tests.root_module.link_libc = true;
-    s3_e2e_tests.root_module.linkSystemLibrary("z", .{});
-    s3_e2e_tests.root_module.linkSystemLibrary("zstd", .{});
-    s3_e2e_tests.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
-    s3_e2e_tests.root_module.addOptions("build_options", build_options);
-    s3_e2e_tests.root_module.addAnonymousImport("otlp_metrics_benchmark_pb", .{
-        .root_source_file = b.path("bench/scaling/payloads/otlp-metrics.pb"),
-    });
     const run_s3_e2e_tests = b.addRunArtifact(s3_e2e_tests);
     const s3_e2e_step = b.step("test-s3-e2e", "Run the s3-dump MinIO smoke test (needs S3 env vars)");
     s3_e2e_step.dependOn(&run_s3_e2e_tests.step);
@@ -270,27 +251,12 @@ pub fn build(b: *std.Build) void {
     // Benchmark Tools
     // ==========================================================================
 
-    const echo_server = b.addExecutable(.{
-        .name = "echo-server",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/echo_server.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    // The fake intake must take the heads a real intake takes, so it shares
-    // the frontend's head repair rather than keeping its own copy.
-    echo_server.root_module.addImport("head_repair", b.createModule(.{
-        .root_source_file = b.path("src/frontend/stdio/head_repair.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
+    const echo_server = b.addExecutable(.{ .name = "echo-server", .root_module = echo_mod });
 
     const echo_step = b.step("echo-server", "Build the echo server for benchmarking");
     echo_step.dependOn(&b.addInstallArtifact(echo_server, .{}).step);
 
-    // Upstream connection-pool poisoning harness: reproduces the stale-keepalive
-    // poison (ziglang/zig#30165 send-side) and verifies the eviction fix.
+    // Pool harness: checks that edge evicts a stale keep-alive connection and retries.
     const pool_harness = b.addExecutable(.{
         .name = "upstream-pool-harness",
         .root_module = b.createModule(.{

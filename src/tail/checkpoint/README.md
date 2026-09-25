@@ -25,10 +25,9 @@ The new design separates concerns:
 
 Each update is `(FileIdentity, offset, last_seen_ns)`.
 
-The in-memory store keeps two indexes:
-
-1. identity hash `(dev,inode,fingerprint)`
-2. inode fallback hash `(dev,inode)`
+The in-memory store keeps one index, keyed by the identity hash
+`(dev,inode,fingerprint)`. A file with new content at the same inode gets a new
+fingerprint, so it does not match an old offset.
 
 ## Write path
 

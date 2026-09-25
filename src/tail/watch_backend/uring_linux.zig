@@ -191,19 +191,9 @@ fn parseInotifyEvents(self: anytype, u: *State, buf: []const u8) void {
         if (u.file_wd_to_idx.get(ev.wd)) |idx| {
             self.markDirty(idx);
         } else if (u.dir_wd_to_path.get(ev.wd)) |dir_path| {
-            markTrackedInDirDirty(self, dir_path);
+            self.markDirDirty(dir_path);
         }
         off += @sizeOf(std.os.linux.inotify_event) + ev.len;
-    }
-}
-
-fn markTrackedInDirDirty(self: anytype, dir_path: []const u8) void {
-    var i: usize = 0;
-    while (i < self.paths.items.len) : (i += 1) {
-        const tracked_dir = std.fs.path.dirname(self.paths.items[i]) orelse ".";
-        if (std.mem.eql(u8, tracked_dir, dir_path)) {
-            self.markDirty(@intCast(i));
-        }
     }
 }
 

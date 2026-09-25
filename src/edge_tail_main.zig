@@ -13,6 +13,25 @@ const ReadFrom = tail_mod.types.ReadFrom;
 const InputFormat = tail_mod.types.InputFormat;
 const IoEngine = tail_mod.types.IoEngine;
 
+/// Numeric CLI flags. Each value is parsed with the type of its config field.
+const NumericFlag = struct { flag: []const u8, field: []const u8 };
+const numeric_flags = [_]NumericFlag{
+    .{ .flag = "--poll-ms", .field = "poll_ms" },
+    .{ .flag = "--glob-interval-ms", .field = "glob_interval_ms" },
+    .{ .flag = "--rotate-wait-ms", .field = "rotate_wait_ms" },
+    .{ .flag = "--removed-expire-ms", .field = "removed_expire_ms" },
+    .{ .flag = "--checkpoint-interval-ms", .field = "checkpoint_interval_ms" },
+    .{ .flag = "--checkpoint-sync-batch", .field = "checkpoint_sync_batch" },
+    .{ .flag = "--checkpoint-snapshot-interval-ms", .field = "checkpoint_snapshot_interval_ms" },
+    .{ .flag = "--checkpoint-ttl-ms", .field = "checkpoint_ttl_ms" },
+    .{ .flag = "--checkpoint-max-slots", .field = "checkpoint_max_slots" },
+    .{ .flag = "--read-buf", .field = "read_buf" },
+    .{ .flag = "--max-line", .field = "max_line" },
+    .{ .flag = "--write-buf", .field = "write_buf" },
+    .{ .flag = "--flush-interval-ms", .field = "flush_interval_ms" },
+    .{ .flag = "--flush-lines", .field = "flush_line_threshold" },
+};
+
 const CliOptions = struct {
     config_path: ?[]const u8 = null,
     output_override: ?[]const u8 = null,
@@ -21,21 +40,8 @@ const CliOptions = struct {
     policy_path_override: ?[]const u8 = null,
     io_engine_override: ?IoEngine = null,
     verbose_increment: u8 = 0,
-    poll_ms_override: ?u64 = null,
-    glob_interval_ms_override: ?u64 = null,
-    rotate_wait_ms_override: ?u64 = null,
-    removed_expire_ms_override: ?u64 = null,
-    checkpoint_interval_ms_override: ?u64 = null,
-    checkpoint_sync_batch_override: ?u32 = null,
-    checkpoint_snapshot_interval_ms_override: ?u64 = null,
-    checkpoint_ttl_ms_override: ?u64 = null,
-    checkpoint_max_slots_override: ?usize = null,
     state_dir_override: ?[]const u8 = null,
-    read_buf_override: ?usize = null,
-    max_line_override: ?usize = null,
-    write_buf_override: ?usize = null,
-    flush_interval_ms_override: ?u64 = null,
-    flush_line_threshold_override: ?usize = null,
+    numeric: [numeric_flags.len]?u64 = @splat(null),
     inputs: std.ArrayList([]const u8),
 
     fn deinit(self: *CliOptions, allocator: std.mem.Allocator) void {
@@ -90,30 +96,6 @@ fn printUsage(io: std.Io) !void {
     try stderr.flush();
 }
 
-fn parseReadFrom(value: []const u8) !ReadFrom {
-    if (std.mem.eql(u8, value, "head")) return .head;
-    if (std.mem.eql(u8, value, "tail")) return .tail;
-    if (std.mem.eql(u8, value, "checkpoint")) return .checkpoint;
-    return error.InvalidReadFrom;
-}
-
-fn parseInputFormat(value: []const u8) !InputFormat {
-    if (std.mem.eql(u8, value, "raw")) return .raw;
-    if (std.mem.eql(u8, value, "json")) return .json;
-    if (std.mem.eql(u8, value, "logfmt")) return .logfmt;
-    return error.InvalidFormat;
-}
-
-fn parseIoEngine(value: []const u8) !IoEngine {
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "uring")) return .uring;
-    if (std.mem.eql(u8, value, "kqueue")) return .kqueue;
-    if (std.mem.eql(u8, value, "poll")) return .poll;
-    if (std.mem.eql(u8, value, "inotify")) return .inotify;
-    if (std.mem.eql(u8, value, "epoll")) return .epoll;
-    return error.InvalidIoEngine;
-}
-
 fn parseCliOptions(init: std.process.Init) !CliOptions {
     const allocator = init.gpa;
     const io = init.io;
@@ -124,7 +106,7 @@ fn parseCliOptions(init: std.process.Init) !CliOptions {
     var opts: CliOptions = .{ .inputs = .empty };
     errdefer opts.deinit(allocator);
 
-    while (it.next()) |arg| {
+    args: while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try printUsage(io);
             return error.HelpRequested;
@@ -144,12 +126,12 @@ fn parseCliOptions(init: std.process.Init) !CliOptions {
         }
         if (std.mem.eql(u8, arg, "--read-from")) {
             const v = it.next() orelse return error.MissingOptionValue;
-            opts.read_from_override = try parseReadFrom(v);
+            opts.read_from_override = std.meta.stringToEnum(ReadFrom, v) orelse return error.InvalidReadFrom;
             continue;
         }
         if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--format")) {
             const v = it.next() orelse return error.MissingOptionValue;
-            opts.format_override = try parseInputFormat(v);
+            opts.format_override = std.meta.stringToEnum(InputFormat, v) orelse return error.InvalidFormat;
             continue;
         }
         if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--policy")) {
@@ -160,57 +142,19 @@ fn parseCliOptions(init: std.process.Init) !CliOptions {
         }
         if (std.mem.eql(u8, arg, "--io-engine")) {
             const v = it.next() orelse return error.MissingOptionValue;
-            opts.io_engine_override = try parseIoEngine(v);
+            opts.io_engine_override = std.meta.stringToEnum(IoEngine, v) orelse return error.InvalidIoEngine;
             continue;
         }
         if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             if (opts.verbose_increment < std.math.maxInt(u8)) opts.verbose_increment += 1;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--poll-ms")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.poll_ms_override = try std.fmt.parseInt(u64, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--glob-interval-ms")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.glob_interval_ms_override = try std.fmt.parseInt(u64, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--rotate-wait-ms")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.rotate_wait_ms_override = try std.fmt.parseInt(u64, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--removed-expire-ms")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.removed_expire_ms_override = try std.fmt.parseInt(u64, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--checkpoint-interval-ms")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.checkpoint_interval_ms_override = try std.fmt.parseInt(u64, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--checkpoint-sync-batch")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.checkpoint_sync_batch_override = try std.fmt.parseInt(u32, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--checkpoint-snapshot-interval-ms")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.checkpoint_snapshot_interval_ms_override = try std.fmt.parseInt(u64, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--checkpoint-ttl-ms")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.checkpoint_ttl_ms_override = try std.fmt.parseInt(u64, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--checkpoint-max-slots")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.checkpoint_max_slots_override = try std.fmt.parseInt(usize, v, 10);
-            continue;
+        inline for (numeric_flags, 0..) |nf, i| {
+            if (std.mem.eql(u8, arg, nf.flag)) {
+                const v = it.next() orelse return error.MissingOptionValue;
+                opts.numeric[i] = try std.fmt.parseInt(@FieldType(RuntimeTailConfig, nf.field), v, 10);
+                continue :args;
+            }
         }
         if (std.mem.eql(u8, arg, "--state-dir")) {
             const v = it.next() orelse return error.MissingOptionValue;
@@ -218,37 +162,8 @@ fn parseCliOptions(init: std.process.Init) !CliOptions {
             opts.state_dir_override = try allocator.dupe(u8, v);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--read-buf")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.read_buf_override = try std.fmt.parseInt(usize, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--max-line")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.max_line_override = try std.fmt.parseInt(usize, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--write-buf")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.write_buf_override = try std.fmt.parseInt(usize, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--flush-interval-ms")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.flush_interval_ms_override = try std.fmt.parseInt(u64, v, 10);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--flush-lines")) {
-            const v = it.next() orelse return error.MissingOptionValue;
-            opts.flush_line_threshold_override = try std.fmt.parseInt(usize, v, 10);
-            continue;
-        }
 
-        if (std.mem.eql(u8, arg, "-")) {
-            try opts.inputs.append(allocator, try allocator.dupe(u8, arg));
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
+        if (!std.mem.eql(u8, arg, "-") and std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
 
         try opts.inputs.append(allocator, try allocator.dupe(u8, arg));
     }
@@ -282,15 +197,12 @@ pub fn main(init: std.process.Init) !void {
     };
     defer opts.deinit(allocator);
 
-    const loaded_cfg = zonfig.load(RuntimeTailConfig, allocator, io, .{
+    const loaded_cfg = try zonfig.load(RuntimeTailConfig, allocator, io, .{
         .json_path = opts.config_path,
         .env_prefix = "TERO",
         .allow_env_only = opts.config_path == null,
         .environ = init.environ_map,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        else => return err,
-    };
+    });
     defer zonfig.deinit(RuntimeTailConfig, allocator, loaded_cfg);
 
     var cfg = loaded_cfg.*;
@@ -299,21 +211,10 @@ pub fn main(init: std.process.Init) !void {
     if (opts.format_override) |v| cfg.input_format = v;
     if (opts.policy_path_override) |v| cfg.policy_path = v;
     if (opts.io_engine_override) |v| cfg.io_engine = v;
-    if (opts.poll_ms_override) |v| cfg.poll_ms = v;
-    if (opts.glob_interval_ms_override) |v| cfg.glob_interval_ms = v;
-    if (opts.rotate_wait_ms_override) |v| cfg.rotate_wait_ms = v;
-    if (opts.removed_expire_ms_override) |v| cfg.removed_expire_ms = v;
-    if (opts.checkpoint_interval_ms_override) |v| cfg.checkpoint_interval_ms = v;
-    if (opts.checkpoint_sync_batch_override) |v| cfg.checkpoint_sync_batch = v;
-    if (opts.checkpoint_snapshot_interval_ms_override) |v| cfg.checkpoint_snapshot_interval_ms = v;
-    if (opts.checkpoint_ttl_ms_override) |v| cfg.checkpoint_ttl_ms = v;
-    if (opts.checkpoint_max_slots_override) |v| cfg.checkpoint_max_slots = v;
     if (opts.state_dir_override) |v| cfg.state_dir = v;
-    if (opts.read_buf_override) |v| cfg.read_buf = v;
-    if (opts.max_line_override) |v| cfg.max_line = v;
-    if (opts.write_buf_override) |v| cfg.write_buf = v;
-    if (opts.flush_interval_ms_override) |v| cfg.flush_interval_ms = v;
-    if (opts.flush_line_threshold_override) |v| cfg.flush_line_threshold = v;
+    inline for (numeric_flags, opts.numeric) |nf, value| {
+        if (value) |v| @field(cfg, nf.field) = @intCast(v);
+    }
     cfg.io_engine = tail_mod.types.normalizeIoEngine(cfg.io_engine);
 
     try validate(opts, cfg);
