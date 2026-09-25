@@ -1,17 +1,6 @@
-//! Lambda Extension Distribution Entry Point
-//!
-//! A Lambda extension distribution for Datadog telemetry ingestion with filtering.
-//! Runs as an external extension, intercepting telemetry from Lambda functions.
-//!
-//! Architecture:
-//! - Main thread: Lambda Extensions API event loop
-//! - Background: httpz proxy server (multi-threaded)
-//!
-//! Features:
-//! - Policy-based log/metric filtering
-//! - Fail-open behavior
-//! - Graceful shutdown within Lambda's deadline
-//! - Environment-based configuration (via zonfig)
+//! Lambda extension distribution: Datadog ingestion with policy filtering.
+//! The main thread runs the Lambda Extensions API event loop. The engine runs in the background.
+//! Config comes from TERO_* env vars.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -29,17 +18,10 @@ const lambda = @import("lambda/root.zig");
 const ExtensionClient = lambda.ExtensionClient;
 
 const o11y = @import("o11y");
-const EventBus = o11y.EventBus;
 const StdLogAdapter = o11y.StdLogAdapter;
 const Level = o11y.Level;
 
 const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
-
-/// Lambda ships the datadog service set: health + datadog logs/metrics +
-/// passthrough, same composition the old module wiring built by hand.
-const lambda_service_kinds = [_]edge.distro.ServiceKind{
-    .health, .datadog_logs, .datadog_metrics, .passthrough,
-};
 
 // =============================================================================
 // Lambda Configuration
@@ -114,10 +96,7 @@ pub const LambdaConfig = struct {
             self.max_connections = clamped;
         }
 
-        // httpz starts one accept/event-loop thread per worker and one handler
-        // thread per pool slot. A 0 override binds the port but never accepts
-        // (or never handles), so every request hangs until timeout. Treat 0 as
-        // "use httpz default" (null) rather than wedging the data plane.
+        // A zero worker or pool count binds the port but never serves a request. Treat 0 as null (the httpz default).
         if (self.worker_count) |w| if (w == 0) {
             std.log.warn("TERO_WORKER_COUNT=0 starts no accept threads; using httpz default", .{});
             self.worker_count = null;
@@ -133,12 +112,7 @@ pub const LambdaConfig = struct {
     }
 };
 
-/// Route std.log through our EventBus adapter
-pub const std_options: std.Options = .{
-    .log_level = .debug,
-    .logFn = StdLogAdapter.logFn,
-    .enable_segfault_handler = true,
-};
+pub const std_options = app.std_options;
 pub const debug = crash.debug;
 
 // =============================================================================
@@ -161,13 +135,6 @@ const StaticPoliciesLoaded = struct { count: usize };
 const StaticPoliciesError = struct { err: []const u8 };
 
 // =============================================================================
-// Global State
-// =============================================================================
-
-var global_event_bus: ?*EventBus = null;
-var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-// =============================================================================
 // Main Entry Point
 // =============================================================================
 
@@ -188,9 +155,6 @@ pub fn main(init: std.process.Init) !void {
     StdLogAdapter.init(bus);
     defer StdLogAdapter.deinit();
 
-    global_event_bus = bus;
-    defer global_event_bus = null;
-
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
     bus.info(LambdaExtensionStarting{});
 
@@ -207,14 +171,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer zonfig.deinit(LambdaConfig, allocator, config);
 
-    // zonfig can't populate a slice-of-struct from an env var, so the env-only
-    // Lambda takes its s3-dump targets as a JSON array in
-    // TERO_S3_DUMP_TARGETS_JSON (see config_types.S3DumpConfig.targets_json).
-    // Kept in its own Parsed arena — NOT spliced into `config.s3_dump.targets`,
-    // since zonfig.deinit would then try to free arena-owned memory. We pass a
-    // struct copy with `.targets` overridden to `configure` below instead.
-    // Gated on `enabled`: a disabled extension is inert, so a malformed or
-    // stale TERO_S3_DUMP_TARGETS_JSON must be a no-op, not a startup abort.
+    // zonfig cannot read a slice of structs from an env var, so Lambda reads s3-dump targets as JSON
+    // from TERO_S3_DUMP_TARGETS_JSON. Keep the parsed targets in their own arena: zonfig.deinit would
+    // free them in config.s3_dump.targets. Parse only when enabled, so a bad value cannot stop startup.
     var s3_targets: []const config_types.S3TargetConfig = config.s3_dump.targets;
     var targets_parsed: ?std.json.Parsed([]const config_types.S3TargetConfig) = null;
     defer if (targets_parsed) |p| p.deinit();
@@ -250,20 +209,14 @@ pub fn main(init: std.process.Init) !void {
         std.Io.Timestamp.now(io, .real).toMilliseconds(),
         std.Thread.getCurrentId(),
     });
-    const instance_id_copy = try allocator.dupe(u8, instance_id);
-    defer allocator.free(instance_id_copy);
 
     // Build service metadata
     const service_metadata: policy.ServiceMetadata = .{
         .name = config.service.name,
         .namespace = config.service.namespace,
         .version = config.service.version,
-        .instance_id = instance_id_copy,
-        .supported_stages = &.{
-            .POLICY_STAGE_LOG_FILTER,
-            .POLICY_STAGE_LOG_TRANSFORM,
-            .POLICY_STAGE_METRIC_FILTER,
-        },
+        .instance_id = instance_id,
+        .supported_stages = edge.distro.supportedStagesFor(.datadog),
     };
 
     var registry = policy.Registry.init(allocator, bus);
@@ -348,8 +301,7 @@ pub fn main(init: std.process.Init) !void {
         try loader.?.startAsync(io);
     }
 
-    // Create Datadog module configuration
-    const kinds: []const edge.distro.ServiceKind = &lambda_service_kinds;
+    const kinds = edge.distro.servicesFor(.datadog);
     const engine = try app.Engine.create(allocator, io, bus, &registry, &runtime_metrics, kinds, .{
         .listen_address = config.listen_address,
         .listen_port = config.listen_port,
@@ -365,10 +317,8 @@ pub fn main(init: std.process.Init) !void {
     });
     defer engine.destroy();
 
-    // Register with the Lambda Extensions API BEFORE starting the proxy thread.
-    // If registration fails (e.g. AWS_LAMBDA_RUNTIME_API unset/unreachable when
-    // run outside Lambda), there is no accept-loop thread to tear down — so we
-    // fail cleanly instead of racing httpz's stop()/destroy (segfault or hang).
+    // Register before the engine starts. If registration fails (for example, outside Lambda),
+    // no accept loop exists to tear down.
     var extension = try ExtensionClient.init(allocator, io, bus, init.environ_map, "tero-edge");
     defer extension.deinit();
     try extension.register();
@@ -384,7 +334,7 @@ pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    while (!shutdown_requested.load(.acquire)) {
+    while (true) {
         // Reset arena for each event
         _ = arena.reset(.retain_capacity);
 
@@ -399,12 +349,8 @@ pub fn main(init: std.process.Init) !void {
                 bus.debug(LambdaInvokeReceived{
                     .request_id = invoke_event.request_id,
                 });
-                // Lambda freezes the environment between invocations, so the
-                // server distro's wall-clock flush timer is unreliable here.
-                // Flush at each invoke boundary instead: receiving this event
-                // means the PRIOR invocation's function has completed, so its
-                // telemetry is fully batched. The final invocation's tail is
-                // drained by the SHUTDOWN force-flush below.
+                // Lambda freezes the process between invocations, so a timer flush is not reliable. INVOKE means
+                // the prior invocation is complete, so flush here. SHUTDOWN flushes the last invocation.
                 if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{}));
             },
             .shutdown => |shutdown_event| {
@@ -413,41 +359,25 @@ pub fn main(init: std.process.Init) !void {
                 });
 
                 // The two-phase S3 drain runs after the loop (see below).
-                shutdown_requested.store(true, .release);
                 engine.requestShutdown();
                 break;
             },
         }
     }
 
-    // Two-phase S3 drain across shutdown, `io` live throughout. `engine.stop()`
-    // joins in-flight connection tasks with no timeout and can block up to ~5s,
-    // while Lambda enforces `shutdown_event.deadline_ms` and may kill us mid-join
-    // — so a single flush is wrong on either side of stop():
-    //   1. BEFORE stop(): persist everything batched by the time SHUTDOWN
-    //      arrived. If a slow task join blows the deadline, the bulk of the
-    //      tail is already durable rather than lost.
-    //   2. AFTER stop(): every connection task has joined, so this captures
-    //      records a still-in-flight handler appended during the join window
-    //      (which a before-only flush would silently drop).
-    // The second flush is a cheap no-op when nothing new was appended.
+    // Flush s3-dump twice, with io live. engine.stop() can block for about 5 s, and Lambda can kill the
+    // process at its deadline.
+    //   1. Before stop(): persist the records batched when SHUTDOWN arrived.
+    //   2. After stop(): persist the records that in-flight handlers appended during the join.
     if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));
 
-    // Flush final policy stats to the control plane BEFORE engine.stop(). The
-    // sync provider reports per-policy stats (hits/misses/errors) only on its
-    // poll interval, which Lambda's freeze-between-invokes makes unreliable, so
-    // this final sync is the only one that carries real stats — and it must run
-    // with deadline budget to spare. engine.stop() can block up to ~5s joining
-    // connections and blow the Lambda shutdown deadline, so anything after it
-    // may never run. Stats are already accumulated (they don't need the drain),
-    // so sync here. Best-effort: a failed report must not crash shutdown; the
-    // deferred `deinit` won't re-sync.
+    // Send final policy stats before engine.stop(). The freeze makes the poll sync unreliable, so this
+    // sync carries the real stats. stop() can block past the deadline. A failure must not stop shutdown.
     if (loader) |l| l.close() catch |err|
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.err(LambdaExtensionError{ .err = @errorName(err) });
 
     // Cancel the accept loop and every connection task, then wait.
-    engine.requestShutdown();
     engine.stop();
 
     if (s3_dump_active) runtime_metrics.recordS3DumpFlush(exts.flush(io, .{ .force = true }));

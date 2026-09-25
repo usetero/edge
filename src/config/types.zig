@@ -1,19 +1,12 @@
 const std = @import("std");
 const policy = @import("policy_zig");
+const o11y = @import("o11y");
 const limits = @import("../core/limits.zig");
 
 const log = std.log.scoped(.config);
 
 pub const ProviderConfig = policy.ProviderConfig;
 pub const ServiceMetadata = policy.ServiceMetadata;
-pub const StringPair = policy.StringPair;
-
-pub const LogLevel = enum(u8) {
-    debug,
-    info,
-    warn,
-    err,
-};
 
 /// Prometheus module configuration
 pub const PrometheusModuleConfig = struct {
@@ -57,13 +50,8 @@ pub const S3DumpConfig = struct {
     max_attempts: usize = 1,
     targets: []const S3TargetConfig = &.{},
 
-    /// Env-only escape hatch for `targets`: a JSON array of `S3TargetConfig`,
-    /// e.g. `TERO_S3_DUMP_TARGETS_JSON='[{"name":"main","bucket":"b",...}]'`.
-    /// zonfig can't express a slice-of-struct through an env var (only scalars
-    /// and string slices), so the Lambda distro — which loads config env-only,
-    /// no JSON file — parses this into `targets` after load. Mirrors the
-    /// `TERO_POLICY_STATIC` pattern. Unused by the server distro (it reads
-    /// `targets` straight from its JSON config file). Parsed in lambda_main.
+    /// Env-only form of `targets`: a JSON array of S3TargetConfig in TERO_S3_DUMP_TARGETS_JSON.
+    /// zonfig cannot read a slice of structs from env, so lambda_main parses this field.
     targets_json: ?[]const u8 = null,
 
     /// Batch/backlog caps that must be nonzero no matter how flush is driven —
@@ -106,7 +94,7 @@ pub const ProxyConfig = struct {
     service: ServiceMetadata = .{},
 
     // Inspection config
-    log_level: LogLevel = .info,
+    log_level: o11y.Level = .info,
 
     max_body_size: u32 = limits.DEFAULT_MAX_BODY_BYTES,
 

@@ -3,9 +3,9 @@
 //! POST and metric intake retain single-attempt semantics; those scenarios
 //! separately verify that eviction permits sender-side recovery.
 const std = @import("std");
+const common = @import("harness_common.zig");
 
 const requests = 10;
-const edge_bin = "zig-out/bin/edge";
 const config_path = "zig-out/upstream_pool_harness.config.json";
 const policies_path = "zig-out/upstream_pool_harness.policies.json";
 
@@ -42,20 +42,6 @@ const scenarios = [_]Scenario{
         .body_file = "bench/scaling/payloads/datadog-metrics.json",
     },
 };
-
-/// policies.json that activates both .log and .metric signals (keep-all), so the
-/// pipe paths actually run instead of falling back to forward_raw.
-const policies_json =
-    \\{
-    \\  "policies": [
-    \\    { "id": "keep-logs", "name": "keep-logs",
-    \\      "log": { "match": [{ "log_field": "body", "regex": ".*" }], "keep": "all" } },
-    \\    { "id": "keep-metrics", "name": "keep-metrics",
-    \\      "metric": { "match": [{ "metric_field": "name", "regex": ".*" }], "keep": true } }
-    \\  ]
-    \\}
-    \\
-;
 
 const Mock = struct {
     server: std.Io.net.Server,
@@ -128,102 +114,11 @@ fn sendWithRetry(client: *std.http.Client, uri: std.Uri, content_type: []const u
     return .failed;
 }
 
-fn readFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    var fr = file.reader(io, &.{});
-    return fr.interface.allocRemaining(gpa, .limited(8 * 1024 * 1024));
-}
-
 fn loadBody(io: std.Io, gpa: std.mem.Allocator, sc: Scenario) ![]u8 {
-    if (sc.body_file) |path| return readFile(io, gpa, path);
+    if (sc.body_file) |path| return common.readFile(io, gpa, path);
     const b = try gpa.alloc(u8, filler_body_len);
     @memset(b, 'x');
     return b;
-}
-
-/// GET `path`; return its body (caller frees) or null on any failure.
-fn get(client: *std.http.Client, gpa: std.mem.Allocator, uri: std.Uri) ?[]u8 {
-    var req = client.request(.GET, uri, .{}) catch return null;
-    defer req.deinit();
-    req.sendBodiless() catch return null;
-    var res = req.receiveHead(&.{}) catch return null;
-    if (res.head.status != .ok) return null;
-    var buf: [1024]u8 = undefined;
-    return res.reader(&buf).allocRemaining(gpa, .limited(64 * 1024)) catch null;
-}
-
-/// Poll `path` until `probe` accepts the body or the deadline passes.
-fn waitFor(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    port: u16,
-    path: []const u8,
-    probe: *const fn ([]const u8) bool,
-) !void {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-    var buf: [96]u8 = undefined;
-    const uri = try std.Uri.parse(try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}{s}", .{ port, path }));
-
-    var waited_ms: u32 = 0;
-    while (waited_ms < 8000) : (waited_ms += 50) {
-        if (get(&client, gpa, uri)) |body| {
-            defer gpa.free(body);
-            if (probe(body)) return;
-        }
-        // ziglint-ignore: Z026 (best-effort poll pacing; a missed sleep is harmless)
-        io.sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
-    }
-    return error.NotReady;
-}
-
-fn healthOk(body: []const u8) bool {
-    return std.mem.indexOf(u8, body, "ok") != null;
-}
-
-fn policiesActive(body: []const u8) bool {
-    // Both signals must show a loaded target, else the pipe paths fall back to
-    // forward_raw (see exec.policiesActiveFor).
-    return std.mem.indexOf(u8, body, "(log=1 metric=1") != null;
-}
-
-/// Bind a free loopback port, then release it so edge can claim it. TOCTOU race
-/// is acceptable for a local harness; reuse_address keeps the rebind quick.
-fn freePort(io: std.Io, start: u16) !u16 {
-    var port = start;
-    while (port < start + 200) : (port += 1) {
-        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch continue;
-        var server = addr.listen(io, .{ .reuse_address = true }) catch continue;
-        server.deinit(io);
-        return port;
-    }
-    return error.NoFreePort;
-}
-
-fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [256]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    try fw.interface.writeAll(contents);
-    try fw.interface.flush();
-}
-
-fn writeConfig(io: std.Io, edge_port: u16, mock_port: u16) !void {
-    var buf: [640]u8 = undefined;
-    const contents = try std.fmt.bufPrint(&buf,
-        \\{{
-        \\  "listen_address": "127.0.0.1",
-        \\  "listen_port": {d},
-        \\  "upstream_url": "http://127.0.0.1:{d}",
-        \\  "log_level": "err",
-        \\  "max_body_size": 2097152,
-        \\  "policy_providers": [{{ "id": "file", "type": "file", "path": "{s}" }}]
-        \\}}
-        \\
-    , .{ edge_port, mock_port, policies_path });
-    try writeFile(io, config_path, contents);
 }
 
 const Result = struct { sc: Scenario, first_try: u32, recovered: u32, failed: u32, dials: u32 };
@@ -233,14 +128,8 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     // Fake upstream: bind a loopback port and keep it; this is edge's upstream.
-    var mock_port: u16 = 14000;
-    const server = while (mock_port < 14200) : (mock_port += 1) {
-        const addr = std.Io.net.IpAddress.parse("127.0.0.1", mock_port) catch continue;
-        break addr.listen(io, .{ .reuse_address = true }) catch continue;
-    } else {
-        std.debug.print("could not bind a loopback port for the mock upstream\n", .{});
-        return error.NoFreePort;
-    };
+    const server = try common.bindLoopback(io, 14000);
+    const mock_port = server.socket.address.getPort();
 
     var mock: Mock = .{ .server = server, .io = io };
     defer mock.server.deinit(io);
@@ -251,25 +140,14 @@ pub fn main(init: std.process.Init) !void {
 
     // Spawn the real edge binary pointed at the fake upstream, with policies that
     // activate the .log and .metric signals so the pipe paths actually run.
-    const edge_port = try freePort(io, 18080);
-    try writeFile(io, policies_path, policies_json);
+    const edge_port = try common.freePort(io, 18080);
+    try common.writeFile(io, policies_path, common.policies_json);
     defer std.Io.Dir.cwd().deleteFile(io, policies_path) catch {};
-    try writeConfig(io, edge_port, mock_port);
+    try common.writeConfig(io, config_path, policies_path, edge_port, mock_port);
     defer std.Io.Dir.cwd().deleteFile(io, config_path) catch {};
 
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ edge_bin, config_path },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
+    var child = try common.startEdge(io, gpa, config_path, edge_port);
     defer child.kill(io); // idempotent: forcibly terminates and reaps
-
-    try waitFor(io, gpa, edge_port, "/_health", healthOk);
-    waitFor(io, gpa, edge_port, "/_edge/policies", policiesActive) catch {
-        std.debug.print("policies never became active — pipe paths would fall back to forward_raw\n", .{});
-        return error.PoliciesNotLoaded;
-    };
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();

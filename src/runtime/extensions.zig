@@ -59,27 +59,10 @@ pub fn datadogLogEncode(record: *const anyopaque, writer: *std.Io.Writer) anyerr
     try std.json.Stringify.value(field_ctx.log.*, .{}, writer);
 }
 
-/// Read S3 credentials from the environment. Returns null when either half is
-/// absent — the extension then counts-and-drops deliveries for its targets
-/// (fail-open), so a missing credential never stalls telemetry.
-///
-/// The `TERO_S3_*` pair is tried first, then the standard `AWS_*` pair — each
-/// resolved as a UNIT (both halves from the same set), never mixed. A partial
-/// `TERO_S3_*` (id without secret) means the override is intentionally absent,
-/// so we fall through to `AWS_*` rather than pairing keys across credential
-/// sets (which would sign every request with an invalid keypair).
-///
-/// Each set also carries its own optional session token, resolved as part of the
-/// same unit — `TERO_S3_SESSION_TOKEN` for the override set, `AWS_SESSION_TOKEN`
-/// for the standard set. A session token is only meaningful with the keypair it
-/// was issued alongside, so it's never pulled from the other set.
-///
-/// This matters in Lambda: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are
-/// *reserved* — the runtime overwrites them with the execution role's TEMPORARY
-/// creds, which come with `AWS_SESSION_TOKEN`. Since z3 now signs an
-/// `x-amz-security-token`, those role creds work directly: no static IAM-user
-/// keypair required. `TERO_S3_*` still wins when set (cross-account/static keys,
-/// or pinning a keypair the runtime won't clobber).
+/// Reads S3 credentials from the env. Returns null when a required half is missing; deliveries then drop.
+/// TERO_S3_* comes first, then AWS_*. Each set resolves as a unit (key, secret, optional token),
+/// because a mixed keypair signs every request wrong. In Lambda, AWS_* holds the role's temporary
+/// credentials with AWS_SESSION_TOKEN. TERO_S3_* overrides them for static or cross-account keys.
 pub fn credentialsFromEnv(env: *const std.process.Environ.Map) ?ext.S3Dump.Credentials {
     return pairFromEnv(env, "TERO_S3_ACCESS_KEY_ID", "TERO_S3_SECRET_ACCESS_KEY", "TERO_S3_SESSION_TOKEN") orelse
         pairFromEnv(env, "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN");

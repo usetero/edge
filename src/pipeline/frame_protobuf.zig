@@ -258,42 +258,10 @@ pub const ProtobufFramer = struct {
 
 const testing = std.testing;
 
-const TestSink = struct {
-    seen: std.ArrayList([]u8) = .empty,
-    allocator: std.mem.Allocator,
-    replacement: []const u8 = "REPLACED-PAYLOAD",
-
-    fn deinit(self: *TestSink) void {
-        for (self.seen.items) |record| self.allocator.free(record);
-        self.seen.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    pub fn onRecord(self: *TestSink, bytes: []const u8) !framer_mod.Decision {
-        try self.seen.append(self.allocator, try self.allocator.dupe(u8, bytes));
-        if (std.mem.indexOf(u8, bytes, "drop") != null) return .drop;
-        if (std.mem.indexOf(u8, bytes, "swap") != null) return .{ .replace = self.replacement };
-        return .keep;
-    }
-};
-
-fn runChunked(input: []const u8, chunk_len: usize, scratch_len: usize, sink: *TestSink) ![]u8 {
-    const scratch = try testing.allocator.alloc(u8, scratch_len);
-    defer testing.allocator.free(scratch);
-    var framer: ProtobufFramer = .init(scratch);
-
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    errdefer out.deinit();
-
-    var offset: usize = 0;
-    while (offset < input.len) {
-        const end = @min(offset + chunk_len, input.len);
-        try framer.ingest(input[offset..end], &out.writer, sink);
-        offset = end;
-    }
-    try framer.finish(&out.writer, sink);
-    return out.toOwnedSlice();
-}
+const frame_testing = @import("frame_testing.zig");
+const TestSink = frame_testing.TestSink;
+const runChunked = frame_testing.runChunked;
+const sink_replacement = "REPLACED-PAYLOAD";
 
 /// field 1, wire type LEN: tag byte 0x0A. Comptime-only fixture builder.
 fn lenRecord(comptime payload: []const u8) []const u8 {
@@ -307,9 +275,9 @@ test "keep-all reproduces input byte-for-byte across chunk sizes" {
         lenRecord("second-resource") ++
         lenRecord(""));
     for ([_]usize{ 1, 3, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 64, &sink);
+        const got = try runChunked(ProtobufFramer, input, chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, input, got);
         try testing.expectEqual(@as(usize, 3), sink.seen.items.len);
@@ -325,9 +293,9 @@ test "non-LEN top-level fields copy through verbatim" {
         &[_]u8{ 0x21, 1, 2, 3, 4, 5, 6, 7, 8 } ++
         lenRecord("b"));
     for ([_]usize{ 1, 3, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 64, &sink);
+        const got = try runChunked(ProtobufFramer, input, chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, input, got);
         try testing.expectEqual(@as(usize, 2), sink.seen.items.len);
@@ -338,9 +306,9 @@ test "drop removes header and payload" {
     const input: []const u8 = comptime (lenRecord("keep-me") ++ lenRecord("drop-me") ++ lenRecord("also-keep"));
     const expected: []const u8 = comptime (lenRecord("keep-me") ++ lenRecord("also-keep"));
     for ([_]usize{ 1, 3, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 64, &sink);
+        const got = try runChunked(ProtobufFramer, input, chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, expected, got);
     }
@@ -348,9 +316,9 @@ test "drop removes header and payload" {
 
 test "replace re-encodes length and keeps original tag" {
     const input: []const u8 = comptime lenRecord("swap-me");
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 3, 64, &sink);
+    const got = try runChunked(ProtobufFramer, input, 3, 64, &sink);
     defer testing.allocator.free(got);
     const expected: []const u8 = comptime (&[_]u8{ 0x0A, 16 } ++ "REPLACED-PAYLOAD");
     try testing.expectEqualSlices(u8, expected, got);
@@ -360,9 +328,9 @@ test "multi-byte length varint round-trips" {
     // 200-byte payload: length varint is 2 bytes (0xC8 0x01).
     const input: []const u8 = comptime (&[_]u8{ 0x0A, 0xC8, 0x01 } ++ ("p" ** 200));
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 256, &sink);
+        const got = try runChunked(ProtobufFramer, input, chunk, 256, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, input, got);
     }
@@ -373,9 +341,9 @@ test "oversized payload fails open without evaluation" {
     const payload = "x" ** 30 ++ "drop" ++ "y" ** 30;
     const input: []const u8 = comptime (lenRecord("small") ++ lenRecord(payload) ++ lenRecord("tail"));
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 16, &sink);
+        const got = try runChunked(ProtobufFramer, input, chunk, 16, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, input, got);
         try testing.expectEqual(@as(usize, 2), sink.seen.items.len);
@@ -385,9 +353,9 @@ test "oversized payload fails open without evaluation" {
 test "invalid wire type desyncs to verbatim copy" {
     // Wire type 3 (start group) at top level.
     const input: []const u8 = comptime (&[_]u8{0x0B} ++ "whatever follows, even drop");
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 5, 64, &sink);
+    const got = try runChunked(ProtobufFramer, input, 5, 64, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(u8, input, got);
     try testing.expectEqual(@as(usize, 0), sink.seen.items.len);
@@ -397,9 +365,9 @@ test "truncated payload flushes buffered bytes at finish" {
     // Trailing field declares 32 payload bytes but only 9 arrive.
     const input: []const u8 = comptime (lenRecord("complete") ++
         &[_]u8{ 0x0A, 0x20 } ++ "only-part");
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 4, 64, &sink);
+    const got = try runChunked(ProtobufFramer, input, 4, 64, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(u8, input, got);
 }
@@ -407,7 +375,7 @@ test "truncated payload flushes buffered bytes at finish" {
 test "stats are accounted" {
     const big = "b" ** 64;
     const input: []const u8 = comptime (lenRecord("keep") ++ lenRecord("drop") ++ lenRecord("swap") ++ lenRecord(big));
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
     const scratch = try testing.allocator.alloc(u8, 32);
     defer testing.allocator.free(scratch);

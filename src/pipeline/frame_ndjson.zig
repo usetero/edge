@@ -147,49 +147,17 @@ pub const NdjsonFramer = struct {
 
 const testing = std.testing;
 
-const TestSink = struct {
-    seen: std.ArrayList([]u8) = .empty,
-    allocator: std.mem.Allocator,
-    replacement: []const u8 = "SWAPPED",
-
-    fn deinit(self: *TestSink) void {
-        for (self.seen.items) |record| self.allocator.free(record);
-        self.seen.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    pub fn onRecord(self: *TestSink, bytes: []const u8) !framer_mod.Decision {
-        try self.seen.append(self.allocator, try self.allocator.dupe(u8, bytes));
-        if (std.mem.indexOf(u8, bytes, "drop") != null) return .drop;
-        if (std.mem.indexOf(u8, bytes, "swap") != null) return .{ .replace = self.replacement };
-        return .keep;
-    }
-};
-
-fn runChunked(input: []const u8, chunk_len: usize, scratch_len: usize, sink: *TestSink) ![]u8 {
-    const scratch = try testing.allocator.alloc(u8, scratch_len);
-    defer testing.allocator.free(scratch);
-    var framer: NdjsonFramer = .init(scratch);
-
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    errdefer out.deinit();
-
-    var offset: usize = 0;
-    while (offset < input.len) {
-        const end = @min(offset + chunk_len, input.len);
-        try framer.ingest(input[offset..end], &out.writer, sink);
-        offset = end;
-    }
-    try framer.finish(&out.writer, sink);
-    return out.toOwnedSlice();
-}
+const frame_testing = @import("frame_testing.zig");
+const TestSink = frame_testing.TestSink;
+const runChunked = frame_testing.runChunked;
+const sink_replacement = "SWAPPED";
 
 test "keep-all reproduces input across chunk sizes" {
     const input = "{\"a\":1}\n{\"b\":2}\n\n{\"c\":3}\n";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 64, &sink);
+        const got = try runChunked(NdjsonFramer, input, chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(input, got);
         try testing.expectEqual(@as(usize, 4), sink.seen.items.len);
@@ -199,9 +167,9 @@ test "keep-all reproduces input across chunk sizes" {
 test "trailing record without newline is preserved without newline" {
     const input = "first\nlast-no-newline";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 64, &sink);
+        const got = try runChunked(NdjsonFramer, input, chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(input, got);
     }
@@ -210,9 +178,9 @@ test "trailing record without newline is preserved without newline" {
 test "drop removes the record and its newline" {
     const input = "keep1\nplease drop me\nkeep2\n";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 64, &sink);
+        const got = try runChunked(NdjsonFramer, input, chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("keep1\nkeep2\n", got);
     }
@@ -221,9 +189,9 @@ test "drop removes the record and its newline" {
 test "replace substitutes record bytes" {
     const input = "one\nswap this\nthree\n";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 64, &sink);
+        const got = try runChunked(NdjsonFramer, input, chunk, 64, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("one\nSWAPPED\nthree\n", got);
     }
@@ -235,9 +203,9 @@ test "oversized record fails open: forwarded verbatim, never evaluated" {
     const big = "x" ** 40 ++ "drop" ++ "y" ** 56;
     const input = "small\n" ++ big ++ "\nsmall2\n";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
-        var sink: TestSink = .{ .allocator = testing.allocator };
+        var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
         defer sink.deinit();
-        const got = try runChunked(input, chunk, 16, &sink);
+        const got = try runChunked(NdjsonFramer, input, chunk, 16, &sink);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(input, got);
         // Sink saw only the two small records.
@@ -248,16 +216,16 @@ test "oversized record fails open: forwarded verbatim, never evaluated" {
 test "oversized trailing record without newline fails open" {
     const big = "z" ** 64;
     const input = "ok\n" ++ big; // no trailing newline
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
-    const got = try runChunked(input, 7, 16, &sink);
+    const got = try runChunked(NdjsonFramer, input, 7, 16, &sink);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(input, got);
 }
 
 test "stats are accounted" {
     const input = "keep\ndrop it\nswap it\n" ++ ("w" ** 64) ++ "\n";
-    var sink: TestSink = .{ .allocator = testing.allocator };
+    var sink: TestSink = .{ .allocator = testing.allocator, .replacement = sink_replacement };
     defer sink.deinit();
 
     const scratch = try testing.allocator.alloc(u8, 16);

@@ -6,17 +6,56 @@
 //! passthrough always last (it owns the wildcard; the router's "last any
 //! wins" rule makes order the tiebreaker).
 const std = @import("std");
-const mode = @import("mode.zig");
+const policy = @import("policy_zig");
 const service_mod = @import("../service/service.zig");
 
 pub const ServiceKind = service_mod.ServiceKind;
 
-pub fn servicesFor(comptime distribution: mode.Distribution) []const ServiceKind {
+pub const Distribution = enum {
+    edge,
+    datadog,
+    otlp,
+    prometheus,
+
+    pub fn defaultConfigPath(self: Distribution) []const u8 {
+        return switch (self) {
+            .otlp => "config-otlp.json",
+            .prometheus => "config-prometheus.json",
+            else => "config.json",
+        };
+    }
+};
+
+pub fn servicesFor(comptime distribution: Distribution) []const ServiceKind {
     return switch (distribution) {
         .edge => &.{ .health, .datadog_logs, .datadog_metrics, .otlp, .prometheus, .passthrough },
         .datadog => &.{ .health, .datadog_logs, .datadog_metrics, .passthrough },
         .otlp => &.{ .health, .otlp, .passthrough },
         .prometheus => &.{ .health, .prometheus, .passthrough },
+    };
+}
+
+/// The policy stages each distribution reports to the control plane.
+pub fn supportedStagesFor(comptime distribution: Distribution) []const policy.proto.policy.PolicyStage {
+    return switch (distribution) {
+        .edge => &.{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+            .POLICY_STAGE_TRACE_SAMPLING,
+        },
+        .datadog => &.{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+        },
+        .otlp => &.{
+            .POLICY_STAGE_LOG_FILTER,
+            .POLICY_STAGE_LOG_TRANSFORM,
+            .POLICY_STAGE_METRIC_FILTER,
+            .POLICY_STAGE_TRACE_SAMPLING,
+        },
+        .prometheus => &.{.POLICY_STAGE_METRIC_FILTER},
     };
 }
 
@@ -45,9 +84,16 @@ pub fn buildService(kind: ServiceKind, options: ServiceOptions) service_mod.Serv
 
 const testing = std.testing;
 
+test "prometheus distro defaults to config-prometheus.json" {
+    try testing.expectEqualStrings(
+        "config-prometheus.json",
+        Distribution.prometheus.defaultConfigPath(),
+    );
+}
+
 test "every distro brackets services with health first and passthrough last" {
-    inline for (@typeInfo(mode.Distribution).@"enum".fields) |field| {
-        const distribution: mode.Distribution = @enumFromInt(field.value);
+    inline for (@typeInfo(Distribution).@"enum".fields) |field| {
+        const distribution: Distribution = @enumFromInt(field.value);
         const services = comptime servicesFor(distribution);
         try testing.expectEqual(ServiceKind.health, services[0]);
         try testing.expectEqual(ServiceKind.passthrough, services[services.len - 1]);

@@ -1,5 +1,5 @@
-//! The record pipeline (PLAN.md §6): decode, frame, evaluate, re-encode,
-//! over caller-provided fixed buffers, with no allocation per byte.
+//! The record pipeline: decode, frame, evaluate, re-encode, over
+//! caller-provided fixed buffers, with no allocation per byte.
 //!
 //!   body ─► codec.Decoder ─► Framer ─► sink.onRecord ─► codec.Encoder ─► out_writer
 //!
@@ -86,8 +86,7 @@ pub fn run(
     return framer.stats();
 }
 
-/// Bounded reader→writer copy; the passthrough fast path and response
-/// streaming use this. Ported from io/transport.zig.
+/// Bounded reader-to-writer copy for passthrough bodies and responses.
 pub fn streamReaderToWriter(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,

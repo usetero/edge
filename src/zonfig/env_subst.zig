@@ -93,44 +93,6 @@ pub fn substitute(
     };
 }
 
-/// Substitute environment variables, returning a required value.
-/// If the variable is not set and no default is provided, returns an error.
-pub fn substituteRequired(
-    allocator: std.mem.Allocator,
-    input: []const u8,
-    comptime allow_empty: bool,
-    environ: *const std.process.Environ.Map,
-) (SubstError || error{MissingRequiredVariable})!SubstResult {
-    const result = try substitute(allocator, input, environ);
-
-    if (!allow_empty and result.value.len == 0 and result.was_substituted) {
-        if (result.was_substituted) {
-            allocator.free(result.value);
-        }
-        return error.MissingRequiredVariable;
-    }
-
-    return result;
-}
-
-/// Check if a string contains any environment variable references
-pub fn containsVariables(input: []const u8) bool {
-    var i: usize = 0;
-    while (i < input.len) {
-        // Skip escape sequences
-        if (i + 2 < input.len and input[i] == '$' and input[i + 1] == '$' and input[i + 2] == '{') {
-            i += 3;
-            continue;
-        }
-
-        if (i + 1 < input.len and input[i] == '$' and input[i + 1] == '{') {
-            return true;
-        }
-        i += 1;
-    }
-    return false;
-}
-
 /// Validate that a variable name is valid.
 /// Valid characters: A-Z, a-z, 0-9, _
 /// Must not start with a digit.
@@ -152,22 +114,6 @@ fn isValidVariableName(name: []const u8) bool {
     }
 
     return true;
-}
-
-/// Parse a variable reference and extract the name.
-/// Returns null if not a valid variable reference.
-pub fn parseVariable(input: []const u8) ?[]const u8 {
-    if (input.len < 3) return null;
-    if (input[0] != '$' or input[1] != '{') return null;
-
-    const closing = std.mem.indexOfScalar(u8, input[2..], '}') orelse return null;
-    const var_name = input[2 .. 2 + closing];
-
-    if (var_name.len == 0 or !isValidVariableName(var_name)) {
-        return null;
-    }
-
-    return var_name;
 }
 
 // ============================================================================
@@ -366,31 +312,6 @@ test "isValidVariableName" {
     try std.testing.expect(!isValidVariableName("VAR NAME"));
     try std.testing.expect(!isValidVariableName("VAR.NAME"));
     try std.testing.expect(!isValidVariableName("VAR$NAME"));
-}
-
-test "containsVariables" {
-    try std.testing.expect(containsVariables("${VAR}"));
-    try std.testing.expect(containsVariables("prefix${VAR}suffix"));
-    try std.testing.expect(containsVariables("${A}${B}"));
-    try std.testing.expect(containsVariables("text${VAR}"));
-
-    try std.testing.expect(!containsVariables(""));
-    try std.testing.expect(!containsVariables("no vars"));
-    try std.testing.expect(!containsVariables("$VAR")); // No braces
-    try std.testing.expect(!containsVariables("$100")); // Not a var
-    try std.testing.expect(!containsVariables("$${ESCAPED}")); // Escaped
-}
-
-test "parseVariable" {
-    try std.testing.expectEqualStrings("VAR", parseVariable("${VAR}").?);
-    try std.testing.expectEqualStrings("MY_VAR", parseVariable("${MY_VAR}suffix").?);
-    try std.testing.expectEqualStrings("a", parseVariable("${a}").?);
-
-    try std.testing.expectEqual(@as(?[]const u8, null), parseVariable(""));
-    try std.testing.expectEqual(@as(?[]const u8, null), parseVariable("VAR"));
-    try std.testing.expectEqual(@as(?[]const u8, null), parseVariable("$VAR"));
-    try std.testing.expectEqual(@as(?[]const u8, null), parseVariable("${}")); // Empty name
-    try std.testing.expectEqual(@as(?[]const u8, null), parseVariable("${1VAR}")); // Invalid name
 }
 
 test "substitute: real environment variable HOME" {
