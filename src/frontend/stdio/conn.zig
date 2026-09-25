@@ -848,3 +848,47 @@ test "inboundBodyOf: Content-Length over max_body_size is rejected up front" {
         inboundBodyOf(&p.request, limits, &body_buf, testing.allocator, &test_chunked),
     );
 }
+
+fn pumpCutChunked(raw: []const u8, chunked: *ChunkedBody) !usize {
+    var p: Parsed = undefined;
+    try parseRequestInto(&p, raw);
+    var body_buf: [256]u8 = undefined;
+    const body = try inboundBodyOf(&p.request, testLimits(), &body_buf, testing.allocator, chunked);
+    try testing.expect(body == .streamed);
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    return pipeline_mod.streamReaderToWriter(body.streamed.reader, &out, testLimits().max_body_size);
+}
+
+const cut_head = "POST /forward HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+test "inboundBodyOf: a chunked body cut short fails the pump" {
+    // Cut between chunks and inside a chunk. Either way the pump fails, so
+    // the closing chunk never goes upstream.
+    for ([_][]const u8{ "5\r\nhello\r\n", "5\r\nhello\r\n6\r\n wo" }) |cut| {
+        var chunked: ChunkedBody = .{};
+        var raw_buf: [256]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&raw_buf, "{s}{s}", .{ cut_head, cut });
+        try testing.expectError(error.ReadFailed, pumpCutChunked(raw, &chunked));
+    }
+}
+
+test "ChunkedBody: an end of body before the last chunk is a failed read" {
+    // std can report the end of a body that has not reached its last chunk.
+    // The server state shows it: the head is received, the body is not done.
+    var p: Parsed = undefined;
+    try parseRequestInto(&p, cut_head);
+    var inner: std.Io.Reader = .fixed("hello");
+    var chunked: ChunkedBody = .{ .inner = &inner, .server = &p.server };
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try testing.expectError(error.ReadFailed, pipeline_mod.streamReaderToWriter(&chunked.interface, &out, 64));
+    try testing.expect(chunked.truncated);
+    try testing.expectEqualStrings("hello", out.buffered());
+}
+
+test "inboundBodyOf: a whole chunked body is not truncated" {
+    var chunked: ChunkedBody = .{};
+    try testing.expectEqual(@as(usize, 5), try pumpCutChunked(cut_head ++ "5\r\nhello\r\n0\r\n\r\n", &chunked));
+    try testing.expect(!chunked.truncated);
+}
