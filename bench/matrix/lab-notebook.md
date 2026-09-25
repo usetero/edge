@@ -774,6 +774,43 @@ pipeline reads them. Two runs agreed to within a few percent; run 1 is shown.
       and moves `latest` only when the release is the newest `v*` tag, so a
       patch to an older line cannot move it back. `actionlint` passes.
 
+## Scaling sweep on the Mac Studio: codec branch against master
+
+`bench/scaling/run.sh --edge-only`, 50,000 requests, 64 oha connections,
+5 ms intake latency, policy counts 0 and 1000. Cells: handler threads 64 and
+256, max connections 256, 1024 and 2048. Master is `df26f84`; the branch is
+`b85aa33`. The two trees alternated inside each cell. Every run was 100%
+successful.
+
+| Scenario | Master | Branch | Change |
+|---|---|---|---|
+| DD Logs, 1000 policies (1 MiB gzip, 4 MiB decoded) | 444–449 req/s, p50 142–144 ms, p99 193–196 ms | 528–544 req/s, p50 118–121 ms, p99 167–175 ms | +18% to +22% req/s |
+| DD Metrics and OTLP, 1000 policies | 77–82 MB | 49–51 MB | about 30 MB less memory |
+| Every other scenario | about 2,100 req/s | about 2,100 req/s | within ±2% |
+
+Two facts about the setup limit what the grid shows:
+
+- On the stdio frontend, `thread_pool_count` does nothing, and with 64
+  senders a connection cap of 256 or more never binds. So the six cells
+  measured one configuration six times, and their spread (about ±2%) is the
+  noise.
+- Each request pays about six times the configured intake latency: the p50
+  is 32 ms at 5 ms here, and 62.7 ms at 10 ms in the earlier master sweep.
+  That caps the small scenarios near 2,100 req/s on both trees. The
+  comparison is fair, but the absolute numbers understate the edge. The
+  cause is in the harness, and it is not found yet.
+
+## Crash reports
+
+The old handler in `runtime/app.zig` started its trace at its own return
+address, so a crash printed the signal trampoline and nothing else. It is
+gone. Every entry point now sets `std_options.enable_segfault_handler`,
+which ReleaseFast turns off by default, and exports `debug.handleSegfault`
+from `runtime/crash.zig`. The hook names the build (version, distribution,
+frontend, commit), then hands over to std, which covers SIGSEGV, SIGBUS,
+SIGILL and SIGFPE and unwinds from the faulting instruction. A crash now
+exits with SIGABRT (134), not SIGSEGV (139).
+
 ## Findings
 
 ### Fixed
