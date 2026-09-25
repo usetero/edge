@@ -33,12 +33,20 @@ const Level = o11y.Level;
 const ProxyConfig = config_types.ProxyConfig;
 const RuntimeMetrics = runtime_metrics_mod.RuntimeMetrics;
 
+const crash = @import("crash.zig");
+
 const log = std.log.scoped(.app);
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
     .logFn = StdLogAdapter.logFn,
+    // ReleaseFast turns std's crash handler off. Keep it on in every mode,
+    // so a crash prints the fault and a stack unwound from it.
+    .enable_segfault_handler = true,
 };
+
+/// The crash report hook std calls. Each entry point exports it.
+pub const debug = crash.debug;
 
 // Named event payloads: the type name is the telemetry event name.
 const ServerStarting = struct {};
@@ -172,36 +180,6 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
         ctx.bus.info(ShutdownForceExit{ .signal = signal_name, .count = count });
         std.process.exit(1);
     }
-}
-
-fn handleSegfault(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
-    _ = sig;
-    _ = ctx_ptr;
-
-    std.debug.print("\n=== SEGFAULT ===\n", .{});
-
-    const fault_addr: usize = switch (builtin.os.tag) {
-        .macos => @intFromPtr(info.addr),
-        .linux => @intFromPtr(info.fields.sigfault.addr),
-        else => 0,
-    };
-    std.debug.print("Faulting address: 0x{x}\n", .{fault_addr});
-    std.debug.print("Signal code: {d}\n", .{info.code});
-    std.debug.print("Stack trace:\n", .{});
-    std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
-
-    std.process.abort();
-}
-
-fn installSegfaultHandler() void {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
-
-    const segv_act: std.posix.Sigaction = .{
-        .handler = .{ .sigaction = handleSegfault },
-        .mask = std.posix.sigemptyset(),
-        .flags = std.posix.SA.SIGINFO,
-    };
-    std.posix.sigaction(std.posix.SIG.SEGV, &segv_act, null);
 }
 
 // =============================================================================
@@ -386,6 +364,7 @@ fn raiseOpenFileLimit() void {
 }
 
 pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
+    crash.setDistribution(@tagName(distribution));
     raiseOpenFileLimit();
     const allocator = init.gpa;
 
@@ -477,7 +456,6 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     var loader = try policy.Loader.init(allocator, io, bus, &registry, config.policy_providers, service_metadata);
     defer loader.deinit();
     try loader.startAsync(io);
-    installSegfaultHandler();
 
     const kinds = serviceKindsFor(distribution);
     const engine = try Engine.create(allocator, io, bus, &registry, &runtime_metrics, kinds, .{
