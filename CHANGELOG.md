@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.32.1](https://github.com/usetero/edge/compare/v1.32.0...v1.32.1) (2026-09-25)
+
+
+### Bug Fixes
+
+* combine 23 independent bug fixes and dead-code removals ([#344](https://github.com/usetero/edge/issues/344)) ([bc8fb40](https://github.com/usetero/edge/commit/bc8fb40c7e09e5a7c000aaf2381b27b3e66d06fd))
+* **otlp:** nothing-modified fast path for metrics and traces ([#346](https://github.com/usetero/edge/issues/346)) ([1d9947b](https://github.com/usetero/edge/commit/1d9947b0c9a711632ff915130cc3f4b837569940))
+* **prometheus:** one type-aware family-membership predicate ([#345](https://github.com/usetero/edge/issues/345)) ([91d7b82](https://github.com/usetero/edge/commit/91d7b822f5ed1cd04d2c974840c88dba6d1eb9de))
+* stop the crash on partial and corrupt compressed bodies ([#353](https://github.com/usetero/edge/issues/353)) ([a6d06bd](https://github.com/usetero/edge/commit/a6d06bd0488c1195ecff7665c8be452d8ab61b6e))
+* **tail:** combine the five interacting tail fixes ([#347](https://github.com/usetero/edge/issues/347)) ([df26f84](https://github.com/usetero/edge/commit/df26f844838b6b92fc425f018e31de02784db28e))
+
+
+### Performance Improvements
+
+* policy-zig 0.7.4, shared datadog record helpers, and sizing from measurement ([#338](https://github.com/usetero/edge/issues/338)) ([dab019a](https://github.com/usetero/edge/commit/dab019a046286299cf86f7b366bf01948ddea13e))
+
 ## [1.32.0](https://github.com/usetero/edge/compare/v1.31.0...v1.32.0) (2026-09-17)
 
 
