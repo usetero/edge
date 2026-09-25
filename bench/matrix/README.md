@@ -116,7 +116,7 @@ with its note.
 | a09 | Corrupt gzip, no policies loaded | Forwarded; the intake's answer is relayed | |
 | a09 | Corrupt gzip, policies loaded | Fails open and forwards, with `policy.failed.open` | |
 | a10 | `content-encoding: br` | Forwarded raw, and the intake receives `br` | the head is repaired; the fake intake repairs too |
-| a11 | Sender vanishes mid-body, five times | Slots return, nothing blames the intake, and nothing reaches it | xfail stdio: forwards the partial body |
+| a11 | Sender vanishes mid-body, five times | Slots return, nothing blames the intake, and nothing reaches it | |
 | a12 | Two requests written in one packet | Both are served | xfail httpz: answers 400 |
 | a13 | 50 requests on one keep-alive connection | All 202, and the connection count stays at one | |
 | a14 | 80 request headers | Refused with a 4xx, never accepted with headers dropped | |
@@ -131,15 +131,16 @@ with its note.
 | a34 | `gzip`, `GZIP`, `x-gzip`, `gzip ` | Every spelling reaches the intake | codings are case-insensitive (RFC 9110 §8.4.1) |
 | a35 | Small gzip that expands past the decoded cap, policies loaded | Bounded, and the batch is not lost | fails open; the raw cap still answers 413 |
 | a35 | The same body with no policies loaded | Forwarded untouched, 202 | nothing reads it |
-| a44 | Gzip batch short of its `Content-Length`, then FIN or close, policies loaded | Never decoded, never forwarded, never 2xx or a drop-class status | xfail stdio: decodes the partial body, and the gzip decoder panics |
-| a45 | Plain 8 KiB batch short of its `Content-Length`, then FIN | Never forwarded, never 2xx | xfail stdio: forwards it, and the intake answers 202 |
+| a44 | Gzip batch short of its `Content-Length`, then FIN or close, policies loaded | Never decoded, never forwarded, never 2xx or a drop-class status | 408, retryable |
+| a45 | Plain 8 KiB batch short of its `Content-Length`, then FIN | Never forwarded, never 2xx | |
 | a45b | Plain 200 KiB batch short of its `Content-Length`, then FIN | Never forwarded, never 2xx | xfail httpz: 4xx, and requests stay counted in flight |
-| a46 | Complete framing around a cut gzip stream, logs and metrics paths | Fails open with `policy.failed.open`, 202 | xfail both: the gzip decoder panics and the process dies |
+| a46 | Complete framing around a cut gzip stream, logs and metrics paths | Fails open with `policy.failed.open`, 202 | |
 | a46b | Complete framing around a cut zstd stream | Fails open with `policy.failed.open`, 202 | |
-| a47 | Full-length gzip and zstd batches with a few corrupt bytes (fixtures) | Fails open with `policy.failed.open`, 202 | xfail both: the std decoder panics and the process dies |
-| a47b | Gzip batch that decodes, but its CRC32 does not match | Forwarded as sent, so the intake can reject it | xfail both: re-encoded behind a fresh CRC |
-| a49 | Valid gzip and zstd batches on the buffered path (metrics JSON, OTLP JSON) | 202, and the intake receives them | xfail both: 413 |
-| a50 | Header value with a bare LF | Refused, or forwarded with no CR or LF in any value | xfail stdio: forwards the LF |
+| a47 | Full-length gzip and zstd batches with a few corrupt bytes (fixtures) | Fails open with `policy.failed.open`, 202 | |
+| a47b | Gzip batch that decodes, but its CRC32 does not match | Forwarded as sent, so the intake can reject it | |
+| a49 | Valid gzip and zstd batches on the buffered path (metrics JSON, OTLP JSON) | 202, and the intake receives them | |
+| a50 | Header value with a bare LF | Refused, or forwarded with no CR or LF in any value | |
+| a51 | Two gzip members; two zstd frames; a zstd window above the cap | Members forwarded as sent; both frames filtered; the wide window fails open | |
 
 ### `b*` — the edge to the intake
 
@@ -173,7 +174,7 @@ with its note.
 | c04 | 48 senders against an intake that never answers | Health and the scrape answer inside a second | slow |
 | c05 | A probe while every slot is held | Health answers at capacity | xfail httpz: the probe waits behind the full connection table |
 | c09 | 400 failing requests with a log pipe nobody drains | The edge keeps serving | slow |
-| c10 | 240 abandoned gzip batches from six senders, then valid batches | The edge stays up, and valid batches still pass | xfail stdio: the process dies |
+| c10 | 240 abandoned gzip batches from six senders, then valid batches | The edge stays up, and valid batches still pass | |
 
 ### `d*` — lifecycle
 

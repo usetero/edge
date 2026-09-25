@@ -54,7 +54,6 @@ class BareLfHeader(MatrixCase):
     ALLOW_PHANTOM_SUCCESS = True
     # A 400 is the right answer to a malformed head.
     EXPECT_PERMANENT_DROP = True
-    DEFECTS = {"stdio": "forwards the header value with its bare LF"}
 
     def setUp(self) -> None:
         self.raw_intake = RawIntake()

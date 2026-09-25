@@ -24,7 +24,10 @@ POLICIES = {
 
 class AbandonChurn(MatrixCase):
     EDGE_POLICIES = POLICIES
-    DEFECTS = {"stdio": "a partial gzip batch reaches the decoder, and the process dies"}
+    # The metrics carry only the status class, so the invariant reads the
+    # retryable 408 as a drop. The valid batches after the churn
+    # carry the check.
+    EXPECT_PERMANENT_DROP = True
 
     def test_valid_batches_survive_a_stream_of_abandoned_ones(self):
         rng = random.Random(24)

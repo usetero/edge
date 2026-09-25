@@ -482,7 +482,13 @@ fn inboundBodyOf(
         _ = try pipeline_mod.streamReaderToWriter(reader, &capture.writer, limits.max_body_size);
         return .{ .bytes = capture.written() };
     }
-    const len = head.content_length orelse 0;
+    const len = head.content_length orelse {
+        // A request with neither framing header has no body (RFC 9112 §6.3).
+        // std asserts that the body reader exists before a response, so make
+        // it. It leaves the connection to close after the response.
+        _ = try request.readerExpectContinue(buffer);
+        return .{ .bytes = "" };
+    };
     if (len == 0) return .{ .bytes = "" };
     if (len > limits.max_body_size) return error.BodyTooLarge;
     const reader = try request.readerExpectContinue(buffer);
@@ -499,8 +505,13 @@ fn inboundBodyOf(
     // a policy deployment already pays through `residentBody`, and a
     // passthrough deployment does not. See bench/matrix a30.
     if (len <= limits.large_body_buffer_size) {
-        var capture: std.Io.Writer.Allocating = .init(arena);
-        _ = try pipeline_mod.streamReaderToWriter(reader, &capture.writer, limits.max_body_size);
+        var capture: std.Io.Writer.Allocating = try .initCapacity(arena, @intCast(len));
+        // std reports a sender that closes before `len` bytes as the end of
+        // the stream. That body is partial, so it must not pass as a batch.
+        reader.streamExact64(&capture.writer, len) catch |err| return switch (err) {
+            error.EndOfStream => error.InboundBodyTruncated,
+            error.ReadFailed, error.WriteFailed => |e| e,
+        };
         return .{ .bytes = capture.written() };
     }
     return .{ .lazy = .{ .reader = reader, .len = @intCast(len) } };
@@ -520,6 +531,9 @@ fn collectRequestHeaders(
     var count: usize = 0;
     var it = request.iterateHeaders();
     while (it.next()) |header| {
+        // std keeps a bare LF inside a value. An upstream that ends a line on
+        // LF would read a header that the name filter below never saw.
+        if (std.mem.findAny(u8, header.value, "\r\n") != null) return error.InvalidRequestHeader;
         if (upstream_mod.shouldSkipRequestHeader(header.name)) continue;
         if (count >= buffer.len) return error.TooManyHeaders;
         const repaired = encoding != null and std.ascii.eqlIgnoreCase(header.name, "content-encoding");

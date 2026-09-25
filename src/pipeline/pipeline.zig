@@ -23,6 +23,8 @@ pub const PipelineSpec = struct {
     /// zstd decode window cap; frames declaring a larger window fail the
     /// decode (PLAN §6.5 — caller aborts, never silently truncates).
     zstd_window_len: usize,
+    // `decode` is never zstd for a sender's body: decode it first with
+    // `compress_buffered.decompressZstd` and pass identity. See `Decoder`.
 };
 
 /// All fixed memory the pipeline operates on. In production these are slab
@@ -56,6 +58,7 @@ pub fn run(
     sink: anytype,
 ) !framer_mod.Stats {
     std.debug.assert(buffers.chunk.len > 0);
+    std.debug.assert(spec.decode != .zstd);
 
     var decoder: encoding.Decoder = .init(spec.decode, in_reader, buffers.decoder, spec.zstd_window_len);
     var encoder: encoding.Encoder = try .init(spec.encode, out_writer, buffers.encoder);
@@ -64,13 +67,16 @@ pub fn run(
 
     const decoded = decoder.reader();
     var total: usize = 0;
+    var crc: std.hash.Crc32 = .init();
     while (true) {
         const n = try decoded.readSliceShort(buffers.chunk);
         if (n == 0) break;
         total += n;
         if (total > spec.max_decoded_bytes) return error.DecodedBodyTooLarge;
+        if (spec.decode == .gzip) crc.update(buffers.chunk[0..n]);
         try framer.ingest(buffers.chunk[0..n], encoder.writer(), sink);
     }
+    try decoder.verifyEnd(crc.final(), @truncate(total));
     try framer.finish(encoder.writer(), sink);
     try encoder.finish();
     return framer.stats();
@@ -92,7 +98,8 @@ pub fn streamReaderToWriter(
             error.EndOfStream => break,
             else => return err,
         };
-        if (bytes == 0) break;
+        // A zero return is not the end: decoders and TLS return 0 before
+        // they have output. Only `EndOfStream` ends the copy.
         total_bytes += bytes;
     }
     // EOF must be observed; merely copying the limit can turn a truncated
@@ -182,7 +189,7 @@ test "identity json_array in, zstd out" {
     const stats = try run(spec, &in, &out.writer, buffers, &sink);
     try testing.expectEqual(@as(u64, 1), stats.dropped);
 
-    const decoded = try buffered.decompressZstd(testing.allocator, out.written(), 0);
+    const decoded = try buffered.decompressZstd(testing.allocator, out.written(), 0, 0);
     defer testing.allocator.free(decoded);
     try testing.expectEqualStrings("[{\"m\":\"keep\"}]", decoded);
 }

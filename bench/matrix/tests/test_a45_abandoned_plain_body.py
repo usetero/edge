@@ -32,7 +32,6 @@ class AbandonedPlainBody(MatrixCase):
     # The metrics carry only the status class, so the invariant reads any
     # retryable 4xx as a drop. The case checks each status itself.
     EXPECT_PERMANENT_DROP = True
-    DEFECTS = {"stdio": "forwards the partial body, and the intake answers 202"}
 
     def test_a_partial_resident_batch_is_not_forwarded(self):
         check_abandoned(self, 8_000)

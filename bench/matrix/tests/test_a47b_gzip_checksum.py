@@ -20,10 +20,6 @@ from tests.test_a44_abandoned_gzip_body import POLICIES
 
 class GzipChecksum(MatrixCase):
     EDGE_POLICIES = POLICIES
-    DEFECTS = {
-        "stdio": "std flate never checks the CRC, so the edge re-encodes the damaged batch",
-        "httpz": "std flate never checks the CRC, so the edge re-encodes the damaged batch",
-    }
 
     def test_a_batch_with_a_bad_crc_is_forwarded_as_sent(self):
         records = [

@@ -31,7 +31,6 @@ class AbandonedGzipBody(MatrixCase):
     # The metrics carry only the status class, so the invariant reads any
     # retryable 4xx as a drop. The case checks each status itself.
     EXPECT_PERMANENT_DROP = True
-    DEFECTS = {"stdio": "decodes the partial body as a whole batch; the gzip decoder then panics"}
     FORBID_LOGS = ["upstream", "policy.failed.open"]
 
     def assert_abandoned(self, answer, why: str) -> None:

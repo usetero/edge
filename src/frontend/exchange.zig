@@ -93,8 +93,10 @@ pub fn errorStatus(err: anyerror) u16 {
         // sender cannot see our decode budget and the agent discards a 413
         // permanently.
         error.BodyTooLarge, error.DecodedBodyTooLarge => 413,
-        error.InboundBodyTimeout => 408,
-        error.InvalidRequestBody => 400,
+        // Retryable: the agent can send the whole batch again, and it
+        // discards a batch for good on 400.
+        error.InboundBodyTimeout, error.InboundBodyTruncated => 408,
+        error.InvalidRequestBody, error.InvalidRequestHeader => 400,
         // Our cap, and the sender can act on it. A 5xx would send an agent
         // into a retry loop against a request that can never succeed.
         error.TooManyHeaders => 431,

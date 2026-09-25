@@ -500,92 +500,138 @@ and python by path, so nothing depends on an activated shell.
 ## Undefined behaviour on sender input
 
 A customer ran 1.32.0 in ECS, and the sidecar exited with SIGSEGV after 23
-to 56 minutes. We reproduced it with one request. This section records what
-is broken. Nothing here is fixed yet.
+to 56 minutes. We reproduced it with one request: a gzip batch that the
+sender abandons partway through. An audit then found more faults of the same
+kind. This section records each fault, what fixed it, and what is still open.
 
-### How we test for it
+### Status
 
-- [x] The runner builds ReleaseSafe by default (`--optimize`). A safety check
-      then stops the edge with a panic, and the "edge died" invariant fails.
-      The shipped container is ReleaseFast, where the same bug is a segfault,
-      a thread that spins forever, or damaged memory that fails later.
-- [x] The runner reports the first failure of a case in time order. It used
-      to report the last one, so a tearDown failure hid the real cause.
-- [x] a11 now also checks that a partial body does not reach the intake.
-- [x] New cases: a44, a45, a45b, a46, a46b, c10, a47, a47b, a49, a50. Each
-      defect below is declared, so the suite reports it as xfail.
-- [x] The two corrupt-body fixtures from the audit are in `fixtures/`.
+| # | Fault | Cases | Status |
+|---|---|---|---|
+| 1 | A partial body passes as a whole batch (stdio) | a11, a44, a45, c10 | Fixed |
+| 2 | std gzip decoder crashes on a stream that ends early (both frontends) | a44, a46, a47 | Fixed by a guard; upstream fix in Zig 0.17 |
+| 3 | std zstd decoder crashes on some corrupt frames | a47 | Fixed: zstd decodes with libzstd |
+| 4 | The gzip CRC and length are never checked | a47b | Fixed |
+| 5 | A zero-byte `stream()` return ends the decode copy, so the buffered path answers 413 | a49 | Fixed |
+| 6 | A bare LF in a header value reaches the upstream (stdio) | a50 | Fixed |
+| 7 | A POST with no framing trips a std assert (stdio) | a05 | Fixed |
+| 8 | Two gzip members: std flate stops after the first | a51 | Fixed: fails open |
+| 9 | Chunk size `ffffffffffffffff` overflows in `std.http` | none | Open |
 
-### Broken: a partial body passes as a whole batch (stdio)
+### 1. A partial body passes as a whole batch
 
-A sender that closes before it sends `Content-Length` bytes gets its partial
-body treated as complete. This affects bodies up to 64 KiB, which stdio holds
-in memory.
+std's Content-Length body reader returns `EndOfStream` when the peer closes
+early, and `inboundBodyOf` took that as the normal end. With no policy the
+edge forwarded the partial body and the intake answered 202. With a log
+policy the partial gzip body went to the decoder, which is fault 2. Chunked
+bodies were safe: std reports `HttpChunkTruncated`.
 
-- std's Content-Length body reader returns `EndOfStream` when the peer closes
-  early. Chunked bodies are different: std reports `HttpChunkTruncated`.
-- `inboundBodyOf` (`stdio/conn.zig`) reads through `streamReaderToWriter`,
-  which takes `EndOfStream` as the normal end.
-- With no policy, the edge forwards the partial body, and the intake answers
-  202. (a11, a45)
-- With a log policy, the partial gzip body goes to the decoder, which is the
-  crash below. (a44, c10)
-- Bodies above 64 KiB use `streamExact`, which fails correctly.
+Fix: `inboundBodyOf` reads a resident body with `streamExact64`. A short body
+fails as `InboundBodyTruncated` and gets a 408, which the agent retries.
 
-### Broken: the std gzip decoder on a stream that ends early (both frontends)
+### 2. The std gzip decoder on a stream that ends early
 
-`std.compress.flate.Decompress` in Zig 0.16.0 reaches `unreachable`
-(`Decompress.zig:467`) or overflows an integer (`:548`) when its input ends
-before the gzip stream does. `tossBitsShort` checks
-`bufferedLen() * 8 + consumed_bits < n`, so it moves `seek` past `end`, and
-the bit reader state goes bad from there. A complete stream never reaches this
-path, because the 8-byte footer keeps `peekInt(u32)` fed.
+In Zig 0.16.0, `tossBitsShort` in `flate/Decompress.zig` adds `consumed_bits`
+where it must subtract them. When the input ends before the stream, the bit
+reader passes its own end, and the decoder reaches `unreachable` or overflows.
+In ReleaseFast that is undefined behaviour: a segfault, or a thread that spins
+forever. The published amd64 image spun 257 threads under chaos traffic.
 
-- Two ways in: the partial body above, or complete framing around a cut
-  stream (a46). httpz dies on a46 too, so 1.31.0 has this crash.
-- It affects the streamed logs path (`paths.zig`, `pipeline.run`) and the
-  buffered path (`exec.processBuffered`).
-- Proof that uses no edge code: a program that feeds every truncation of a
-  valid gzip stream to the decoder panics at byte 19.
-- The published amd64 image, sent the same request: at one cut point, one
-  thread spun at 100% CPU and held its connection. At the other cuts, the edge
-  answered 202 and forwarded the partial batch. Under chaos traffic, 257
-  threads spun and the edge shed 211,837 connections with 503.
+Corrupt bytes reach the same fault. A corruption can make the deflate data ask
+for more bits than the stream holds. All 55 gzip crash inputs from the audit
+panic with std's reader and none with the guard, including the full-length
+corrupt ones. So a body length check alone cannot prevent the crash.
 
-### Broken, found by the audit
+Fix: `encoding.residentReader` makes the end of a resident gzip body read as
+`ReadFailed`. A complete stream never reads past its 8-byte footer, so a valid
+body never sees the end, and flate returns `ReadFailed` as a clean error.
 
-A background audit fuzzed the decoders and read the request paths.
+**Upstream:** reported as https://codeberg.org/ziglang/zig/issues/35789 and
+fixed on master by PR 35815 (June 2026), a one-character change. The fix is
+not in 0.16.0 and not on the `0.16.x` branch. It should ship in Zig 0.17.
+When the edge moves to that release, delete the gzip case in
+`residentReader`. The matrix and the decode safety tests then prove std alone.
 
-1. **Corrupt gzip, complete length (a47).** A few changed bytes in a
-   full-length gzip body break std flate: a panic in ReleaseSafe, and an
-   endless loop in ReleaseFast. About 0.06% of random corruptions of a large
-   level-9 stream trigger it. It is the same end-of-input fault: the
-   corruption makes the deflate data ask for more bits than the stream holds.
-   So a body length check alone cannot prevent the crash.
-2. **The gzip CRC is never checked (a47b).** std flate reads the CRC32 and
-   ISIZE and never compares them. When a policy changes the batch, the edge
-   writes a new stream with a valid CRC, so damaged data reaches the intake
-   as sound.
-3. **Corrupt zstd, complete length (a47).** std zstd reaches
-   `unreachableRebase` (`Io/Writer.zig`) from `decodeLiterals`, on 2 of 3000
-   corruptions of a multi-block frame. A cut zstd stream does not trigger it
-   (a46b passes).
-4. **Chunk size overflow. No matrix case yet.** std.http accepts a chunk size of
-   `ffffffffffffffff`, then computes `chunk_len + 2 - n` (`http.zig:586`, and
-   the discard path at `:654`). In ReleaseSafe, one request panics the
-   process. In ReleaseFast, the value wraps and the chunk framing goes out of
-   sync. Upstream responses reach the same code.
-5. **A zero-byte `stream()` return ends the copy (a49).** `streamReaderToWriter`
-   stops when `stream()` returns 0, but std decoders return 0 before they have
-   data. On the buffered policy path, a valid gzip or zstd body then fails the
-   excess check and gets 413, which the agent drops for good. That path serves
-   Datadog metrics JSON and OTLP JSON. By reading the code, the audit also
-   thinks an HTTPS response body that spans more than one TLS record fails the
-   same way. That is not proven. a49 fails on both frontends, for every
-   valid compressed batch on that path.
-6. **Bare LF in a header value (a50).** `x-a: b\nx-c: d` parses as one
-   header, and stdio's `collectRequestHeaders` forwards the LF upstream.
-   httpz refuses the request.
+### 3. The std zstd decoder on corrupt frames
+
+`zstd.Decompress` writes the literals after the sequences with
+`writableSlice(len)`, and nothing checks that the block stays inside the one
+block of space reserved for it. A valid frame never goes over, but a corrupt
+one can, and the rebase is `unreachableRebase`. A larger buffer does not help:
+std guarantees only one block of free space before each block. This bug is
+not reported upstream, and master has the same code.
+
+Fix: the edge decodes zstd from a sender with
+`compress_buffered.decompressZstd` (libzstd), then runs the pipeline on the
+decoded bytes as identity. `decompressZstd` was rewritten for untrusted input:
+it decoded some valid frames with no declared size as failures, it refused
+bodies below the cap, it set no window limit, and it logged every bad input
+at error level. It now reads every frame, caps output exactly, and caps the
+window at `zstd_window_len`. A frame that declares its size decodes into the
+output with no window, so only frames with no declared size need the cap.
+
+Cost: on the streamed logs path, a zstd body is decoded into memory once,
+up to `max_decoded_bytes`, instead of streamed. The buffered path already
+held the whole decoded body.
+
+### 4. The gzip CRC and length
+
+std flate reads the CRC32 and ISIZE from the footer and never compares them.
+When a policy changed the batch, the edge wrote a new stream with a fresh CRC,
+so damaged data reached the intake as sound. Fix: `Decoder.verifyEnd` compares
+both against the decoded bytes, on the streamed and the buffered path. A
+mismatch fails open, so the intake gets the body as sent and rejects it.
+
+### 5. Zero-byte returns
+
+`streamReaderToWriter` stopped when `stream()` returned 0. std decoders return
+0 before they have output, and so does TLS. On the buffered path every valid
+gzip or zstd body then failed the excess check and got 413, which the agent
+discards for good. That path serves Datadog metrics JSON and OTLP JSON. Fix:
+only `EndOfStream` ends the copy, as in std's `streamRemaining`.
+
+### 6 to 8. Smaller faults
+
+- **Bare LF (a50).** `x-a: b\nx-c: d` parses in std as one header with an LF
+  in its value, and stdio forwarded it. A lenient upstream would read a second
+  header that the name filter never saw. stdio now answers 400. httpz already
+  refused it.
+- **Unframed POST (a05).** A POST with no `Content-Length` and no chunking
+  has no body (RFC 9112 §6.3). stdio skipped the body reader, and std's
+  `discardBody` asserts that it exists. stdio now makes the reader, and the
+  connection closes after the response.
+- **Two gzip members (a51).** std flate stops after the first member, so a
+  policy would have filtered part of the batch and dropped the rest.
+  `verifyEnd` treats bytes after the member as an error, so the body fails
+  open.
+
+### 9. Open: chunk size overflow
+
+std.http accepts a chunk size of `ffffffffffffffff`, then computes
+`chunk_len + 2 - n` (`http.zig:586`, and the discard path at `:654`). In
+ReleaseSafe one request panics the process. In ReleaseFast the value wraps and
+the chunk framing goes out of sync. Upstream responses reach the same code.
+Master has the same code. There is no matrix case yet.
+
+### How it is tested
+
+- **Matrix.** The runner builds ReleaseSafe by default (`--optimize`), so
+  undefined behaviour panics and the "edge died" invariant fails. The runner
+  reports the first failure of a case in time order. Cases: a05, a11, a44,
+  a45, a45b, a46, a46b, a47, a47b, a49, a50, a51, c10. The corrupt-body
+  fixtures from the audit are in `fixtures/`.
+- **Decode safety tests** (`src/pipeline/decode_safety_test.zig`). Every test
+  checks one property: a decode returns an error or the exact input, and never
+  panics or returns other bytes. They cover zlib levels 0, 1, 6 and 9 and
+  std's encoder for gzip, and three zstd levels with and without a checksum
+  and with no declared size. They decode every prefix of short streams, the
+  ends and a spread of long ones, random corruption, random bytes behind a
+  valid header, the audit's crash inputs, footer faults, header fields, extra
+  members and frames, the window cap, the exact decoded-size cap, and the
+  streamed path through `pipeline.run`. Two `std.testing.fuzz` tests search
+  for new inputs under `zig build test --fuzz`.
+- **Deep run:** `zig build test -Doptimize=ReleaseSafe -Ddecode-test-scale=50`
+  multiplies the random cases and the prefixes of long streams by 50.
 
 ### Other faults seen on the way
 
@@ -599,6 +645,10 @@ A background audit fuzzed the decoders and read the request paths.
   misleads the operator.
 - `latest` moves on every chart release. release-please publishes a chart
   release after each app release, and `release.yaml` tags it `latest`.
+- The metrics carry only the status class, so the drop invariant reads every
+  4xx as a permanent drop. a03, a11, a44, a45, a45b, c01, c05 and c10 opt out
+  and check their statuses themselves. A counter for retryable 4xx answers
+  would let the invariant tell them apart.
 
 ## Findings
 

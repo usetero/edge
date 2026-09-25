@@ -9,6 +9,8 @@ const c = @cImport({
     @cInclude("zstd.h");
 });
 
+const log = std.log.scoped(.compress_buffered);
+
 // Define these constants manually to avoid the overflow issue
 const ZSTD_CONTENTSIZE_ERROR: u64 = @bitCast(@as(i64, -2));
 const ZSTD_CONTENTSIZE_UNKNOWN: u64 = @bitCast(@as(i64, -1));
@@ -18,6 +20,11 @@ pub const default_max_decompressed_size: usize = 100 * 1024 * 1024;
 
 /// Compress data using zlib's gzip compression (actual gzip format)
 pub fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    return compressGzipLevel(allocator, data, c.Z_DEFAULT_COMPRESSION);
+}
+
+/// `compressGzip` at a zlib level: 0 (stored blocks) to 9.
+pub fn compressGzipLevel(allocator: std.mem.Allocator, data: []const u8, level: c_int) ![]u8 {
 
     // Calculate maximum compressed size
     const max_compressed_size = c.deflateBound(null, @intCast(data.len)) + 18; // Add extra for gzip headers
@@ -33,7 +40,7 @@ pub fn compressGzip(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     // The key is using (15 + 16) for windowBits to get gzip format
     var result = c.deflateInit2(
         &stream,
-        c.Z_DEFAULT_COMPRESSION,
+        level,
         c.Z_DEFLATED,
         15 + 16, // 15 is default window size, +16 tells zlib to use gzip format
         8,
@@ -168,134 +175,94 @@ pub fn compressZstd(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     return final;
 }
 
-/// Decompress zstd data
-/// max_size: Maximum allowed decompressed size to prevent compression bombs.
-///           Use 0 for default_max_decompressed_size.
-pub fn decompressZstd(allocator: std.mem.Allocator, compressed: []const u8, max_size: usize) ![]u8 {
+/// Decompress every zstd frame in `compressed`, in order.
+///
+/// Safe on untrusted input: libzstd returns an error for each malformed
+/// frame, and input that ends inside a frame fails with `DecompressionFailed`.
+/// The edge decodes zstd here and not with `std.compress.zstd`, which in Zig
+/// 0.16.0 reaches `unreachable` on some corrupt frames.
+///
+/// `max_size` bounds the output (0 = default_max_decompressed_size).
+/// `window_len` bounds the window a frame may declare, which is the memory
+/// libzstd allocates (0 = the libzstd limit). A frame that declares its size
+/// and fits the output decodes into the output, needs no window, and skips
+/// that check; `max_size` still bounds it.
+pub fn decompressZstd(allocator: std.mem.Allocator, compressed: []const u8, max_size: usize, window_len: usize) ![]u8 {
     const max_decompressed = if (max_size == 0) default_max_decompressed_size else max_size;
 
-    // Get the decompressed size from the frame header
-    const decompressed_size = c.ZSTD_getFrameContentSize(compressed.ptr, compressed.len);
-
-    // Use our manually defined constants instead of c.ZSTD_CONTENTSIZE_*
-    if (decompressed_size == ZSTD_CONTENTSIZE_ERROR) {
-        return error.InvalidCompressedData;
+    const dctx = c.ZSTD_createDCtx() orelse return error.DecompressionInitFailed;
+    defer if (c.ZSTD_isError(c.ZSTD_freeDCtx(dctx)) != 0) log.warn("ZSTD_freeDCtx failed", .{});
+    if (window_len != 0) {
+        const log_max: c_int = std.math.log2_int_ceil(usize, window_len);
+        if (c.ZSTD_isError(c.ZSTD_DCtx_setParameter(dctx, c.ZSTD_d_windowLogMax, log_max)) != 0) {
+            return error.DecompressionInitFailed;
+        }
     }
 
-    if (decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
-        // If size is unknown, we need to use streaming decompression
-        return decompressZstdStreaming(allocator, compressed, max_decompressed);
+    // A declared content size only sets the first allocation. The frame can
+    // lie, so the cap below still applies to what it actually produces.
+    const declared = c.ZSTD_getFrameContentSize(compressed.ptr, compressed.len);
+    if (declared == ZSTD_CONTENTSIZE_ERROR) return error.InvalidCompressedData;
+    const first: usize = if (declared == ZSTD_CONTENTSIZE_UNKNOWN)
+        compressed.len *| 4
+    else
+        @intCast(@min(declared, max_decompressed));
+    var out: std.ArrayList(u8) = try .initCapacity(allocator, @max(@min(first, max_decompressed), 64));
+    errdefer out.deinit(allocator);
+
+    var in_buffer: c.ZSTD_inBuffer = .{ .src = compressed.ptr, .size = compressed.len, .pos = 0 };
+    while (true) {
+        if (out.items.len == out.capacity) {
+            if (out.capacity >= max_decompressed) return error.DecompressedSizeTooLarge;
+            try out.ensureTotalCapacityPrecise(allocator, @min(out.capacity *| 2, max_decompressed));
+        }
+        const spare = out.unusedCapacitySlice();
+        var out_buffer: c.ZSTD_outBuffer = .{ .dst = spare.ptr, .size = spare.len, .pos = 0 };
+        const in_before = in_buffer.pos;
+        const result = c.ZSTD_decompressStream(dctx, &out_buffer, &in_buffer);
+        if (c.ZSTD_isError(result) != 0) return error.DecompressionFailed;
+        out.items.len += out_buffer.pos;
+
+        const input_done = in_buffer.pos == in_buffer.size;
+        // 0: the frame is complete and flushed. More input is another frame.
+        if (result == 0 and input_done) break;
+        // Room was left and no input remains, so the last frame is open:
+        // the input ended early. A step with no progress is also malformed.
+        if (input_done and out_buffer.pos < out_buffer.size) return error.DecompressionFailed;
+        const stuck = out_buffer.pos == 0 and in_buffer.pos == in_before;
+        if (stuck and out_buffer.size != 0) return error.DecompressionFailed;
     }
-
-    // Check against max size limit to prevent compression bombs
-    if (decompressed_size > max_decompressed) {
-        return error.DecompressedSizeTooLarge;
-    }
-
-    // Allocate exact size needed
-    const decompressed = try allocator.alloc(u8, decompressed_size);
-    errdefer allocator.free(decompressed);
-
-    // Perform decompression
-    const actual_size = c.ZSTD_decompress(
-        decompressed.ptr,
-        decompressed_size,
-        compressed.ptr,
-        compressed.len,
-    );
-
-    // Check for errors
-    if (c.ZSTD_isError(actual_size) != 0) {
-        const error_name = c.ZSTD_getErrorName(actual_size);
-        std.log.err("ZSTD decompression failed: {s}", .{error_name});
-        return error.DecompressionFailed;
-    }
-
-    if (actual_size != decompressed_size) {
-        // Resize if needed (shouldn't happen with known size)
-        const final = try allocator.realloc(decompressed, actual_size);
-        return final;
-    }
-
-    return decompressed;
+    return out.toOwnedSlice(allocator);
 }
 
-/// Streaming decompression for when content size is unknown
-fn decompressZstdStreaming(allocator: std.mem.Allocator, compressed: []const u8, max_decompressed: usize) ![]u8 {
+/// Options for `compressZstdWith`, for tests that need a specific frame.
+pub const ZstdFrameOptions = struct {
+    level: c_int = c.ZSTD_CLEVEL_DEFAULT,
+    checksum: bool = false,
+    /// 0 keeps the libzstd default.
+    window_log: c_int = 0,
+    /// False leaves the content size out of the frame header.
+    content_size: bool = true,
+};
 
-    // Create a decompression context
-    const dctx = c.ZSTD_createDCtx();
-    if (dctx == null) {
-        return error.DecompressionInitFailed;
-    }
-    defer _ = c.ZSTD_freeDCtx(dctx);
+fn setZstdParameter(cctx: *c.ZSTD_CCtx, parameter: c.ZSTD_cParameter, value: c_int) error{CompressionInitFailed}!void {
+    if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(cctx, parameter, value)) != 0) return error.CompressionInitFailed;
+}
 
-    // Start with a reasonable buffer, but cap at max
-    var decompressed_capacity: usize = @min(compressed.len * 10, max_decompressed);
-    var decompressed = try allocator.alloc(u8, decompressed_capacity);
-    errdefer allocator.free(decompressed);
-
-    var in_buffer: c.ZSTD_inBuffer = .{
-        .src = compressed.ptr,
-        .size = compressed.len,
-        .pos = 0,
-    };
-
-    var out_buffer: c.ZSTD_outBuffer = .{
-        .dst = decompressed.ptr,
-        .size = decompressed_capacity,
-        .pos = 0,
-    };
-
-    var frame_complete = false;
-    while (in_buffer.pos < in_buffer.size) {
-        // Check if we need more output space
-        if (out_buffer.pos == out_buffer.size) {
-            const new_capacity = decompressed_capacity * 2;
-
-            // Check against max size limit to prevent compression bombs
-            if (new_capacity > max_decompressed) {
-                return error.DecompressedSizeTooLarge;
-            }
-
-            decompressed_capacity = new_capacity;
-            decompressed = try allocator.realloc(decompressed, decompressed_capacity);
-            out_buffer.dst = decompressed.ptr;
-            out_buffer.size = decompressed_capacity;
-        }
-
-        const result = c.ZSTD_decompressStream(dctx, &out_buffer, &in_buffer);
-
-        if (c.ZSTD_isError(result) != 0) {
-            const error_name = c.ZSTD_getErrorName(result);
-            std.log.err("ZSTD decompression failed: {s}", .{error_name});
-            return error.DecompressionFailed;
-        }
-
-        // result == 0 means frame is completely decoded
-        if (result == 0) {
-            // Final check: ensure decompressed size doesn't exceed limit
-            if (out_buffer.pos > max_decompressed) {
-                return error.DecompressedSizeTooLarge;
-            }
-            frame_complete = true;
-            break;
-        }
-    }
-
-    // Input ran out before the frame closed: truncated input. Mirrors the
-    // sibling gzip path's Z_BUF_ERROR branch — ZSTD_decompressStream returns
-    // a positive non-error hint (>0) here instead of synthesizing an error,
-    // so without this guard a byte-exact plaintext prefix would be returned
-    // on the success path (silent data corruption).
-    if (!frame_complete) {
-        return error.DecompressionFailed;
-    }
-
-    // Resize to actual size
-    const final = try allocator.realloc(decompressed, out_buffer.pos);
-
-    return final;
+/// Compress with explicit frame parameters.
+pub fn compressZstdWith(allocator: std.mem.Allocator, data: []const u8, options: ZstdFrameOptions) ![]u8 {
+    const cctx = c.ZSTD_createCCtx() orelse return error.CompressionInitFailed;
+    defer if (c.ZSTD_isError(c.ZSTD_freeCCtx(cctx)) != 0) log.warn("ZSTD_freeCCtx failed", .{});
+    try setZstdParameter(cctx, c.ZSTD_c_compressionLevel, options.level);
+    try setZstdParameter(cctx, c.ZSTD_c_checksumFlag, @intFromBool(options.checksum));
+    try setZstdParameter(cctx, c.ZSTD_c_contentSizeFlag, @intFromBool(options.content_size));
+    if (options.window_log != 0) try setZstdParameter(cctx, c.ZSTD_c_windowLog, options.window_log);
+    const bound = c.ZSTD_compressBound(data.len);
+    const compressed = try allocator.alloc(u8, bound);
+    errdefer allocator.free(compressed);
+    const n = c.ZSTD_compress2(cctx, compressed.ptr, bound, data.ptr, data.len);
+    if (c.ZSTD_isError(n) != 0) return error.CompressionFailed;
+    return allocator.realloc(compressed, n);
 }
 
 // ========== Tests ==========
@@ -317,7 +284,7 @@ test "compressZstd and decompressZstd" {
     try std.testing.expect(compressed[3] == 0xFD);
 
     // Decompress to verify (0 = use default max size)
-    const decompressed = try decompressZstd(allocator, compressed, 0);
+    const decompressed = try decompressZstd(allocator, compressed, 0, 0);
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualStrings(originalData, decompressed);
@@ -346,7 +313,7 @@ test "zstd compress and decompress JSON payload" {
     try std.testing.expect(compressed.len < originalData.len);
 
     // Decompress to verify (0 = use default max size)
-    const decompressed = try decompressZstd(allocator, compressed, 0);
+    const decompressed = try decompressZstd(allocator, compressed, 0, 0);
     defer allocator.free(decompressed);
 
     try std.testing.expectEqualStrings(originalData, decompressed);
@@ -465,7 +432,7 @@ test "decompressZstd rejects data exceeding max size" {
     defer allocator.free(compressed);
 
     // ZSTD stores the decompressed size in the header, so it checks upfront
-    const result = decompressZstd(allocator, compressed, 500);
+    const result = decompressZstd(allocator, compressed, 500, 0);
     try std.testing.expectError(error.DecompressedSizeTooLarge, result);
 }
 
@@ -497,7 +464,7 @@ test "decompressZstd rejects truncated frame with known content size" {
 
     // Sanity: a complete frame round-trips.
     {
-        const decoded = try decompressZstd(allocator, compressed, 0);
+        const decoded = try decompressZstd(allocator, compressed, 0, 0);
         defer allocator.free(decoded);
         try std.testing.expectEqualSlices(u8, payload, decoded);
     }
@@ -507,6 +474,6 @@ test "decompressZstd rejects truncated frame with known content size" {
     // error.InvalidCompressedData, never a silent partial plaintext.
     for ([_]usize{ 0, 3, 4 }) |keep| {
         const truncated = compressed[0..@min(keep, compressed.len)];
-        try std.testing.expectError(error.InvalidCompressedData, decompressZstd(allocator, truncated, 0));
+        try std.testing.expectError(error.InvalidCompressedData, decompressZstd(allocator, truncated, 0, 0));
     }
 }

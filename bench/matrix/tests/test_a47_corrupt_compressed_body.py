@@ -30,10 +30,6 @@ class CorruptCompressedBody(MatrixCase):
     EDGE_POLICIES = POLICIES
     EXPECT_LOGS = ["policy.failed.open"]
     FORBID_LOGS = ["request.failed"]
-    DEFECTS = {
-        "stdio": "the std decoder reaches unreachable, and the process dies",
-        "httpz": "the std decoder reaches unreachable, and the process dies",
-    }
 
     def send(self, name: str, encoding: str) -> None:
         response = self.post_raw_body(fixture(name), headers={"Content-Encoding": encoding}, timeout=30)

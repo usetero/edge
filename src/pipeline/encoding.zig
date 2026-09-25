@@ -14,6 +14,8 @@ const c = @cImport({
     @cInclude("zstd.h");
 });
 
+const buffered = @import("compress_buffered.zig");
+
 const log = std.log.scoped(.encoding);
 
 pub const ContentEncoding = enum {
@@ -62,6 +64,92 @@ pub const ContentEncoding = enum {
     }
 };
 
+/// The reader a decoder of `encoding` must get for a resident body.
+///
+/// For gzip, the end of the bytes reads as `ReadFailed`, not `EndOfStream`.
+/// In Zig 0.16.0, `tossBitsShort` in `flate/Decompress.zig` adds
+/// `consumed_bits` where it must subtract them. When the input ends before
+/// the stream does, the bit reader passes its own end and the decoder reaches
+/// `unreachable` or overflows. A complete stream never reads past its 8-byte
+/// footer, so it never sees the end. On `ReadFailed` the decoder returns a
+/// clean error instead. Upstream fixed this on master
+/// (https://codeberg.org/ziglang/zig/issues/35789, PR 35815), so remove the
+/// gzip case when the edge moves to a Zig release with that fix (0.17).
+pub fn residentReader(encoding: ContentEncoding, bytes: []const u8) std.Io.Reader {
+    return switch (encoding) {
+        .identity, .zstd => .fixed(bytes),
+        .gzip => .{
+            .vtable = &.{
+                .stream = endFails,
+                .discard = endFailsDiscard,
+                .readVec = endFailsReadVec,
+                // The default rebase moves bytes inside `buffer`, which is the
+                // body a failed decode forwards as sent.
+                .rebase = endFailsRebase,
+            },
+            .buffer = @constCast(bytes),
+            .seek = 0,
+            .end = bytes.len,
+        },
+    };
+}
+
+fn endFails(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    return error.ReadFailed;
+}
+
+fn endFailsDiscard(_: *std.Io.Reader, _: std.Io.Limit) std.Io.Reader.Error!usize {
+    return error.ReadFailed;
+}
+
+fn endFailsReadVec(_: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+    return error.ReadFailed;
+}
+
+fn endFailsRebase(_: *std.Io.Reader, _: usize) std.Io.Reader.RebaseError!void {
+    return error.ReadFailed;
+}
+
+/// Decodes a whole body from a sender into `allocator`. zstd goes through
+/// libzstd, and gzip through std with `residentReader` and `verifyEnd`.
+/// Every malformed input is an error: output past `max_decoded` is
+/// `DecodedBodyTooLarge`, and anything else the caller fails open on.
+pub fn decodeResident(
+    encoding: ContentEncoding,
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    max_decoded: usize,
+    zstd_window_len: usize,
+) ![]const u8 {
+    switch (encoding) {
+        .identity => return raw,
+        .zstd => return buffered.decompressZstd(allocator, raw, max_decoded, zstd_window_len) catch |err| switch (err) {
+            error.DecompressedSizeTooLarge => error.DecodedBodyTooLarge,
+            else => |e| e,
+        },
+        .gzip => {
+            var in = residentReader(.gzip, raw);
+            const window = try allocator.alloc(u8, encoding.decoderBufferLen(zstd_window_len));
+            defer allocator.free(window);
+            var decoder: Decoder = .init(.gzip, &in, window, zstd_window_len);
+            // std reports `StreamTooLong` when output reaches the limit, so
+            // the limit is one past the largest body allowed.
+            const limit: std.Io.Limit = .limited(max_decoded +| 1);
+            const decoded = decoder.reader().allocRemaining(allocator, limit) catch |err| return switch (err) {
+                error.StreamTooLong => error.DecodedBodyTooLarge,
+                error.OutOfMemory, error.ReadFailed => |e| e,
+            };
+            errdefer allocator.free(decoded);
+            try decoder.verifyEnd(std.hash.Crc32.hash(decoded), @truncate(decoded.len));
+            return decoded;
+        },
+    }
+}
+
+/// Streaming decoders over std. For input from a sender, give gzip a
+/// `residentReader` and call `verifyEnd` after the last byte. Decode zstd
+/// from a sender with `compress_buffered.decompressZstd`: `std.compress.zstd`
+/// in Zig 0.16.0 reaches `unreachable` on some corrupt frames.
 pub const Decoder = union(ContentEncoding) {
     identity: *std.Io.Reader,
     gzip: flate.Decompress,
@@ -86,6 +174,22 @@ pub const Decoder = union(ContentEncoding) {
                 .{ .window_len = @intCast(zstd_window_len) },
             ) },
         };
+    }
+
+    /// Checks a gzip stream that decoded to its end. std flate reads the
+    /// CRC32 and length from the footer but does not compare them, and it
+    /// stops after the first gzip member. `crc` and `len` cover every decoded
+    /// byte, with `len` taken mod 2^32 as gzip stores it. Bytes after the
+    /// member are an error too, so a caller forwards the body as sent.
+    pub fn verifyEnd(self: *const Decoder, crc: u32, len: u32) error{ReadFailed}!void {
+        switch (self.*) {
+            .identity, .zstd => {},
+            .gzip => |*d| {
+                const footer = d.container_metadata.gzip;
+                if (footer.crc != crc or footer.count != len) return error.ReadFailed;
+                if (d.input.bufferedLen() != 0) return error.ReadFailed;
+            },
+        }
     }
 
     /// The decoded-bytes reader. Identity hands back the inner reader: zero
@@ -278,7 +382,6 @@ pub const ZstdCompressor = struct {
 // compress_buffered.zig: every fixture must round-trip both directions.
 
 const testing = std.testing;
-const buffered = @import("compress_buffered.zig");
 
 const TEST_ZSTD_WINDOW: usize = 256 * 1024;
 
@@ -389,7 +492,7 @@ test "streaming zstd encode is decodable by buffered oracle" {
         for ([_]usize{ 1, 7, 4096 }) |chunk| {
             const encoded = try encodeAll(.zstd, fixture, chunk);
             defer testing.allocator.free(encoded);
-            const decoded = try buffered.decompressZstd(testing.allocator, encoded, 0);
+            const decoded = try buffered.decompressZstd(testing.allocator, encoded, 0, 0);
             defer testing.allocator.free(decoded);
             try testing.expectEqualStrings(fixture, decoded);
         }
@@ -418,7 +521,7 @@ test "buffered zstd oracle rejects truncated streaming-encoded frame" {
 
         // A complete frame round-trips through the buffered oracle.
         {
-            const decoded = try buffered.decompressZstd(allocator, encoded, 0);
+            const decoded = try buffered.decompressZstd(allocator, encoded, 0, 0);
             defer allocator.free(decoded);
             try testing.expectEqualSlices(u8, payload, decoded);
         }
@@ -428,7 +531,7 @@ test "buffered zstd oracle rejects truncated streaming-encoded frame" {
         for ([_]usize{ 1, 16, 64, encoded.len / 2 }) |drop| {
             if (drop >= encoded.len) continue;
             const truncated = encoded[0 .. encoded.len - drop];
-            try testing.expectError(error.DecompressionFailed, buffered.decompressZstd(allocator, truncated, 0));
+            try testing.expectError(error.DecompressionFailed, buffered.decompressZstd(allocator, truncated, 0, 0));
         }
     }
 }
@@ -454,7 +557,7 @@ test "zstd compression contexts are cached and reused across encoders" {
     try second.writer().writeAll("world");
     try second.finish();
 
-    const decoded = try buffered.decompressZstd(testing.allocator, out.written(), 0);
+    const decoded = try buffered.decompressZstd(testing.allocator, out.written(), 0, 0);
     defer testing.allocator.free(decoded);
     try testing.expectEqualStrings("world", decoded);
 }

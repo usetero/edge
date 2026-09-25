@@ -9,7 +9,9 @@ from harness import MatrixCase
 
 class ClientDisconnect(MatrixCase):
     FORBID_LOGS = ["upstream.timed.out"]
-    DEFECTS = {"stdio": "forwards the partial body to the intake"}
+    # The metrics carry only the status class, so the invariant reads the
+    # retryable 408 as a drop. The case checks the intake instead.
+    EXPECT_PERMANENT_DROP = True
     def test_disconnect_frees_the_slot(self):
         for _ in range(5):
             client = self.raw(timeout=10)

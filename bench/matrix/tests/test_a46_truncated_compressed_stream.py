@@ -33,7 +33,7 @@ POLICIES = {
 
 def series_body() -> bytes:
     points = [
-        {"metric": "system.load.%d" % i, "points": [{"timestamp": 1, "value": i}], "type": 3}
+        {"metric": "%s.%d" % ("system.load" if i % 2 else "app.requests", i), "points": [{"timestamp": 1, "value": i}], "type": 3}
         for i in range(400)
     ]
     return json.dumps({"series": points}).encode()
@@ -43,10 +43,6 @@ class TruncatedCompressedStream(MatrixCase):
     EDGE_POLICIES = POLICIES
     EXPECT_LOGS = ["policy.failed.open"]
     FORBID_LOGS = ["request.failed"]
-    DEFECTS = {
-        "stdio": "the gzip decoder reaches unreachable on a cut stream, and the process dies",
-        "httpz": "the gzip decoder reaches unreachable on a cut stream, and the process dies",
-    }
 
     def send_cuts(self, stream: bytes, encoding: str, path: str) -> None:
         for cut in (19, 40, 100, len(stream) // 2, len(stream) - 4, len(stream) - 1):

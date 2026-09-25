@@ -11,6 +11,10 @@ from harness import MatrixCase
 class HealthAtCapacity(MatrixCase):
     EDGE_CONFIG = {"max_connections": 8}
     EXPECT_SHED = True
+    # The held senders declare a body and close without it, which answers the
+    # retryable 408. The metrics carry only the status class, so the invariant
+    # would read it as a drop.
+    EXPECT_PERMANENT_DROP = True
     DEFECTS = {"httpz": "health waits behind the full connection table"}
 
     def test_health_answers_at_capacity(self):

@@ -14,7 +14,6 @@ const o11y = @import("o11y");
 const service_mod = @import("../service/service.zig");
 const router_mod = @import("../service/router.zig");
 const upstream_mod = @import("upstream.zig");
-const pipeline_mod = @import("../pipeline/pipeline.zig");
 const encoding_mod = @import("../pipeline/encoding.zig");
 const framer_mod = @import("../pipeline/framer.zig");
 const tap_mod = @import("../pipeline/tap.zig");
@@ -375,13 +374,15 @@ pub fn processBuffered(
     if (!policiesActiveFor(ctx.registry, pipe.signal)) {
         return .{ .body = raw_body, .all_dropped = false };
     }
-    var raw_reader = std.Io.Reader.fixed(raw_body);
-    const decode_buf = try arena.alloc(u8, pipe.codec.decoderBufferLen(ctx.limits.zstd_window_len));
-    var decoder: encoding_mod.Decoder = .init(pipe.codec, &raw_reader, decode_buf, ctx.limits.zstd_window_len);
-    var decoded_capture: std.Io.Writer.Allocating = .init(arena);
-    _ = try pipeline_mod.streamReaderToWriter(decoder.reader(), &decoded_capture.writer, ctx.limits.max_decoded_bytes);
+    const decoded = try encoding_mod.decodeResident(
+        pipe.codec,
+        arena,
+        raw_body,
+        ctx.limits.max_decoded_bytes,
+        ctx.limits.zstd_window_len,
+    );
 
-    var decoded_reader = std.Io.Reader.fixed(decoded_capture.written());
+    var decoded_reader = std.Io.Reader.fixed(decoded);
     var transformed: std.Io.Writer.Allocating = try .initCapacity(arena, 4096);
     const registry = ctx.registry;
     // The per-signal StreamProcessResult types are distinct; normalize.

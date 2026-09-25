@@ -32,7 +32,16 @@ pub fn build(b: *std.Build) void {
         "Inbound HTTP frontend (stdio = std.Io-native, httpz = event loop + worker pool)",
     ) orelse .stdio;
 
+    // Multiplies the work in src/pipeline/decode_safety_test.zig. 1 keeps
+    // `zig build test` fast; a deep run uses 20 or more.
+    const decode_test_scale = b.option(
+        u32,
+        "decode-test-scale",
+        "Work multiplier for the decode safety tests",
+    ) orelse 1;
+
     const build_options = b.addOptions();
+    build_options.addOption(u32, "decode_test_scale", decode_test_scale);
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "commit", commit);
     build_options.addOption(Frontend, "frontend", frontend);

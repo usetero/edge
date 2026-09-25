@@ -25,10 +25,6 @@ def otlp_logs_body() -> bytes:
 class BufferedCompressedBody(MatrixCase):
     EDGE_POLICIES = POLICIES
     FORBID_LOGS = ["request.failed"]
-    DEFECTS = {
-        "stdio": "answers 413, because the decode copy stops on a zero-byte read",
-        "httpz": "answers 413, because the decode copy stops on a zero-byte read",
-    }
 
     def send(self, body: bytes, encoding: str, path: str) -> None:
         response = self.post_raw_body(body, path=path, headers={"Content-Encoding": encoding}, timeout=30)

@@ -11,6 +11,8 @@ const std = @import("std");
 const exec = @import("exec.zig");
 const service_mod = @import("../service/service.zig");
 const pipeline_mod = @import("../pipeline/pipeline.zig");
+const encoding_mod = @import("../pipeline/encoding.zig");
+const buffered = @import("../pipeline/compress_buffered.zig");
 const limits_mod = @import("../core/limits.zig");
 const prom = @import("../signals/prometheus/root.zig");
 const exchange = @import("exchange.zig");
@@ -129,10 +131,20 @@ pub fn execPipeStream(
     const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
     const raw_body = try residentBody(ctx, body);
     try bufs.prepare(ctx.gpa, ctx.limits, pipe.codec);
-    var body_reader = std.Io.Reader.fixed(raw_body);
+    // zstd decodes with libzstd first (see `encoding.Decoder`), and the
+    // pipeline then reads the decoded bytes as identity.
+    const zstd_decoded: ?[]u8 = if (pipe.codec == .zstd)
+        buffered.decompressZstd(ctx.gpa, raw_body, ctx.limits.max_decoded_bytes, ctx.limits.zstd_window_len) catch |err|
+            return failOpen(ctx, in, sink, pipe, raw_body, "probe", err)
+    else
+        null;
+    defer if (zstd_decoded) |decoded| ctx.gpa.free(decoded);
+    const decode_input = zstd_decoded orelse raw_body;
+    const decode: encoding_mod.ContentEncoding = if (zstd_decoded != null) .identity else pipe.codec;
+    var body_reader = encoding_mod.residentReader(decode, decode_input);
     const initial_capacity = @max(@min(raw_body.len, limits_mod.LARGE_BODY_BUFFER_BYTES), 64);
     const spec: pipeline_mod.PipelineSpec = .{
-        .decode = pipe.codec,
+        .decode = decode,
         .format = pipe.format,
         .encode = .identity,
         .max_decoded_bytes = ctx.limits.max_decoded_bytes,
@@ -167,7 +179,7 @@ pub fn execPipeStream(
         }
         return exchange.exchange(ctx, in, sink, pipe.upstream, .{ .bytes = raw_body }, pipe.signal == .log);
     }
-    body_reader = .fixed(raw_body);
+    body_reader = encoding_mod.residentReader(decode, decode_input);
     var output: std.Io.Writer.Allocating = try .initCapacity(in.arena, initial_capacity);
     var record_sink = exec.RecordSink.init(ctx, pipe.signal, pipe.format, &bufs.record);
     defer record_sink.deinit();

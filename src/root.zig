@@ -85,6 +85,7 @@ test {
     _ = @import("core/arena_pool.zig");
     _ = @import("core/lifecycle.zig");
     _ = @import("pipeline/compress_buffered.zig");
+    _ = @import("pipeline/decode_safety_test.zig");
     _ = @import("pipeline/encoding.zig");
     _ = @import("pipeline/framer.zig");
     _ = @import("pipeline/pipeline.zig");
