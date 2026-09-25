@@ -51,7 +51,7 @@ version at its next deploy, with no review.
 edge_container = {
   name       = "tero-edge"
   # Pin a release tag. Each release updates this line.
-  image      = "ghcr.io/usetero/edge-datadog:1.32.0" # x-release-please-version
+  image      = "ghcr.io/usetero/edge-datadog:1.32.1" # x-release-please-version
   cpu        = 0
   # Always set this. Without it the container can consume the whole task
   # allocation, and the kernel OOM killer stops it with nothing in the logs.

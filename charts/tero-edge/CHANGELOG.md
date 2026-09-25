@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.3](https://github.com/usetero/edge/compare/tero-edge-chart-v0.18.2...tero-edge-chart-v0.18.3) (2026-09-25)
+
+
+### Performance Improvements
+
+* policy-zig 0.7.4, shared datadog record helpers, and sizing from measurement ([#338](https://github.com/usetero/edge/issues/338)) ([dab019a](https://github.com/usetero/edge/commit/dab019a046286299cf86f7b366bf01948ddea13e))
+
 ## [0.18.2](https://github.com/usetero/edge/compare/tero-edge-chart-v0.18.1...tero-edge-chart-v0.18.2) (2026-09-17)
 
 

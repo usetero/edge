@@ -400,19 +400,19 @@ tag in production: `latest` moves to each new release as it ships.
 
 ```bash
 # Pull the full distribution
-docker pull ghcr.io/usetero/edge:1.32.0 # x-release-please-version
+docker pull ghcr.io/usetero/edge:1.32.1 # x-release-please-version
 
 # Pull Datadog-only distribution
-docker pull ghcr.io/usetero/edge-datadog:1.32.0 # x-release-please-version
+docker pull ghcr.io/usetero/edge-datadog:1.32.1 # x-release-please-version
 
 # Pull OTLP-only distribution
-docker pull ghcr.io/usetero/edge-otlp:1.32.0 # x-release-please-version
+docker pull ghcr.io/usetero/edge-otlp:1.32.1 # x-release-please-version
 
 # Pull Prometheus-only distribution
-docker pull ghcr.io/usetero/edge-prometheus:1.32.0 # x-release-please-version
+docker pull ghcr.io/usetero/edge-prometheus:1.32.1 # x-release-please-version
 
 # Pull Tail-only distribution
-docker pull ghcr.io/usetero/edge-tail:1.32.0 # x-release-please-version
+docker pull ghcr.io/usetero/edge-tail:1.32.1 # x-release-please-version
 ```
 
 Available distributions: `edge`, `datadog`, `otlp`, `prometheus`, `tail`
