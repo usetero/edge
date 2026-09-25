@@ -304,6 +304,24 @@ pub fn build(b: *std.Build) void {
     run_pool_harness.step.dependOn(b.getInstallStep()); // harness spawns zig-out/bin/edge
     pool_harness_step.dependOn(&run_pool_harness.step);
 
+    // End-to-end chunked-request harness for the stdio frontend. It runs the
+    // real edge binary; see src/bench/chunked_harness.zig.
+    const chunked_harness = b.addExecutable(.{
+        .name = "chunked-harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/chunked_harness.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const chunked_harness_step = b.step(
+        "chunked-harness",
+        "Verify chunked request streaming through the stdio frontend against real edge",
+    );
+    const run_chunked_harness = b.addRunArtifact(chunked_harness);
+    run_chunked_harness.step.dependOn(b.getInstallStep()); // harness spawns zig-out/bin/edge
+    chunked_harness_step.dependOn(&run_chunked_harness.step);
+
     // Datadog log search/filter microbenchmark (zbench).
     const datadog_log_bench = b.addExecutable(.{
         .name = "datadog-log-bench",

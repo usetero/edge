@@ -39,6 +39,11 @@ pub const InboundBody = union(enum) {
     /// Still on the client socket. `len` is the declared Content-Length,
     /// already checked against max_body_size by the frontend.
     lazy: struct { reader: *std.Io.Reader, len: usize },
+    /// Still on the client socket with no declared length (chunked). The pump
+    /// enforces `max_bytes`, the frontend's `max_body_size`. `forward_raw`
+    /// streams it upstream; the policy paths drain it through `residentBody`.
+    /// Never replayable.
+    streamed: struct { reader: *std.Io.Reader, max_bytes: usize },
 };
 
 fn bufferLazyBody(reader: *std.Io.Reader, dst: []u8, len: usize) ![]const u8 {
@@ -53,7 +58,8 @@ fn bufferLazyBody(reader: *std.Io.Reader, dst: []u8, len: usize) ![]const u8 {
 }
 
 /// Forward an inbound body as-is: buffered bytes go with the route's replay
-/// policy; a lazy body streams socket to socket and cannot be replayed.
+/// policy. A lazy or streamed body streams socket to socket and cannot be
+/// replayed. A chunked body goes upstream as chunked.
 fn forwardInbound(
     ctx: *exec.SharedCtx,
     in: Inbound,
@@ -68,11 +74,16 @@ fn forwardInbound(
             const body: BodySource = .{ .stream = .{ .reader = l.reader, .len = l.len } };
             return exchange.exchange(ctx, in, sink, upstream, body, false);
         },
+        .streamed => |s| {
+            const body: BodySource = .{ .chunked = .{ .reader = s.reader, .max_bytes = s.max_bytes } };
+            return exchange.exchange(ctx, in, sink, upstream, body, false);
+        },
     }
 }
 
-/// Drain a lazy body into this thread's body buffer; the policy paths read
-/// the body twice (probe, then encode), so it must be resident.
+/// Drain a lazy or streamed body into this thread's body buffer; the policy
+/// paths read the body twice (probe, then encode), so it must be resident.
+/// The thread buffer, not the connection arena, holds the body-sized memory.
 fn residentBody(ctx: *exec.SharedCtx, inbound: InboundBody) ![]const u8 {
     return switch (inbound) {
         .bytes => |b| b,
@@ -80,6 +91,13 @@ fn residentBody(ctx: *exec.SharedCtx, inbound: InboundBody) ![]const u8 {
             const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
             const dst = try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size);
             break :blk try bufferLazyBody(l.reader, dst, l.len);
+        },
+        .streamed => |s| blk: {
+            const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
+            const dst = try bufs.ensureBody(ctx.gpa, ctx.limits.max_body_size);
+            var fixed: std.Io.Writer = .fixed(dst);
+            const n = try pipeline_mod.streamReaderToWriter(s.reader, &fixed, s.max_bytes);
+            break :blk dst[0..n];
         },
     };
 }
@@ -268,11 +286,17 @@ pub fn execFetchFiltered(
     defer upstream_req.deinit();
     thread_bufs.trackUpstream(ctx.io, bufs, upstream_req.connection);
     defer thread_bufs.trackUpstream(ctx.io, bufs, null);
+    // A dead keep-alive fails during send or receiveHead. Body handling below
+    // also evicts incomplete responses and distinguishes watchdog timeouts.
     var upstream_res = blk: {
-        errdefer |err| exchange.evictUpstream(ctx, &upstream_req, in.path, err);
-        try upstream_req.sendBodiless();
-        break :blk try upstream_req.receiveHead(&.{});
+        upstream_req.sendBodiless() catch |err| break :blk err;
+        break :blk upstream_req.receiveHead(&.{});
+    } catch |err| {
+        exchange.evictUpstream(ctx, &upstream_req, in.path, err);
+        if (bufs.timed_out.load(.acquire)) return exchange.timedOut(ctx, in.path, "head");
+        return err;
     };
+    const declared = upstream_res.head.content_length;
     var extra_headers: [64]std.http.Header = undefined;
     const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, in.arena, &extra_headers);
     const out = try sink.begin(@intFromEnum(upstream_res.head.status), relayed);
@@ -296,7 +320,20 @@ pub fn execFetchFiltered(
 
     const upstream_body = upstream_res.reader(bufs.upstream);
     const max_in = if (fetch.max_input_bytes == 0) std.math.maxInt(usize) else fetch.max_input_bytes;
-    _ = try pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in);
+    const copied = pipeline_mod.streamReaderToWriter(upstream_body, filtering.writer(), max_in);
+    // Socket shutdown can surface as EOF, so a successful copy does not prove
+    // the response completed. Never finish a timed-out or short exposition.
+    if (bufs.timed_out.load(.acquire)) {
+        exchange.evictUpstream(ctx, &upstream_req, in.path, error.UpstreamTimeout);
+        return exchange.timedOut(ctx, in.path, "relay");
+    }
+    const n = try copied;
+    if (declared) |want| {
+        if (n < want) {
+            exchange.evictUpstream(ctx, &upstream_req, in.path, error.UpstreamResponseTruncated);
+            return error.UpstreamResponseTruncated;
+        }
+    }
     _ = try filtering.finish();
     try sink.end();
 }

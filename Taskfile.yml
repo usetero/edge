@@ -263,6 +263,12 @@ tasks:
     cmds:
       - zig build upstream-pool-harness -Doptimize=ReleaseSafe
 
+  harness:chunked:
+    desc: "Verify chunked request streaming through the stdio frontend against real edge"
+    aliases: [chunked-harness]
+    cmds:
+      - zig build chunked-harness -Doptimize=ReleaseSafe
+
   benchmark:setup:
     desc: "Install benchmark dependencies (oha, jq)"
     cmds:

@@ -32,6 +32,10 @@ pub fn stringify(allocator: std.mem.Allocator, value: AnyValue) ![]u8 {
 ///
 /// `jws` is `anytype` because callers hold it by pointer or by value depending
 /// on how they opened the object.
+///
+/// A malformed container surfaces as an error from the ondemand iterator, and
+/// the error propagates. A swallowed error would leave `jws` after an
+/// `objectField` with no value, where `endObject` is `unreachable`.
 pub fn write(jws: anytype, value: AnyValue) !void {
     switch (value) {
         .null => try jws.write(null),
@@ -48,17 +52,17 @@ pub fn write(jws: anytype, value: AnyValue) !void {
         .array => |arr| {
             try jws.beginArray();
             var it = arr.iterator();
-            while (it.next() catch null) |item| {
-                try write(jws, item.asAny() catch continue);
+            while (it.next() catch return error.Malformed) |item| {
+                try write(jws, try item.asAny());
             }
             try jws.endArray();
         },
         .object => |obj| {
             try jws.beginObject();
             var it = obj.iterator();
-            while (it.next() catch null) |field| {
-                try jws.objectField(field.key.get() catch continue);
-                try write(jws, field.value.asAny() catch continue);
+            while (it.next() catch return error.Malformed) |field| {
+                try jws.objectField(try field.key.get());
+                try write(jws, try field.value.asAny());
             }
             try jws.endObject();
         },
