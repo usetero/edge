@@ -4,7 +4,19 @@
   "packages": {
     ".": {
       "release-type": "simple",
-      "exclude-paths": ["charts"]
+      "exclude-paths": [
+        "charts"
+      ],
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "README.md"
+        },
+        {
+          "type": "generic",
+          "path": "examples/ecs-datadog-sidecar/README.md"
+        }
+      ]
     },
     "charts/tero-edge": {
       "release-type": "helm",
