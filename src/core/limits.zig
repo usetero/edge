@@ -25,17 +25,18 @@ pub const CHUNK_BUF_BYTES: usize = 4 * 1024;
 
 /// zstd frames declare their window. One-shot libzstd at the default level
 /// declares min(content, 2 MiB); other producers can declare up to the 8 MiB
-/// format max. std.compress.zstd rejects a frame whose declared window exceeds
-/// the cap at frame init, before `max_decoded_bytes` is checked. So
-/// `Limits.resolve` keys the cap to `max_decoded_bytes`, not `max_body_size`.
+/// format max. The decoder sets libzstd's windowLogMax from the cap, rounded
+/// up to a power of two, and refuses a larger frame as WindowTooLarge before
+/// any output. So `Limits.resolve` keys the cap to `max_decoded_bytes`, not
+/// `max_body_size`.
 pub const ZSTD_WINDOW_MIN: usize = 256 * 1024;
 /// Largest window a zstd frame may declare (format limit, 2^23).
 pub const ZSTD_WINDOW_MAX: usize = 8 * 1024 * 1024;
 /// Largest decode window cap `Limits.resolve` chooses.
 ///
-/// The window sizes the `threadlocal` `ThreadBufs.decode`, one per OS thread
-/// that decoded a compressed body. The multiplier is the CPU count, not the
-/// inert `thread_pool_count`. Each thread retains `window + ~0.5 MiB`.
+/// Each OS thread that decodes a compressed body keeps one libzstd context in
+/// `ThreadBufs.decoder`, and that context can retain a window of the cap. The
+/// multiplier is the CPU count, not the inert `thread_pool_count`.
 ///
 /// 2 MiB admits every frame from one-shot libzstd at the default level. A
 /// producer that declares a larger window (windowLog >= 22) is refused. To
