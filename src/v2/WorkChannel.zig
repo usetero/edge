@@ -4,6 +4,7 @@ const Self = @This();
 const std = @import("std");
 const RequestTable = @import("RequestTable.zig");
 const Readiness = @import("Readiness.zig");
+const Response = @import("Response.zig");
 
 jobs: []Job,
 completions: []Completion,
@@ -17,7 +18,7 @@ pub const Limits = struct {
     ceiling_bytes: u64 = std.math.maxInt(u64),
 };
 
-pub const Input = struct { head_len: u32, body_len: u32, deadline: std.Io.Timestamp };
+pub const Input = struct { head_len: u32, body_len: u32, trailer_len: u32 = 0, deadline: std.Io.Timestamp };
 
 /// Immutable input and exclusive response storage, pinned until acknowledgement.
 /// A worker must publish exactly one completion for every job it takes.
@@ -25,11 +26,19 @@ pub const Job = struct {
     request: RequestTable.Id,
     head: []const u8,
     body: []const u8,
+    trailers: []const u8,
     response: []u8,
+    response_head: []u8,
+    response_tail: []u8,
     deadline: std.Io.Timestamp,
+
+    /// Receive directly into body; prepare all metadata here before completion.
+    pub fn responseBuffers(self: Job) Response.Buffers {
+        return .{ .head = self.response_head, .body = self.response, .tail = self.response_tail };
+    }
 };
 
-pub const Outcome = union(enum) { response: u32, failed: anyerror };
+pub const Outcome = union(enum) { response: u32, framed_response: Response.Lengths, file_response: @import("FileResponse.zig").Complete, failed: anyerror };
 pub const Completion = struct { request: RequestTable.Id, outcome: Outcome };
 
 /// One channel belongs to one reactor and request table. Only take/publish may
@@ -89,14 +98,18 @@ pub fn cancelReservation(self: *Self, table: *RequestTable, request: RequestTabl
 /// reserved so the caller can correct input or cancel it without losing credit.
 pub fn submit(self: *Self, io: std.Io, table: *RequestTable, request: RequestTable.Id, sizes: Input) !void {
     if (self.closed) return error.Closed;
-    const spans = try table.buffers(request);
-    if (sizes.head_len > spans.head.len or sizes.body_len > spans.body.len) return error.InvalidInputLength;
+    const spans = try table.ingressBuffers(request);
+    if (sizes.head_len > spans.head.len or sizes.body_len > spans.body.len or
+        sizes.trailer_len > spans.trailers.len) return error.InvalidInputLength;
     try table.dispatch(request);
     const job: Job = .{
         .request = request,
         .head = spans.head[0..sizes.head_len],
         .body = spans.body[0..sizes.body_len],
+        .trailers = spans.trailers[0..sizes.trailer_len],
         .response = spans.response,
+        .response_head = spans.response_head,
+        .response_tail = spans.response_tail,
         .deadline = sizes.deadline,
     };
     // Capacity is reserved and only this reactor closes work. Publication must
@@ -119,6 +132,9 @@ pub fn take(self: *Self, io: std.Io) !?Job {
 /// The readiness driver must wake its reactor after this publication returns.
 pub fn publish(self: *Self, io: std.Io, job: Job, outcome: Outcome) void {
     if (outcome == .response) std.debug.assert(outcome.response <= job.response.len);
+    if (outcome == .framed_response) {
+        _ = Response.init(job.responseBuffers(), outcome.framed_response) catch unreachable;
+    }
     const completion: Completion = .{ .request = job.request, .outcome = outcome };
     const count = self.done.putUncancelable(io, &.{completion}, 0) catch unreachable;
     std.debug.assert(count == 1);
@@ -236,6 +252,13 @@ test "v2 work channel cancels admission before a worker owns the request" {
         .body_len = 0,
         .deadline = input.deadline,
     }));
+    try testing.expectError(error.InvalidInputLength, channel.submit(io, &table, id, .{
+        .head_len = 0,
+        .body_len = 0,
+        .trailer_len = 1,
+        .deadline = input.deadline,
+    }));
+    _ = try table.ingressBuffers(id);
     try table.disconnect(id);
     try testing.expectEqual(@as(u32, 1), table.live);
     try channel.cancelReservation(&table, id);

@@ -8,6 +8,8 @@ const std = @import("std");
 const Readiness = @import("Readiness.zig");
 const RequestTable = @import("RequestTable.zig");
 const WorkChannel = @import("WorkChannel.zig");
+const RequestHead = @import("RequestHead.zig");
+const RequestIngress = @import("RequestIngress.zig");
 
 readiness: Readiness,
 slots: []Slot,
@@ -232,7 +234,8 @@ pub fn closeAll(self: *Self, table: *RequestTable, channel: *WorkChannel) void {
     }
 }
 
-fn setInterest(
+/// Runtime-only scheduling for the current phase; failures detach its ownership.
+pub fn setInterest(
     self: *Self,
     table: *RequestTable,
     channel: *WorkChannel,
@@ -603,4 +606,46 @@ test "v2 connection lifecycle needs no application allocation after startup" {
     try fixture.disconnect(second);
     try testing.expectEqual(allocations, failing.alloc_index);
     try testing.expect(!failing.has_induced_failure);
+}
+
+test "v2 validated ingress copies into admitted storage before worker publication" {
+    var fixture = try Fixture.init(testing.allocator, 1, 1, 1);
+    defer fixture.deinit(testing.allocator);
+    const token = try fixture.connect();
+    const wire_head = "POST / HTTP/1.1\r\nHost: e\r\nContent-Length: 3\r\n\r\n";
+    const connection_head = try fixture.connections.head(token);
+    @memcpy(connection_head[0..wire_head.len], wire_head);
+    var fields: [4]RequestHead.Field = undefined;
+    const parsed = try RequestHead.parse(connection_head[0..wire_head.len], &fields, .{ .head_bytes = 64 });
+    try testing.expectEqual(.none, parsed.continueAction(true, false));
+    try fixture.connections.enqueue(token);
+    const admission = (try fixture.admit()).?;
+
+    var line: [32]u8 = undefined;
+    var trailer_fields: [2]RequestHead.Field = undefined;
+    var ingress = try RequestIngress.init(&fixture.requests, admission.request, connection_head[0..wire_head.len], .{
+        .head_fields = &fields,
+        .line = &line,
+        .trailer_fields = &trailer_fields,
+    }, .{ .head = .{ .head_bytes = 64 }, .body = .{ .body_bytes = 64 } });
+    @memset(connection_head, 'x');
+    const wire_body = "abcGET /next HTTP/1.1\r\nHost: e\r\n\r\n";
+    const body = try ingress.feed(wire_body);
+    try testing.expectEqual(.done, body.status);
+    try testing.expectEqual(@as(usize, 3), body.consumed);
+    try testing.expectEqualStrings(wire_body[body.consumed..], "GET /next HTTP/1.1\r\nHost: e\r\n\r\n");
+    try fixture.connections.dispatch(
+        testing.io,
+        &fixture.requests,
+        &fixture.channel,
+        token,
+        try ingress.input(.{ .nanoseconds = 1000 }),
+    );
+    const job = (try fixture.channel.take(testing.io)).?;
+    try testing.expectEqualStrings(wire_head, job.head);
+    try testing.expectEqualStrings("abc", job.body);
+    fixture.channel.publish(testing.io, job, .{ .response = 0 });
+    _ = try fixture.complete(fixture.channel.receive(testing.io).?);
+    try fixture.connections.finishResponse(&fixture.requests, &fixture.channel, token);
+    try testing.expectEqual(State.reading_head, try fixture.connections.state(token));
 }

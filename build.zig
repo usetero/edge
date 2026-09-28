@@ -10,6 +10,17 @@ fn keepProfilingSymbols(m: *std.Build.Module) void {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const relay = b.addExecutable(.{
+        .name = "edge-v2",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/v2_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const relay_step = b.step("v2", "Build the opt-in raw v2 relay");
+    relay_step.dependOn(&b.addInstallArtifact(relay, .{}).step);
     // Keep frame pointers + symbols so sampling profilers (Instruments) can
     // unwind and name frames instead of dumping self-time onto
     // <deduplicated_symbol>. Pair with -Doptimize=ReleaseFast for a realistic
@@ -64,6 +75,15 @@ pub fn build(b: *std.Build) void {
     // Optional extensions module (pulls in the z3 S3 client). Only edge code
     // that wires s3-dump imports it.
     const ext_mod = policy_dep.module("extensions");
+
+    relay.root_module.addImport("proto", proto_mod);
+    relay.root_module.addImport("o11y", o11y_mod);
+    relay.root_module.addImport("policy_zig", policy_dep.module("policy_zig"));
+    relay.root_module.addImport("zimdjson", zimdjson.module("zimdjson"));
+    relay.root_module.addImport("extensions", ext_mod);
+    relay.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
+    relay.root_module.linkSystemLibrary("z", .{});
+    relay.root_module.linkSystemLibrary("zstd", .{});
 
     // ==========================================================================
     // Edge Library Module

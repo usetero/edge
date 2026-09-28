@@ -17,7 +17,7 @@ Base: freshly fetched `origin/master` at `22629b0c4bc447d693e9f358de93e7e973e535
 ## Delivery checklist
 
 - [ ] Phase 0 — Feasibility and contracts (**local dependency verified**; platform, coverage and deferred items remain recorded).
-- [ ] Phase 1 — One vertical relay slice (**in progress — phase-1B foundations implemented; HTTP framing/relay next**).
+- [x] Phase 1 — One vertical relay slice (**complete — opt-in raw HTTP relay, real socket tests, bounded deadlines/shutdown, aggregate budget and measured baseline**).
 - [ ] Phase 2 — One policy slice.
 - [ ] Phase 3 — Protocol parity.
 - [ ] Phase 4 — Durability.
@@ -89,8 +89,9 @@ not replace the current loader or enable the new runtime.
   of partial-mutation failure containment.
 - [x] Full file/HTTP provider lifecycle, extension hooks/config lock order and close
   callbacks (see provider lifecycle slice below).
-- [ ] Quarantine process-exit behavior: the store reports `quarantined` from `deinit`;
-  what the process owner does with retained allocations is a phase-1 runtime decision.
+- [x] Quarantine process-exit decision: retain the failed registry/allocator until
+  exit, keep raw forwarding, require operator restart; no automatic exit/retry.
+  See the phase-1 README. Applying this to providers is phase-2 policy wiring.
 
 ### Provider lifecycle slice (2026-09-14)
 
@@ -120,8 +121,9 @@ Checked resource formulas (`src/v2/Budget.zig`):
 
 - [x] Write failing tests for per-request overlap, overflow, and a too-small ceiling.
 - [x] Implement checked arithmetic for connection, body, processing, forwarding and control terms.
-- [ ] Bind the formula to all real v2 layouts and config once phase 1 defines them.
-  Request-table layouts and their startup ceiling are now bound (phase 1A).
+- [x] Bind the formula to the real phase-1 layouts and runtime config. Relay now
+  includes all raw-runtime tables, client scratch, queues and thread reservations.
+  Future policy/codec layouts must extend this accounting when implemented.
 
 Stack high-water and dependency allocations (`src/v2/StackProbe.zig`):
 
@@ -201,7 +203,7 @@ order; the existing production frontend stays selected throughout this phase.
 - [x] Derive request-table reservation from actual metadata/head/input/response
   layouts and reject a total above its configured ceiling. `Budget.core` now also
   rejects an aggregate above the ceiling; equality remains allowed.
-- [ ] Bind connection tables, queues, worker stacks and runtime config to the same
+- [x] Bind connection tables, queues, worker stacks and runtime config to the same
   budget after those phase-1 components exist. Table limits alone are not a full
   process RSS bound; allocator overhead, C allocations and OS memory are separate.
 - [x] Prove error unwinding, exact credit return, and reuse with allocator-failure tests.
@@ -284,22 +286,222 @@ Accept/handoff slice (expanded before implementation):
 
 ### 1C. HTTP framing and relay
 
-- [ ] Write incremental request-head/body framing tests, including split boundaries,
+Transport decision gate (expanded before implementation, user requested httpz review):
+
+- [x] Audit pinned httpz APIs and call paths for head-only admission, body-buffer
+  allocation, async request ownership, response completion and transport reuse.
+- [x] Build an executable fixture for the relevant public hooks, or capture a
+  concrete blocker with source references; distinguish integration limits from
+  fundamental library limits and performance assumptions.
+- [x] Record the transport decision and implications before implementing HTTP
+  framing. Production remains on httpz; v2's existing OS components are not proof
+  that replacing httpz is faster.
+
+Request-head slice (expanded before implementation):
+
+- [x] Write failing tests for every split boundary, exact capacity, incomplete
+  input and preservation of body/next-request read-ahead; inspect std scanner
+  acceptance before reuse.
+- [x] Implement nonallocating head boundary tracking over caller-owned bytes;
+  return exact consumed lengths and distinguish incomplete from oversized input.
+- [x] Write head validation cases for CL/TE ambiguity, duplicate framing/Host
+  fields, overflow, strict CRLF, token syntax, controls, folding and field limits.
+- [x] Parse request metadata as offsets into owned bytes; preserve unknown
+  Content-Encoding, repeated end-to-end fields and query bytes.
+- [x] Represent framing, keep-alive and Expect decisions without socket IO;
+  reserve body/queue capacity before Continue in later runtime integration.
+- [x] Verify Debug/ReleaseSafe, layout bounds and lint; record remaining body,
+  response and runtime wiring work without marking the whole phase complete.
+
+Strict head/metadata substeps (expanded before implementation):
+
+- [x] Add failing cases for complete-head boundaries, request-line and field
+  syntax, duplicate Host/CL/TE, decimal overflow, body framing and header limits.
+- [x] Implement offset-only metadata with caller-owned header descriptors;
+  validate without allocation, mutation, decoding or socket IO.
+- [x] Test target forms, unknown methods/encodings, repeated fields, relocated
+  backing bytes, HTTP/1.0 close behavior and Connection token lists.
+- [x] Add pure Expect decisions for unsupported expectations, bodyless/already
+  received bodies and pending versus granted admission; never emit Continue here.
+- [x] Combine scanner and validator over split reads/read-ahead, verify layout
+  limits and run native Debug/ReleaseSafe, Linux isolated coverage and lint.
+
+Verification follow-up (expanded after the httpz ReleaseSafe run failed):
+
+- [x] Locate the existing acceptor fixture's connect-to-accept timing assumption:
+  two tests observed no handoff, one by null unwrap; no framing code was involved.
+- [x] Wait for actual listener readiness with a finite deadline in the fixture
+  before assuming a connected peer can be accepted; preserve production turn bounds.
+- [x] Re-run isolated acceptor coverage and the complete Debug/ReleaseSafe suites.
+
+Body/trailer slice (expanded before implementation):
+
+- [x] Write failing tests for Content-Length/no-body/chunked framing, every split,
+  output backpressure, terminal framing and untouched pipelined read-ahead.
+- [x] Implement a pure bounded framer borrowing line/trailer/descriptor storage;
+  copy entity bytes in bulk without content decoding or heap allocation.
+- [x] Validate checked hexadecimal lengths, chunk extensions/quoted values and
+  strict CRLF; bound cumulative framing work separately from entity-body bytes.
+- [x] Retain trailer bytes/order/duplicates with relocatable descriptors; reuse
+  field syntax validation and reject critical framing/routing/interpretation fields.
+- [x] Test byte/capacity boundaries, malformed extensions/trailers, early EOF and
+  sticky failure; provisional output must never authorize partial forwarding.
+- [x] Compose head and body parsers over split input; run Debug/ReleaseSafe,
+  isolated Linux checks and lint, update budgets/limitations and handoff.
+
+Admission-copy slice (expanded before implementation):
+
+- [x] Add tests that reserve RequestTable/WorkChannel before copying, retain
+  copied head/body through worker take, and release on pre-submit failure.
+  Correction: this slice added implementation and tests together; its initial
+  compiler failures were not a behavioral TDD red run.
+- [x] Implement an allocation-free ingress owner that validates/copies a complete
+  head only after reservation, frames body bytes into the request slot and exposes
+  dispatch input only after complete framing.
+- [x] Preserve temporary head/trailer descriptors for the ingress lifetime;
+  expose a pure Continue decision and exact unconsumed suffix without socket IO.
+- [x] Test no-body, chunked trailers, copied-source overwrite, body/storage caps,
+  transport failure fencing and disconnected-reservation cleanup.
+- [x] Verify full suites, Linux isolated coverage and lint; record that reactor
+  read-loop/deadline/timer wiring and actual one-time writes remain outstanding.
+
+Ingress ownership/trailer handoff follow-up (expanded before implementation):
+
+- [x] Reproduce access without reservation and after cancellation, disconnect,
+  dispatch and slot reuse; verify rejected access leaves worker bytes untouched.
+- [x] Require a live attached reading reservation at every ingress access;
+  keep all checks on the reactor and preserve completion ownership.
+- [x] Reserve distinct trailer bytes in RequestTable, account for them in its
+  checked budget, and carry immutable initialized trailers in WorkChannel jobs.
+- [x] Test trailer lifetime through scratch reuse/disconnect/completion, exact
+  capacity and invalid handoff lengths; fix fixture allocation/credit cleanup.
+- [x] Run Debug/ReleaseSafe, isolated Linux checks and lint; reconcile work log,
+  handoff and proposal with actual implementation and remaining runtime work.
+
+Raw outbound request slice (expanded before implementation):
+
+- [x] Add behavioral red tests for selected Host/target, repeated fields, opaque
+  encoded body bytes, Connection nominations, Expect removal and exact framing.
+- [x] Prepare bounded HTTP/1.1 head/tail spans around the borrowed original body;
+  validate all metadata before exposing output and allocate nothing per request.
+- [x] Preserve ordered trailers separately with regenerated Trailer/chunk framing;
+  reject critical trailers and filter fields nominated by every Connection value.
+- [x] Test partial-write traversal, empty bodies, target forms, malformed input,
+  exact byte/header limits and unchanged source buffers; compose ingress to wire.
+- [x] Verify native Debug/ReleaseSafe, isolated Linux, lint and update handoff.
+  This slice is raw relay only; transformed representation metadata, routing/base
+  path construction, real upstream IO and response framing remain separate work.
+
+Buffered upstream response slice (expanded before implementation):
+
+- [x] Add failing strict response-head tests: status/reason syntax, duplicate and
+  ambiguous framing, opaque/repeated metadata, HEAD/1xx/204/304 body rules, 205,
+  Connection persistence, and explicit upgrade/CONNECT rejection.
+- [x] Reuse bounded head scanning and shared field/framing validation; represent
+  response metadata as offsets and keep declared length distinct from body rules.
+- [x] Add failing incremental receive tests across every split, bounded 1xx events,
+  chunked trailers, clean EOF versus transport failure, truncation and byte caps.
+- [x] Implement allocation-free buffered response ownership over caller storage;
+  expose informational heads until the next feed and final data only when complete.
+- [x] Verify read-ahead, exact storage boundaries, sticky errors and connection
+  reuse decisions; run Debug/ReleaseSafe, Linux checks and lint, update handoff.
+  Downstream response rewriting, response-slot layout/queue handoff and socket IO
+  remain follow-up work; unlimited Prometheus streaming is a separate contract.
+
+Final response serialization/handoff slice (expanded before implementation):
+
+- [x] Add behavioral red tests for final status/reason, duplicate end-to-end
+  metadata, Connection filtering, trailers, HEAD/304 lengths and HTTP/1.0 close.
+- [x] Serialize validated raw final metadata into request-owned head/tail spans;
+  require the received body to already occupy the reserved response body span.
+- [x] Budget separate response head/tail capacity and publish only lengths/close
+  state through WorkChannel; validate reactor views after acknowledgement.
+- [x] Test scratch overwrite, live/detached completion lifetimes, slot reuse,
+  short writes, overflow and startup OOM/accounting with the new layouts.
+- [x] Run full Debug/ReleaseSafe, isolated Linux, lint; update proposal and handoff.
+  Interim delivery/ordering and socket IO are completed by the runtime below;
+  transformed entities remain phase-2 work.
+
+- [x] Write incremental request-head/body framing tests, including split boundaries,
   chunked trailers, ambiguous framing, Expect, and preserved pipelined bytes.
-- [ ] Implement raw HTTP request ownership and bounded body admission.
-- [ ] Connect upstream lanes and `UpstreamWatch` absolute deadlines to real exchanges.
-- [ ] Relay response status/headers/body with bounded storage and backpressure.
-- [ ] Test disconnects, slow clients, exhausted queues, silent/trickling upstreams,
+- [x] Wire raw HTTP ownership and bounded admission into the serving socket read
+  loop, including read-ahead offsets, deadlines and one-time Continue writes.
+- [x] Connect upstream lanes and `UpstreamWatch` absolute deadlines to real exchanges.
+- [x] Relay response status/headers/body with bounded storage and backpressure.
+- [x] Test disconnects, slow clients, exhausted queues, silent/trickling upstreams,
   and response order over keep-alive connections.
 
 ### 1D. Composition, verification and measurement
 
-- [ ] Add opt-in v2 composition root with juicy main, explicit I/O/allocators,
+Phase-1 completion run (expanded before implementation, 2026-09-16):
+
+- [x] Add a real-process relay fixture before wiring the runtime: opaque bodies,
+  chunked trailers, Continue, interim/final ordering, keep-alive and health.
+- [x] Compose one reactor, bounded accept handoff and fixed forwarder threads;
+  integrate existing admission, ingress, wire preparation and completion ownership.
+- [x] Enforce absolute client/upstream deadlines, bounded socket turns and output
+  backpressure; test disconnects, saturation, silent/trickling peers and shutdown.
+- [x] Bind actual tables, metadata, scratch and thread reservations to validated
+  startup config; expose an opt-in executable without changing production defaults.
+- [x] Decide quarantine behavior, document the runnable contract and record a full
+  relay benchmark with memory data, rather than another isolated helper benchmark.
+- [x] Run Debug/ReleaseSafe tests, real-process fixtures, six distribution builds,
+  Linux checks and lint; update every phase-1 item against evidence.
+
+- [x] Add opt-in v2 composition root with juicy main, explicit I/O/allocators,
   validated config, health, and ordered shutdown.
-- [ ] Decide quarantine lifecycle using the fixed dependency's tested guarantees.
-- [ ] Add an end-to-end raw relay integration fixture and benchmark full relay.
-- [ ] Run all tests, six distribution builds and lint; record memory/high-water data
+- [x] Decide quarantine lifecycle using the fixed dependency's tested guarantees.
+- [x] Add an end-to-end raw relay integration fixture and benchmark full relay.
+- [x] Run all tests, six distribution builds and lint; record memory/high-water data
   and platform limitations without declaring production cutover.
+
+## Phase 2 — One policy slice (expanded before implementation, 2026-09-17)
+
+- [x] Add failing Datadog policy tests for drop/transform/all-drop, malformed
+  suffix rollback, output/scratch exhaustion, opaque encoding and empty snapshots.
+- [x] Build bounded worker workspaces and a sticky allocation-failure adapter;
+  reuse existing format accessors under PolicyStore guards, evaluate each record
+  once, and publish candidate bytes only after framing/encoding finishes.
+- [x] Wire providers and extension callbacks into the runnable composition;
+  retain original encoded entities, rewrite changed representation metadata and
+  release policy guards before upstream IO. Apply quarantine recovery decision.
+- [x] Exercise reload under traffic, sampling counts, extension ordering and
+  processing/bypass counters with real socket fixtures. Include gzip/zstd paths.
+- [ ] Validate memory accounting, fault injection, Debug/ReleaseSafe, distribution
+  builds and lint; record coverage and remaining dependency/platform limitations.
+
+## Phase 3 — Protocol parity (expanded 2026-09-17)
+
+Format/route substeps (write fixtures before enabling each route):
+
+- [ ] Add a pure route table for Datadog logs/series, OTLP signals and Prometheus;
+  retain query bytes, support absolute request targets and select separate origins.
+- [ ] Apply existing Datadog metric and OTLP nested accessors inside bounded
+  transactional workspaces; test compressed input, all-drop responses, malformed
+  input, unknown fields and resource/scope context before marking parity.
+- [ ] Add Prometheus sample/metadata and overlong-line fixtures, then finite
+  filtering; add bounded streaming for explicitly unlimited scrape settings.
+- [ ] Load existing ProxyConfig through unchanged zonfig; validate/derive v2
+  reservations and map provider, origin and distribution settings explicitly.
+- [ ] Add DNS resolution, authenticated TLS and origin connection reuse with
+  cancellation/deadlines; test DNS/TLS failure, stale pooled connections and EOF.
+- [ ] Wire admin routes and metrics, optional tap, extension resolver/S3 flush
+  ownership and HTTP-provider final sync; test shutdown and quarantine ordering.
+- [ ] Run old/new wire fixtures and representative full-path benchmarks, then
+  record remaining compatibility differences and cutover gates.
+
+
+- [ ] Route/config parity across HTTP distributions and separate upstreams.
+- [ ] Datadog metrics and OTLP JSON/protobuf with preserved envelopes/unknown fields.
+- [ ] Prometheus finite/unlimited response filtering and backpressure.
+- [ ] Upstream DNS/TLS/pooling with bounded deadlines and authenticated TLS.
+- [ ] Admin metrics/policies/tap, providers, S3 extension and observability parity.
+- [ ] Compare wire/semantic fixtures and full-path measurements against both
+  existing frontends; document intentional fixes, run acceptance checks.
+
+The user requested continuous work up to phase 4. Phases are checkpoints in this
+document, not permission stops. Whether phase 4 itself is included was asked
+asynchronously; phases 2 and 3 proceed independently of that clarification.
 
 ## Work log
 
@@ -773,6 +975,519 @@ clean. Preserved `.path = "../policy-zig"`; neither dependency was edited.
 Acceptor/target state and actual queue arrays are bounded, but fd demand, kernel
 backlog/socket buffers and the complete runtime budget still need composition.
 
+### 2026-09-15 — checkpoint, httpz audit and first request-head mechanism
+
+The user's requested checkpoint is `0a72fbc`
+(`feat(v2): establish bounded transport and policy ownership foundations`).
+It contains the prior implementation and notes, including the authorized sibling
+policy dependency. It was not pushed. Work described below follows that commit.
+
+Completed the phase-1C transport decision gate before writing a head scanner.
+[HTTPZ-TRANSPORT-REVIEW.md](HTTPZ-TRANSPORT-REVIEW.md) records exact dependency
+identity, APIs, source paths, fixtures and alternatives. The proposal now links
+that decision. Continue Edge-owned v2 reactors and bounded HTTP framing while
+keeping httpz as the production frontend through cutover. Performance remains
+unmeasured; httpz already has native event loops.
+
+Five new inline dependency probes establish:
+
+- Public lazy Content-Length dispatch can expose only a read-ahead prefix;
+  lazy reads bypass httpz's configured body-size check, so the application must
+  enforce it. Earlier blanket "fully buffered" descriptions are too broad.
+- Chunked bodies still reserve decoded/raw buffers before application dispatch.
+  The desired head-only assertion failed first (`/tmp/edge-v2-httpz-red.log`);
+  the final test characterizes that blocker rather than pretending to fix it.
+- The parser sends Continue before rejecting an oversized non-lazy body.
+- A CL body followed by another request head in one read is rejected by this pin.
+- Disown removes a real readiness registration and leaves a usable socket, but
+  requestDone clears request state and the arena. The fixture never dereferences
+  released objects. Actual handler-return scheduling was verified in source;
+  this is not a complete httpz server/concurrency fixture.
+
+Expanded the request-head slice before implementing `HeadScanner`. It borrows
+newly received bytes, tracks a bounded total with `std.http.HeadParser`, and
+reports exact consumed/head lengths for CRLF heads. No IO, allocator, heap storage
+or body copy is required. At the exact byte cap, a complete head succeeds and
+an incomplete head fails; completion/exhaustion require reset before more input.
+The connection owner retains head bytes for subsequent strict validation.
+
+TDD: the five initial scanner tests failed on the stub
+(`/tmp/edge-v2-head-scanner-red.log`). The four valid-input/capacity tests then
+passed. An additional assertion assumed the std scanner would locate a malformed
+LF-only head exactly; it instead returned a later boundary (64 versus 27 bytes).
+That assumption is not a supported v2 protocol contract. The final negative
+probe only demonstrates that invalid input can appear complete (`x\n\n` in Zig
+string notation). Strict validation must reject it before queue admission,
+Continue or forwarding. Added a sixth test varying CRLF header padding across
+129 lengths and every split to verify boundaries for supported line endings.
+
+The initial full ReleaseSafe run also exposed an existing acceptor test race:
+two immediate post-connect turns observed no handoff; one test unwrapped null.
+The test fixture now waits for actual listener readiness with a two-second
+absolute deadline before returning a connected peer. The stop test asserts the
+handoff count before inspecting its fd. Production acceptor code/turn bounds are
+unchanged. Repetition then exposed the same assumption for multiple clients:
+one ready connection does not guarantee the whole expected backlog is present.
+Those two tests now accumulate bounded turns under an absolute deadline, assert
+each turn's attempt bound and inspect the resulting distribution/saturation.
+They no longer require a particular OS batch size. Ten successive isolated native
+ReleaseSafe runs passed all 50 tests after this adjustment.
+
+Final validation:
+
+- `zig build test --summary all` and `zig build test -Doptimize=ReleaseSafe
+  --summary all`: **613 passed, one skipped (614 total)** in each mode.
+- `zig test src/v2/HeadScanner.zig`: **6/6 passed**.
+- `zig test src/v2/Acceptor.zig -lc -O ReleaseSafe`: **50/50 passed**.
+- Cross-compiled those two isolated roots with `-O ReleaseSafe -target
+  aarch64-linux-musl --test-no-exec`, then ran in Alpine 3.24 arm64:
+  **6/6 and 50/50 passed**, respectively.
+- `task lint` passed. No serving/distribution code changed; prior distribution
+  build evidence remains attached to the checkpoint rather than being rerun.
+- Current sibling policy-zig HEAD:
+  `502efcc67bda53b07cc715a42390cfba61d28303`, clean during final verification.
+  The local ref remains selected. The new httpz boundary fixture ran on macOS;
+  isolated Linux tests above do not include that dependency fixture.
+- Logs: `/tmp/edge-v2-httpz-scanner-final-{debug,release,lint}.log`,
+  `/tmp/edge-v2-head-scanner-final.log`, `/tmp/edge-v2-httpz-acceptor-release.log`,
+  `/tmp/edge-v2-httpz-acceptor-linux.log`, `/tmp/edge-v2-head-scanner-linux.log`,
+  `/tmp/edge-v2-acceptor-readiness-repeat.log`. Lint was also rerun directly after
+  the final fixture adjustment.
+
+Remaining 1C work: strict head metadata/framing validation, no-IO Expect and
+keep-alive decisions, incremental body/trailer parsing, request admission wiring,
+header rewriting, upstream exchanges, response framing and real wire tests.
+Head scanning is not a complete HTTP parser and no v2 runtime serves traffic.
+
+### 2026-09-15 — strict request heads and admission-independent metadata
+
+Implemented `src/v2/RequestHead.zig`, imported by the v2 test root. Expanded the
+strict-head substeps before writing the first 12 tests. All 12 failed on the
+unimplemented parser while the six imported scanner tests passed
+(`/tmp/edge-v2-request-head-red.log`). Implemented the parser and pure Continue
+decision, then added exhaustive field-value byte coverage and method-independent
+framing cases. There are now 14 request-head tests plus six scanner tests.
+
+The parser accepts exactly one complete head, including its terminating CRLF.
+It reports incomplete input, trailing body/pipelined bytes passed by mistake,
+oversized heads and exhausted header-descriptor capacity. The default head cap
+is 16 KiB; the caller's descriptor slice sets the header count cap. A caller with
+64 entries accepts exactly 64 fields and rejects the next. Descriptor capacity
+above u16 and a zero byte cap are invalid startup/API parameters.
+
+Metadata consists of scalar state and u32 spans into caller-owned bytes. It
+includes raw method/target, target form, path/query, authority and Host spans,
+field count, version, framing, persistence and expectation state. Each field has
+name/value spans; field order, casing and repeated values survive unchanged.
+The parser trims only outer field OWS in its value view and never changes input.
+No allocator or IO is needed. Span access checks bounds, but the owner remains
+responsible for supplying identical bytes with the correct request lifetime.
+On parse error, discard partially populated descriptor storage; no valid head is
+returned or published. Layout tests cap metadata at 128 bytes and the 64-entry
+descriptor array at 1 KiB. This is not full runtime budget/config binding; the
+composition still has to decide where these layouts reside and count them.
+
+Implemented acceptance profile:
+
+- Strict CRLF, token method/field names, no whitespace before colon, no folding,
+  no forbidden controls or DEL in values; HTAB and obs-text remain permitted.
+- One nonempty, syntactically valid Host required for HTTP/1.1. Duplicate Host,
+  CL or TE is rejected, including identical values; CL lists are rejected too.
+  CL accepts only decimal digits with checked u64 arithmetic, independently of
+  method. No CL/TE means no body, not a connection-close-delimited request.
+- Only a single case-insensitive `chunked` transfer coding is supported; CL/TE
+  coexistence and HTTP/1.0 TE are rejected. Content-Encoding is intentionally
+  opaque, including unknown or repeated values, and does not change framing.
+- Origin and HTTP(S) absolute targets preserve escaped path/query bytes.
+  OPTIONS `*` and CONNECT authority syntax are recognized. No tunnel support
+  was added. Relative targets, fragments, userinfo, invalid percent escapes and
+  invalid URI characters are rejected. Host authorities support reg-name,
+  bracketed IPv6 and IPvFuture syntax without DNS. IPv6 scope identifiers are
+  unsupported by the reused pure std parser. Port syntax is checked, not used
+  as an upstream destination. Empty absolute paths remain empty spans; the later
+  request writer must apply HTTP's slash/asterisk rules rather than dropping query.
+- Connection tokens are case-insensitive, tolerate empty list members, and keep
+  close sticky across repeated fields. HTTP/1.0 always closes, including a
+  keep-alive request. Header forwarding still needs to remove every nominated
+  hop-by-hop field; parsing the token list does not perform that rewrite.
+- `continueAction` returns none, wait-for-admission, send-continue or rejection
+  for unsupported expectations. No body, already-received body bytes, and a
+  recognized HTTP/1.0 Continue expectation suppress the interim response.
+  The runtime must supply real reservation state, enforce its deadline, track
+  whether Continue was sent, and send final responses. The parser does none of
+  those effects. Unsupported expectations stay rejected across repeated fields.
+
+Protocol references checked during implementation:
+[RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3) for framing,
+[persistence](https://www.rfc-editor.org/rfc/rfc9112.html#section-9.3), and
+[RFC 9110 Expect](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.1.1).
+The explicit refusal of duplicate/list CL and empty Host is the initial Edge
+acceptance profile, not a claim to accept every valid HTTP variation. Run the
+broader compatibility/wire suite before cutover. API discovery used zigdoc;
+generic std head parsing was not reused because it rejects opaque encodings,
+and numeric parsing that accepts signs/underscores was not used for CL.
+
+Tests include all split positions through scanner + owned-buffer assembly +
+validation, relocation, 16 KiB and 64-header boundaries, malformed-line/Host/URI
+tables, CL overflow, repeated encodings, Connection/Expect lists and every byte
+value in a field-value position. These are deterministic unit/integration tests
+of parsing components, not fuzzing or a serving relay fixture.
+
+Verification before the final formatting cleanup: Debug and ReleaseSafe each
+passed **627 tests, one skipped (628 total)**. Isolated Linux arm64 musl on
+Alpine 3.24 passed **20/20**. Lint initially requested line wrapping and separate
+span bounds assertions; those were corrected, and `task lint` passed. Final
+verification after cleanup:
+
+- `zig build test --summary all`: **627 passed, one skipped (628 total)**.
+- `zig build test -Doptimize=ReleaseSafe --summary all`: **627 passed, one skipped**.
+- `zig test src/v2/RequestHead.zig -O ReleaseSafe -target aarch64-linux-musl
+  --test-no-exec`, then execute in Alpine 3.24 arm64: **20/20 passed**.
+- The same isolated root cross-compiles for `x86_64-linux-musl`. This does not
+  close the native x86_64 full-dependency validation gate.
+- `task lint` and `git diff --check` pass. Current distribution code is untouched;
+  prior distribution build evidence remains attached to the checkpoint.
+- Logs: `/tmp/edge-v2-request-head-final-{debug,release}.log`,
+  `/tmp/edge-v2-request-head-linux.log`,
+  `/tmp/edge-v2-request-head-{arm64,amd64}-build.log`.
+
+Preserved `.path = "../policy-zig"`; observed clean sibling HEAD
+`502efcc67bda53b07cc715a42390cfba61d28303`. No dependencies or current serving
+runtime were changed. This continues the uncommitted work after `0a72fbc`.
+
+Next: expand the body-framing slice into minor tasks before implementation.
+Implement Content-Length/chunked consumption with bounded chunk-line/trailer
+storage, exact consumed-byte counts and untouched encoded entity bytes. Then
+wire body/queue reservation, admission deadlines and Continue to Connections /
+RequestTable. Response framing, upstream lanes and the real relay remain open.
+
+### 2026-09-15 — body framing and admission bridge verified
+
+The body/trailer slice implements `BodyFramer` with caller-owned bounded storage,
+bulk entity copying, strict Content-Length/chunked framing, checked hexadecimal
+lengths, extensions, trailer validation and separate cumulative metadata limits.
+Every consumed-byte count preserves read-ahead. Output remains provisional until
+complete framing validates; malformed input or early EOF fences the parser.
+`http_field.zig` shares field syntax and offset descriptors with RequestHead.
+
+The initial nine body tests failed behaviorally with `NotImplemented`, then passed
+after implementation. Additional tests cover tiny output windows, exact metadata
+capacities, u64 lengths and full head/body composition across every split. Recorded
+body validation: full Debug/ReleaseSafe **640 passed, one skipped (641 total)**;
+isolated Linux arm64 **33/33 passed**, x86_64 musl compile-only, lint passed.
+Logs: `/tmp/edge-v2-body-final-{debug,release}.log` and
+`/tmp/edge-v2-body-linux.log`.
+
+`RequestIngress` then connected reserved request storage to head/body parsing and
+`WorkChannel.Input`. A Connections fixture validates FIFO admission, copies the
+head before connection-buffer reuse, preserves the next-request suffix, dispatches
+the copied entity and returns to reading after completion. This is an in-memory
+handoff fixture, not a serving reactor or upstream exchange. That slice's tests
+and implementation were introduced together; initial compiler errors did not
+constitute behavioral TDD. Its checklist now reflects that distinction.
+
+The interrupted ingress ReleaseSafe run finished successfully. Before the next
+review, both full modes had **646 passed, one skipped (647 total)**; isolated
+Connections Linux arm64 had **78/78 passed** and x86_64 musl compiled. Logs:
+`/tmp/edge-v2-ingress-final-{debug,release}.log` and
+`/tmp/edge-v2-ingress-linux.log`.
+
+### 2026-09-15 — ingress ownership and trailer handoff corrected
+
+Review found two production-contract gaps before building further on ingress:
+`RequestTable.buffers` checked only generation, so a still-live worker-owned slot
+was accessible to ingress; trailers lived in temporary scratch and never reached
+the worker. Regression tests reproduced unreserved construction and post-dispatch
+access (**67 passed, two failed**) before the fix. Fixture fault injection also
+found leaked RequestTable allocations on channel startup OOM and a lost request
+slot on failed reservation; both cleanup paths now unwind explicitly. A separate
+test reproduced Continue being offered after body-framing failure.
+
+Changes:
+
+- `ingressBuffers` requires the current generation, attached client, reading state
+  and reserved lease. Ingress operations and WorkChannel submission check this
+  boundary on the reactor. Cancellation, disconnect and dispatch revoke ingress
+  access; stale generations remain rejected after slot reuse. Failed framing also
+  blocks Continue, and incomplete trailers return an error rather than asserting.
+- RequestTable reserves distinct head/body/trailer/response spans. Trailer bytes
+  contribute to its checked startup budget and exact ceiling/OOM tests. A zero
+  trailer capacity is valid for non-chunked users; chunked framing requires at
+  least two bytes for the final CRLF. No allocation was added to request handling.
+- BodyFramer writes trailers directly into the request slot. WorkChannel.Input
+  carries their initialized length; Job borrows immutable raw bytes pinned by the
+  same work/completion lease. Oversized trailer handoff lengths fail before
+  publication and leave the reservation available for cleanup.
+- The trailer handoff test first failed with an empty worker trailer span, then
+  passed after wiring. It overwrites ingress scratch and disconnects the client,
+  verifies duplicate trailer order/casing and proves the slot cannot recycle before
+  acknowledgement. Capacity tests cover one-byte rejection, exact empty-trailer
+  capacity and overflow without overwriting response storage.
+
+Final verification:
+
+- Full native Debug and ReleaseSafe: **653 passed, one skipped (654 total)**.
+- Isolated Connections suite on Linux arm64 musl, ReleaseSafe in Alpine 3.24:
+  **85/85 passed**. The same root compiles for x86_64 musl; native full-dependency
+  x86_64 execution remains open.
+- `task lint` and `git diff --check` pass. Logs:
+  `/tmp/edge-v2-ingress-owned-full-{debug,release}.log`,
+  `/tmp/edge-v2-ingress-owned-linux.log`,
+  `/tmp/edge-v2-ingress-owned-{arm64,amd64}-build.log` and
+  `/tmp/edge-v2-ingress-owned-lint.log`. Behavioral red evidence:
+  `/tmp/edge-v2-ingress-{ownership,cleanup,trailers,continue}-red.log`.
+- The local policy-zig checkout remains clean at
+  `502efcc67bda53b07cc715a42390cfba61d28303`; `.path = "../policy-zig"` remains.
+  No dependency changes. All work after checkpoint `0a72fbc` remains uncommitted.
+
+Next: expand header/trailer rewriting and outbound framing into minor tasks before
+coding. Preserve end-to-end duplicates and opaque content encodings, filter
+Connection-nominated fields, derive framing from the actual body/trailer spans,
+and test bounded output before connecting a real upstream exchange. Phase 1C is
+still open: socket read/write scheduling, admission deadlines, Continue writes,
+response framing and upstream deadlines are not wired into a serving runtime.
+
+### 2026-09-15 — bounded outbound raw request framing verified
+
+Added `RequestWire` and registered its inline tests through `v2/root.zig`. The
+first five behavioral tests failed with `NotImplemented` (**20 imported tests
+passed, five failed**). They passed after implementing preparation. A subsequent
+input-trailer-byte-limit test failed before adding that limit, then passed. Red
+evidence is in `/tmp/edge-v2-request-wire-red.log` and
+`/tmp/edge-v2-request-wire-limits-red.log`.
+
+The allocation-free preparer builds a complete HTTP/1.1 head/tail in caller-owned
+storage and borrows the unchanged entity body between them. It validates supplied
+body length and trailer completeness before returning any sendable spans. All
+generated metadata must fit before network commitment. Destination authority and
+optional route-built target are syntax checked; the original absolute URI never
+selects the network peer. Query/path bytes remain encoded and unchanged when no
+override is supplied. CONNECT and unsupported expectations return explicit errors.
+
+The output rebuilds Host and Content-Length/chunk framing, adds Via, consumes
+Expect, strips fixed connection fields and every original Connection nomination,
+and preserves ordered repeated end-to-end fields and opaque content encodings.
+Trailers remain separate, retain order/casing/duplicates and receive a generated
+Trailer declaration after filtering. A shared critical-trailer predicate now
+serves BodyFramer and RequestWire. Nonempty chunked input becomes one data chunk;
+empty input goes directly to its zero chunk/trailers. This deliberately preserves
+entity bytes rather than original transfer chunk boundaries/extensions.
+
+The cursor returns a contiguous pending span and advances only by the bytes the
+transport reports as written. Tests cover blocked and 1–31-byte short writes,
+invalid advances, empty body framing, destination injection, incomplete/forbidden
+trailers, filtered-field accounting, exact head/tail/chunk-prefix capacity, the
+64-output-field ceiling including generated fields, and a full 16 KiB output head.
+The ingress/channel composition test detaches the client, prepares the worker's
+pinned job, overwrites descriptor scratch, traverses output one byte at a time,
+and reparses it to the same binary entity and retained trailers. Source body and
+trailer bytes stay unchanged; no extra body copy occurs. These are in-memory
+wire fixtures; actual socket writes and upstream response handling remain open.
+
+Final verification:
+
+- Native `zig build test --summary all` and ReleaseSafe: **665 passed, one skipped
+  (666 total)**. Twelve new RequestWire tests run in the full suite.
+- Isolated RequestWire plus imported ownership/parser tests: **86/86 passed** on
+  native Debug and Linux arm64 musl ReleaseSafe in Alpine 3.24.
+- The same isolated root cross-compiles for x86_64 musl. This does not close the
+  full native x86_64 dependency validation gate.
+- `task lint` and `git diff --check` pass. Lint initially caught long lines and
+  local helper imports; corrected before final verification.
+- Logs: `/tmp/edge-v2-request-wire-full-{debug,release}.log`,
+  `/tmp/edge-v2-request-wire-final-isolated.log`,
+  `/tmp/edge-v2-request-wire-linux.log` and
+  `/tmp/edge-v2-request-wire-{arm64,amd64}-build.log`.
+- Preserved local policy-zig reference; sibling remains clean at
+  `502efcc67bda53b07cc715a42390cfba61d28303`. No dependency or production runtime
+  edits. Work after checkpoint `0a72fbc` remains uncommitted.
+
+See REDESIGN-NOTES §23 and proposal §6.4 for buffer formulas, ownership and
+tradeoffs. Default output caps can reject a maximal input after generated fields
+are added; runtime admission/config must reserve that room explicitly. Worker
+head/tail and descriptor residency still need aggregate budget binding. This API
+is raw-only: processed entities require separate truthful encoding/validator
+handling. Next: expand response framing and ownership, then wire real upstream
+exchanges/deadlines and serving-loop backpressure. Phase 1C remains open.
+
+### 2026-09-16 — buffered upstream response framing verified
+
+Implemented `ResponseHead` and `ResponseIngress`, registered through `v2/root.zig`.
+The response-head slice began with five behavioral failures against the stub;
+the receiver began with six behavioral failures after correcting test declaration
+names. Red logs: `/tmp/edge-v2-response-head-red.log` and
+`/tmp/edge-v2-response-ingress-red.log`. Added boundary and lifecycle coverage after
+the initial green runs; the final additions total 17 new tests (seven head, ten
+receiver), plus imported request/framing regressions.
+
+ResponseHead validates status/reason/field syntax and retains offset metadata,
+unknown content encodings and ordered repeated fields. It distinguishes declared
+representation length from body framing for HEAD/304, rejects prohibited 1xx/204
+framing, rejects upgrades/successful CONNECT, and requires empty 205 content while
+still consuming ordinary framing. Repeated/ambiguous framing is rejected, and
+Connection close remains sticky across repeated fields. The shared strict line,
+decimal-length and Connection validators moved into `http_field.zig`; the request
+parser uses those same functions without changing its acceptance contract.
+
+The receiver borrows fixed head/body/chunk-line/trailer/descriptor storage. It
+reuses HeadScanner and BodyFramer for fixed/chunked responses and implements
+bounded EOF-delimited copying separately. It returns one event per informational
+head so the transport can rewrite/relay it before another feed overwrites that
+store. Both informational count and total head bytes are bounded. Final message
+views remain unavailable until full framing completes; every parser/transport
+failure permanently fences the receiver. EOF-delimited completion requires an
+explicit clean EOF classification from the transport owner, including checking
+the watchdog/TLS result. Informational Connection close persists through the final
+response, and observed EOF prohibits connection reuse.
+
+Tests cover every split of informational + chunked final + following head, every
+truncated fixed/chunked response prefix, bytewise reads, clean EOF versus transport
+failure, HEAD representation length, 205 framing, interim-only EOF, exact head/
+body/trailer/metadata/field capacities, source-buffer reuse and all 256 reason
+bytes. Extra bytes are preserved, and complete metadata/body/trailers remain in
+caller-owned storage. The reuse flag is a framing prerequisite, not permission to
+pool a socket without checking request/transport/deadline state.
+
+Final verification:
+
+- Full native Debug and ReleaseSafe: **682 passed, one skipped (683 total)**.
+- Isolated ResponseIngress plus imported parser tests: **50/50 passed** native
+  Debug and Linux arm64 musl ReleaseSafe in Alpine 3.24.
+- Isolated x86_64 musl root compiles; native full-dependency validation is still
+  outstanding. `task lint` and `git diff --check` pass after style cleanup.
+- Logs: `/tmp/edge-v2-response-full-{debug,release}.log`,
+  `/tmp/edge-v2-response-final-isolated.log`, `/tmp/edge-v2-response-linux.log`,
+  `/tmp/edge-v2-response-{arm64,amd64}-build.log`.
+- Local policy-zig remains clean at `502efcc67bda53b07cc715a42390cfba61d28303`;
+  `.path = "../policy-zig"` is unchanged. No dependencies or current serving path
+  were edited. Work after checkpoint `0a72fbc` remains uncommitted.
+
+See REDESIGN-NOTES §24 and proposal §6.4. Next: expand downstream response
+serialization and budgeted response-slot handoff, including preserving status,
+repeated fields/trailers and HEAD/304 metadata lengths. Forwarder scratch cannot
+be referenced by a final completion after reuse; interim responses need bounded
+handoff and write ordering too. Then wire the real upstream exchanges, watchdog,
+socket scheduling and downstream backpressure. Non-chunked transfer codings/coding
+chains remain an explicit compatibility gate, and unlimited Prometheus streaming
+is not implemented by this finite receiver. Phase 1C remains open.
+
+### 2026-09-16 — final response serialization and completion ownership verified
+
+Expanded the final-response slice before implementing it. `ResponseWire` began
+with five behavioral failures against its stub; the final slice adds eight tests.
+Red evidence: `/tmp/edge-v2-response-wire-red.log`. `Response` and `ResponseWire`
+are registered through the v2 test root. The final tests also cover RequestTable,
+WorkChannel, Readiness and the existing parser/framer contracts.
+
+ResponseWire serializes a completed raw response into request-owned head/body/tail
+spans. The upstream receiver writes its body directly into the worker job's
+reserved response buffer, so final completion does not copy the body again.
+Metadata is prepared before publication and never borrows reusable worker scratch.
+Status/reason, duplicate fields, opaque Content-Encoding, authentication challenges
+and validated trailers survive. All Connection nominations are filtered from both
+metadata sections. Framing and Via are regenerated, HEAD/304 representation lengths
+are preserved, and 204 framing is omitted. Ordinary complete bodies use CL unless
+retained trailers require chunked framing. HTTP/1.0 closes and rejects retained
+trailers before commitment; this is a recorded compatibility gate, not silent loss.
+
+RequestTable now separately budgets response head/tail capacity around its existing
+response body region. Defaults of zero preserve existing contiguous-response users;
+composition must supply capacities for framed responses. WorkChannel jobs expose
+the three regions and `.framed_response` completions carry only lengths/close state.
+Queue accounting uses the new actual element layouts. `responseView` rejects stale
+IDs, unacknowledged work, detached clients and lengths beyond reserved capacity.
+After acknowledgement, a live response retains its request slot through the last
+write even though its queue credit is returned. Detached completions recycle.
+
+Tests overwrite receive scratch after publication, traverse output a byte at a
+time, parse the resulting wire with a fresh receiver, and verify binary body and
+trailer preservation. They exercise live/detached completion, slot reuse, exact
+head/tail/field limits, wrong body storage, short-write cursor bounds, empty bodies,
+filtered trailers and bodyless status semantics. Existing exact-budget/OOM tests
+now cover the new response metadata regions and enlarged queue layouts. The final
+round-trip fixture initially omitted the trailer section's terminal CRLF from its
+expectation; corrected that expectation against BodyFramer's existing contract.
+
+Final verification:
+
+- Full native Debug and ReleaseSafe: **690 passed, one skipped (691 total)**.
+- Isolated ResponseWire plus imported tests: **87/87 passed** native Debug and
+  Linux arm64 musl ReleaseSafe in Alpine 3.24.
+- Isolated x86_64 musl root compiles. This does not close the native full-dependency
+  x86_64 execution gate. `task lint` and `git diff --check` pass.
+- Logs: `/tmp/edge-v2-response-wire-full-{debug,release}.log`,
+  `/tmp/edge-v2-response-wire-handoff.log`, `/tmp/edge-v2-response-wire-linux.log`,
+  `/tmp/edge-v2-response-wire-{arm64,amd64}-build.log`.
+- Local policy-zig remains clean at `502efcc67bda53b07cc715a42390cfba61d28303`;
+  `.path = "../policy-zig"` is unchanged. No dependency or production serving-path
+  changes. Work after checkpoint `0a72fbc` remains uncommitted.
+
+See REDESIGN-NOTES §25 and proposal §6.4 for capacity formulas and ownership order.
+Phase 1C remains open: next expand interim-response handoff/ordering, then connect
+actual upstream exchanges with deadlines, partial writes and downstream
+backpressure. Runtime close handling, transformed-entity metadata and unlimited
+Prometheus streaming are not implemented by this buffered serializer. Combined
+config/budget binding and the serving composition root remain phase-1 work.
+
+### 2026-09-17 — phase 1 completed with a runnable relay
+
+Implemented the phase-1 completion checklist as one integrated delivery. The real
+process fixture preceded the executable (`/tmp/edge-v2-runtime-red.log`); its first
+socket run exposed Zig 0.16 Threaded's panic on connect timeout. `os/connect.zig`
+uses nonblocking connect, finite poll, SO_ERROR and the absolute deadline instead,
+checking shutdown between waits. A separate red config test caught accepting an
+upstream port of zero; a wire regression caught forwarding 103 to HTTP/1.0. Both
+were fixed and verified. See `src/v2/README.md` for the runtime contract and diagram.
+
+`Relay` composes one reactor, one acceptor and fixed upstream workers. It retains
+read-ahead over keep-alive, bounds every socket turn, sends Continue after admission,
+reserves body/completion capacity before reads, and writes final responses directly
+from pinned request spans. Deadlines cover head/body/admission and upstream work;
+stalled downstream output has its own absolute budget. Health bypasses work credits.
+Turn-budget exhaustion schedules an immediate poll; finite 10 ms waits recover
+lost wake hints. Shutdown detaches clients, shuts down upstreams, drains completion
+ownership and joins producers before releasing storage. No automatic raw replay or
+local durability acknowledgement was introduced.
+
+Startup validation binds the actual connection/request/queue/client layouts and
+configured stacks to one memory ceiling, and checks calculated fd demand against
+RLIMIT_NOFILE. Exact ceiling and all application allocation-failure paths pass.
+Application reservations and observed peak RSS/request occupancy are distinct;
+allocator/OS/backend overhead and future codec/regex allocations remain explicit.
+Quarantine lifecycle is decided in the README; its policy wiring belongs to phase 2.
+
+Verification:
+
+- Native full Debug and ReleaseSafe: **693 passed, one skipped (694 total)**.
+- Real-process fixture: **13/13 passed** in native Debug, native ReleaseSafe and
+  Linux arm64 musl ReleaseSafe (Alpine 3.24). Includes opaque/chunked bodies,
+  trailers, Continue/1xx, pipelining, queue pressure, health, half-close, disconnect,
+  silent/trickling upstreams, truncated responses, slow/stalled readers and shutdown.
+- Isolated Linux arm64 component suite: **103/103 passed**. Linux x86_64 musl
+  executable compiles; native full-dependency x86_64 execution remains a phase-0 gate.
+- Six production distributions: **22/22 build steps succeeded** in ReleaseSafe.
+  `task lint` and `git diff --check` pass. Existing production defaults are unchanged.
+- Full-relay baseline: 1,000 verified sequential 4 KiB POST/echo round trips,
+  **6,161 requests/s, p50 0.152 ms, p99 0.280 ms**, 4,915,200 B peak child RSS,
+  12,714,782 B calculated reservation, peak one active request, zero failed.
+  This measures the complete raw path against a Python loopback origin; it is
+  neither an old/new comparison nor production sizing evidence.
+- Logs: `/tmp/edge-v2-phase1-{debug,release,distributions,benchmark}.log`,
+  `/tmp/edge-v2-phase1-native-{debug,release}-integration.log`,
+  `/tmp/edge-v2-phase1-linux-{integration,tests}.log`,
+  `/tmp/edge-v2-phase1-{arm64,amd64}-build.log`. Source at `tests/v2/relay.py`
+  reproduces the checks and benchmark.
+- Local policy-zig remains clean at `502efcc67bda53b07cc715a42390cfba61d28303`;
+  its local path is unchanged. No dependency edits. Changes after `0a72fbc`
+  remain uncommitted; phase completion does not imply a merge or production cutover.
+
+Phase 1 is complete as a **raw HTTP vertical slice**. Numeric-IP HTTP endpoints,
+one origin, buffered responses and one upstream connection per exchange are the
+explicit initial contract. TLS/DNS/pooling and full production protocol/config
+parity remain later work. Next: phase 2 Datadog policies, bounded scratch and
+whole-request fail-open through this executable. Do not start another transport
+foundation phase or claim full Edge replacement.
+
 ## Handoff
 
 Latest review: all earlier policy-zig findings are resolved for the tested cases.
@@ -785,11 +1500,28 @@ or commit after the user merges. The sibling checkout is being updated by its
 implementing agent, so record its actual HEAD with final verification. Do not
 edit policy-zig or zonfig as part of Edge work.
 
-Phase 1A ownership and all standalone phase-1B components, including bounded
-accept/handoff, are implemented. Next work: phase 1C HTTP framing and raw relay.
-The combined runtime budget/config gate in 1A remains open. Admission deadlines and reserved health/fallback capacity must be wired
-before serving traffic. Expand any newly started mechanism into minor tasks
-before coding it. No v2 runtime is serving requests yet.
+Phase 1 is complete for the planned raw HTTP vertical slice. Build with
+`zig build v2 -Doptimize=ReleaseSafe`; see [src/v2/README.md](src/v2/README.md)
+for commands, bounds, benchmark and the exact runnable contract. `Relay` connects
+Acceptor/Connections/RequestIngress/WorkChannel/RequestWire/ResponseIngress/
+ResponseWire with real sockets, native bounded connect, UpstreamWatch deadlines,
+request-owned response writes, health and ordered abort/drain/join shutdown.
+Aggregate config accounting includes real tables, scratch, queues and explicit
+thread reservations. Health bypasses work admission but still needs fd/client
+capacity. Production remains on httpz; no default distribution was switched.
+
+The executable intentionally serves a single configured numeric-IP HTTP origin.
+TLS/DNS/pooling, production routing/config parity and policy processing are not
+claimed complete. Informational responses are bounded and delayed until the final
+response, with 100 handled locally and no 1xx forwarded to HTTP/1.0. See the README
+for remaining compatibility limits and why application reservation is not RSS.
+
+Next delivery work is **phase 2: one Datadog policy slice through this working
+relay**, with retained original bytes and whole-request fallback. Expand it into
+minor tasks before coding. Quarantine decision: continue raw forwarding, expose
+degraded policy status, stop affected providers, retain the failed registry until
+process exit and require operator restart; do not auto-exit or silently resume
+mutation. Phase 1 has no registry, so applying that decision belongs to phase 2.
 
 Ownership rules:
 
@@ -808,7 +1540,7 @@ Ownership rules:
 - Publish a completion before calling `Readiness.wake`; the integration fixture
   exercises this ordering. A bounded drain that exhausts its turn budget must
   schedule another immediate turn, even after the single coalesced wake is gone.
-  FIFO admission is implemented; the serving worker/reactor loop is outstanding.
+  Relay applies FIFO admission and polls immediately after exhausting a turn cap.
   Queue min=0 operations avoid waiting for capacity but take an internal lock.
 - `Readiness.adopt` ALWAYS consumes its fd, including errors/exhaustion. Never
   duplicate or separately close an adopted fd. An interest-update error closes
@@ -825,7 +1557,7 @@ Ownership rules:
 - Drain handoff queues with a bounded budget; budget exhaustion schedules another
   immediate reactor turn. Stop/join the acceptor before tearing down target queues
   and wakes. Queue deinit closes all descriptors that were never adopted. The
-  runtime still needs accept/drain budgets, fd demand and backoff config binding.
+  Relay binds accept/drain turn budgets, fd demand, memory limits and backoff.
 - `Connections` owns all registration changes when wrapping Readiness. Use its
   embedded poller only to wait/resolve/wake; direct adoption/close/interest mutation
   would bypass connection and request ownership. Revalidate both token and current
@@ -834,19 +1566,29 @@ Ownership rules:
   the reactor turn budget. Retry after queue acknowledgement AND response-storage
   release/canceled admission. Available queue credit does not imply request space.
   Copy initialized head/body bytes to RequestTable before dispatch; worker jobs
-  cannot reference reusable connection heads. HTTP framing/length tracking is not
-  implemented by this ownership layer.
+  cannot reference reusable connection heads or ingress scratch. RequestIngress
+  performs that copy and body/trailer framing into reserved request spans. Stop
+  using ingress and any borrowed views after cancellation or publication.
+  Relay now manages partial reads, read-ahead and one-time Continue.
 - `Connections.complete` consumes acknowledgement and returns the live connection
   token or null for a detached request. Null may free the request bytes immediately.
   A live response is framed before `responseReady` arms writes. Calling complete
   again after a later interest failure is a duplicate acknowledgement bug.
+- For `framed_response`, receive the upstream body directly into `job.response`,
+  then prepare metadata into `job.response_head`/`response_tail` before publishing.
+  Publish errors as failed outcomes; partially prepared metadata is not sendable.
+  Stop using all job spans at publication. After a live acknowledgement, obtain
+  `RequestTable.responseView` and retain the slot through the last downstream byte.
+  Drop the cursor before close/release; it cannot validate its own borrowed lifetime.
+  Honor `response.close` at write completion rather than returning that connection
+  to reading. HTTP/1.0 with retained trailers currently fails before commitment.
 - `closeAll` unlinks waiters, returns unpublished reservations and detaches clients;
   it does not drain jobs. Keep Connections/RequestTable/WorkChannel alive through
   all late completions, then join wake producers and deinit.
 - Stop/join wake producers before poller destruction. Native waits are canceled
   through explicit wake/shutdown state, not `Io` cancellation. Use finite wait
   deadlines to recover from wake failure; the composition root must choose the
-  maximum fallback interval and report errors. No runtime does this yet.
+  maximum fallback interval and report errors. Relay uses a 10 ms fallback.
 
 Dependency and validation limits:
 
@@ -854,16 +1596,76 @@ Dependency and validation limits:
   by default. The alignment adapter and old opt-in skip have been removed.
 - `PolicyStore` still permanently fences a failed publication and conservatively
   retains that registry until process exit. Tested cleanup is now safe for the
-  fixtures, but failed updates are not transactional; process-owner recovery is
-  still a composition decision. No non-failing allocator workaround is needed.
+  fixtures, but failed updates are not transactional. Recovery will keep raw
+  forwarding and require operator restart, as decided above. No non-failing
+  allocator workaround is needed.
 - The dependency's regex-engine OOM exclusion and native C allocation accounting
   remain outside the verified fault fixture. Do not claim universal cleanup safety.
 - Linux x86_64 still needs a native runner. A controlled DNS deadline probe still
   lacks local injection. The new isolated readiness/queue Linux aarch64 coverage is recorded above;
   the older full-distribution Linux run predates current dependency changes.
-- Full runtime budget binding, codec/hyperscan scratch measurement and Lambda
-  lifecycle remain with the phases defining those layouts and execution paths.
+- Phase-1 raw-runtime budget binding is complete. Codec/hyperscan scratch and
+  Lambda lifecycle remain with the phases defining those paths. Native Linux
+  x86_64 full-dependency execution and controlled DNS fault injection remain
+  phase-0/platform gates; neither is silently marked complete by this slice.
 
 `ProviderSet` and `PolicyStore` still do not replace `Loader`. Keep stores and
 callback contexts stable, join providers before teardown, and honor read guards.
 Disarm `UpstreamWatch` slots before the owning forwarder closes a stream.
+
+### 2026-09-17 — phase 2 integrated policy path in progress
+
+- Bounded worker workspaces and sticky OOM tracking are implemented. Datadog
+  log candidates remain private until JSON grammar, framing and encoding finish.
+  Unchanged requests use the original encoded bytes; failed candidates roll back
+  without evaluating a record twice. Changed bodies regenerate length and remove
+  stale representation digests/validators in both headers and trailers.
+- Runnable `--policy-file` starts a ProviderSet watcher. Registry quarantine is
+  monitored off the reactor: stop publishers, retain unsafe registry storage
+  until process exit, and keep forwarding raw. Registry allocations currently
+  use page_allocator; these control-plane/C allocations are outside the core
+  reservation, as are codec cache allocations. This is not a process RSS cap.
+- Native real-process suite: 15/15, including gzip processing, malformed suffix
+  rollback, unsupported encoding passthrough, file reload and output exhaustion
+  (`/tmp/edge-v2-phase2-integration.log`). Additional transform, sticky OOM,
+  extension-order and zstd tests are being validated; phase 2 is not checked off.
+- Existing zstd encoding uses a global eight-slot C context cache (~3.5 MiB each)
+  and its default streaming window exceeds the 256 KiB decoder cap. Tests must
+  distinguish accepted windows from intentional fail-open of oversized windows;
+  include C codec retention in deployment measurements.
+
+### 2026-09-17 — phase 3 formats and transport integrated
+
+- Phase 2's policy path is integrated, including sticky swallowed-OOM detection,
+  transform/drop rollback, gzip/zstd round trips, one-time pre-transform extension
+  delivery and reload under socket traffic. Native Debug and ReleaseSafe passed
+  701 tests with one existing skip before phase-3 work; final broad checks remain.
+- `Routes.zig` reuses the existing pure service tables without allocating a hash
+  map for six services. `--distribution` selects edge/datadog/otlp/prometheus;
+  routing excludes query bytes and uses parsed path for absolute request targets.
+- `--config` and TERO environment loading use unchanged zonfig and ProxyConfig.
+  `logs_url`/`metrics_url` select separate origins; explicit CLI values win.
+  Root composition maps provider configs and S3 resolver/sink/flush tasks. HTTP
+  provider shutdown/final sync still needs bounded lifecycle integration; this
+  is NOT checked off as complete.
+- `Origin.zig` validates HTTP(S) authorities and resolves DNS in a cancellable
+  task under the exchange deadline. It tries addresses before sending HTTP;
+  no request replay occurs. `UpstreamLane.zig` reserves one stable TLS/HTTP
+  connection per worker; stale/dirty idle sockets are evicted before reuse.
+  Authenticated TLS verifies CA and hostname and flushes both plaintext and
+  underlying ciphertext buffers. Real socket tests prove localhost DNS,
+  certificate success and hostname rejection (16/16, integration2 log).
+- Nested Datadog metrics/OTLP JSON/protobuf run inside bounded scratch. Top-level
+  unknown OTLP envelope fields are restored after transformation; no second
+  policy evaluation occurs. Nested unknown schema fields still need a lossless
+  strategy or explicit conservative bypass before claiming complete parity.
+- Finite Prometheus filtering preserves full metadata lines and passes overlong
+  lines intact, fixing the old silent truncation behavior. HELP/TYPE are retained
+  even if every sample in a family is dropped. Unlimited scrape transport is
+  still outstanding; zero policy caps currently do NOT make response storage
+  unlimited. Do not claim phase 3 done or use this as production cutover.
+- Admin policy rendering, v2 counters and optional Datadog record taps are being
+  wired and tested. Full metrics-name/OTLP tap parity remains to verify.
+- Latest full green before admin additions: 708 passed, one skip (709 total),
+  Debug, plus v2 executable (`/tmp/edge-v2-phase3-envelope2.log`). This is a
+  checkpoint, not acceptance of untested later edits.

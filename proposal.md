@@ -1,7 +1,8 @@
 # Tero Edge v2 — from-scratch design proposal
 
-Date: 2026-09-11. Target: Zig 0.16.0. Status: revised design, not an
-implemented or benchmark-validated runtime. Companion: [REDESIGN-NOTES.md](REDESIGN-NOTES.md).
+Date: 2026-09-11; status updated 2026-09-17. Target: Zig 0.16.0.
+Phase 1 raw HTTP relay is implemented and measured; phases 2–6 remain planned.
+Companion: [REDESIGN-NOTES.md](REDESIGN-NOTES.md).
 The review findings and source evidence are recorded in that document, §13.
 
 ## 1. Summary
@@ -71,6 +72,14 @@ errors before response commitment when possible; after commitment an incomplete
 exchange must close. An assertion/panic is not a recoverable policy error.
 
 ## 3. Architecture
+
+Transport decision (reviewed 2026-09-15): retain the Edge-owned v2 reactor design.
+The pinned httpz supports lazy Content-Length reads, but buffers chunked bodies
+before dispatch, sends Continue before application admission, and does not retain
+request storage after handler return through `disown()`. See the source audit,
+executable probes and alternatives in [HTTPZ-TRANSPORT-REVIEW.md](HTTPZ-TRANSPORT-REVIEW.md).
+Production continues using httpz until cutover. This choice fits the proposed
+ownership contract; its performance benefit remains unmeasured.
 
 ### 3.1 Process view
 
@@ -718,6 +727,124 @@ state explicitly between work turns.
 
 ### 6.4 HTTP protocol contract
 
+The phase-1 request-head implementation is `src/v2/RequestHead.zig`, separate
+from the incremental delimiter scanner. It validates a complete bounded head,
+stores relocatable offsets, and leaves body admission and all writes to the
+runtime. Header descriptors use caller-owned storage. Unknown content encodings
+and repeated end-to-end fields are retained without decoding or coalescing.
+
+Initial acceptance choices: require one nonempty Host in HTTP/1.1, reject repeated
+Host/CL/TE and comma-list CL even when values agree, and support only a single
+`chunked` transfer coding. Accept HTTP(S) absolute targets, origin targets,
+OPTIONS `*`, and syntactically valid CONNECT authority targets; recognition does
+not enable tunneling. Preserve encoded path/query bytes. HTTP/1.0 exchanges close
+after the response. Continue is a pure decision gated on body/queue reservation;
+runtime wiring must also enforce admission deadlines and send it at most once.
+
+The phase-1 `BodyFramer` consumes no-body, Content-Length and chunked entities
+over caller-provided body, line, trailer and descriptor storage. It retains
+encoded entity bytes exactly; it does not decode Content-Encoding. Chunked output
+is provisional until the zero-size chunk, complete validated trailers and final
+CRLF arrive. Failure or early EOF fences the instance permanently so a prefix
+cannot be forwarded as a valid request. It returns exact consumed byte counts,
+leaving a pipelined request untouched. Output exhaustion stops before consuming
+any entity byte that lacks room in the caller's body buffer.
+
+Chunk length uses checked u64 hexadecimal arithmetic. The configured body limit
+applies to aggregate decoded transfer-framing bytes; line/trailer framing work
+has a separate cumulative metadata budget. Chunk extensions support bounded token
+and quoted-string syntax. Trailer fields retain ordering and duplicates as offsets
+into the supplied trailer store. Reject framing, routing, connection and critical
+representation/authentication trailers. Later header rewriting must also reject
+any field nominated by a received Connection header and apply field-specific
+trailer rules before forwarding. No body storage, queue credit, timeout or socket
+write is allocated/changed by the framer.
+
+`RequestIngress` wires this parsing contract to the existing FIFO admission
+ownership: only an already reserved request slot receives copied head/body bytes;
+then `Connections.dispatch` publishes the job. The reusable connection head is
+never exposed to workers. Every ingress access checks the live generation,
+attached reading state and reserved lease before touching request bytes. Dispatch,
+cancellation and disconnect revoke that access even while a worker keeps the
+slot alive. Parsed descriptors and chunk-line scratch are reactor-local; worker
+jobs borrow immutable raw head, entity-body and trailer spans from RequestTable.
+Trailer storage is reserved separately from body and response capacity, included
+in the checked startup budget, and pinned through completion acknowledgement.
+Chunked trailers include their final CRLF; forwarding still requires validated
+header/trailer rewriting and output framing. A real reactor loop still must
+handle read offsets, peer closure, deadlines and a one-time Continue write.
+
+`RequestWire` prepares raw outbound HTTP/1.1 messages in caller-owned head/tail
+buffers, with the original encoded body borrowed between them. Preparation must
+succeed before exposing any bytes to an upstream. It regenerates the selected
+Host and actual framing, strips fixed hop-by-hop fields and all Connection-named
+fields from both metadata sections, and retains ordered end-to-end duplicates.
+Chunked input becomes one data chunk plus separate validated trailers; an empty
+body emits only the terminal chunk and trailers. A generated Trailer declaration
+names the retained trailer fields. Via records the received protocol version.
+Expect is consumed locally; unsupported expectations and CONNECT are rejected.
+
+The three spans permit partial writes without copying the body. The cursor
+advances only over bytes accepted by the transport; it grants no retry authority.
+Source metadata and descriptor scratch can be reused after preparation, while
+output buffers and request body stay pinned until sending ends. Input/head/tail
+capacities and generated field counts are checked, including the default 64-field
+and 16 KiB output-head limits. Reserve up to 18 extra head-buffer bytes for the
+chunk size line; tail worst-case capacity is input trailer capacity plus trailer
+field count plus five framing bytes. Composition must budget these per active
+forwarder and leave space for generated metadata rather than assume that every
+maximum-sized input head fits an equally sized output head. This component handles
+the unchanged original entity; transformed-body encoding/validator rules belong
+to the later policy pipeline. It performs no network IO or route selection.
+
+`ResponseHead` applies strict status-line/field validation with relocatable
+metadata. Unknown content encodings and repeated fields remain opaque. Declared
+representation length is separate from body framing: HEAD and 304 end at the
+head while retaining their Content-Length metadata; 1xx/204 reject prohibited
+framing fields. A 205 must contain zero content but still consume its declared
+framing. 101 and successful CONNECT tunnels are unsupported. Duplicate or
+ambiguous lengths fail instead of normalizing them. Transfer coding is currently
+limited to single chunked; other transfer codings require an explicit compatibility
+decision before cutover, while Content-Encoding is preserved verbatim.
+
+`ResponseIngress` borrows fixed head/body/line/trailer/descriptor stores, reuses
+the scanner and BodyFramer, and exposes a final response only after complete
+framing. It stops at each informational head so the owner can rewrite/forward it
+before the next feed reuses that store. Both count and aggregate head bytes are
+bounded. Explicit clean EOF completes a close-delimited body; transport failure,
+deadline cancellation and TLS truncation fence the receiver. Connection reuse is
+only a framing precondition: the transport owner must also validate request state,
+watchdog result, transport health and read-ahead. This buffered path does not
+implement the separate unlimited Prometheus streaming contract.
+
+`ResponseWire` prepares complete raw final responses before publishing completion.
+It copies status/reason and retained metadata into request-owned response head/tail
+regions; the receiver writes the body directly into the reserved response body.
+There is no second body copy for completion. Connection nominations are removed
+from headers and trailers, ordered repeated end-to-end fields remain intact, and
+framing/Via are regenerated. Without retained trailers, use Content-Length for
+ordinary complete bodies; HEAD/304 retain representation lengths and 204 has no
+framing fields. With retained trailers, generate one data chunk and a separate
+terminal chunk/trailer section. HTTP/1.0 closes and currently rejects retained
+trailers before commitment because it cannot carry this framing faithfully.
+
+RequestTable budgets independent response head/body/tail capacities. Head/tail
+capacities default to zero for callers using the existing contiguous response
+outcome; serving composition must set them explicitly. Budget the output-head
+limit plus up to 18 chunk-prefix bytes, and input trailer capacity plus trailer
+field count plus five framing bytes for the tail. Generated fields count toward
+the head limits. `framed_response` carries scalar lengths/close state through
+WorkChannel. Workers stop touching request bytes after publication; the reactor
+obtains a response cursor only after acknowledging a live completion. Storage
+stays pinned until the response ends, and a detached completion recycles without
+writing. Partial writes traverse the three spans without copying. The runtime
+must honor the close flag and discard the cursor before releasing the slot.
+The phase-1 `Relay` now wires these spans to real socket reads/writes and honors
+close/release ordering. Informational responses use a bounded prefix in the same
+request-owned head region and are sent before the final HTTP/1.1 response; 100 is
+handled locally and HTTP/1.0 receives no 1xx. This deliberately delays Early Hints
+until final validation. Transformed metadata still belongs to the policy pipeline.
+
 Own only the HTTP/1.1 transport needed for opaque proxying. Reuse appropriate
 std parsing helpers after checking their acceptance behavior; fuzzing alone is
 not proof of conformance. Reject conflicting Content-Length, CL/TE ambiguity,
@@ -993,6 +1120,14 @@ This is an adaptation of its engineering principles, not a claim to reproduce
 its database fault model. [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 
 ## 14. Delivery plan
+
+Implementation status (2026-09-17): phase 1 is complete as an opt-in raw HTTP
+vertical slice. `zig build v2 -Doptimize=ReleaseSafe` builds the runnable relay;
+[src/v2/README.md](src/v2/README.md) documents commands, bounds and measured results.
+It uses one reactor, fixed workers, a numeric-IP HTTP origin, buffered responses
+and a new upstream connection per exchange. TLS/DNS/pooling and production routing/
+config parity remain later work. The six production distributions keep their
+existing frontend. See IMPLEMENTATION-PROGRESS.md for test and platform evidence.
 
 Each phase has failing tests before implementation, `zig build test`, appropriate
 integration checks, six distribution builds, and `task lint` before merge. Keep

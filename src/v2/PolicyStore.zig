@@ -127,7 +127,7 @@ pub fn init(allocator: std.mem.Allocator, bus: *policy.observability.EventBus) S
 }
 
 /// Stop/join providers and readers first. Retain a failed registry until process
-/// exit: dependency-internal allocation ownership is not fully recoverable yet.
+/// exit: failed replacement is not transactional, even with safe OOM cleanup.
 pub fn deinit(self: *Self, io: std.Io) DeinitResult {
     self.gate.lockUncancelable(io);
     defer self.* = undefined;

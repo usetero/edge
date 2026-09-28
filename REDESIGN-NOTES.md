@@ -992,3 +992,467 @@ buffers and std.Io backend storage are outside those byte reservations. The fina
 runtime must validate combined budgets, pick finite wait deadlines, report turn
 failures and coordinate shutdown state. HTTP framing, local replies, admission
 request deadlines and the serving reactor remain phase-1C/1D work.
+
+## 19. httpz decision and first head scanner — 2026-09-15
+
+See [HTTPZ-TRANSPORT-REVIEW.md](HTTPZ-TRANSPORT-REVIEW.md) for the full pinned-source
+audit, five executable boundary probes and alternatives. The public lazy-read
+hook permits Content-Length admission before the body, but delegates body size
+checks to the handler. Chunked requests still buffer before dispatch; Continue
+is emitted before handler admission. Disown transfers the socket, while handler
+return still resets request storage. Retaining a synchronous handler through
+completion is a safe alternative with different scheduling/memory tradeoffs.
+Existing httpz already uses native readiness; no performance improvement from
+replacing it has been demonstrated. Keep it as production default through cutover.
+
+Continue the v2 ownership architecture. The first head mechanism reuses
+`std.http.HeadParser` with a byte cap and precise consumed lengths for CRLF heads.
+`HeadScanner` stores only scalar parsing state, borrows each new input slice and
+does not retain pointers or allocate. At capacity, complete beats oversized;
+after completion or capacity failure, the owner must reset before feeding again.
+Six tests cover incremental input, all split positions, read-ahead preservation,
+capacity, reuse and 129 header alignments across std's scanning vectors.
+
+This scanner is not an HTTP validator. Std can mark malformed LF-only input
+complete; one longer LF-only fixture also returned a later-than-expected boundary.
+Do not depend on meaningful consumed offsets for invalid heads. The forthcoming
+strict validator must reject bare LF/CR, folding, invalid tokens/controls and
+ambiguous framing before admission. Full `std.http.Server.Request.Head.parse`
+also rejects unknown Content-Encoding, so it cannot be used unchanged for opaque
+proxying. Both std behaviors were inspected through zigdoc and local source.
+
+An existing acceptor test assumed client connect implied immediate acceptability.
+ReleaseSafe exposed the race; its fixture now waits for real listener readiness
+with an absolute deadline, and the stop test checks the handoff before unwrapping.
+Multi-client tests also accumulate bounded turns instead of assuming all expected
+peers arrive in one OS batch. No production acceptor behavior changed.
+Final counts, dependency HEAD, logs and
+remaining work are in IMPLEMENTATION-PROGRESS.md. The original checkpoint is
+`0a72fbc`; subsequent audit/scanner work is separate from that commit.
+
+## 20. Strict request-head metadata — 2026-09-15
+
+`RequestHead` completes the standalone head slice on top of `HeadScanner`. It
+accepts exactly the completed head and returns scalar framing/expectation state
+and u32 offsets into caller-owned bytes. Header descriptors remain in a supplied
+slice; no pointers or allocations are retained in metadata. Copy bytes unchanged
+to request storage before workers borrow them, and carry/rebuild descriptors
+according to that owner's lifetime. On parse error, discard the partial descriptor
+array and close/reply through the future serving layer. Validation cannot admit
+work or send network bytes by itself.
+
+Why separate the two: the scanner bounds incremental input and preserves the
+unconsumed suffix; the validator rejects malformed line endings and ambiguous
+framing before any resource admission. It performs one bounded pass over lines,
+fields and special-header tokens. Repeated end-to-end fields and unknown encoding
+values survive as independent descriptors, in order. There is no dictionary,
+string normalization or content decoding here. The later planner/writer must
+respect duplicate field semantics, remove Connection-nominated fields, and avoid
+mistaking a first encoding value for the complete representation encoding.
+
+The initial request acceptance profile is documented in proposal §6.4 and the
+progress log. It deliberately refuses duplicate/list CL, empty Host, folding and
+CL/TE ambiguity. It recognizes all four request-target forms needed to classify
+HTTP requests; CONNECT recognition does not enable a tunnel. Only HTTP(S)
+absolute targets are accepted. Unknown method tokens remain raw for the planner
+to classify. Host syntax validation does not resolve hosts or choose destinations.
+Configured upstream routing remains authoritative. Empty absolute paths need
+slash/asterisk normalization in the later writer while preserving query bytes.
+
+Connection close is sticky across lists/fields. HTTP/1.0 requests are marked
+nonpersistent, following the proxy rule in
+[RFC 9112 §9.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-9.3).
+Expect handling produces a pure action only; the owner supplies real admission
+state, enforces the admission deadline and prevents repeated interim responses.
+Unsupported expectations remain rejected even if a later field requests Continue.
+No-body/already-received-body and HTTP/1.0 Continue cases require no interim write.
+Body limits are admission decisions; checked u64 CL parsing is not a body-memory
+reservation. Refer to [RFC 9110 §10.1.1](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.1.1)
+for expectation semantics.
+
+Fourteen parser tests follow twelve initially failing cases. They cover strict
+syntax tables, all 256 field-value bytes, decimal overflow, caps, repeated fields,
+opaque encodings, method-independent framing, offset relocation, Expect and
+Connection lists, and scanner/validator composition at every split. Layout gates
+require metadata <=128 bytes and 64 field descriptors <=1 KiB. Neither their
+ultimate reactor/request residency nor the aggregate runtime budget is wired.
+The test suite is deterministic, not a substitute for later wire fixtures,
+differential/fuzz testing or measured throughput. See the latest implementation
+log for verification and the next body/trailer-framing work.
+
+## 21. Bounded body and trailer framing — 2026-09-15
+
+`BodyFramer` adds the standalone transfer-framing half of phase 1C. It owns only
+scalar parser state while borrowing fixed line, trailer and trailer-descriptor
+stores. Entity output goes to caller-provided storage. The caller must retain all
+stores for the message lifetime and must never move an owning structure holding
+borrowed storage. The framer does not allocate, perform IO, emit Continue, reserve
+queue credit, process policies or forward upstream bytes.
+
+For Content-Length, it copies the available bulk suffix until the exact length;
+for no-body messages it completes without consuming a following request. Chunked
+framing reads one strict CRLF line at a time, validates checked hex size and
+extension syntax, copies each data segment, requires CRLF after it, then validates
+the zero chunk and trailers. It returns exact consumed/written counts, so caller
+read-ahead is preserved. If the output buffer is full, it stops before consuming
+the next entity byte. It accepts an aggregate body only after every last trailer
+byte validates. `finish` rejects all unfinished states and fences the framer;
+later feed calls fail. This is the boundary that prevents fail-open logic from
+mistaking a truncation or malformed suffix for a complete original request.
+
+The default caller-selected limits distinguish body bytes from metadata work.
+Body limits include decoded transfer-framing payload bytes but intentionally do
+not claim to bound content decoding, compressed history or eventual policy output.
+Metadata includes chunk-size and trailer bytes, which blocks a peer from spending
+unbounded CPU on tiny chunks/extensions/trailers. The later configuration/budget
+root must reserve actual body + line + trailer + descriptor layouts together and
+apply turn/input limits around `feed`; it is not currently wired.
+
+Trailer descriptors use the same strict field parser and offsets as heads,
+against the separate trailer store. Order, casing and repeated end-to-end fields
+are retained. Critical framing, routing, connection, representation and auth
+fields are rejected as late overrides. This list is conservative. The future
+header writer must additionally apply Connection-nominated field removal from the
+original head, route-specific policy, and protocol-specific trailer rules. It
+must never merge trailer fields into the head simply because the framer parsed
+them. Refer to [RFC 9112 §7.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1)
+when extending coding support.
+
+## 22. Reserved request-slot ingress — 2026-09-15
+
+`RequestIngress` connects the completed standalone parsers to the existing
+request-table and work-channel ownership. It is reactor-local and takes an
+already reserved `RequestTable.Id`; callers must reach that state through the
+FIFO `Connections.admitNext` path, which reserves both request bytes and a future
+completion credit before body reads. Ingress copies a complete head from the
+reusable connection buffer into the request slot before parsing it, then frames
+the body directly into the request slot. All head metadata spans therefore refer
+to immutable-per-request bytes while the connection head can be reused.
+
+Ingress preserves its temporary head and trailer descriptors only for the ingress
+lifetime. Worker jobs carry immutable head/body/trailer spans, an absolute
+deadline, and exclusive response storage. Trailer bytes now live directly in a
+separate RequestTable span; the framer writes there without an intermediate copy.
+Do not capture ingress pointers or descriptor scratch in worker code. The request
+table's work/completion lease pins all input spans after disconnect. Workers can
+reparse their raw metadata into their own bounded scratch for header rewriting.
+
+An ingress exposes `WorkChannel.Input` only after body framing reaches done. It
+does not publish by itself; `Connections.dispatch` turns the reservation into an
+uncancelable job after disabling client read interest. Malformed/EOF-framed input
+fences the body framer and leaves the reservation so the connection owner can
+close and explicitly cancel it. A disconnect before publish follows the existing
+close/cancel path; after publication the existing completion lease owns storage.
+The integration test overwrites the connection head after construction, proves
+the worker receives the old copied head/body, completes the job and returns the
+connection to `reading_head`. There is no serving reactor loop yet.
+
+Continue remains a pure ingress/head action. `admitNext` makes capacity real;
+the future loop must decide whether a full body prefix already arrived, enforce
+the absolute admission deadline, emit at most one interim response, and track
+the write result. It must not call this a grant merely because head scanning or
+validation completed. No-body requests consume zero bytes of a pipelined suffix.
+
+The ownership review found that generation validation alone allowed ingress to
+touch a dispatched worker's still-live slot. `RequestTable.ingressBuffers` now
+requires a live generation, attached client, reading state and reserved lease.
+Ingress init/feed/input/Continue/trailer access and channel submission all use
+that guard on the reactor. A failed body framer also rejects Continue. Stop using
+ingress and its borrowed views on cancellation or publication; do not revive an
+old ingress if a caller cancels and re-reserves the same request ID.
+
+`RequestTable.Limits.trailer_bytes` reserves raw trailer bytes, including the final
+empty CRLF for chunked messages. Zero is useful for callers that never accept
+chunked input; chunked ingress requires at least two bytes. This capacity is
+separate from the body limit and response buffer. RequestTable's exact byte budget
+includes it; WorkChannel's budget includes the enlarged Job layout. The combined
+runtime budget still must include ingress metadata, scratch and all other owners.
+The handoff now preserves trailers through scratch reuse and disconnect. The next
+writer/relay slice must filter Connection-nominated fields and frame outbound
+trailers correctly; retaining bytes alone does not implement forwarding.
+
+## 23. Bounded outbound raw request preparation — 2026-09-15
+
+`RequestWire` is the next phase-1C component. It prepares the entire request's
+metadata before upstream commitment, using `std.Io.Writer.fixed` over caller-owned
+buffers and no allocator or IO. Its result contains three borrowed spans: generated
+head plus optional chunk size line, original entity body, and generated tail. No
+full-body copy or decode occurs. The value has no pointers into itself, so moving
+it is safe while the external buffers remain fixed. `pending`/`advance` traverse
+short writes without interpreting retries, scheduling, cancellation or deadlines.
+
+The raw contract requires the complete original entity from successful ingress.
+Content-Length must match the supplied body exactly, and unframed requests must
+have an empty body. Chunked input must include a complete trailer section, even
+when it is only CRLF. Reparse head/trailer metadata into bounded worker scratch;
+do not capture reactor ingress descriptors. A returned plan is the only valid
+publication boundary; all partial output on preparation failure is discarded.
+Success does not extend the WorkChannel lease: keep the job's body pinned until
+upstream sending finishes and publish completion only after all borrows end.
+
+Destinations come from the route owner. Host is regenerated from the selected
+authority, which is syntax checked using RequestHead's shared rules. The optional
+target override accepts only origin form or OPTIONS `*`; route/base-path building
+is still future work. Otherwise absolute-form input loses its authority, retains
+the encoded path/query and gets `/` for an empty path (or `*` for server-wide
+OPTIONS without a query). CONNECT is rejected; this never enables tunneling or
+chooses a network destination from inbound Host/absolute authority.
+
+Headers are emitted in their original order with name casing and repeated values
+preserved; outer whitespace is normalized. Fixed connection/transport fields and
+every field named by any original Connection value are removed. Incoming Expect
+is consumed, proxy credentials are not forwarded to the origin, and ordinary
+Authorization/opaque Content-Encoding remain unless nominated for removal. Host,
+Via and framing are generated and count against the output header limit. The
+received version is appended in Via with pseudonym `tero-edge`; no host identity
+is leaked. Existing end-to-end Via values remain separate ordered fields.
+
+The shared critical-trailer blacklist moved to `http_field.zig` so ingress and
+outbound preparation cannot drift. Noncritical Connection-nominated trailers are
+filtered; surviving trailer order/casing/duplicates are preserved separately from
+headers. The original Trailer declaration is replaced with the actual retained
+names. Chunk boundaries/extensions are not entity data and are regenerated as one
+data chunk, followed by the zero chunk and trailers. Empty chunked bodies emit a
+single zero chunk; emitting an empty data chunk first would terminate too early.
+These choices follow [RFC 9110 §7.6.1](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.1)
+and [RFC 9112 §7.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1).
+
+Resource contract: defaults bound input head/trailer bytes and output HTTP head to
+16 KiB each, and output fields to 64 including generated metadata. Descriptor
+slices bound input field counts, including discarded trailers. The original head
+and Connection token lists are rescanned for each candidate field; cost is bounded
+by candidate count times head bytes. This avoids allocating a hash table or token
+index. Measure before replacing it with a more complex representation. Normal
+request processing only borrows the body and copies metadata into fixed buffers.
+
+The output head buffer additionally needs up to 18 bytes beyond the HTTP head cap
+for a 64-bit hexadecimal chunk-size line plus CRLF. A tail buffer of input trailer
+capacity + trailer descriptor capacity + 5 covers normalized fields (at most one
+extra space per field) and framing for nonempty chunked bodies. Short buffers fail
+explicitly before publication. The runtime must bind these sizes to its aggregate
+budget and reserve room for generated Host/Via/framing/Trailer fields. The 64-field
+and 16 KiB tests deliberately reject overflowing regenerated output instead of
+silently truncating metadata.
+
+Tests include exact wire expectations, selected-destination injection attempts,
+empty chunks, 1–31-byte write windows, blocked-write cursor behavior, malformed
+tails, exact byte/field limits, and RequestIngress → WorkChannel → RequestWire
+after client disconnect. The latter reparses the output and recovers the original
+binary body and retained trailers, while asserting source body/trailers remain
+unchanged and the slot cannot recycle before completion. This is still an
+in-memory composition test, not an upstream socket exchange.
+
+Raw preparation preserves representation metadata because the entity is unchanged.
+Do not reuse this API with transformed bytes merely because their lengths match:
+Content-Encoding, validators, digests and signature semantics need explicit policy
+pipeline handling. Response framing, real upstream exchanges, TLS/DNS lifetimes,
+route binding and serving-loop backpressure remain open; no production cutover.
+
+## 24. Buffered upstream response framing — 2026-09-16
+
+`ResponseHead` and `ResponseIngress` extend phase 1C through upstream response
+reception, still without network IO. The response-head tests first failed with
+`NotImplemented`, followed by the receiver tests failing behaviorally after their
+compile issues were corrected. The receiver borrows bounded storage; there are
+no allocations during parsing or any hidden owning slices.
+
+The Zig 0.16 `std.http.Client.Response.Head.parse` API was inspected with zigdoc
+and in the installed source. It rejects unknown Content-Encoding, accepts equal
+duplicate Content-Length values and does not interpret Connection lists with the
+strictness our contracts require. We reuse `std.http.HeadParser` via HeadScanner,
+plus the existing strict field parser, rather than wrapping that response parser
+with a second complete validation pass. Strict CRLF line extraction, decimal
+length parsing and Connection token validation moved to `http_field.zig`; existing
+request-head behavior remains covered by its tests.
+
+Response metadata keeps status as u16 (including unregistered 100–599 values),
+reason bytes as a span, version, field count, optional declared Content-Length,
+effective body framing and persistence. Reasons accept HTAB/SP/VCHAR/obs-text;
+controls, malformed status codes, folding and malformed fields are errors. The
+mandatory space after the status code is enforced even for an empty reason.
+Metadata remains relocatable and <=128 bytes. Repeated end-to-end headers, such as
+Set-Cookie, retain order and case without combining values or interpreting codecs.
+
+Body framing follows request method and response status. HEAD and 304 retain
+declared representation length while consuming no body. 1xx/204 reject CL/TE;
+101 and successful CONNECT are explicitly unsupported. A 205 still consumes
+ordinary framing but has a zero content limit, including chunked and EOF-delimited
+forms. All repeated CL/TE and CL+TE combinations are rejected, even on a bodyless
+message. Only a single chunked transfer coding is supported in this slice; coding
+chains and other transfer codings are an explicit pre-cutover compatibility gate.
+Unknown Content-Encoding remains opaque. HTTP/1.0 never enters the reusable pool.
+See [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3) and
+[RFC 9110 §15.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.6).
+
+Receiver ownership and sequencing:
+
+- Give each receiver disjoint stable head/body/descriptor/chunk-line/trailer
+  buffers. Input read buffers must not alias them. Initialization checks that the
+  configured body/head capacities fit; additional chunk storage requirements are
+  checked before consuming a chunked body. Keep any containing buffer owner fixed.
+- `feed` copies only consumed bytes. It returns immediately at each 1xx head with
+  an informational event; `informational()` borrows that head and its descriptors
+  until the next feed. The owner must rewrite/forward applicable 1xx responses
+  before allowing overwrite. The parser does not silently discard 103, emit a
+  second local Continue, or treat interim output as final-response commitment.
+- Default ceilings are eight informational heads, 16 KiB per head, 64 KiB across
+  all informational plus final heads, and 64 KiB chunk/trailer framing work.
+  Body bytes are caller-configured; descriptor and trailer buffers impose their
+  own limits. Count and total-byte limits include every accepted interim head.
+- Final fixed/chunked bodies reuse BodyFramer; EOF-delimited bodies copy directly
+  into the bounded body span. `message()` is unavailable until the complete final
+  body/trailers validate. Errors fence feed/finish/views permanently. Valid prefixes
+  cannot be promoted to responses after malformed input, truncation or overflow.
+- `finish(.clean_eof)` may complete an EOF-delimited body. This is an assertion by
+  the transport owner about the termination, not something the parser can infer.
+  Reset, timeout, cancellation, watchdog shutdown and TLS truncation must use
+  `.transport_failure`. In particular, a socket shutdown returning zero bytes is
+  not sufficient: disarm/check UpstreamWatch and consult transport/TLS state before
+  classifying EOF or publishing completion. Clean EOF cannot prove an origin's
+  semantic intent when no length was declared; that limitation is inherent in HTTP.
+- Informational Connection: close stays sticky through the final response, and
+  observed EOF always forbids reuse. The returned reusable flag is only a framing
+  precondition; the pool owner must also check request completion, deadline result,
+  transport health and unsolicited read-ahead. Extra bytes are preserved, never
+  automatically assigned to a future request that has not yet been sent.
+
+Tests exercise every split of 103 + chunked final + following head, every truncated
+prefix of fixed/chunked finals, bytewise input, empty/bodyless/205 responses,
+interim-only EOF, clean EOF versus transport failure, reason-byte exhaustiveness,
+Connection persistence, exact limits and input-buffer overwrite. They establish
+parser and borrowed-storage contracts, not real upstream or downstream IO.
+
+At this slice's boundary, RequestTable had a single response span and WorkChannel
+completion carried its length. The following §25 adds budgeted downstream
+serialization and response metadata handoff so no completion refers to recycled
+forwarder scratch. Interim delivery still needs bounded handoff and write ordering.
+This finite buffered receiver must not silently replace the unlimited Prometheus
+streaming path. No serving runtime, TLS/DNS lifecycle or network backpressure is
+claimed complete by this slice.
+
+## 25. Request-owned final response handoff — 2026-09-16
+
+`ResponseWire.prepare` accepts a completed `ResponseIngress`, not arbitrary
+unvalidated metadata. It serializes the unchanged final entity into three
+request-owned spans. Response body storage must be the same destination used by
+the receiver; it is not copied again. Head/tail metadata is copied from forwarder
+scratch before publication. The cursor in `Response` tracks only span/offset and
+advances by actual successful write counts, including zero; it performs no IO,
+allocation or retry decision. The reactor applies its own write-turn budget.
+
+The memory choice is explicit: each admitted request reserves independent response
+head/body/tail capacities. Metadata consumes request capacity even while receiving
+the input, but it remains valid after the worker starts another exchange. Retaining
+worker scratch would tie worker availability to slow clients; copying a combined
+body into a second buffer would waste memory and bandwidth. Existing contiguous
+response outcomes remain usable with zero metadata capacities. Runtime composition
+must configure the new capacities, not rely on those compatibility defaults.
+
+`RequestTable.requiredBytes` includes these actual regions. `WorkChannel` derives
+queue bytes from the enlarged Job/Completion layouts. Startup exact-ceiling and
+allocation-failure tests exercise the new layout. For a chunked output head, reserve
+the allowed HTTP head size plus up to 18 bytes for the chunk-size prefix. A safe
+tail bound is input trailer capacity plus its maximum field count plus five bytes;
+rewriting a field can insert one space absent from its source. Ordinary fixed
+responses consume no tail bytes. Default head limits are 16 KiB and 64 fields;
+generated Via/framing/Trailer/Connection fields count toward those limits. Failure
+may leave partial output metadata, which must never be published as success.
+
+Header behavior:
+
+- Preserve status/reason, ordered repeated end-to-end fields, opaque content
+  encoding and representation metadata for an unchanged body. Remove transport
+  fields and every Connection-nominated field from both headers and trailers.
+  Via records the upstream protocol; its connection persistence is independent
+  of the downstream client's persistence.
+- With no retained trailers, emit Content-Length for complete ordinary bodies,
+  including formerly chunked or EOF-delimited bodies. HEAD/304 retain any declared
+  representation length, rather than substituting zero; 204 has no framing fields.
+- Retained trailers produce a generated Trailer declaration, one data chunk when
+  nonempty, then the terminating chunk and ordered trailers. An empty entity emits
+  only the terminal chunk. If every trailer is removed by Connection nominations,
+  the ordinary fixed-length output is valid.
+- HTTP/1.0 always closes; requests asking to close also produce Connection: close.
+  HTTP/1.0 with retained trailers currently returns `TrailersUnsupported` before
+  commitment. Silent removal or merging into the header section would change
+  semantics. Decide this compatibility limit before cutover.
+
+Completion ordering and lifetime:
+
+1. Give ResponseIngress the worker job's response body destination. Keep receive
+   scratch and outgoing head/tail regions disjoint and stable during preparation.
+2. Validate the entire final response, prepare head/tail, then publish exactly one
+   `.framed_response` outcome with lengths and the downstream close flag. On error,
+   publish a failed outcome; error response/fail-open decisions belong to the
+   exchange owner. Stop using all job spans at publication and then wake the reactor.
+3. The reactor acknowledges completion once. A detached completion can recycle
+   immediately; it has no sendable view. A live completion retains the request slot,
+   even though its queue credit is returned. `responseView` requires the current
+   generation, responding state, attached client and no outstanding worker lease.
+4. Hold the resulting cursor only while that slot remains live. Finish all partial
+   writes, drop the cursor, then release/close via Connections. Honor its close flag.
+   A cursor's borrowed slices cannot themselves detect a later close/reuse.
+
+Behavioral tests first failed against a NotImplemented stub. Coverage includes
+scratch overwrite after publication, live versus detached acknowledgement, no slot
+reuse while responding, stale generations, invalid view lengths, one-byte writes,
+empty-trailer framing, exact byte/field limits, HTTP/1.0, HEAD/304/204, and a fresh
+receiver parsing the serialized binary body/trailers. These are in-memory exchange
+and ownership fixtures. They do not prove socket backpressure or TLS termination.
+
+Next work: bounded informational-response delivery and ordering, including avoiding
+duplicate local/upstream Continue, then real upstream IO with watchdog deadlines
+and transport-aware EOF. A final completion cannot carry an unbounded interim queue
+or point into reused receive scratch. Expand that mechanism before implementation.
+The transformed-body policy path and unlimited Prometheus streaming path remain
+separate. No serving runtime or dependency changes are part of this slice.
+
+## 26. Phase 1 integrated and runnable — 2026-09-17
+
+`src/v2/Relay.zig` and `main.zig` complete the raw HTTP vertical slice. Build with
+`zig build v2 -Doptimize=ReleaseSafe`; the runnable contract, architecture, knobs,
+shutdown order and benchmark are in [src/v2/README.md](src/v2/README.md). The current
+handoff and exact validation logs are in IMPLEMENTATION-PROGRESS.md. This replaces
+the outstanding integration work recorded at the end of §25.
+
+Implementation decisions worth preserving:
+
+- One reactor/acceptor and a fixed upstream pool establish the first working path.
+  Workers own blocking upstream streams; only the reactor owns clients and request
+  transitions. Accepted sockets pass through the existing bounded queue. Native
+  readiness handles partial client writes; budget exhaustion polls immediately.
+- Zig 0.16 Threaded's IP connect timeout currently panics. The first actual socket
+  fixture exposed this. `os/connect.zig` uses nonblocking connect plus finite poll,
+  SO_ERROR and the request's absolute deadline, restores blocking mode for the
+  worker, and observes shutdown between polls. Watchdog ownership starts before
+  blocking request writes and ends before the sole worker closes the stream.
+- The buffered contract permits informational heads to be copied into a bounded
+  prefix of request-owned response storage. They are delivered in order before
+  final output; no extra queue/lease protocol is needed. This delays Early Hints.
+  Local admission owns Continue; upstream 100 is suppressed. No informational
+  responses go to HTTP/1.0, covered by a failing-then-passing socket regression.
+- Original bodies remain retained; incomplete/malformed upstream responses never
+  become partial successes. Local error responses use static bytes and consume no
+  extra request credit. Health bypasses work admission but still needs fd/client
+  space. No automatic retry was added: acceptance before a network failure is
+  ambiguous without the later replay contract.
+- Actual connection/request/queue/client layouts and fixed thread stacks feed one
+  validated startup ceiling. FD demand is checked against RLIMIT_NOFILE. Body
+  stores allocate at init; request operation state/scratch uses existing slots and
+  bounded stacks. This is not an exact RSS claim. Startup OOM sweeps and equality
+  at the memory ceiling pass. Peak request occupancy and child RSS were measured.
+- SIGINT/SIGTERM use an atomic stop flag and finite reactor waits. Stop/join accept,
+  detach clients, close work, shut down armed upstreams, acknowledge completions,
+  join workers, then destroy owners. Native connect observes stop independently.
+  Phase 1 chooses bounded abort over pretending shutdown completed delivery.
+- Quarantine decision: keep raw forwarding and expose degraded policy state, stop
+  affected providers, retain failed registry allocation ownership until process
+  exit, and require operator restart. Do not auto-exit or retry mutation. This is
+  a phase-2 integration requirement; the raw executable creates no registry.
+
+The initial executable deliberately uses a numeric-IP HTTP origin, one upstream
+connection per request, bounded buffered responses and small explicit CLI config.
+DNS/TLS/pooling and production routing/config compatibility remain later work;
+TLS deadline probes are not an implemented HTTPS relay. This is the planned first
+vertical slice, not permission to cut over production. Policy processing is next.
+No policy-zig or zonfig changes were made; preserve the authorized local reference.

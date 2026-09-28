@@ -157,12 +157,9 @@ test "v2 acceptor bounds a real TCP backlog and distributes descriptors round ro
     const c = try fixture.connect();
     defer c.close(testing.io);
     const targets = fixture.targets();
-    const first = try fixture.acceptor.turn(testing.io, &targets, 2);
-    try testing.expectEqual(@as(u32, 2), first.accepted);
-    try testing.expectEqual(Stop.budget, first.stop);
-    const second = try fixture.acceptor.turn(testing.io, &targets, 2);
-    try testing.expectEqual(@as(u32, 1), second.accepted);
-    try testing.expectEqual(Stop.drained, second.stop);
+    const totals = try fixture.handlePeers(&targets, 2, 3);
+    try testing.expectEqual(@as(u32, 3), totals.accepted);
+    try testing.expectEqual(@as(u32, 0), totals.rejected);
     const fd_a = fixture.channels[0].receive(testing.io).?;
     defer Native.closeFd(fd_a);
     const fd_b = fixture.channels[1].receive(testing.io).?;
@@ -214,7 +211,45 @@ const Fixture = struct {
     }
 
     fn connect(self: *Fixture) !std.Io.net.Stream {
-        return self.acceptor.server.socket.address.connect(testing.io, .{ .mode = .stream });
+        const peer = try self.acceptor.server.socket.address.connect(testing.io, .{ .mode = .stream });
+        errdefer peer.close(testing.io);
+        // A completed client connect does not guarantee server-side accept is
+        // ready yet. Model the serving loop's readiness wait instead of racing it.
+        try self.waitReadable(deadlineIn(2000));
+        return peer;
+    }
+
+    fn waitReadable(self: *Fixture, deadline: std.Io.Timestamp) !void {
+        var events: [2]Native.RawEvent = undefined;
+        while (std.Io.Timestamp.now(testing.io, .awake).nanoseconds < deadline.nanoseconds) {
+            const count = try self.acceptor.native.wait(testing.io, &events, deadline);
+            for (events[0..count]) |raw| {
+                const event = try self.acceptor.native.decode(raw);
+                if (event.token == LISTENER_TOKEN and event.readable) return;
+            }
+        }
+        return error.ListenerNotReady;
+    }
+
+    const Totals = struct { accepted: u32 = 0, rejected: u32 = 0 };
+
+    fn handlePeers(self: *Fixture, destinations: []const Target, budget: u16, expected: u32) !Totals {
+        const deadline = deadlineIn(2000);
+        var totals: Totals = .{};
+        // Readiness promises some pending work, not that every connected client
+        // has reached the accept queue in the same turn. Bound each actual turn.
+        while (totals.accepted + totals.rejected < expected) {
+            try self.waitReadable(deadline);
+            const report = try self.acceptor.turn(testing.io, destinations, budget);
+            try testing.expect(report.attempts <= budget);
+            try testing.expect(report.stop == .budget or report.stop == .drained);
+            try testing.expectEqual(null, report.failure);
+            try testing.expectEqual(@as(u32, 0), report.wake_failures);
+            totals.accepted += report.accepted;
+            totals.rejected += report.rejected;
+        }
+        try testing.expectEqual(expected, totals.accepted + totals.rejected);
+        return totals;
     }
 
     fn targets(self: *Fixture) [2]Target {
@@ -246,11 +281,9 @@ test "v2 acceptor skips closed targets and sheds overload at its turn budget" {
     const c = try fixture.connect();
     defer c.close(testing.io);
     const targets = fixture.targets();
-    const report = try fixture.acceptor.turn(testing.io, &targets, 3);
-    try testing.expectEqual(@as(u32, 2), report.accepted);
-    try testing.expectEqual(@as(u32, 1), report.rejected);
-    try testing.expectEqual(@as(u32, 3), report.attempts);
-    try testing.expectEqual(Stop.budget, report.stop);
+    const totals = try fixture.handlePeers(&targets, 3, 3);
+    try testing.expectEqual(@as(u32, 2), totals.accepted);
+    try testing.expectEqual(@as(u32, 1), totals.rejected);
     try testing.expect(fixture.channels[0].receive(testing.io) == null);
     // A rejected TCP connection has no acknowledged request and is closed.
     var bytes: [1]u8 = undefined;
@@ -331,7 +364,8 @@ test "v2 acceptor stop preserves pending handoff and refuses more accepts" {
     const peer = try fixture.connect();
     defer peer.close(testing.io);
     const targets = fixture.targets();
-    _ = try fixture.acceptor.turn(testing.io, &targets, 1);
+    const report = try fixture.acceptor.turn(testing.io, &targets, 1);
+    try testing.expectEqual(@as(u32, 1), report.accepted);
     fixture.acceptor.stop(testing.io);
     fixture.acceptor.stop(testing.io);
     try testing.expectEqual(Stop.stopped, (try fixture.acceptor.turn(testing.io, &targets, 1)).stop);

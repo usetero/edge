@@ -3,6 +3,7 @@ const Self = @This();
 
 const std = @import("std");
 const Budget = @import("Budget.zig");
+const Response = @import("Response.zig");
 
 slots: []Slot,
 storage: []u8,
@@ -20,7 +21,10 @@ pub const Limits = struct {
     requests: u32,
     head_bytes: u32,
     body_bytes: u32,
+    trailer_bytes: u32 = 0,
     response_bytes: u32,
+    response_head_bytes: u32 = 0,
+    response_tail_bytes: u32 = 0,
     ceiling_bytes: u64 = std.math.maxInt(u64),
 };
 
@@ -33,7 +37,19 @@ const Slot = struct {
     client_attached: bool = false,
 };
 
-pub const Buffers = struct { head: []u8, body: []u8, response: []u8 };
+pub const Buffers = struct {
+    head: []u8,
+    body: []u8,
+    trailers: []u8,
+    response: []u8,
+    response_head: []u8,
+    response_tail: []u8,
+
+    /// Group the independently reserved response regions without copying bytes.
+    pub fn responseBuffers(self: Buffers) Response.Buffers {
+        return .{ .head = self.response_head, .body = self.response, .tail = self.response_tail };
+    }
+};
 
 /// Allocate only for admitted request capacity, independently of idle connections.
 /// All methods after init run on the owning reactor and allocate nothing.
@@ -77,7 +93,8 @@ pub fn requiredBytes(capacity: Limits) !u64 {
         .max_body_bytes = capacity.body_bytes,
         .max_output_bytes = 0,
         .max_response_bytes = capacity.response_bytes,
-        .request_overhead_bytes = @sizeOf(Slot) + @as(u64, capacity.head_bytes),
+        .request_overhead_bytes = @sizeOf(Slot) + @as(u64, capacity.head_bytes) + capacity.trailer_bytes +
+            capacity.response_head_bytes + capacity.response_tail_bytes,
         .processing_workers = 0,
         .processing_workspace_bytes = 0,
         .forwarders = 0,
@@ -89,7 +106,7 @@ pub fn requiredBytes(capacity: Limits) !u64 {
     return terms.total;
 }
 
-/// Reserve head/input/response capacity together, before admitting a request body.
+/// Reserve head/input/trailer/response capacity before admitting a request body.
 pub fn acquire(self: *Self) ?Id {
     if (self.free_head == NONE) return null;
     const index = self.free_head;
@@ -111,11 +128,35 @@ pub fn buffers(self: *Self, id: Id) !Buffers {
     const start = @as(usize, id.index) * self.stride;
     const head_end = start + self.capacity.head_bytes;
     const body_end = head_end + self.capacity.body_bytes;
+    const trailer_end = body_end + self.capacity.trailer_bytes;
+    const response_head_end = trailer_end + self.capacity.response_head_bytes;
+    const response_end = response_head_end + self.capacity.response_bytes;
     return .{
         .head = self.storage[start..head_end],
         .body = self.storage[head_end..body_end],
-        .response = self.storage[body_end .. start + self.stride],
+        .trailers = self.storage[body_end..trailer_end],
+        .response_head = self.storage[trailer_end..response_head_end],
+        .response = self.storage[response_head_end..response_end],
+        .response_tail = self.storage[response_end .. start + self.stride],
     };
+}
+
+/// Reactor-only ingress access ends when admission is canceled or transferred.
+/// Generation alone is insufficient: worker leases deliberately keep slots live.
+pub fn ingressBuffers(self: *Self, id: Id) !Buffers {
+    const slot = try self.lookup(id);
+    if (slot.state != .reading or slot.lease != .reserved or !slot.client_attached) {
+        return error.InvalidTransition;
+    }
+    return self.buffers(id);
+}
+
+/// Reactor-only, after acknowledging a live completion. Worker leases still own
+/// their mutable output before then. Drop this view before disconnect or release.
+pub fn responseView(self: *Self, id: Id, lengths: Response.Lengths) !Response {
+    const slot = try self.lookup(id);
+    if (slot.state != .responding or slot.lease != .none or !slot.client_attached) return error.InvalidTransition;
+    return .init((try self.buffers(id)).responseBuffers(), lengths);
 }
 
 /// Bind once before dispatch. Zero is reserved for an unbound request. Retain
@@ -219,11 +260,22 @@ fn recycle(self: *Self, index: u32) void {
 }
 
 fn bufferBytes(capacity: Limits) !u64 {
-    return std.math.add(u64, capacity.head_bytes, try std.math.add(u64, capacity.body_bytes, capacity.response_bytes));
+    const input_bytes = try std.math.add(u64, capacity.head_bytes, capacity.body_bytes);
+    const tail_bytes = try std.math.add(u64, capacity.trailer_bytes, capacity.response_bytes);
+    const metadata_bytes = try std.math.add(u64, capacity.response_head_bytes, capacity.response_tail_bytes);
+    return std.math.add(u64, try std.math.add(u64, input_bytes, tail_bytes), metadata_bytes);
 }
 
 const testing = std.testing;
-const limits: Limits = .{ .requests = 2, .head_bytes = 128, .body_bytes = 256, .response_bytes = 512 };
+const limits: Limits = .{
+    .requests = 2,
+    .head_bytes = 128,
+    .body_bytes = 256,
+    .trailer_bytes = 64,
+    .response_bytes = 512,
+    .response_head_bytes = 128,
+    .response_tail_bytes = 64,
+};
 
 test "v2 request table bounds admission and rejects handles from a reused slot" {
     var table: Self = try .init(testing.allocator, limits);
@@ -334,11 +386,17 @@ fn testAllocation(allocator: std.mem.Allocator) !void {
     const a = try table.buffers(first);
     const b = try table.buffers(second);
     @memset(a.body, 1);
+    @memset(a.trailers, 4);
     @memset(a.response, 2);
+    @memset(a.response_head, 5);
+    @memset(a.response_tail, 6);
     @memset(b.head, 3);
     try testing.expectEqual(@as(u8, 1), a.body[0]);
     try testing.expectEqual(@as(u8, 2), a.response[0]);
     try testing.expectEqual(@as(u8, 3), b.head[0]);
+    try testing.expectEqual(@as(u8, 4), a.trailers[0]);
+    try testing.expectEqual(@as(u8, 5), a.response_head[0]);
+    try testing.expectEqual(@as(u8, 6), a.response_tail[0]);
     try table.disconnect(first);
     try table.disconnect(second);
 }

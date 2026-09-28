@@ -79,7 +79,8 @@ pub fn close(self: *Self) !void {
     if (first_error) |err| return err;
 }
 
-fn stopAll(self: *Self) void {
+/// Join publishers without a final sync; used when registry mutation is quarantined.
+pub fn stopAll(self: *Self) void {
     for (self.slots) |slot| {
         const provider = slot.provider orelse continue;
         switch (provider) {
