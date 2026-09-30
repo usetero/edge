@@ -23,6 +23,8 @@
 //! included, so a crash loop cannot fill the disk. A dump counts once for its
 //! `<stem>`, whether both files are there or only one, so a body orphaned by a
 //! crash still takes its slot. A write that fails removes what it wrote.
+//! While the directory is full the writer counts it again every 5 s, so
+//! deleting dumps arms the capture again without a restart.
 const std = @import("std");
 const builtin = @import("builtin");
 const o11y = @import("o11y");
@@ -43,6 +45,8 @@ const FailureCaptureDirPermissions = struct { dir: []const u8, err: []const u8 }
 const UpstreamFailureCaptureDropped = struct { path: []const u8, queued: usize };
 /// The writer did not finish at shutdown, most likely on a stalled volume.
 const FailureCaptureStalled = struct { dir: []const u8, queued: usize };
+/// Dumps were deleted from a full directory, and the capture writes again.
+const FailureCaptureRearmed = struct { dir: []const u8, free: u32 };
 
 /// Dumps hold customer payloads, so only the edge's own user may read them.
 const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
@@ -109,6 +113,9 @@ pub const queue_len = 8;
 const idle_wait: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } };
 /// How long `close` waits for the writer, in 50 ms steps.
 const close_wait_steps = 40;
+/// How often a full directory is counted again, so deleted dumps free their
+/// slots without a restart.
+const rescan_interval_ns: i96 = 5 * std.time.ns_per_s;
 
 /// One dump, owned by the capture from `record` until the writer frees it.
 const Job = struct {
@@ -139,9 +146,15 @@ pub const Capture = struct {
     /// Bytes the streamed-body copies may hold at once.
     copy_budget: usize,
     copy_used: std.atomic.Value(usize) = .init(0),
-    /// Dumps on disk plus dumps queued or being written. Changed only under
-    /// `mutex`; `armed` reads it without the lock.
+    /// Dumps on disk plus `pending`. Changed only under `mutex`; `armed`
+    /// reads it without the lock.
     used: std.atomic.Value(u32),
+    /// Dumps reserved and not yet on disk: being prepared, queued or being
+    /// written. Guarded by `mutex`. A rescan keeps these, so it never frees a
+    /// slot that a dump in flight still needs.
+    pending: u32 = 0,
+    /// When the writer last counted a full directory. Writer thread only.
+    last_rescan_ns: i96 = 0,
     seq: std.atomic.Value(u32) = .init(0),
     full_reported: std.atomic.Value(bool) = .init(false),
     /// Set when a dump was dropped on a full queue; cleared by the next write.
@@ -258,7 +271,10 @@ pub const Capture = struct {
         self.mutex.lockUncancelable(self.io);
         const used = self.used.load(.monotonic);
         const room = used < self.max_dumps;
-        if (room) self.used.store(used + 1, .monotonic);
+        if (room) {
+            self.used.store(used + 1, .monotonic);
+            self.pending += 1;
+        }
         self.mutex.unlock(self.io);
         if (!room and !self.full_reported.swap(true, .monotonic)) {
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
@@ -271,6 +287,42 @@ pub const Capture = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.used.store(self.used.load(.monotonic) - 1, .monotonic);
+        self.pending -= 1;
+    }
+
+    /// A dump reached the disk: its slot stays spent, and it is no longer
+    /// in flight.
+    fn settle(self: *Capture) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.pending -= 1;
+    }
+
+    fn rescanIfFull(self: *Capture) void {
+        if (self.armed()) return;
+        const now_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
+        if (now_ns - self.last_rescan_ns < rescan_interval_ns) return;
+        self.last_rescan_ns = now_ns;
+        self.rescan();
+    }
+
+    /// Counts the directory again, so dumps an operator deleted free their
+    /// slots. Runs on the writer between writes, so no dump is half written.
+    fn rescan(self: *Capture) void {
+        const on_disk = countDumps(self.io, self.gpa, self.dir) catch |err| {
+            self.warnFailed(self.path, err);
+            return;
+        };
+        self.mutex.lockUncancelable(self.io);
+        const before = self.used.load(.monotonic);
+        const after = on_disk + self.pending;
+        self.used.store(after, .monotonic);
+        self.mutex.unlock(self.io);
+        if (before >= self.max_dumps and after < self.max_dumps) {
+            self.full_reported.store(false, .monotonic);
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            self.bus.info(FailureCaptureRearmed{ .dir = self.path, .free = self.max_dumps - after });
+        }
     }
 
     fn warnFailed(self: *Capture, path: []const u8, err: anyerror) void {
@@ -353,6 +405,7 @@ pub const Capture = struct {
                 job.deinit(self.gpa);
             }
             if (self.stopping.load(.acquire)) break;
+            self.rescanIfFull();
         }
         self.stopped.set(self.io);
     }
@@ -364,6 +417,7 @@ pub const Capture = struct {
             self.warnFailed(job.path, err);
             return;
         };
+        self.settle();
         self.drop_reported.store(false, .monotonic);
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         self.bus.warn(UpstreamFailureCaptured{ .path = job.path, .file = name });
@@ -817,4 +871,34 @@ test "a full queue drops a dump at once instead of waiting for the disk" {
     try testing.expectEqual(@as(u32, queue_len), capture.used.load(.monotonic));
     try testing.expect(capture.drop_reported.load(.monotonic));
     capture.close(); // frees the queued jobs; the testing allocator checks
+}
+
+test "deleting dumps from a full directory frees their slots" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "1-0.body", .data = "old" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "1-0.json", .data = "{}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var capture: Capture = try .open(io, testing.allocator, noop_bus.eventBus(), path, 2, 1024);
+    defer capture.close();
+
+    // One dump on disk and one in flight: the directory is full.
+    capture.record(arena_state.allocator(), testFailure("queued"));
+    try testing.expect(!capture.armed());
+    capture.full_reported.store(true, .monotonic);
+
+    // The operator deletes the old dump. A rescan frees that slot, and keeps
+    // the one the queued dump still needs.
+    try tmp.dir.deleteFile(io, "1-0.body");
+    try tmp.dir.deleteFile(io, "1-0.json");
+    capture.rescan();
+    try testing.expectEqual(@as(u32, 1), capture.used.load(.monotonic));
+    try testing.expect(capture.armed());
+    try testing.expect(!capture.full_reported.load(.monotonic));
 }
