@@ -103,7 +103,7 @@ fn failOpen(
     sink: anytype,
     pipe: service_mod.PipeStream,
     raw_body: []const u8,
-    stage: []const u8,
+    comptime stage: []const u8,
     err: anyerror,
 ) !void {
     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
@@ -111,6 +111,7 @@ fn failOpen(
     if (ctx.metrics) |metrics| {
         metrics.recordRequestError(exec.classifyKnownPath(in.path, .POST), .module);
     }
+    exchange.recordFailOpen(ctx, in, pipe.upstream, raw_body, "policy_" ++ stage, err);
     return exchange.exchange(ctx, in, sink, pipe.upstream, .{ .bytes = raw_body }, pipe.signal == .log);
 }
 
@@ -223,6 +224,7 @@ pub fn execPipeBuffered(
         if (ctx.metrics) |metrics| {
             metrics.recordRequestError(exec.classifyKnownPath(in.path, .POST), .module);
         }
+        exchange.recordFailOpen(ctx, in, pipe.upstream, raw_body, "policy_buffered", err);
         break :blk .{ .body = raw_body, .all_dropped = false };
     };
 

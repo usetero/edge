@@ -187,13 +187,56 @@ pub fn exchange(
     };
     const started_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
     var report: Report = .{};
+    const tee_ptr = if (tee) |*t| t else null;
     exchangeAttempts(ctx, in, sink, choice, sent, replayable, &report) catch |err| {
-        recordFailure(ctx, capture, in, choice, body, if (tee) |*t| t else null, report, err, started_ns);
+        // A sender that left mid-relay is not an upstream failure. A dump
+        // would spend the budget on the disconnect, unless the status it
+        // missed is one we capture anyway.
+        if (!report.downstream_failed or failure_capture.capturesStatus(report.status)) {
+            recordFailure(ctx, capture, in, choice, body, tee_ptr, report, err, started_ns);
+        }
         return err;
     };
-    if (report.status == 408) {
-        recordFailure(ctx, capture, in, choice, body, if (tee) |*t| t else null, report, null, started_ns);
+    if (failure_capture.capturesStatus(report.status)) {
+        recordFailure(ctx, capture, in, choice, body, tee_ptr, report, null, started_ns);
     }
+}
+
+/// Dumps a batch a policy stage could not read. The untouched forward that
+/// follows usually succeeds, so without this the input that broke the decoder
+/// is gone. `phase` names the stage.
+pub fn recordFailOpen(
+    ctx: *exec.SharedCtx,
+    in: Inbound,
+    choice: service_mod.UpstreamChoice,
+    raw_body: []const u8,
+    phase: []const u8,
+    err: anyerror,
+) void {
+    const capture = ctx.failure_capture orelse return;
+    const url = exec.upstreamUri(ctx, in.arena, in.target, choice) catch |uri_err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.warn(UpstreamFailureCaptureFailed{ .path = in.path, .err = @errorName(uri_err) });
+        return;
+    };
+    capture.record(ctx.bus, in.arena, .{
+        .method = in.method,
+        .target = in.target,
+        .path = in.path,
+        .url = url,
+        .headers = in.headers,
+        .framing = .content_length,
+        .body = raw_body,
+        .declared_len = raw_body.len,
+        .complete = true,
+        .status = null,
+        .err = @errorName(err),
+        .phase = phase,
+        .attempts = 0,
+        .retried_err = null,
+        .watchdog_fired = false,
+        .elapsed_ms = 0,
+    });
 }
 
 /// What `exchangeAttempts` saw, for a failure dump.
@@ -202,6 +245,8 @@ const Report = struct {
     status: ?u16 = null,
     attempts: usize = 0,
     retried_err: ?anyerror = null,
+    /// The relay failed on the sender's side: it left before the answer did.
+    downstream_failed: bool = false,
 };
 
 fn recordFailure(
@@ -318,6 +363,8 @@ fn exchangeAttempts(
         report.phase = "relay";
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(choice));
         relayResponse(sink, in.arena, &upstream_res, max_response, bufs) catch |err| {
+            // During the relay only the sink writes, so this is the sender.
+            if (err == error.WriteFailed) report.downstream_failed = true;
             if (bufs.timed_out.load(.acquire)) {
                 evictUpstream(ctx, &upstream_req, in.path, err);
                 return timedOut(ctx, in.path, "relay");

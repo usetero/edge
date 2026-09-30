@@ -40,10 +40,10 @@ extraEnv: []
 extraVolumes: []
 extraVolumeMounts: []
 
-# Opt-in dumps of failed upstream requests, for replay. On an upstream 408, or
-# on a transport failure (reset, refused dial, watchdog timeout), the edge
-# writes the body it sent, still compressed, and a .json file with the method,
-# URL, headers and outcome. Credentials in headers and query parameters are
+# Opt-in dumps of failed upstream requests, for replay. On an upstream 408,
+# 400 or 413, on a transport failure (reset, refused dial, watchdog timeout),
+# or when a policy cannot read a batch, the edge writes the body it sent,
+# still compressed, and a .json file with the method, URL, headers and outcome. Credentials in headers and query parameters are
 # redacted. The dumps hold customer payloads: turn this on for an incident and
 # off after it.
 failureCapture:

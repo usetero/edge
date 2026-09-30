@@ -171,8 +171,16 @@ failureCapture:
   enabled: true
 ```
 
-On an upstream 408, or on a transport failure (reset, refused dial, watchdog
-timeout), the edge writes two files to `failureCapture.path`:
+The edge writes a dump when:
+
+- the upstream answers 408, or 400 or 413, which make the Datadog agent drop
+  the batch for good;
+- the upstream exchange fails (reset, refused dial, watchdog timeout), but not
+  when only the sender left before the answer reached it;
+- a policy cannot read a batch and forwards it untouched. The dump keeps the
+  batch that broke the decoder, even though its forward succeeds.
+
+A dump is two files in `failureCapture.path`:
 
 - `<unix_ms>-<seq>.body` holds the body as the edge sent it, still compressed.
 - `<unix_ms>-<seq>.json` holds the method, URL, headers, outcome and body

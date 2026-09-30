@@ -1,7 +1,9 @@
 //! Opt-in dumps of upstream requests that failed, for replay.
 //!
-//! On a relayed upstream 408, or on any error out of the upstream exchange,
-//! the edge writes two files to the capture directory:
+//! The edge writes a dump on a relayed upstream 408, 400 or 413 (see
+//! `capturesStatus`), on any error out of the upstream exchange except a
+//! sender that left mid-relay, and when a policy stage cannot read a batch
+//! and forwards it untouched. A dump is two files in the capture directory:
 //!
 //!   <unix_ms>-<seq>.body   the body as the edge sent it, still compressed
 //!   <unix_ms>-<seq>.json   method, URL, headers, outcome and body framing
@@ -29,6 +31,14 @@ const UpstreamFailureCaptureFull = struct { dir: []const u8, max_dumps: u32 };
 
 pub const redacted = "[redacted]";
 
+/// Upstream statuses worth a dump. 408: the intake waited for bytes it never
+/// got. 400 and 413: the Datadog agent drops the batch for good, so the dump is
+/// the only copy left. 401 and 403 are about the key, not the payload.
+pub fn capturesStatus(status: ?u16) bool {
+    const code = status orelse return false;
+    return code == 408 or code == 400 or code == 413;
+}
+
 /// How the body went upstream.
 pub const Framing = enum { none, content_length, chunked };
 
@@ -54,7 +64,9 @@ pub const Failure = struct {
     status: ?u16,
     /// The error that ended the exchange, when one did.
     err: ?[]const u8,
-    /// Where the exchange stopped: `dial`, `send_or_head`, `relay` or `response`.
+    /// Where the exchange stopped: `dial`, `send_or_head`, `relay` or
+    /// `response`. `policy_probe`, `policy_encode` or `policy_buffered` names
+    /// the policy stage that could not read the batch.
     phase: []const u8,
     attempts: usize,
     /// The error of an earlier attempt that was retried.
@@ -265,6 +277,14 @@ pub const Tee = struct {
 // ============================== Tests ==============================
 
 const testing = std.testing;
+
+test "only the statuses that lose or stall a batch are captured" {
+    try testing.expect(capturesStatus(408));
+    try testing.expect(capturesStatus(400));
+    try testing.expect(capturesStatus(413));
+    for ([_]u16{ 200, 202, 401, 403, 429, 500, 503 }) |code| try testing.expect(!capturesStatus(code));
+    try testing.expect(!capturesStatus(null));
+}
 
 test "credential names are redacted, other names are kept" {
     try testing.expect(sensitiveName("DD-API-KEY"));

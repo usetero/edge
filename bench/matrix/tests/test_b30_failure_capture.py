@@ -1,15 +1,19 @@
 """B30: the failure capture writes a dump an engineer can replay.
 
-On a relayed 408, or on an error out of the upstream exchange, the edge writes
-the outgoing body and its metadata to `TERO_FAILURE_CAPTURE_DIR`. What the
-customer's engineer needs from a dump:
+On a relayed 408, 400 or 413, on an error out of the upstream exchange, and
+when a policy stage cannot read a batch, the edge writes the outgoing body and
+its metadata to `TERO_FAILURE_CAPTURE_DIR`. What the customer's engineer needs
+from a dump:
 
 - the body is the bytes the edge sent, still compressed: equal to what the
   intake received, and not the inbound body when a policy changed the batch;
 - the metadata says what happened (status or error, phase, attempts, the
   watchdog) and never holds a credential;
 - a dump that cannot hold the whole body says so;
-- a success, a retry that recovered, and a status other than 408 write nothing;
+- a batch the agent will drop for good (400, 413) is kept;
+- the batch a decoder rejected is kept, even though its forward succeeds;
+- a success, a retry that recovered, another status, and a sender that leaves
+  mid-relay write nothing;
 - the directory never grows past its cap, across restarts too;
 - a capture that cannot open its directory never stops the data plane.
 """
@@ -17,6 +21,9 @@ customer's engineer needs from a dump:
 import gzip
 import json
 import os
+import socket
+import struct
+import time
 
 import requests
 
@@ -58,10 +65,10 @@ def check_dump(case, dump, body, status=None, err=None, phase=None, complete=Tru
         case.assertEqual(dump.body, body[: len(dump.body)], "a partial dump must be a prefix")
 
 
-def post(case, body, query="", headers=None, timeout=60.0):
+def post(case, body, query="", headers=None, timeout=60.0, path="/api/v2/logs"):
     merged = dict(AGENT_HEADERS)
     merged.update(headers or {})
-    return case.post_raw_body(body, path="/api/v2/logs" + query, headers=merged, timeout=timeout)
+    return case.post_raw_body(body, path=path + query, headers=merged, timeout=timeout)
 
 
 class Relayed408IsCaptured(MatrixCase):
@@ -115,6 +122,101 @@ class Relayed408IsCaptured(MatrixCase):
         self.assertEqual(len(dumps), 1)
         # The dump holds what went upstream: the de-chunked body with a length.
         check_dump(self, dumps[0], body, status=408, phase="response")
+
+
+class DroppedByTheAgentIsCaptured(MatrixCase):
+    """400 and 413 make the agent drop the batch for good: the dump is the only copy."""
+
+    CAPTURE_MAX_DUMPS = 10
+    # The metrics carry only the status class. The early reject never reaches
+    # the intake's counter, so the invariant reads the relayed 400 as ours.
+    # b05 owns that relay; this case owns the dump.
+    EXPECT_PERMANENT_DROP = True
+
+    def test_relayed_400_and_413(self):
+        bodies = {}
+        for status in (400, 413):
+            bodies[status] = self.gzipped([{"message": "drop-class %d" % status}])
+            self.intake.capture_start("b30-%d" % status)
+            self.intake.arm("status", status, count=1)
+            self.assert_status(post(self, bodies[status]), status, "the intake's %d must be relayed" % status)
+            self.assertEqual(self.intake.capture_stop(), [bodies[status]])
+        dumps = self.captures.wait_for(2)
+        self.assertEqual([d.meta["outcome"]["status"] for d in dumps], [400, 413])
+        for dump in dumps:
+            status = dump.meta["outcome"]["status"]
+            check_dump(self, dump, bodies[status], status=status, phase="response")
+
+    def test_an_early_reject(self):
+        body = self.gzipped()
+        self.intake.arm("reject_early", count=1)
+        self.assert_status(post(self, body), 400)
+        dumps = self.captures.wait_for(1)
+        self.assertEqual(len(dumps), 1, "the intake rejected on the head; the batch is still ours to keep")
+        check_dump(self, dumps[0], body, status=400, phase="response")
+
+
+FAIL_OPEN_POLICIES = {
+    "policies": [
+        {
+            "id": "drop-debug",
+            "name": "drop-debug",
+            "log": {"match": [{"log_field": "body", "regex": "^DEBUG"}], "keep": "none"},
+        },
+        {
+            "id": "drop-load",
+            "name": "drop-load",
+            "metric": {"match": [{"metric_field": "name", "regex": "^system\\.load"}], "keep": False},
+        },
+    ]
+}
+
+
+def series_body() -> bytes:
+    points = [
+        {"metric": "%s.%d" % ("system.load" if i % 2 else "app.requests", i), "points": [{"timestamp": 1, "value": i}], "type": 3}
+        for i in range(400)
+    ]
+    return json.dumps({"series": points}).encode()
+
+
+class PolicyFailOpenIsCaptured(MatrixCase):
+    """A batch the decoder cannot read is forwarded untouched, and kept."""
+
+    CAPTURE_MAX_DUMPS = 10
+    EDGE_POLICIES = FAIL_OPEN_POLICIES
+    EXPECT_LOGS = ["policy.failed.open", "upstream.failure.captured"]
+
+    def check_fail_open(self, path, stream, phases):
+        cut = stream[: len(stream) // 2]
+        self.intake.capture_start("b30-failopen")
+        self.assert_status(post(self, cut, path=path), 202, "a cut stream must fail open")
+        self.assertEqual(self.intake.capture_stop(), [cut], "the forward must be untouched")
+        dumps = self.captures.wait_for(1)
+        self.assertEqual(len(dumps), 1, "one unreadable batch, one dump")
+        meta = dumps[0].meta
+        self.assertIn(meta["outcome"]["phase"], phases, meta)
+        self.assertIsNotNone(meta["outcome"]["err"], "the dump must name the decoder error")
+        check_dump(self, dumps[0], cut, err=meta["outcome"]["err"])
+        self.assertEqual(meta["outcome"]["attempts"], 0)
+
+    def test_the_streamed_logs_path(self):
+        stream = gzip.compress(self.log_batch(30_000, level="DEBUG"), 1)
+        self.check_fail_open("/api/v2/logs", stream, ("policy_probe", "policy_encode"))
+
+    def test_the_buffered_metrics_path(self):
+        self.check_fail_open("/api/v2/series", gzip.compress(series_body(), 1), ("policy_buffered",))
+
+    def test_a_fail_open_whose_forward_fails_is_kept_twice(self):
+        stream = gzip.compress(self.log_batch(30_000, level="DEBUG"), 1)
+        cut = stream[: len(stream) // 2]
+        self.intake.arm("status", 408, count=1)
+        self.assert_status(post(self, cut), 408)
+        dumps = self.captures.wait_for(2)
+        self.assertEqual(len(dumps), 2, "the unreadable batch and the failed forward are two facts")
+        self.assertIn("response", [d.meta["outcome"]["phase"] for d in dumps])
+        for dump in dumps:
+            self.assertEqual(dump.body, cut)
 
 
 class PolicyChangedBatchIsCapturedAsSent(MatrixCase):
@@ -245,12 +347,35 @@ class NothingIsCapturedForOtherOutcomes(MatrixCase):
         # A retry that recovered is a success.
         self.intake.arm("close_early", count=1)
         self.assert_status(post(self, body), 202)
-        for status in (400, 429, 500, 503):
+        for status in (401, 403, 429, 500, 503):
             self.intake.arm("status", status, count=1)
             self.assert_status(post(self, body), status)
-        self.intake.arm("reject_early", count=1)
-        self.assert_status(post(self, body), 400)
-        self.assertEqual(self.captures.wait_for(1, timeout=2), [], "only a 408 or an error writes a dump")
+        self.assertEqual(self.captures.wait_for(1, timeout=2), [], "only 408, 400, 413 or an error writes a dump")
+
+
+class SenderLeftMidRelayIsNotCaptured(MatrixCase):
+    """The intake answered; the sender was gone. That is not an upstream failure."""
+
+    CAPTURE_MAX_DUMPS = 10
+    ALLOW_PHANTOM_SUCCESS = True
+    FORBID_LOGS = ["upstream.failure.captured"]
+
+    def test_a_vanished_sender_writes_no_dump(self):
+        body = self.gzipped()
+        self.intake.arm("slow", 1500, count=1)
+        client = self.raw(timeout=30)
+        head = self.head(body_len=len(body), extra="DD-API-KEY: %s\r\nContent-Encoding: gzip" % SECRET)
+        client.send(head + body)
+        self.assertGreaterEqual(self.intake_saw(self.baseline_intake + 1), self.baseline_intake + 1)
+        # RST, so the edge's relay write fails at once instead of filling a buffer.
+        client.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        time.sleep(2.5)
+        if self.edge.frontend() == "stdio":
+            # stdio relays through the socket inside the exchange, so the
+            # write fails there. httpz buffers the answer and writes it later.
+            self.assert_logged("WriteFailed", "the relay never failed, so the case proved nothing")
+        self.assertEqual(self.captures.dumps(), [], "a sender's disconnect is not an upstream failure")
 
 
 class CaptureIsCapped(MatrixCase):

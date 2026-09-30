@@ -165,7 +165,7 @@ with its note.
 | b23 | Intake reads the whole batch, then closes with no answer | Exactly two copies at the intake | pins at-least-once |
 | b24 | Every request fails the same way, 100 of them | At most two attempts each, health unaffected | |
 | b28 | TLS 1.2/1.3 bodies near record boundaries | All 1,312 bodies per TLS version arrive byte-for-byte, across pooled/retry clients and buffered/streamed writes | shared upstream-client test, not a frontend test; requires openssl |
-| b30 | 408, reset, refused dial, hang, a policy that rewrites the batch, a sender that quits mid-body | One dump per failure: the body the intake received, byte for byte, and no credential in the metadata. A partial body is marked incomplete. Success, a recovered retry and other statuses write nothing. The cap holds across a restart, and a bad directory never stops serving | the watchdog cell is slow; xfail httpz on the partial body: the a45b defect |
+| b30 | 408, 400, 413, an early reject, reset, refused dial, hang, a policy that rewrites the batch, a batch the decoder cannot read, a sender that quits mid-body, a sender that leaves mid-relay | One dump per failure: the body the intake received, byte for byte, and no credential in the metadata. A partial body is marked incomplete. A fail-open keeps the unreadable batch. Success, a recovered retry, other statuses and a vanished sender write nothing. The cap holds across a restart, and a bad directory never stops serving | the watchdog cell is slow; xfail httpz on the partial body: the a45b defect |
 
 ### `c*` — capacity
 

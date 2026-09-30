@@ -479,22 +479,34 @@ failed. It is off by default. Turn it on with a directory:
 }
 ```
 
-On an upstream 408, or on any error in the upstream exchange (reset, refused
-dial, watchdog timeout), the edge writes:
+The edge writes a dump when:
+
+- the upstream answers 408, or 400 or 413. The Datadog agent drops a batch
+  for good on 400 and 413, so the dump is the only copy left. 401 and 403 are
+  about the key, not the batch, and write nothing.
+- the upstream exchange fails (reset, refused dial, watchdog timeout). A
+  sender that left before the answer reached it is not an upstream failure
+  and writes nothing.
+- a policy stage cannot read a batch and forwards it untouched. The forward
+  usually succeeds, so this dump keeps the input that broke the decoder. If
+  the forward then fails too, that failure writes a second dump.
+
+A dump is two files:
 
 - `<unix_ms>-<seq>.body` - the body as the edge sent it, still compressed.
   When a policy changed the batch, this is the changed batch, not the inbound
   one.
 - `<unix_ms>-<seq>.json` - `method`, `url`, `target`, `headers`, and:
   - `outcome` - `status` or `err`, `phase` (`dial`, `send_or_head`, `relay`
-    or `response`), `attempts`, `retried_err`, `watchdog_fired` and
-    `elapsed_ms`.
+    or `response`, or `policy_probe`, `policy_encode` or `policy_buffered`
+    for a batch a policy could not read), `attempts`, `retried_err`,
+    `watchdog_fired` and `elapsed_ms`.
   - `body` - `framing`, `declared_bytes`, `captured_bytes` and `complete`.
     `complete` is `false` when the edge held less than the whole body, for
     example when the sender quit while the body streamed.
 
 A dump shows what the edge meant to send. It does not prove what reached the
-intake. A success, a retry that recovered, and a status other than 408 write
+intake. A success, a retry that recovered, and any other status write
 nothing.
 
 Headers and query parameters whose names look like credentials keep their
