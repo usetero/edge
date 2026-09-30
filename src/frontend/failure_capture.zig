@@ -40,9 +40,10 @@ const UpstreamFailureCaptureFull = struct { dir: []const u8, max_dumps: u32 };
 /// The capture directory already existed and its mode could not be narrowed.
 /// The dump files are still created `0600`.
 const FailureCaptureDirPermissions = struct { dir: []const u8, err: []const u8 };
-/// A dump was dropped because `queue_len` dumps were already waiting for the
-/// disk. Warned once until the writer writes again.
-const UpstreamFailureCaptureDropped = struct { path: []const u8, queued: usize };
+/// A dump was dropped before anything was copied, because `in_flight` dumps
+/// were already being prepared, queued or written. Warned once until the
+/// writer writes again.
+const UpstreamFailureCaptureDropped = struct { dir: []const u8, in_flight: usize };
 /// The writer did not finish at shutdown, most likely on a stalled volume.
 const FailureCaptureStalled = struct { dir: []const u8, queued: usize };
 /// Dumps were deleted from a full directory, and the capture writes again.
@@ -105,8 +106,9 @@ pub const Failure = struct {
 /// Past this a streamed failure is dumped without its body.
 pub const max_copies = 4;
 
-/// Dumps waiting for the writer, at most. A dump that finds the queue full is
-/// dropped with a warning, so a stalled volume costs dumps, never requests.
+/// Dumps in flight (being prepared, queued or written), at most. A dump past
+/// this is dropped with a warning before anything is copied, so a stalled
+/// volume costs dumps, never requests or memory.
 pub const queue_len = 8;
 
 /// How long the writer sleeps when nothing wakes it.
@@ -278,20 +280,29 @@ pub const Capture = struct {
         return self.used.load(.monotonic) < self.max_dumps;
     }
 
+    /// Takes a slot on disk and a slot in memory, before anything is
+    /// copied. `pending` counts every dump being prepared, queued or written,
+    /// so at most `queue_len` dump bodies are held at once, however many
+    /// requests fail together.
     fn reserve(self: *Capture) bool {
         self.mutex.lockUncancelable(self.io);
         const used = self.used.load(.monotonic);
-        const room = used < self.max_dumps;
-        if (room) {
+        const full = used >= self.max_dumps;
+        const busy = !full and self.pending >= queue_len;
+        if (!full and !busy) {
             self.used.store(used + 1, .monotonic);
             self.pending += 1;
         }
         self.mutex.unlock(self.io);
-        if (!room and !self.full_reported.swap(true, .monotonic)) {
+        if (full and !self.full_reported.swap(true, .monotonic)) {
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             self.bus.warn(UpstreamFailureCaptureFull{ .dir = self.path, .max_dumps = self.max_dumps });
         }
-        return room;
+        if (busy and !self.drop_reported.swap(true, .monotonic)) {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            self.bus.warn(UpstreamFailureCaptureDropped{ .dir = self.path, .in_flight = queue_len });
+        }
+        return !full and !busy;
     }
 
     fn refund(self: *Capture) void {
@@ -351,15 +362,7 @@ pub const Capture = struct {
             self.warnFailed(failure.path, err);
             return;
         };
-        if (!self.enqueue(job)) {
-            job.deinit(self.gpa);
-            self.refund();
-            if (!self.drop_reported.swap(true, .monotonic)) {
-                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-                self.bus.warn(UpstreamFailureCaptureDropped{ .path = failure.path, .queued = queue_len });
-            }
-            return;
-        }
+        self.enqueue(job);
         self.wake.set(self.io);
     }
 
@@ -382,13 +385,14 @@ pub const Capture = struct {
         return .{ .stem = stem, .path = path, .body = body, .meta = meta };
     }
 
-    fn enqueue(self: *Capture, job: Job) bool {
+    /// Always has room: `reserve` keeps `pending`, which counts every queued
+    /// dump, at or below `queue_len`.
+    fn enqueue(self: *Capture, job: Job) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.queue_count == queue_len) return false;
+        std.debug.assert(self.queue_count < queue_len);
         self.queue[(self.queue_head + self.queue_count) % queue_len] = job;
         self.queue_count += 1;
-        return true;
     }
 
     fn dequeue(self: *Capture) ?Job {
@@ -910,10 +914,15 @@ test "a full queue drops a dump at once instead of waiting for the disk" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     // No writer: the queue stands in for a stalled volume.
-    var capture: Capture = try .open(io, testing.allocator, noop_bus.eventBus(), path, 100, 1024);
-    for (0..queue_len + 1) |_| capture.record(arena_state.allocator(), testFailure("payload"));
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var capture: Capture = try .open(io, counting.allocator(), noop_bus.eventBus(), path, 100, 1024);
+    for (0..queue_len) |_| capture.record(arena_state.allocator(), testFailure("payload"));
     try testing.expectEqual(@as(usize, queue_len), capture.queue_count);
-    // The dropped dump gave its slot back.
+    // Past `queue_len` in flight, a dump is dropped before it copies anything.
+    const before = counting.allocations;
+    for (0..5) |_| capture.record(arena_state.allocator(), testFailure("payload"));
+    try testing.expectEqual(before, counting.allocations);
+    try testing.expectEqual(@as(usize, queue_len), capture.queue_count);
     try testing.expectEqual(@as(u32, queue_len), capture.used.load(.monotonic));
     try testing.expect(capture.drop_reported.load(.monotonic));
     capture.close(); // frees the queued jobs; the testing allocator checks
