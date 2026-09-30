@@ -10,6 +10,11 @@ pub const UpstreamId = enum(u32) { _ };
 
 /// Minimum buffer size required for TLS operations
 const tls_min_buffer = std.crypto.tls.max_ciphertext_record_len;
+/// Zig 0.16's TLS flush encrypts only what fits in one output buffer, then
+/// clears the entire plaintext buffer. Leave room for record overhead or a
+/// nearly full plaintext buffer silently loses its tail, and the intake waits
+/// for the missing Content-Length bytes until it answers 408.
+const tls_plaintext_buffer = std.crypto.tls.max_ciphertext_inner_record_len;
 
 /// Internal storage for upstream data
 const UpstreamData = struct {
@@ -52,10 +57,11 @@ pub const UpstreamManager = struct {
             .http_client = .{
                 .allocator = allocator,
                 .io = io,
-                // TLS requires buffers of at least max_ciphertext_record_len for read/write
+                // Encrypted buffers need record overhead; plaintext must fit
+                // inside one encrypted record when the TLS writer flushes.
                 .tls_buffer_size = tls_min_buffer,
                 .read_buffer_size = tls_min_buffer,
-                .write_buffer_size = tls_min_buffer,
+                .write_buffer_size = tls_plaintext_buffer,
                 // std's default keeps only 32 idle connections; with one
                 // in-flight upstream request per downstream connection,
                 // anything smaller than max_connections forces fresh dials
@@ -67,7 +73,7 @@ pub const UpstreamManager = struct {
                 .io = io,
                 .tls_buffer_size = tls_min_buffer,
                 .read_buffer_size = tls_min_buffer,
-                .write_buffer_size = tls_min_buffer,
+                .write_buffer_size = tls_plaintext_buffer,
                 .connection_pool = .{ .free_size = 0 },
             },
             .allocator = allocator,

@@ -162,6 +162,7 @@ with its note.
 | b12 | Dial `198.51.100.1`, which swallows the SYN | An answer inside 35 s | slow, xfail both: the dial has no deadline. Skips where the route is refused |
 | b23 | Intake reads the whole batch, then closes with no answer | Exactly two copies at the intake | pins at-least-once |
 | b24 | Every request fails the same way, 100 of them | At most two attempts each, health unaffected | |
+| b28 | TLS 1.2/1.3 bodies near record boundaries | All 1,312 bodies per TLS version arrive byte-for-byte, across pooled/retry clients and buffered/streamed writes | shared upstream-client test, not a frontend test; requires openssl |
 
 ### `c*` — capacity
 
