@@ -221,7 +221,7 @@ pub fn recordFailOpen(
         ctx.bus.warn(UpstreamFailureCaptureFailed{ .path = in.path, .err = @errorName(uri_err) });
         return;
     };
-    capture.record(ctx.bus, in.arena, .{
+    capture.record(in.arena, .{
         .method = in.method,
         .target = in.target,
         .path = in.path,
@@ -285,7 +285,7 @@ fn recordFailure(
         bufs.timed_out.load(.acquire)
     else |_|
         false;
-    capture.record(ctx.bus, in.arena, .{
+    capture.record(in.arena, .{
         .method = in.method,
         .target = in.target,
         .path = in.path,

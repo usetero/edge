@@ -282,6 +282,16 @@ pub const Engine = struct {
         self.tap = .{ .io = io };
         const max_body_size = self.limits.max_body_size;
         self.failure_capture = openFailureCapture(io, allocator, bus, options.failure_capture, max_body_size);
+        // The writer thread holds the capture's address, so it starts here,
+        // after the capture has moved into the engine.
+        if (self.failure_capture) |*capture| {
+            capture.start() catch |err| {
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                bus.err(FailureCaptureUnavailable{ .dir = capture.path, .err = @errorName(err) });
+                capture.close();
+                self.failure_capture = null;
+            };
+        }
         errdefer if (self.failure_capture) |*capture| capture.close();
         self.shared_ctx = .{
             .io = io,

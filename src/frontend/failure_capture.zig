@@ -11,6 +11,11 @@
 //! A dump shows what the edge meant to send. It does not prove what reached
 //! the intake: a send that failed part way wrote less than the dump holds.
 //!
+//! The request path only builds a dump in memory and queues it; one writer
+//! thread does the disk work (see `Capture`). Memory is bounded twice: by
+//! `max_copies` streamed-body copies in flight, and by `queue_len` queued
+//! dumps.
+//!
 //! Credentials never reach the disk. A header or query parameter whose name
 //! looks like a credential keeps its name and loses its value.
 //!
@@ -33,6 +38,11 @@ const UpstreamFailureCaptureFull = struct { dir: []const u8, max_dumps: u32 };
 /// The capture directory already existed and its mode could not be narrowed.
 /// The dump files are still created `0600`.
 const FailureCaptureDirPermissions = struct { dir: []const u8, err: []const u8 };
+/// A dump was dropped because `queue_len` dumps were already waiting for the
+/// disk. Warned once until the writer writes again.
+const UpstreamFailureCaptureDropped = struct { path: []const u8, queued: usize };
+/// The writer did not finish at shutdown, most likely on a stalled volume.
+const FailureCaptureStalled = struct { dir: []const u8, queued: usize };
 
 /// Dumps hold customer payloads, so only the edge's own user may read them.
 const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
@@ -91,22 +101,64 @@ pub const Failure = struct {
 /// Past this a streamed failure is dumped without its body.
 pub const max_copies = 4;
 
+/// Dumps waiting for the writer, at most. A dump that finds the queue full is
+/// dropped with a warning, so a stalled volume costs dumps, never requests.
+pub const queue_len = 8;
+
+/// How long the writer sleeps when nothing wakes it.
+const idle_wait: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } };
+/// How long `close` waits for the writer, in 50 ms steps.
+const close_wait_steps = 40;
+
+/// One dump, owned by the capture from `record` until the writer frees it.
+const Job = struct {
+    stem: []u8,
+    /// The request path, for the log line.
+    path: []u8,
+    body: []u8,
+    meta: []u8,
+
+    fn deinit(self: Job, gpa: std.mem.Allocator) void {
+        gpa.free(self.stem);
+        gpa.free(self.path);
+        gpa.free(self.body);
+        gpa.free(self.meta);
+    }
+};
+
+/// The request path only prepares a dump in memory and queues it. One writer
+/// thread does every disk operation, so a slow or stalled volume never holds
+/// a request, before or after its forward.
 pub const Capture = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
+    bus: *EventBus,
     dir: std.Io.Dir,
     path: []const u8,
     max_dumps: u32,
     /// Bytes the streamed-body copies may hold at once.
     copy_budget: usize,
     copy_used: std.atomic.Value(usize) = .init(0),
-    /// Dumps in the directory, counted at open, plus dumps reserved since.
+    /// Dumps on disk plus dumps queued or being written. Changed only under
+    /// `mutex`; `armed` reads it without the lock.
     used: std.atomic.Value(u32),
     seq: std.atomic.Value(u32) = .init(0),
     full_reported: std.atomic.Value(bool) = .init(false),
+    /// Set when a dump was dropped on a full queue; cleared by the next write.
+    drop_reported: std.atomic.Value(bool) = .init(false),
+
+    mutex: std.Io.Mutex = .init,
+    queue: [queue_len]Job = undefined,
+    queue_head: usize = 0,
+    queue_count: usize = 0,
+    wake: std.Io.Event = .unset,
+    stopping: std.atomic.Value(bool) = .init(false),
+    stopped: std.Io.Event = .unset,
+    writer: ?std.Thread = null,
 
     /// Creates `path` when it is missing and counts the dumps already in it.
-    /// `max_body_size` sizes the copy budget for streamed bodies.
+    /// `max_body_size` sizes the copy budget for streamed bodies. Call
+    /// `start` once the capture is at its final address.
     pub fn open(
         io: std.Io,
         gpa: std.mem.Allocator,
@@ -130,12 +182,50 @@ pub const Capture = struct {
         return .{
             .io = io,
             .gpa = gpa,
+            .bus = bus,
             .dir = dir,
             .path = path,
             .max_dumps = max_dumps,
             .copy_budget = max_copies * max_body_size,
             .used = .init(existing),
         };
+    }
+
+    /// Starts the writer thread.
+    pub fn start(self: *Capture) !void {
+        self.writer = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Stops the writer once it has written what is queued. A writer stuck
+    /// on a stalled volume keeps its jobs and the directory, and the process
+    /// exits without it.
+    pub fn close(self: *Capture) void {
+        if (self.writer) |thread| {
+            self.stopping.store(true, .release);
+            self.wake.set(self.io);
+            if (!self.waitStopped()) {
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                self.bus.warn(FailureCaptureStalled{ .dir = self.path, .queued = self.queue_count });
+                return;
+            }
+            thread.join();
+            self.writer = null;
+        }
+        while (self.dequeue()) |job| job.deinit(self.gpa);
+        self.dir.close(self.io);
+    }
+
+    fn waitStopped(self: *Capture) bool {
+        const step: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+        var steps: u32 = 0;
+        while (!self.stopped.isSet() and steps < close_wait_steps) : (steps += 1) {
+            self.stopped.waitTimeout(self.io, step) catch |err| switch (err) {
+                // A timeout or a spurious wakeup: look again.
+                error.Timeout => {},
+                error.Canceled => break,
+            };
+        }
+        return self.stopped.isSet();
     }
 
     /// A buffer to copy one streamed body into, or null: the directory is
@@ -158,90 +248,152 @@ pub const Capture = struct {
         _ = self.copy_used.fetchSub(buf.len, .monotonic);
     }
 
-    pub fn close(self: *Capture) void {
-        self.dir.close(self.io);
-    }
-
     /// True while the budget has room. A streamed body is copied only when
     /// this holds, so a full directory costs the data path nothing.
     pub fn armed(self: *const Capture) bool {
         return self.used.load(.monotonic) < self.max_dumps;
     }
 
-    fn reserve(self: *Capture, bus: *EventBus) bool {
-        if (self.used.fetchAdd(1, .monotonic) < self.max_dumps) return true;
-        _ = self.used.fetchSub(1, .monotonic);
-        if (!self.full_reported.swap(true, .monotonic)) {
+    fn reserve(self: *Capture) bool {
+        self.mutex.lockUncancelable(self.io);
+        const used = self.used.load(.monotonic);
+        const room = used < self.max_dumps;
+        if (room) self.used.store(used + 1, .monotonic);
+        self.mutex.unlock(self.io);
+        if (!room and !self.full_reported.swap(true, .monotonic)) {
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            bus.warn(UpstreamFailureCaptureFull{ .dir = self.path, .max_dumps = self.max_dumps });
+            self.bus.warn(UpstreamFailureCaptureFull{ .dir = self.path, .max_dumps = self.max_dumps });
         }
-        return false;
+        return room;
     }
 
-    /// Writes one dump. Errors are reported on the bus: the capture must not
-    /// change how the request itself fails.
-    pub fn record(self: *Capture, bus: *EventBus, arena: std.mem.Allocator, failure: Failure) void {
-        if (!self.reserve(bus)) return;
-        const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
-        const stem = std.fmt.allocPrint(arena, "{d}-{d}", .{ now_ms, self.seq.fetchAdd(1, .monotonic) }) catch |err| {
-            _ = self.used.fetchSub(1, .monotonic);
-            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            bus.warn(UpstreamFailureCaptureFailed{ .path = failure.path, .err = @errorName(err) });
-            return;
-        };
-        const name = self.write(bus, arena, failure, stem, now_ms) catch |err| {
-            _ = self.used.fetchSub(1, .monotonic);
-            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-            bus.warn(UpstreamFailureCaptureFailed{ .path = failure.path, .err = @errorName(err) });
-            return;
-        };
+    fn refund(self: *Capture) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.used.store(self.used.load(.monotonic) - 1, .monotonic);
+    }
+
+    fn warnFailed(self: *Capture, path: []const u8, err: anyerror) void {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-        bus.warn(UpstreamFailureCaptured{ .path = failure.path, .file = name });
+        self.bus.warn(UpstreamFailureCaptureFailed{ .path = path, .err = @errorName(err) });
     }
 
-    /// Everything that can fail without touching the disk runs first. Once
-    /// the body file exists, a failure removes both files, so a refunded slot
-    /// never leaves bytes behind.
-    fn write(
-        self: *Capture,
-        bus: *EventBus,
-        arena: std.mem.Allocator,
-        failure: Failure,
-        stem: []const u8,
-        now_ms: i64,
-    ) ![]const u8 {
-        const body_name = try std.fmt.allocPrint(arena, "{s}.body", .{stem});
-        const meta_name = try std.fmt.allocPrint(arena, "{s}.json", .{stem});
-        var json: std.Io.Writer.Allocating = .init(arena);
-        const meta = try metaOf(arena, failure, body_name, now_ms);
-        try std.json.Stringify.value(meta, .{ .whitespace = .indent_2 }, &json.writer);
-        try json.writer.writeByte('\n');
-
-        // The body goes first: a `.json` file means the dump is whole.
-        const exclusive: std.Io.Dir.CreateFileOptions = .{ .exclusive = true, .permissions = file_permissions };
-        try self.dir.writeFile(self.io, .{ .sub_path = body_name, .data = failure.body, .flags = exclusive });
-        errdefer self.remove(bus, failure.path, body_name);
-        const meta_file: std.Io.Dir.WriteFileOptions = .{
-            .sub_path = meta_name,
-            .data = json.written(),
-            .flags = exclusive,
+    /// Queues one dump and returns at once; the writer does the disk work.
+    /// Errors are reported on the bus: the capture must not change how the
+    /// request itself fails.
+    pub fn record(self: *Capture, arena: std.mem.Allocator, failure: Failure) void {
+        if (!self.reserve()) return;
+        const job = self.prepare(arena, failure) catch |err| {
+            self.refund();
+            self.warnFailed(failure.path, err);
+            return;
         };
-        self.dir.writeFile(self.io, meta_file) catch |err| {
+        if (!self.enqueue(job)) {
+            job.deinit(self.gpa);
+            self.refund();
+            if (!self.drop_reported.swap(true, .monotonic)) {
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                self.bus.warn(UpstreamFailureCaptureDropped{ .path = failure.path, .queued = queue_len });
+            }
+            return;
+        }
+        self.wake.set(self.io);
+    }
+
+    /// Everything a dump needs, in memory the capture owns: the request
+    /// arena is reset once the request is answered.
+    fn prepare(self: *Capture, arena: std.mem.Allocator, failure: Failure) !Job {
+        const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+        const stem = try std.fmt.allocPrint(self.gpa, "{d}-{d}", .{ now_ms, self.seq.fetchAdd(1, .monotonic) });
+        errdefer self.gpa.free(stem);
+        const body_name = try std.fmt.allocPrint(arena, "{s}.body", .{stem});
+        var json: std.Io.Writer.Allocating = .init(arena);
+        const meta_value = try metaOf(arena, failure, body_name, now_ms);
+        try std.json.Stringify.value(meta_value, .{ .whitespace = .indent_2 }, &json.writer);
+        try json.writer.writeByte('\n');
+        const meta = try self.gpa.dupe(u8, json.written());
+        errdefer self.gpa.free(meta);
+        const body = try self.gpa.dupe(u8, failure.body);
+        errdefer self.gpa.free(body);
+        const path = try self.gpa.dupe(u8, failure.path);
+        return .{ .stem = stem, .path = path, .body = body, .meta = meta };
+    }
+
+    fn enqueue(self: *Capture, job: Job) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.queue_count == queue_len) return false;
+        self.queue[(self.queue_head + self.queue_count) % queue_len] = job;
+        self.queue_count += 1;
+        return true;
+    }
+
+    fn dequeue(self: *Capture) ?Job {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.queue_count == 0) return null;
+        const job = self.queue[self.queue_head];
+        self.queue_head = (self.queue_head + 1) % queue_len;
+        self.queue_count -= 1;
+        return job;
+    }
+
+    /// The writer thread: drain the queue, then sleep until woken.
+    fn run(self: *Capture) void {
+        while (true) {
+            self.wake.waitTimeout(self.io, idle_wait) catch |err| switch (err) {
+                // A timeout, a spurious wakeup or a cancel: look at the queue.
+                error.Timeout, error.Canceled => {},
+            };
+            // Reset before draining: a dump queued after this point sets the
+            // event again, so no wakeup is lost.
+            self.wake.reset();
+            while (self.dequeue()) |job| {
+                self.writeJob(job);
+                job.deinit(self.gpa);
+            }
+            if (self.stopping.load(.acquire)) break;
+        }
+        self.stopped.set(self.io);
+    }
+
+    fn writeJob(self: *Capture, job: Job) void {
+        var name_buf: [64]u8 = undefined;
+        const name = self.writeFiles(job, &name_buf) catch |err| {
+            self.refund();
+            self.warnFailed(job.path, err);
+            return;
+        };
+        self.drop_reported.store(false, .monotonic);
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        self.bus.warn(UpstreamFailureCaptured{ .path = job.path, .file = name });
+    }
+
+    /// The body goes first: a `.json` file means the dump is whole. Once the
+    /// body file exists, a failure removes both files, so a refunded slot
+    /// never leaves bytes behind.
+    fn writeFiles(self: *Capture, job: Job, name_buf: *[64]u8) ![]const u8 {
+        var body_buf: [64]u8 = undefined;
+        const body_name = try std.fmt.bufPrint(&body_buf, "{s}.body", .{job.stem});
+        const meta_name = try std.fmt.bufPrint(name_buf, "{s}.json", .{job.stem});
+        const exclusive: std.Io.Dir.CreateFileOptions = .{ .exclusive = true, .permissions = file_permissions };
+        try self.dir.writeFile(self.io, .{ .sub_path = body_name, .data = job.body, .flags = exclusive });
+        errdefer self.remove(job.path, body_name);
+        self.dir.writeFile(self.io, .{ .sub_path = meta_name, .data = job.meta, .flags = exclusive }) catch |err| {
             // An exclusive create that failed part way may have left the file.
-            if (err != error.PathAlreadyExists) self.remove(bus, failure.path, meta_name);
+            if (err != error.PathAlreadyExists) self.remove(job.path, meta_name);
             return err;
         };
         return meta_name;
     }
 
-    fn remove(self: *Capture, bus: *EventBus, path: []const u8, name: []const u8) void {
+    fn remove(self: *Capture, path: []const u8, name: []const u8) void {
         self.dir.deleteFile(self.io, name) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {
                 // The file stays and still counts against the cap after a
                 // restart, so the disk bound holds.
-                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
-                bus.warn(UpstreamFailureCaptureFailed{ .path = path, .err = @errorName(err) });
+                self.warnFailed(path, err);
             },
         };
     }
@@ -505,7 +657,7 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
 
     const path = try tmp.dir.realPathFileAlloc(io, ".", arena);
     var capture: Capture = try .open(io, testing.allocator, bus, path, 1, 1024);
-    defer capture.close();
+    try capture.start();
     const body = "\x28\xb5\x2f\xfd compressed bytes";
     const failure: Failure = .{
         .method = .POST,
@@ -528,15 +680,18 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
         .watchdog_fired = false,
         .elapsed_ms = 30012.5,
     };
-    capture.record(bus, arena, failure);
-    capture.record(bus, arena, failure); // over the cap: no second dump
+    capture.record(arena, failure);
+    capture.record(arena, failure); // over the cap: no second dump
     try testing.expect(!capture.armed());
+    capture.close(); // the writer writes what is queued, then stops
 
     var bodies: usize = 0;
     var metas: usize = 0;
-    var it = capture.dir.iterate();
+    var dir = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        const data = try capture.dir.readFileAlloc(io, entry.name, arena, .unlimited);
+        const data = try dir.readFileAlloc(io, entry.name, arena, .unlimited);
         if (std.mem.endsWith(u8, entry.name, ".body")) {
             bodies += 1;
             try testing.expectEqualStrings(body, data);
@@ -559,10 +714,10 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
                 return @as(u32, @intCast(@intFromEnum(p))) & 0o777;
             }
         }.of;
-        try testing.expectEqual(mode(dir_permissions), mode((try capture.dir.stat(io)).permissions));
-        var files = capture.dir.iterate();
+        try testing.expectEqual(mode(dir_permissions), mode((try dir.stat(io)).permissions));
+        var files = dir.iterate();
         while (try files.next(io)) |entry| {
-            const stat = try capture.dir.statFile(io, entry.name, .{});
+            const stat = try dir.statFile(io, entry.name, .{});
             try testing.expectEqual(mode(file_permissions), mode(stat.permissions));
         }
     }
@@ -571,6 +726,8 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
     var reopened: Capture = try .open(io, testing.allocator, bus, path, 1, 1024);
     defer reopened.close();
     try testing.expect(!reopened.armed());
+    // The dump reached the disk, and the writer's slot stayed spent.
+    try testing.expectEqual(@as(u32, 1), reopened.used.load(.monotonic));
 }
 
 fn testFailure(body: []const u8) Failure {
@@ -611,7 +768,14 @@ test "a failed write leaves no file behind and refunds its slot" {
     // A directory where the metadata file must go makes the second write fail
     // after the body is on disk.
     try capture.dir.createDir(io, "stuck.json", .default_dir);
-    try testing.expectError(error.PathAlreadyExists, capture.write(bus, arena, testFailure("payload"), "stuck", 1));
+    const job: Job = .{
+        .stem = try arena.dupe(u8, "stuck"),
+        .path = try arena.dupe(u8, "/api/v2/logs"),
+        .body = try arena.dupe(u8, "payload"),
+        .meta = try arena.dupe(u8, "{}"),
+    };
+    var name_buf: [64]u8 = undefined;
+    try testing.expectError(error.PathAlreadyExists, capture.writeFiles(job, &name_buf));
     try testing.expectError(error.FileNotFound, capture.dir.statFile(io, "stuck.body", .{}));
 }
 
@@ -633,4 +797,24 @@ test "a body orphaned by a crash still counts against the cap" {
     defer capture.close();
     try testing.expectEqual(@as(u32, 2), capture.used.load(.monotonic));
     try testing.expect(!capture.armed());
+}
+
+test "a full queue drops a dump at once instead of waiting for the disk" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    // No writer: the queue stands in for a stalled volume.
+    var capture: Capture = try .open(io, testing.allocator, noop_bus.eventBus(), path, 100, 1024);
+    for (0..queue_len + 1) |_| capture.record(arena_state.allocator(), testFailure("payload"));
+    try testing.expectEqual(@as(usize, queue_len), capture.queue_count);
+    // The dropped dump gave its slot back.
+    try testing.expectEqual(@as(u32, queue_len), capture.used.load(.monotonic));
+    try testing.expect(capture.drop_reported.load(.monotonic));
+    capture.close(); // frees the queued jobs; the testing allocator checks
 }
