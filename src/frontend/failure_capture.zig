@@ -86,18 +86,35 @@ pub const Failure = struct {
     elapsed_ms: f64,
 };
 
+/// Streamed bodies copied at once, at most. Each copy is one declared body
+/// length, so the copies never hold more than `max_copies` bodies of memory.
+/// Past this a streamed failure is dumped without its body.
+pub const max_copies = 4;
+
 pub const Capture = struct {
     io: std.Io,
+    gpa: std.mem.Allocator,
     dir: std.Io.Dir,
     path: []const u8,
     max_dumps: u32,
+    /// Bytes the streamed-body copies may hold at once.
+    copy_budget: usize,
+    copy_used: std.atomic.Value(usize) = .init(0),
     /// Dumps in the directory, counted at open, plus dumps reserved since.
     used: std.atomic.Value(u32),
     seq: std.atomic.Value(u32) = .init(0),
     full_reported: std.atomic.Value(bool) = .init(false),
 
     /// Creates `path` when it is missing and counts the dumps already in it.
-    pub fn open(io: std.Io, gpa: std.mem.Allocator, bus: *EventBus, path: []const u8, max_dumps: u32) !Capture {
+    /// `max_body_size` sizes the copy budget for streamed bodies.
+    pub fn open(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        bus: *EventBus,
+        path: []const u8,
+        max_dumps: u32,
+        max_body_size: usize,
+    ) !Capture {
         const dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{
             .permissions = dir_permissions,
             .open_options = .{ .iterate = true },
@@ -110,7 +127,35 @@ pub const Capture = struct {
             bus.warn(FailureCaptureDirPermissions{ .dir = path, .err = @errorName(err) });
         };
         const existing = try countDumps(io, gpa, dir);
-        return .{ .io = io, .dir = dir, .path = path, .max_dumps = max_dumps, .used = .init(existing) };
+        return .{
+            .io = io,
+            .gpa = gpa,
+            .dir = dir,
+            .path = path,
+            .max_dumps = max_dumps,
+            .copy_budget = max_copies * max_body_size,
+            .used = .init(existing),
+        };
+    }
+
+    /// A buffer to copy one streamed body into, or null: the directory is
+    /// full, the copy budget is spent, or memory is short. The request
+    /// forwards either way. Give it back with `releaseCopy`.
+    pub fn acquireCopy(self: *Capture, len: usize) ?[]u8 {
+        if (!self.armed()) return null;
+        if (self.copy_used.fetchAdd(len, .monotonic) + len > self.copy_budget) {
+            _ = self.copy_used.fetchSub(len, .monotonic);
+            return null;
+        }
+        return self.gpa.alloc(u8, len) catch {
+            _ = self.copy_used.fetchSub(len, .monotonic);
+            return null;
+        };
+    }
+
+    pub fn releaseCopy(self: *Capture, buf: []u8) void {
+        self.gpa.free(buf);
+        _ = self.copy_used.fetchSub(buf.len, .monotonic);
     }
 
     pub fn close(self: *Capture) void {
@@ -339,16 +384,20 @@ pub fn redactQuery(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
 }
 
 /// Copies every byte a streamed body yields, so a failed send can still be
-/// dumped. A body that streams cannot be read again afterwards.
+/// dumped. A body that streams cannot be read again afterwards. The copy is a
+/// fixed buffer of the declared length from `Capture.acquireCopy`.
 pub const Tee = struct {
     interface: std.Io.Reader = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
     inner: *std.Io.Reader,
-    copy: std.Io.Writer.Allocating,
-    /// Set when `inner` reported the end of the body.
-    ended: bool = false,
-    /// Set when the copy ran out of memory. The body still streams; only the
-    /// dump is short.
+    copy: []u8,
+    copied: usize = 0,
+    /// Set when the body ran past the buffer. The body still streams; only
+    /// the dump is short.
     copy_failed: bool = false,
+
+    pub fn written(self: *const Tee) []const u8 {
+        return self.copy[0..self.copied];
+    }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *Tee = @alignCast(@fieldParentPtr("interface", r));
@@ -357,16 +406,12 @@ pub const Tee = struct {
         // Zero means the bytes landed in `inner`'s buffer; the next call
         // returns them.
         while (true) {
-            const n = self.inner.readVec(&vec) catch |err| {
-                if (err == error.EndOfStream) self.ended = true;
-                return err;
-            };
+            const n = try self.inner.readVec(&vec);
             if (n == 0) continue;
-            if (!self.copy_failed) {
-                self.copy.writer.writeAll(dest[0..n]) catch {
-                    self.copy_failed = true;
-                };
-            }
+            const take = @min(n, self.copy.len - self.copied);
+            @memcpy(self.copy[self.copied..][0..take], dest[0..take]);
+            self.copied += take;
+            if (take < n) self.copy_failed = true;
             w.advance(n);
             return n;
         }
@@ -416,13 +461,35 @@ test "percent-encoded query names are redacted" {
 
 test "the tee forwards every byte and keeps a copy" {
     var source: std.Io.Reader = .fixed("0123456789" ** 100);
-    var tee: Tee = .{ .inner = &source, .copy = .init(testing.allocator) };
-    defer tee.copy.deinit();
+    var buf: [1000]u8 = undefined;
+    var tee: Tee = .{ .inner = &source, .copy = &buf };
     var sink: std.Io.Writer.Allocating = .init(testing.allocator);
     defer sink.deinit();
     try tee.interface.streamExact(&sink.writer, 1000);
     try testing.expectEqualStrings("0123456789" ** 100, sink.written());
-    try testing.expectEqualStrings("0123456789" ** 100, tee.copy.written());
+    try testing.expectEqualStrings("0123456789" ** 100, tee.written());
+    try testing.expect(!tee.copy_failed);
+}
+
+test "the streamed-body copies stay inside their budget" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var capture: Capture = try .open(io, testing.allocator, noop_bus.eventBus(), path, 10, 100);
+
+    var held: [max_copies][]u8 = undefined;
+    for (&held) |*slot| slot.* = capture.acquireCopy(100).?;
+    try testing.expect(capture.acquireCopy(1) == null); // budget spent
+    capture.releaseCopy(held[0]);
+    const again = capture.acquireCopy(100).?; // released bytes come back
+    capture.releaseCopy(again);
+    for (held[1..]) |buf| capture.releaseCopy(buf);
+    try testing.expectEqual(@as(usize, 0), capture.copy_used.load(.monotonic));
+    capture.close();
 }
 
 test "a dump holds the body unchanged and the metadata redacted, up to the cap" {
@@ -437,7 +504,7 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
     const bus = noop_bus.eventBus();
 
     const path = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    var capture: Capture = try .open(io, testing.allocator, bus, path, 1);
+    var capture: Capture = try .open(io, testing.allocator, bus, path, 1, 1024);
     defer capture.close();
     const body = "\x28\xb5\x2f\xfd compressed bytes";
     const failure: Failure = .{
@@ -501,7 +568,7 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
     }
 
     // A restart counts what is already on disk.
-    var reopened: Capture = try .open(io, testing.allocator, bus, path, 1);
+    var reopened: Capture = try .open(io, testing.allocator, bus, path, 1, 1024);
     defer reopened.close();
     try testing.expect(!reopened.armed());
 }
@@ -539,7 +606,7 @@ test "a failed write leaves no file behind and refunds its slot" {
     const bus = noop_bus.eventBus();
 
     const path = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    var capture: Capture = try .open(io, testing.allocator, bus, path, 1);
+    var capture: Capture = try .open(io, testing.allocator, bus, path, 1, 1024);
     defer capture.close();
     // A directory where the metadata file must go makes the second write fail
     // after the body is on disk.
@@ -562,7 +629,7 @@ test "a body orphaned by a crash still counts against the cap" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    var capture: Capture = try .open(io, testing.allocator, bus, path, 2);
+    var capture: Capture = try .open(io, testing.allocator, bus, path, 2, 1024);
     defer capture.close();
     try testing.expectEqual(@as(u32, 2), capture.used.load(.monotonic));
     try testing.expect(!capture.armed());

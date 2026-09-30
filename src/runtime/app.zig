@@ -280,7 +280,8 @@ pub const Engine = struct {
 
         self.lifecycle = .init;
         self.tap = .{ .io = io };
-        self.failure_capture = openFailureCapture(io, allocator, bus, options.failure_capture);
+        const max_body_size = self.limits.max_body_size;
+        self.failure_capture = openFailureCapture(io, allocator, bus, options.failure_capture, max_body_size);
         errdefer if (self.failure_capture) |*capture| capture.close();
         self.shared_ctx = .{
             .io = io,
@@ -349,9 +350,11 @@ fn openFailureCapture(
     gpa: std.mem.Allocator,
     bus: *EventBus,
     config: config_types.FailureCaptureConfig,
+    max_body_size: usize,
 ) ?exec_mod.failure_capture_mod.Capture {
     const dir = config.dir orelse return null;
-    const capture = exec_mod.failure_capture_mod.Capture.open(io, gpa, bus, dir, config.max_dumps) catch |err| {
+    const Capture = exec_mod.failure_capture_mod.Capture;
+    const capture = Capture.open(io, gpa, bus, dir, config.max_dumps, max_body_size) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.err(FailureCaptureUnavailable{ .dir = dir, .err = @errorName(err) });
         return null;
