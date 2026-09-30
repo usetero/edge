@@ -18,6 +18,7 @@
 //! runs included, so a crash loop cannot fill the disk. Delete dumps to arm
 //! the capture again.
 const std = @import("std");
+const builtin = @import("builtin");
 const o11y = @import("o11y");
 const EventBus = o11y.EventBus;
 
@@ -28,6 +29,13 @@ const UpstreamFailureCaptured = struct { path: []const u8, file: []const u8 };
 const UpstreamFailureCaptureFailed = struct { path: []const u8, err: []const u8 };
 /// The directory holds `max_dumps` dumps. Warned once per process.
 const UpstreamFailureCaptureFull = struct { dir: []const u8, max_dumps: u32 };
+/// The capture directory already existed and its mode could not be narrowed.
+/// The dump files are still created `0600`.
+const FailureCaptureDirPermissions = struct { dir: []const u8, err: []const u8 };
+
+/// Dumps hold customer payloads, so only the edge's own user may read them.
+const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
+const file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
 
 pub const redacted = "[redacted]";
 
@@ -88,9 +96,18 @@ pub const Capture = struct {
     full_reported: std.atomic.Value(bool) = .init(false),
 
     /// Creates `path` when it is missing and counts the dumps already in it.
-    pub fn open(io: std.Io, path: []const u8, max_dumps: u32) !Capture {
-        const dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{ .open_options = .{ .iterate = true } });
+    pub fn open(io: std.Io, bus: *EventBus, path: []const u8, max_dumps: u32) !Capture {
+        const dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{
+            .permissions = dir_permissions,
+            .open_options = .{ .iterate = true },
+        });
         errdefer dir.close(io);
+        // A directory that already existed keeps its own mode, which is often
+        // world-readable (a Kubernetes emptyDir is 0777).
+        dir.setPermissions(io, dir_permissions) catch |err| {
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            bus.warn(FailureCaptureDirPermissions{ .dir = path, .err = @errorName(err) });
+        };
         var existing: u32 = 0;
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
@@ -141,7 +158,7 @@ pub const Capture = struct {
         const meta_name = try std.fmt.allocPrint(arena, "{s}.json", .{stem});
 
         // The body goes first: a `.json` file means the dump is whole.
-        const exclusive: std.Io.Dir.CreateFileOptions = .{ .exclusive = true };
+        const exclusive: std.Io.Dir.CreateFileOptions = .{ .exclusive = true, .permissions = file_permissions };
         try self.dir.writeFile(self.io, .{ .sub_path = body_name, .data = failure.body, .flags = exclusive });
         var json: std.Io.Writer.Allocating = .init(arena);
         const meta = try metaOf(arena, failure, body_name, now_ms);
@@ -356,7 +373,7 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
     const bus = noop_bus.eventBus();
 
     const path = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    var capture: Capture = try .open(io, path, 1);
+    var capture: Capture = try .open(io, bus, path, 1);
     defer capture.close();
     const body = "\x28\xb5\x2f\xfd compressed bytes";
     const failure: Failure = .{
@@ -403,8 +420,24 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
     try testing.expectEqual(@as(usize, 1), bodies);
     try testing.expectEqual(@as(usize, 1), metas);
 
+    // Only the edge's own user may read a dump.
+    if (builtin.os.tag != .windows) {
+        // `stat` carries the file type bits too; compare the mode only.
+        const mode = struct {
+            fn of(p: std.Io.File.Permissions) u32 {
+                return @as(u32, @intCast(@intFromEnum(p))) & 0o777;
+            }
+        }.of;
+        try testing.expectEqual(mode(dir_permissions), mode((try capture.dir.stat(io)).permissions));
+        var files = capture.dir.iterate();
+        while (try files.next(io)) |entry| {
+            const stat = try capture.dir.statFile(io, entry.name, .{});
+            try testing.expectEqual(mode(file_permissions), mode(stat.permissions));
+        }
+    }
+
     // A restart counts what is already on disk.
-    var reopened: Capture = try .open(io, path, 1);
+    var reopened: Capture = try .open(io, bus, path, 1);
     defer reopened.close();
     try testing.expect(!reopened.armed());
 }

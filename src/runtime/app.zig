@@ -350,7 +350,7 @@ fn openFailureCapture(
     config: config_types.FailureCaptureConfig,
 ) ?exec_mod.failure_capture_mod.Capture {
     const dir = config.dir orelse return null;
-    const capture = exec_mod.failure_capture_mod.Capture.open(io, dir, config.max_dumps) catch |err| {
+    const capture = exec_mod.failure_capture_mod.Capture.open(io, bus, dir, config.max_dumps) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.err(FailureCaptureUnavailable{ .dir = dir, .err = @errorName(err) });
         return null;
