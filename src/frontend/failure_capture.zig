@@ -14,9 +14,10 @@
 //! Credentials never reach the disk. A header or query parameter whose name
 //! looks like a credential keeps its name and loses its value.
 //!
-//! `max_dumps` caps the `.json` files in the directory, the files from earlier
-//! runs included, so a crash loop cannot fill the disk. Delete dumps to arm
-//! the capture again.
+//! `max_dumps` caps the dumps in the directory, the files from earlier runs
+//! included, so a crash loop cannot fill the disk. A dump counts once for its
+//! `<stem>`, whether both files are there or only one, so a body orphaned by a
+//! crash still takes its slot. A write that fails removes what it wrote.
 const std = @import("std");
 const builtin = @import("builtin");
 const o11y = @import("o11y");
@@ -96,7 +97,7 @@ pub const Capture = struct {
     full_reported: std.atomic.Value(bool) = .init(false),
 
     /// Creates `path` when it is missing and counts the dumps already in it.
-    pub fn open(io: std.Io, bus: *EventBus, path: []const u8, max_dumps: u32) !Capture {
+    pub fn open(io: std.Io, gpa: std.mem.Allocator, bus: *EventBus, path: []const u8, max_dumps: u32) !Capture {
         const dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{
             .permissions = dir_permissions,
             .open_options = .{ .iterate = true },
@@ -108,11 +109,7 @@ pub const Capture = struct {
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             bus.warn(FailureCaptureDirPermissions{ .dir = path, .err = @errorName(err) });
         };
-        var existing: u32 = 0;
-        var it = dir.iterate();
-        while (try it.next(io)) |entry| {
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) existing += 1;
-        }
+        const existing = try countDumps(io, gpa, dir);
         return .{ .io = io, .dir = dir, .path = path, .max_dumps = max_dumps, .used = .init(existing) };
     }
 
@@ -140,7 +137,14 @@ pub const Capture = struct {
     /// change how the request itself fails.
     pub fn record(self: *Capture, bus: *EventBus, arena: std.mem.Allocator, failure: Failure) void {
         if (!self.reserve(bus)) return;
-        const name = self.write(arena, failure) catch |err| {
+        const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+        const stem = std.fmt.allocPrint(arena, "{d}-{d}", .{ now_ms, self.seq.fetchAdd(1, .monotonic) }) catch |err| {
+            _ = self.used.fetchSub(1, .monotonic);
+            // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+            bus.warn(UpstreamFailureCaptureFailed{ .path = failure.path, .err = @errorName(err) });
+            return;
+        };
+        const name = self.write(bus, arena, failure, stem, now_ms) catch |err| {
             _ = self.used.fetchSub(1, .monotonic);
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             bus.warn(UpstreamFailureCaptureFailed{ .path = failure.path, .err = @errorName(err) });
@@ -150,24 +154,84 @@ pub const Capture = struct {
         bus.warn(UpstreamFailureCaptured{ .path = failure.path, .file = name });
     }
 
-    fn write(self: *Capture, arena: std.mem.Allocator, failure: Failure) ![]const u8 {
-        const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
-        const seq = self.seq.fetchAdd(1, .monotonic);
-        const stem = try std.fmt.allocPrint(arena, "{d}-{d}", .{ now_ms, seq });
+    /// Everything that can fail without touching the disk runs first. Once
+    /// the body file exists, a failure removes both files, so a refunded slot
+    /// never leaves bytes behind.
+    fn write(
+        self: *Capture,
+        bus: *EventBus,
+        arena: std.mem.Allocator,
+        failure: Failure,
+        stem: []const u8,
+        now_ms: i64,
+    ) ![]const u8 {
         const body_name = try std.fmt.allocPrint(arena, "{s}.body", .{stem});
         const meta_name = try std.fmt.allocPrint(arena, "{s}.json", .{stem});
-
-        // The body goes first: a `.json` file means the dump is whole.
-        const exclusive: std.Io.Dir.CreateFileOptions = .{ .exclusive = true, .permissions = file_permissions };
-        try self.dir.writeFile(self.io, .{ .sub_path = body_name, .data = failure.body, .flags = exclusive });
         var json: std.Io.Writer.Allocating = .init(arena);
         const meta = try metaOf(arena, failure, body_name, now_ms);
         try std.json.Stringify.value(meta, .{ .whitespace = .indent_2 }, &json.writer);
         try json.writer.writeByte('\n');
-        try self.dir.writeFile(self.io, .{ .sub_path = meta_name, .data = json.written(), .flags = exclusive });
+
+        // The body goes first: a `.json` file means the dump is whole.
+        const exclusive: std.Io.Dir.CreateFileOptions = .{ .exclusive = true, .permissions = file_permissions };
+        try self.dir.writeFile(self.io, .{ .sub_path = body_name, .data = failure.body, .flags = exclusive });
+        errdefer self.remove(bus, failure.path, body_name);
+        const meta_file: std.Io.Dir.WriteFileOptions = .{
+            .sub_path = meta_name,
+            .data = json.written(),
+            .flags = exclusive,
+        };
+        self.dir.writeFile(self.io, meta_file) catch |err| {
+            // An exclusive create that failed part way may have left the file.
+            if (err != error.PathAlreadyExists) self.remove(bus, failure.path, meta_name);
+            return err;
+        };
         return meta_name;
     }
+
+    fn remove(self: *Capture, bus: *EventBus, path: []const u8, name: []const u8) void {
+        self.dir.deleteFile(self.io, name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                // The file stays and still counts against the cap after a
+                // restart, so the disk bound holds.
+                // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+                bus.warn(UpstreamFailureCaptureFailed{ .path = path, .err = @errorName(err) });
+            },
+        };
+    }
 };
+
+/// Dumps in `dir`: distinct stems of `.body` and `.json` files, so a dump
+/// missing either half still counts once.
+fn countDumps(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !u32 {
+    var stems: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var keys = stems.keyIterator();
+        while (keys.next()) |key| gpa.free(key.*);
+        stems.deinit(gpa);
+    }
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const stem = if (std.mem.endsWith(u8, entry.name, ".json"))
+            entry.name[0 .. entry.name.len - ".json".len]
+        else if (std.mem.endsWith(u8, entry.name, ".body"))
+            entry.name[0 .. entry.name.len - ".body".len]
+        else
+            continue;
+        const slot = try stems.getOrPut(gpa, stem);
+        if (!slot.found_existing) {
+            // The key still points into the iterator's buffer; replace it
+            // with an owned copy, or take the entry out before returning.
+            slot.key_ptr.* = gpa.dupe(u8, stem) catch |err| {
+                _ = stems.remove(stem);
+                return err;
+            };
+        }
+    }
+    return @intCast(stems.count());
+}
 
 const Meta = struct {
     unix_ms: i64,
@@ -373,7 +437,7 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
     const bus = noop_bus.eventBus();
 
     const path = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    var capture: Capture = try .open(io, bus, path, 1);
+    var capture: Capture = try .open(io, testing.allocator, bus, path, 1);
     defer capture.close();
     const body = "\x28\xb5\x2f\xfd compressed bytes";
     const failure: Failure = .{
@@ -437,7 +501,69 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
     }
 
     // A restart counts what is already on disk.
-    var reopened: Capture = try .open(io, bus, path, 1);
+    var reopened: Capture = try .open(io, testing.allocator, bus, path, 1);
     defer reopened.close();
     try testing.expect(!reopened.armed());
+}
+
+fn testFailure(body: []const u8) Failure {
+    return .{
+        .method = .POST,
+        .target = "/api/v2/logs",
+        .path = "/api/v2/logs",
+        .url = "https://intake/api/v2/logs",
+        .headers = &.{},
+        .framing = .content_length,
+        .body = body,
+        .declared_len = body.len,
+        .complete = true,
+        .status = 408,
+        .err = null,
+        .phase = "response",
+        .attempts = 1,
+        .retried_err = null,
+        .watchdog_fired = false,
+        .elapsed_ms = 1,
+    };
+}
+
+test "a failed write leaves no file behind and refunds its slot" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+    const bus = noop_bus.eventBus();
+
+    const path = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var capture: Capture = try .open(io, testing.allocator, bus, path, 1);
+    defer capture.close();
+    // A directory where the metadata file must go makes the second write fail
+    // after the body is on disk.
+    try capture.dir.createDir(io, "stuck.json", .default_dir);
+    try testing.expectError(error.PathAlreadyExists, capture.write(bus, arena, testFailure("payload"), "stuck", 1));
+    try testing.expectError(error.FileNotFound, capture.dir.statFile(io, "stuck.body", .{}));
+}
+
+test "a body orphaned by a crash still counts against the cap" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+    const bus = noop_bus.eventBus();
+    try tmp.dir.writeFile(io, .{ .sub_path = "1-0.body", .data = "orphan" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "2-0.body", .data = "whole" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "2-0.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "not a dump" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var capture: Capture = try .open(io, testing.allocator, bus, path, 2);
+    defer capture.close();
+    try testing.expectEqual(@as(u32, 2), capture.used.load(.monotonic));
+    try testing.expect(!capture.armed());
 }

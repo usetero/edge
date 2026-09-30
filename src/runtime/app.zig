@@ -280,7 +280,7 @@ pub const Engine = struct {
 
         self.lifecycle = .init;
         self.tap = .{ .io = io };
-        self.failure_capture = openFailureCapture(io, bus, options.failure_capture);
+        self.failure_capture = openFailureCapture(io, allocator, bus, options.failure_capture);
         errdefer if (self.failure_capture) |*capture| capture.close();
         self.shared_ctx = .{
             .io = io,
@@ -346,11 +346,12 @@ pub const Engine = struct {
 /// capture off with an error line: a debug aid must not stop the data plane.
 fn openFailureCapture(
     io: std.Io,
+    gpa: std.mem.Allocator,
     bus: *EventBus,
     config: config_types.FailureCaptureConfig,
 ) ?exec_mod.failure_capture_mod.Capture {
     const dir = config.dir orelse return null;
-    const capture = exec_mod.failure_capture_mod.Capture.open(io, bus, dir, config.max_dumps) catch |err| {
+    const capture = exec_mod.failure_capture_mod.Capture.open(io, gpa, bus, dir, config.max_dumps) catch |err| {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         bus.err(FailureCaptureUnavailable{ .dir = dir, .err = @errorName(err) });
         return null;
