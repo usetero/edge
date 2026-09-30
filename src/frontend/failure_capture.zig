@@ -167,7 +167,10 @@ pub const Capture = struct {
     wake: std.Io.Event = .unset,
     stopping: std.atomic.Value(bool) = .init(false),
     stopped: std.Io.Event = .unset,
-    writer: ?std.Thread = null,
+    writer: ?std.Io.Future(void) = null,
+    /// Test hook: every file write blocks, as on a stalled volume, until the
+    /// writer is canceled.
+    test_stall_writes: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
     /// Creates `path` when it is missing and counts the dumps already in it.
     /// `max_body_size` sizes the copy budget for streamed bodies. Call
@@ -204,24 +207,28 @@ pub const Capture = struct {
         };
     }
 
-    /// Starts the writer thread.
+    /// Starts the writer as an Io task, so `close` can interrupt it.
     pub fn start(self: *Capture) !void {
-        self.writer = try std.Thread.spawn(.{}, run, .{self});
+        self.writer = try self.io.concurrent(run, .{self});
     }
 
-    /// Stops the writer once it has written what is queued. A writer stuck
-    /// on a stalled volume keeps its jobs and the directory, and the process
-    /// exits without it.
+    /// Stops the writer, and returns only once it has stopped: the writer
+    /// uses this capture, its allocator, the bus and the directory, so none
+    /// of them may go before it. The writer gets 2 s to write what is queued.
+    /// After that it is canceled, which interrupts a write blocked on a
+    /// stalled volume, and it does no more disk work. A volume that ignores
+    /// the interrupt (an uninterruptible hard NFS mount) holds shutdown.
     pub fn close(self: *Capture) void {
-        if (self.writer) |thread| {
+        if (self.writer) |*writer| {
             self.stopping.store(true, .release);
             self.wake.set(self.io);
-            if (!self.waitStopped()) {
+            if (self.waitStopped()) {
+                writer.await(self.io);
+            } else {
                 // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
                 self.bus.warn(FailureCaptureStalled{ .dir = self.path, .queued = self.queue_count });
-                return;
+                writer.cancel(self.io);
             }
-            thread.join();
             self.writer = null;
         }
         while (self.dequeue()) |job| job.deinit(self.gpa);
@@ -390,37 +397,51 @@ pub const Capture = struct {
         return job;
     }
 
-    /// The writer thread: drain the queue, then sleep until woken.
+    /// The writer: drain the queue, then sleep until woken. Once `close` has
+    /// asked it to stop, a failed write ends all disk work: after a cancel,
+    /// the next disk call is not interrupted again, and on a stalled volume
+    /// it would block for good. A dump left half written then counts at the
+    /// next start.
     fn run(self: *Capture) void {
+        defer self.stopped.set(self.io);
         while (true) {
             self.wake.waitTimeout(self.io, idle_wait) catch |err| switch (err) {
-                // A timeout, a spurious wakeup or a cancel: look at the queue.
-                error.Timeout, error.Canceled => {},
+                // A timeout or a spurious wakeup: look at the queue.
+                error.Timeout => {},
+                error.Canceled => return self.dropQueued(),
             };
             // Reset before draining: a dump queued after this point sets the
             // event again, so no wakeup is lost.
             self.wake.reset();
             while (self.dequeue()) |job| {
-                self.writeJob(job);
+                const keep_going = self.writeJob(job);
                 job.deinit(self.gpa);
+                if (!keep_going) return self.dropQueued();
             }
-            if (self.stopping.load(.acquire)) break;
+            if (self.stopping.load(.acquire)) return;
             self.rescanIfFull();
         }
-        self.stopped.set(self.io);
     }
 
-    fn writeJob(self: *Capture, job: Job) void {
+    /// Frees what is still queued without writing it. Shutdown only.
+    fn dropQueued(self: *Capture) void {
+        while (self.dequeue()) |job| job.deinit(self.gpa);
+    }
+
+    /// Writes one dump. False when the writer must stop all disk work.
+    fn writeJob(self: *Capture, job: Job) bool {
         var name_buf: [64]u8 = undefined;
         const name = self.writeFiles(job, &name_buf) catch |err| {
-            self.refund();
             self.warnFailed(job.path, err);
-            return;
+            if (self.stopping.load(.acquire)) return false;
+            self.refund();
+            return true;
         };
         self.settle();
         self.drop_reported.store(false, .monotonic);
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         self.bus.warn(UpstreamFailureCaptured{ .path = job.path, .file = name });
+        return true;
     }
 
     /// The body goes first: a `.json` file means the dump is whole. Once the
@@ -431,6 +452,7 @@ pub const Capture = struct {
         const body_name = try std.fmt.bufPrint(&body_buf, "{s}.body", .{job.stem});
         const meta_name = try std.fmt.bufPrint(name_buf, "{s}.json", .{job.stem});
         const exclusive: std.Io.Dir.CreateFileOptions = .{ .exclusive = true, .permissions = file_permissions };
+        if (builtin.is_test and self.test_stall_writes) try self.io.sleep(.fromSeconds(60), .awake);
         try self.dir.writeFile(self.io, .{ .sub_path = body_name, .data = job.body, .flags = exclusive });
         errdefer self.remove(job.path, body_name);
         self.dir.writeFile(self.io, .{ .sub_path = meta_name, .data = job.meta, .flags = exclusive }) catch |err| {
@@ -901,4 +923,30 @@ test "deleting dumps from a full directory frees their slots" {
     try testing.expectEqual(@as(u32, 1), capture.used.load(.monotonic));
     try testing.expect(capture.armed());
     try testing.expect(!capture.full_reported.load(.monotonic));
+}
+
+test "close stops a writer stalled on the disk before it returns" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var capture: Capture = try .open(io, testing.allocator, noop_bus.eventBus(), path, 10, 1024);
+    capture.test_stall_writes = true;
+    try capture.start();
+    capture.record(arena_state.allocator(), testFailure("stalled"));
+    capture.record(arena_state.allocator(), testFailure("queued behind it"));
+
+    const started = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    capture.close();
+    const took_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() - started;
+    // The writer has returned, so nothing uses the capture after this; the
+    // testing allocator also checks that both jobs were freed.
+    try testing.expect(capture.writer == null);
+    try testing.expect(capture.stopped.isSet());
+    try testing.expect(took_ns < 10 * std.time.ns_per_s);
 }
