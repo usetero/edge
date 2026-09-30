@@ -517,13 +517,19 @@ creates it `0700` (and narrows it to `0700` if it already exists and the edge
 owns it) and writes every dump file `0600`.
 
 The request path never touches the disk. It builds a dump in memory and
-queues it, and one writer thread writes the files. At most 8 dumps wait in the
-queue; a dump that finds it full is dropped and logged as
-`upstream.failure.capture.dropped`, so a slow or stalled volume costs dumps,
-never requests. A streamed body is copied while it is sent, and at most 4
-such copies are held at once; past that, a streamed failure is dumped without
-its body (`complete: false`). Capture memory is therefore at most about
-12 x `max_body_size`.
+queues it, and one writer thread writes the files. At most 8 dumps are in
+flight (being prepared, queued or written); past that, a dump is dropped
+before anything is copied and logged as `upstream.failure.capture.dropped`, so
+a slow or stalled volume costs dumps, never requests or memory. A streamed
+body is copied while it is sent, and at most 4 such copies are held at once;
+past that, a streamed failure is dumped without its body (`complete: false`).
+Capture memory is therefore at most about 12 x `max_body_size`.
+
+A write that fails part way removes the file it made; if the removal fails
+too, the file keeps its slot. At shutdown the edge gives the writer 2 s to
+write what is queued, then interrupts it and waits for it to stop. A volume
+that ignores the interrupt (an uninterruptible hard NFS mount) holds
+shutdown.
 
 `max_dumps` caps the dumps in the directory, dumps from earlier runs included.
 A dump counts once for its `<unix_ms>-<seq>` stem, so a `.body` left without

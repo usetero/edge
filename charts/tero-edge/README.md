@@ -196,9 +196,12 @@ payload, so turn the capture on for an incident and off after it. The edge
 narrows the directory to `0700` and writes every dump file `0600`.
 
 Disk writes happen on a background thread, never on a request. At most 8
-dumps wait for the disk; past that, a dump is dropped and logged as
-`upstream.failure.capture.dropped`, so a stalled volume never holds traffic.
-Capture memory is at most about 12 x `config.maxBodySize`.
+dumps are in flight; past that, a dump is dropped before anything is copied
+and logged as `upstream.failure.capture.dropped`, so a stalled volume never
+holds traffic or memory. Capture memory is at most about
+12 x `config.maxBodySize`. At shutdown the edge gives the writer 2 s, then
+interrupts it and waits; a volume that ignores the interrupt holds
+shutdown, and the kubelet's grace period then applies.
 
 Each dump logs `upstream.failure.captured`. After `maxDumps` dumps, the edge
 logs `upstream.failure.capture.full` once and writes no more. The count
