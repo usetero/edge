@@ -203,6 +203,7 @@ pub const EngineOptions = struct {
     service_options: distro.ServiceOptions = .{},
     tap_enabled: bool = false,
     extension_sink: ?policy.ExtensionSink = null,
+    failure_capture: config_types.FailureCaptureConfig = .{},
 };
 
 pub const Engine = struct {
@@ -216,6 +217,7 @@ pub const Engine = struct {
     lifecycle: lifecycle_mod.Lifecycle,
     shared_ctx: exec_mod.SharedCtx,
     tap: exec_mod.TapState,
+    failure_capture: ?exec_mod.failure_capture_mod.Capture,
     server: frontend_select.Server,
 
     pub fn create(
@@ -278,6 +280,8 @@ pub const Engine = struct {
 
         self.lifecycle = .init;
         self.tap = .{ .io = io };
+        self.failure_capture = openFailureCapture(io, bus, options.failure_capture);
+        errdefer if (self.failure_capture) |*capture| capture.close();
         self.shared_ctx = .{
             .io = io,
             .gpa = allocator,
@@ -290,6 +294,7 @@ pub const Engine = struct {
             .metrics = metrics,
             .limits = self.limits,
             .tap = if (options.tap_enabled) &self.tap else null,
+            .failure_capture = if (self.failure_capture) |*capture| capture else null,
             .extension_sink = options.extension_sink,
         };
 
@@ -332,9 +337,37 @@ pub const Engine = struct {
         self.server.deinit();
         self.router.deinit();
         self.upstreams.deinit();
+        if (self.failure_capture) |*capture| capture.close();
         allocator.destroy(self);
     }
 };
+
+/// Opens the capture directory. A directory that cannot be opened turns the
+/// capture off with an error line: a debug aid must not stop the data plane.
+fn openFailureCapture(
+    io: std.Io,
+    bus: *EventBus,
+    config: config_types.FailureCaptureConfig,
+) ?exec_mod.failure_capture_mod.Capture {
+    const dir = config.dir orelse return null;
+    const capture = exec_mod.failure_capture_mod.Capture.open(io, dir, config.max_dumps) catch |err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        bus.err(FailureCaptureUnavailable{ .dir = dir, .err = @errorName(err) });
+        return null;
+    };
+    // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+    bus.warn(FailureCaptureEnabled{
+        .dir = dir,
+        .max_dumps = config.max_dumps,
+        .existing = capture.used.load(.monotonic),
+    });
+    return capture;
+}
+
+/// Failed upstream requests are dumped to `dir`. Warn level: the dumps hold
+/// customer payloads.
+const FailureCaptureEnabled = struct { dir: []const u8, max_dumps: u32, existing: u32 };
+const FailureCaptureUnavailable = struct { dir: []const u8, err: []const u8 };
 
 pub fn serviceKindsFor(distribution: mode.Distribution) []const distro.ServiceKind {
     return switch (distribution) {
@@ -475,6 +508,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
         },
         .tap_enabled = config.tap_enabled,
         .extension_sink = extension_sink,
+        .failure_capture = config.failure_capture,
     });
     defer engine.destroy();
 

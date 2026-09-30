@@ -34,6 +34,7 @@ pub const frontend_stdio_deadline_reader = @import("frontend/stdio/deadline_read
 pub const frontend_stdio_head_repair = @import("frontend/stdio/head_repair.zig");
 pub const frontend_httpz_server = @import("frontend/httpz/server.zig");
 pub const frontend_exchange = @import("frontend/exchange.zig");
+pub const frontend_failure_capture = @import("frontend/failure_capture.zig");
 pub const frontend_paths = @import("frontend/paths.zig");
 pub const frontend_endpoints = @import("frontend/endpoints.zig");
 pub const frontend_thread_bufs = @import("frontend/thread_bufs.zig");
@@ -109,6 +110,7 @@ test {
     _ = @import("frontend/stdio/server.zig");
     _ = @import("frontend/httpz/server.zig");
     _ = @import("frontend/exchange.zig");
+    _ = @import("frontend/failure_capture.zig");
     _ = @import("frontend/paths.zig");
     _ = @import("frontend/endpoints.zig");
     _ = @import("frontend/thread_bufs.zig");

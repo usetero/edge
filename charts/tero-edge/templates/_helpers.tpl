@@ -93,3 +93,19 @@ Validate top-level Tero auth config.
 {{- fail "Set either tero.apiKey or tero.existingSecret.name, not both." -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+The failure capture volume source. With no volume set, an emptyDir whose
+sizeLimit holds maxDumps full bodies plus 16 MiB for the metadata files: the
+kubelet evicts a pod whose emptyDir grows past its limit.
+*/}}
+{{- define "tero-edge.failureCaptureVolume" -}}
+{{- if .Values.failureCapture.volume -}}
+{{- toYaml .Values.failureCapture.volume -}}
+{{- else -}}
+{{- $bytes := mul (int .Values.failureCapture.maxDumps) (int .Values.config.maxBodySize) -}}
+{{- $mib := add (div (add $bytes 1048575) 1048576) 16 -}}
+emptyDir:
+  sizeLimit: {{ printf "%dMi" $mib }}
+{{- end -}}
+{{- end }}

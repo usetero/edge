@@ -115,6 +115,10 @@ Provide auth either via:
 | `config.fileProvider.path`          | string | `/etc/tero/policies.json`                      | File policy path                                              |
 | `config.extraPolicyProviders`       | list   | `[]`                                           | Additional raw policy providers                               |
 | `policiesJSON`                      | list   | `[]`                                           | List of raw JSON policy objects (supports multiline strings)  |
+| `failureCapture.enabled`            | bool   | `false`                                        | Dump failed upstream requests (see Failure capture)           |
+| `failureCapture.maxDumps`           | int    | `20`                                           | Dumps kept on the volume, earlier runs included               |
+| `failureCapture.path`               | string | `/var/lib/tero/failure-capture`                | Mount path of the capture volume                              |
+| `failureCapture.volume`             | object | `{}`                                           | Volume source; empty uses a sized emptyDir                    |
 | `extraEnv`                          | list   | `[]`                                           | Extra container env vars                                      |
 | `extraVolumes`                      | list   | `[]`                                           | Extra pod volumes                                             |
 | `extraVolumeMounts`                 | list   | `[]`                                           | Extra container volume mounts                                 |
@@ -156,6 +160,51 @@ carry a `threadPoolCount` from an older chart, drop it.
 
 If a pod is OOMKilled with nothing in its logs, look at peak
 `edge_connections_active` first. The kernel gives the process no chance to log.
+
+## Failure capture
+
+To see exactly what the edge sent when an upstream request failed, turn on the
+failure capture:
+
+```yaml
+failureCapture:
+  enabled: true
+```
+
+On an upstream 408, or on a transport failure (reset, refused dial, watchdog
+timeout), the edge writes two files to `failureCapture.path`:
+
+- `<unix_ms>-<seq>.body` holds the body as the edge sent it, still compressed.
+- `<unix_ms>-<seq>.json` holds the method, URL, headers, outcome and body
+  framing. `outcome.watchdog_fired` tells you if the edge's own 30s deadline
+  fired first. `body.complete` is `false` when the edge held less than the
+  whole body, for example when the sender quit mid-body.
+
+A header or query parameter whose name looks like a credential (`key`,
+`token`, `secret`, `auth`, `cookie`, `password`, `signature`, `session`,
+`credential`) keeps its name and loses its value. The body is not redacted:
+it is the customer's payload, so turn the capture on for an incident and off
+after it.
+
+Each dump logs `upstream.failure.captured`. After `maxDumps` dumps, the edge
+logs `upstream.failure.capture.full` once and writes no more. The count
+includes dumps from earlier container runs, so a crash loop cannot fill the
+disk. Delete dumps to capture again. If the directory cannot be opened, the
+edge logs `failure.capture.unavailable` and serves traffic without capture.
+
+The default volume is an `emptyDir` with a `sizeLimit` of
+`maxDumps x config.maxBodySize` plus 16 MiB, so a full directory cannot get the
+pod evicted. An `emptyDir` survives a container restart, not a pod
+replacement. Set `failureCapture.volume` to keep dumps longer. If you set
+`resources.limits.ephemeral-storage`, leave room for the capture volume.
+
+Copy the dumps out of a pod:
+
+```bash
+kubectl cp -n tero-system <pod>:/var/lib/tero/failure-capture ./dumps
+```
+
+The repository README shows how to replay a dump.
 
 ## Notes
 

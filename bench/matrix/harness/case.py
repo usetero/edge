@@ -21,6 +21,7 @@ Class attributes a case may set:
     EDGE_POLICIES   policy document to load, so the decode path runs
     INTAKE_LATENCY  intake round trip, in milliseconds
     SLOW            true when the case waits for a 30 s deadline
+    CAPTURE_MAX_DUMPS  turns the failure capture on, in `self.captures`
     EXPECT_SHED     true when the case shed connections on purpose
     DEFECTS         {frontend: note} for behaviour we know is wrong today
 
@@ -49,6 +50,7 @@ import time
 import unittest
 
 from . import agent
+from .capture import CaptureDir
 from .procs import Edge, EchoIntake
 from .raw import RawClient, request_head
 
@@ -66,6 +68,9 @@ class MatrixCase(unittest.TestCase):
     EDGE_POLICIES: dict | None = None
     INTAKE_LATENCY: int = 0
     SLOW: bool = False
+    #: Turns on the failure capture with this many dumps, in a fresh
+    #: directory at `self.captures`.
+    CAPTURE_MAX_DUMPS: int | None = None
     EXPECT_SHED: bool = False
     DEFECTS: dict = {}
     #: The case ends the edge process itself, so the post-case invariants that
@@ -139,6 +144,11 @@ class MatrixCase(unittest.TestCase):
         if os.environ.get("MATRIX_FAST") and self.SLOW:
             self.skipTest("slow case; unset MATRIX_FAST to run it")
         self.intake = EchoIntake(latency_ms=self.INTAKE_LATENCY)
+        self.captures = None
+        self.edge_env = dict(self.EDGE_ENV)
+        if self.CAPTURE_MAX_DUMPS is not None:
+            self.captures = CaptureDir(self.CAPTURE_MAX_DUMPS)
+            self.edge_env.update(self.captures.env())
         config = dict(self.EDGE_CONFIG)
         if self.EDGE_POLICIES is not None:
             handle = tempfile.NamedTemporaryFile("w", suffix=".policies.json", delete=False)
@@ -147,10 +157,13 @@ class MatrixCase(unittest.TestCase):
             self._policy_path = handle.name
             config["policy_providers"] = [{"id": "file", "type": "file", "path": handle.name}]
         try:
-            self.edge = Edge(self.intake.url, config, self.EDGE_ENV)
+            self.edge = Edge(self.intake.url, config, self.edge_env)
         except Exception:
             self.intake.stop()
+            if self.captures is not None:
+                self.captures.remove()
             raise
+        self.edge_config = config
         # A stdio build without --prefix overwrites the httpz binary, which
         # would silently test one frontend twice. The edge reports its own
         # frontend, so trust that, not the path.
@@ -177,6 +190,8 @@ class MatrixCase(unittest.TestCase):
         finally:
             self.edge.stop()
             self.intake.stop()
+            if self.captures is not None:
+                self.captures.remove()
 
     # ---------------------------------------------------------------- senders
 

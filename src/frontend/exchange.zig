@@ -10,6 +10,7 @@ const upstream_mod = @import("upstream.zig");
 const pipeline_mod = @import("../pipeline/pipeline.zig");
 const thread_bufs = @import("thread_bufs.zig");
 const limits_mod = @import("../core/limits.zig");
+const failure_capture = @import("failure_capture.zig");
 
 const ThreadBufs = thread_bufs.ThreadBufs;
 
@@ -24,6 +25,8 @@ const UpstreamEarlyResponse = struct { path: []const u8, status: u16, err: []con
 /// request reports a generic transport failure, and nothing names the stalled
 /// intake as the cause.
 const UpstreamTimedOut = struct { path: []const u8, phase: []const u8 };
+/// The failure dump could not be written. The request still fails as it did.
+const UpstreamFailureCaptureFailed = struct { path: []const u8, err: []const u8 };
 /// A dial slow enough to matter. `std.http.Client` takes no connect timeout,
 /// so a stalled dial holds its handler thread and the watchdog has no socket
 /// to interrupt; this line is the only way to see one.
@@ -169,6 +172,105 @@ pub fn exchange(
     body: BodySource,
     replayable: bool,
 ) !void {
+    const capture = ctx.failure_capture orelse return exchangeAttempts(ctx, in, sink, choice, body, replayable, null);
+
+    // A streamed body is gone once it is sent, so keep a copy while it goes.
+    // A full capture directory skips the copy; the failure still reaches
+    // `record`, which reports the full directory.
+    var tee: ?failure_capture.Tee = null;
+    const sent: BodySource = switch (body) {
+        .bytes => body,
+        .stream => |st| if (!capture.armed()) body else blk: {
+            tee = .{ .inner = st.reader, .copy = try .initCapacity(in.arena, st.len) };
+            break :blk .{ .stream = .{ .reader = &tee.?.interface, .len = st.len } };
+        },
+    };
+    const started_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
+    var report: Report = .{};
+    exchangeAttempts(ctx, in, sink, choice, sent, replayable, &report) catch |err| {
+        recordFailure(ctx, capture, in, choice, body, if (tee) |*t| t else null, report, err, started_ns);
+        return err;
+    };
+    if (report.status == 408) {
+        recordFailure(ctx, capture, in, choice, body, if (tee) |*t| t else null, report, null, started_ns);
+    }
+}
+
+/// What `exchangeAttempts` saw, for a failure dump.
+const Report = struct {
+    phase: []const u8 = "dial",
+    status: ?u16 = null,
+    attempts: usize = 0,
+    retried_err: ?anyerror = null,
+};
+
+fn recordFailure(
+    ctx: *exec.SharedCtx,
+    capture: *failure_capture.Capture,
+    in: Inbound,
+    choice: service_mod.UpstreamChoice,
+    body: BodySource,
+    /// Null for a buffered body, or when the directory was full at the start.
+    tee: ?*failure_capture.Tee,
+    report: Report,
+    err: ?anyerror,
+    started_ns: i96,
+) void {
+    const elapsed_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds() - started_ns;
+    const url = exec.upstreamUri(ctx, in.arena, in.target, choice) catch |uri_err| {
+        // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
+        ctx.bus.warn(UpstreamFailureCaptureFailed{ .path = in.path, .err = @errorName(uri_err) });
+        return;
+    };
+    const has_body = in.method.requestHasBody();
+    const bytes, const complete = switch (body) {
+        .bytes => |b| .{ b, true },
+        .stream => |st| if (tee) |t|
+            .{ t.copy.written(), !t.copy_failed and t.copy.written().len == st.len }
+        else
+            .{ "", false },
+    };
+    const declared: usize = switch (body) {
+        .bytes => |b| b.len,
+        .stream => |st| st.len,
+    };
+    const watchdog_fired = if (thread_bufs.get(ctx.io, ctx.gpa, ctx.limits)) |bufs|
+        bufs.timed_out.load(.acquire)
+    else |_|
+        false;
+    capture.record(ctx.bus, in.arena, .{
+        .method = in.method,
+        .target = in.target,
+        .path = in.path,
+        .url = url,
+        .headers = in.headers,
+        .framing = if (has_body) .content_length else .none,
+        .body = bytes,
+        .declared_len = if (has_body) declared else null,
+        .complete = complete,
+        .status = report.status,
+        .err = if (err) |e| @errorName(e) else null,
+        .phase = report.phase,
+        .attempts = report.attempts,
+        .retried_err = if (report.retried_err) |e| @errorName(e) else null,
+        .watchdog_fired = watchdog_fired,
+        .elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms,
+    });
+}
+
+/// The attempt loop behind `exchange`. `report`, when set, records how far
+/// the exchange got.
+fn exchangeAttempts(
+    ctx: *exec.SharedCtx,
+    in: Inbound,
+    sink: anytype,
+    choice: service_mod.UpstreamChoice,
+    body: BodySource,
+    replayable: bool,
+    report_out: ?*Report,
+) !void {
+    var unused: Report = .{};
+    const report = report_out orelse &unused;
     const bufs = try thread_bufs.get(ctx.io, ctx.gpa, ctx.limits);
     if (body == .stream) _ = try bufs.ensurePump(ctx.gpa);
     const retry = body == .bytes and (replayable or in.method == .GET or in.method == .HEAD);
@@ -176,11 +278,14 @@ pub fn exchange(
     for (0..attempts) |attempt| {
         const client = if (attempt == 0) ctx.upstreams.getHttpClient() else &ctx.upstreams.retry_client;
         if (ctx.metrics) |metrics| metrics.recordUpstreamAttempt(attempt > 0);
+        report.attempts = attempt + 1;
+        report.phase = "dial";
         var upstream_req = try dialUpstream(ctx, in, choice, client);
         defer upstream_req.deinit();
         thread_bufs.trackUpstream(ctx.io, bufs, upstream_req.connection);
         defer thread_bufs.trackUpstream(ctx.io, bufs, null);
 
+        report.phase = "send_or_head";
         var upstream_res = sendAndReceiveHead(&upstream_req, in.method, body, bufs) catch |err| blk: {
             // An intake that rejects a request answers as soon as it has seen
             // the headers and stops reading, so our write fails while its
@@ -205,9 +310,12 @@ pub fn exchange(
             if (attempt + 1 == attempts) return error.UpstreamTransportFailed;
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             ctx.bus.info(UpstreamRetried{ .path = in.path, .err = @errorName(err) });
+            report.retried_err = err;
             continue;
         };
+        report.status = @intFromEnum(upstream_res.head.status);
 
+        report.phase = "relay";
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(choice));
         relayResponse(sink, in.arena, &upstream_res, max_response, bufs) catch |err| {
             if (bufs.timed_out.load(.acquire)) {
@@ -224,6 +332,7 @@ pub fn exchange(
             }
             return err;
         };
+        report.phase = "response";
         return;
     }
     unreachable;

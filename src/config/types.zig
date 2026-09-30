@@ -91,6 +91,19 @@ pub const S3DumpConfig = struct {
     }
 };
 
+/// Opt-in dumps of failed upstream requests. See
+/// frontend/failure_capture.zig. Env: `TERO_FAILURE_CAPTURE_DIR`,
+/// `TERO_FAILURE_CAPTURE_MAX_DUMPS`.
+pub const FailureCaptureConfig = struct {
+    /// Directory for the dumps. Null turns the capture off. The dumps hold
+    /// customer payloads, so give the directory the same care as the tap.
+    dir: ?[]const u8 = null,
+    /// Dumps kept in `dir`, the dumps of earlier runs included. The disk cost
+    /// is at most `max_dumps` times `max_body_size`, plus a small `.json` file
+    /// for each dump.
+    max_dumps: u32 = 20,
+};
+
 /// Main proxy configuration - loadable via zonfig
 pub const ProxyConfig = struct {
     // Network config
@@ -130,6 +143,8 @@ pub const ProxyConfig = struct {
     /// default — this exposes customer payloads, so only enable on a trusted
     /// listener.
     tap_enabled: bool = false,
+
+    failure_capture: FailureCaptureConfig = .{},
 
     // Policy providers - array of provider configurations
     policy_providers: []ProviderConfig = &.{},

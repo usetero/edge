@@ -40,6 +40,31 @@ extraEnv: []
 extraVolumes: []
 extraVolumeMounts: []
 
+# Opt-in dumps of failed upstream requests, for replay. On an upstream 408, or
+# on a transport failure (reset, refused dial, watchdog timeout), the edge
+# writes the body it sent, still compressed, and a .json file with the method,
+# URL, headers and outcome. Credentials in headers and query parameters are
+# redacted. The dumps hold customer payloads: turn this on for an incident and
+# off after it.
+failureCapture:
+  enabled: false
+  # Dumps kept in the directory, dumps from earlier container runs on the same
+  # volume included. When it is full, the edge warns once and writes no more.
+  # Delete dumps to capture again.
+  maxDumps: 20
+  # Mount path of the capture volume in the container.
+  path: /var/lib/tero/failure-capture
+  # The volume for the dumps. Empty uses an emptyDir sized for
+  # maxDumps x config.maxBodySize plus 16 MiB, so a full directory never
+  # exceeds its sizeLimit and never gets the pod evicted. An emptyDir survives
+  # a container restart, not a pod replacement. Set any volume source here,
+  # for example:
+  #   volume:
+  #     hostPath:
+  #       path: /var/lib/tero-edge/failure-capture
+  #       type: DirectoryOrCreate
+  volume: {}
+
 service:
   enabled: false
   type: ClusterIP
