@@ -219,6 +219,24 @@ pub fn sensitiveName(name: []const u8) bool {
     return false;
 }
 
+/// A query parameter name that may carry a credential. The name is checked
+/// as written and after percent-decoding, repeated, so `dd-api-%6b%65%79`
+/// is caught. A name too long to decode here is treated as sensitive.
+fn sensitiveQueryName(name: []const u8) bool {
+    if (sensitiveName(name)) return true;
+    var buf: [256]u8 = undefined;
+    if (name.len > buf.len) return true;
+    @memcpy(buf[0..name.len], name);
+    var decoded: []u8 = buf[0..name.len];
+    while (std.mem.findScalar(u8, decoded, '%') != null) {
+        const next = std.Uri.percentDecodeInPlace(decoded);
+        if (next.len == decoded.len) break; // nothing left that decodes
+        decoded = next;
+        if (sensitiveName(decoded)) return true;
+    }
+    return false;
+}
+
 /// `url` with the value of every sensitive query parameter replaced.
 pub fn redactQuery(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     const q = std.mem.findScalar(u8, url, '?') orelse return url;
@@ -230,7 +248,7 @@ pub fn redactQuery(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
         if (!first) try out.writer.writeByte('&');
         first = false;
         const eq = std.mem.findScalar(u8, param, '=') orelse param.len;
-        if (eq < param.len and sensitiveName(param[0..eq])) {
+        if (eq < param.len and sensitiveQueryName(param[0..eq])) {
             try out.writer.print("{s}={s}", .{ param[0..eq], redacted });
         } else {
             try out.writer.writeAll(param);
@@ -299,6 +317,20 @@ test "credential names are redacted, other names are kept" {
     defer testing.allocator.free(url);
     try testing.expectEqualStrings("https://h/api/v2/logs?dd-api-key=[redacted]&ddsource=x&flag", url);
     try testing.expectEqualStrings("https://h/p", try redactQuery(testing.allocator, "https://h/p"));
+}
+
+test "percent-encoded query names are redacted" {
+    const cases = [_][2][]const u8{
+        .{ "https://h/p?dd-api-%6b%65%79=SECRET", "https://h/p?dd-api-%6b%65%79=[redacted]" },
+        .{ "https://h/p?dd-api-%256b%2565%2579=SECRET", "https://h/p?dd-api-%256b%2565%2579=[redacted]" },
+        .{ "https://h/p?%41uthorization=SECRET&x=1", "https://h/p?%41uthorization=[redacted]&x=1" },
+        .{ "https://h/p?ddsource=%6bey", "https://h/p?ddsource=%6bey" },
+    };
+    for (cases) |case| {
+        const url = try redactQuery(testing.allocator, case[0]);
+        defer testing.allocator.free(url);
+        try testing.expectEqualStrings(case[1], url);
+    }
 }
 
 test "the tee forwards every byte and keeps a copy" {
