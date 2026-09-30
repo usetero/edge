@@ -171,6 +171,10 @@ pub const Capture = struct {
     /// Test hook: every file write blocks, as on a stalled volume, until the
     /// writer is canceled.
     test_stall_writes: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// Test hook: every file write stops half way with `NoSpaceLeft`.
+    test_short_write: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// Test hook: removing a failed write's file fails.
+    test_remove_fails: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
     /// Creates `path` when it is missing and counts the dumps already in it.
     /// `max_body_size` sizes the copy budget for streamed bodies. Call
@@ -431,10 +435,13 @@ pub const Capture = struct {
     /// Writes one dump. False when the writer must stop all disk work.
     fn writeJob(self: *Capture, job: Job) bool {
         var name_buf: [64]u8 = undefined;
-        const name = self.writeFiles(job, &name_buf) catch |err| {
+        var left = false;
+        const name = self.writeFiles(job, &name_buf, &left) catch |err| {
             self.warnFailed(job.path, err);
             if (self.stopping.load(.acquire)) return false;
-            self.refund();
+            // A file that could not be removed is still on disk, so its slot
+            // stays spent: refunding it would let the directory outgrow the cap.
+            if (left) self.settle() else self.refund();
             return true;
         };
         self.settle();
@@ -444,31 +451,46 @@ pub const Capture = struct {
         return true;
     }
 
-    /// The body goes first: a `.json` file means the dump is whole. Once the
-    /// body file exists, a failure removes both files, so a refunded slot
-    /// never leaves bytes behind.
-    fn writeFiles(self: *Capture, job: Job, name_buf: *[64]u8) ![]const u8 {
+    /// The body goes first: a `.json` file means the dump is whole. Each file
+    /// is removed on failure from the moment it exists, so a write that
+    /// fails part way leaves nothing. `left` is set when a file could not be
+    /// removed.
+    fn writeFiles(self: *Capture, job: Job, name_buf: *[64]u8, left: *bool) ![]const u8 {
         var body_buf: [64]u8 = undefined;
         const body_name = try std.fmt.bufPrint(&body_buf, "{s}.body", .{job.stem});
         const meta_name = try std.fmt.bufPrint(name_buf, "{s}.json", .{job.stem});
-        const exclusive: std.Io.Dir.CreateFileOptions = .{ .exclusive = true, .permissions = file_permissions };
         if (builtin.is_test and self.test_stall_writes) try self.io.sleep(.fromSeconds(60), .awake);
-        try self.dir.writeFile(self.io, .{ .sub_path = body_name, .data = job.body, .flags = exclusive });
-        errdefer self.remove(job.path, body_name);
-        self.dir.writeFile(self.io, .{ .sub_path = meta_name, .data = job.meta, .flags = exclusive }) catch |err| {
-            // An exclusive create that failed part way may have left the file.
-            if (err != error.PathAlreadyExists) self.remove(job.path, meta_name);
-            return err;
-        };
+        try self.writeNew(job.path, body_name, job.body, left);
+        errdefer self.discard(job.path, body_name, left);
+        try self.writeNew(job.path, meta_name, job.meta, left);
         return meta_name;
     }
 
-    fn remove(self: *Capture, path: []const u8, name: []const u8) void {
+    /// Creates `name` and writes `data` to it, and removes the file again if
+    /// the write fails after the create.
+    fn writeNew(self: *Capture, path: []const u8, name: []const u8, data: []const u8, left: *bool) !void {
+        const file = try self.dir.createFile(self.io, name, .{ .exclusive = true, .permissions = file_permissions });
+        errdefer self.discard(path, name, left);
+        defer file.close(self.io);
+        if (builtin.is_test and self.test_short_write) {
+            try file.writeStreamingAll(self.io, data[0 .. data.len / 2]);
+            return error.NoSpaceLeft;
+        }
+        try file.writeStreamingAll(self.io, data);
+    }
+
+    /// Removes a file a failed write left. Sets `left` when the file stays.
+    /// During shutdown the file stays: the writer does no more disk work,
+    /// and the file counts against the cap at the next start.
+    fn discard(self: *Capture, path: []const u8, name: []const u8, left: *bool) void {
+        if (self.stopping.load(.acquire) or (builtin.is_test and self.test_remove_fails)) {
+            left.* = true;
+            return;
+        }
         self.dir.deleteFile(self.io, name) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {
-                // The file stays and still counts against the cap after a
-                // restart, so the disk bound holds.
+                left.* = true;
                 self.warnFailed(path, err);
             },
         };
@@ -851,8 +873,10 @@ test "a failed write leaves no file behind and refunds its slot" {
         .meta = try arena.dupe(u8, "{}"),
     };
     var name_buf: [64]u8 = undefined;
-    try testing.expectError(error.PathAlreadyExists, capture.writeFiles(job, &name_buf));
+    var left = false;
+    try testing.expectError(error.PathAlreadyExists, capture.writeFiles(job, &name_buf, &left));
     try testing.expectError(error.FileNotFound, capture.dir.statFile(io, "stuck.body", .{}));
+    try testing.expect(!left);
 }
 
 test "a body orphaned by a crash still counts against the cap" {
@@ -949,4 +973,43 @@ test "close stops a writer stalled on the disk before it returns" {
     try testing.expect(capture.writer == null);
     try testing.expect(capture.stopped.isSet());
     try testing.expect(took_ns < 10 * std.time.ns_per_s);
+}
+
+test "a write that fails part way removes its file, or keeps its slot" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var noop_bus: o11y.NoopEventBus = undefined;
+    noop_bus.init(io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var capture: Capture = try .open(io, testing.allocator, noop_bus.eventBus(), path, 1, 1024);
+    defer capture.close();
+    capture.test_short_write = true;
+    const job: Job = .{
+        .stem = try arena.dupe(u8, "short"),
+        .path = try arena.dupe(u8, "/api/v2/logs"),
+        .body = try arena.dupe(u8, "payload bytes"),
+        .meta = try arena.dupe(u8, "{}"),
+    };
+
+    // The body file is created, half written, then the disk is full: the
+    // file goes, and the slot comes back.
+    try testing.expect(capture.reserve());
+    try testing.expect(capture.writeJob(job));
+    try testing.expectError(error.FileNotFound, capture.dir.statFile(io, "short.body", .{}));
+    try testing.expectEqual(@as(u32, 0), capture.used.load(.monotonic));
+
+    // The same, but the file cannot be removed: it stays on disk and keeps
+    // its slot, so the directory cannot outgrow the cap.
+    capture.test_remove_fails = true;
+    try testing.expect(capture.reserve());
+    try testing.expect(capture.writeJob(job));
+    _ = try capture.dir.statFile(io, "short.body", .{});
+    try testing.expectEqual(@as(u32, 1), capture.used.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), capture.pending);
+    try testing.expect(!capture.armed());
 }
