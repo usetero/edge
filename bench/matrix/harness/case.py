@@ -71,6 +71,9 @@ class MatrixCase(unittest.TestCase):
     #: Turns on the failure capture with this many dumps, in a fresh
     #: directory at `self.captures`.
     CAPTURE_MAX_DUMPS: int | None = None
+    #: Set by `setUp`. The class default keeps `tearDown` working for a case
+    #: that replaces `setUp` (c09, d04).
+    captures: CaptureDir | None = None
     EXPECT_SHED: bool = False
     DEFECTS: dict = {}
     #: The case ends the edge process itself, so the post-case invariants that
