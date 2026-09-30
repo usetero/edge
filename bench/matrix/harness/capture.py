@@ -26,15 +26,28 @@ class Dump:
 
 
 class CaptureDir:
-    def __init__(self, max_dumps: int):
+    def __init__(self, max_dumps: int, seed: dict | None = None):
         self.path = tempfile.mkdtemp(suffix=".failure-capture")
+        # Open to everyone, the way a Kubernetes emptyDir starts, so every
+        # case also checks that the edge narrows the directory.
+        os.chmod(self.path, 0o777)
         self.max_dumps = max_dumps
+        for name, data in (seed or {}).items():
+            with open(os.path.join(self.path, name), "wb") as handle:
+                handle.write(data)
 
     def env(self) -> dict:
         return {
             "TERO_FAILURE_CAPTURE_DIR": self.path,
             "TERO_FAILURE_CAPTURE_MAX_DUMPS": str(self.max_dumps),
         }
+
+    def names(self) -> list[str]:
+        return sorted(os.listdir(self.path))
+
+    def clear(self) -> None:
+        for name in os.listdir(self.path):
+            os.unlink(os.path.join(self.path, name))
 
     def dumps(self) -> list[Dump]:
         """Every whole dump, oldest first. A `.body` without its `.json` is
