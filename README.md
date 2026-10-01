@@ -435,6 +435,8 @@ OTLP distribution.
 - `log_level` - Logging level (trace, debug, info, warn, err)
 - `policy_providers` - List of policy sources (file/http)
 - `max_body_size` - Request/response body limits
+- `failure_capture` - (Optional) Dumps of failed upstream requests; see
+  Failure capture below
 
 ### Example OTLP Configuration (`config-otlp.json`):
 
@@ -463,6 +465,74 @@ OTLP distribution.
 ### Environment Variables:
 
 - `TERO_LOG_LEVEL` - Override log level (trace, debug, info, warn, err)
+- `TERO_FAILURE_CAPTURE_DIR` / `TERO_FAILURE_CAPTURE_MAX_DUMPS` - Turn on
+  the failure capture without a config change
+
+### Failure capture
+
+The failure capture keeps a replayable copy of every upstream request that
+failed. It is off by default. Turn it on with a directory:
+
+```json
+{
+  "failure_capture": { "dir": "/var/lib/tero/failure-capture", "max_dumps": 20 }
+}
+```
+
+The edge writes a dump when:
+
+- the upstream answers 408, or 400 or 413. The Datadog agent drops a batch
+  for good on 400 and 413, so the dump is the only copy left. 401 and 403 are
+  about the key, not the batch, and write nothing.
+- the upstream exchange fails (reset, refused dial, watchdog timeout). A
+  sender that left before the answer reached it is not an upstream failure
+  and writes nothing.
+- a policy stage cannot read a batch and forwards it untouched. The forward
+  usually succeeds, so this dump keeps the input that broke the decoder. If
+  the forward then fails too, that failure writes a second dump.
+
+A dump is two files:
+
+- `<unix_ms>-<seq>.body` - the body as the edge sent it, still compressed.
+  When a policy changed the batch, this is the changed batch, not the inbound
+  one.
+- `<unix_ms>-<seq>.json` - `method`, `url`, `target`, `headers`, and:
+  - `outcome` - `status` or `err`, `phase` (`dial`, `send_or_head`, `relay`
+    or `response`, or `policy_probe`, `policy_encode` or `policy_buffered`
+    for a batch a policy could not read), `attempts`, `retried_err`,
+    `watchdog_fired` and `elapsed_ms`.
+  - `body` - `framing`, `declared_bytes`, `captured_bytes` and `complete`.
+    `complete` is `false` when the edge held less than the whole body, for
+    example when the sender quit while the body streamed.
+
+A dump shows what the edge meant to send. It does not prove what reached the
+intake. A success, a retry that recovered, and any other status write
+nothing.
+
+Headers and query parameters whose names look like credentials keep their
+names and lose their values. The body is not redacted, so treat the directory
+like the customer data it holds.
+
+`max_dumps` caps the `.json` files in the directory, dumps from earlier runs
+included. The disk cost is at most `max_dumps` x `max_body_size`. When the
+directory is full, the edge logs `upstream.failure.capture.full` once. If it
+cannot open the directory, it logs `failure.capture.unavailable` and runs
+without capture. The Helm chart sets all of this with `failureCapture` (see
+`charts/tero-edge/README.md`).
+
+To replay a dump, send its body with its headers and put the redacted
+credential back:
+
+```bash
+dump=1790801655318-0
+headers=()
+while IFS= read -r header; do headers+=(-H "$header"); done < <(
+  jq -r '.headers[] | select(.value != "[redacted]") | "\(.name): \(.value)"' "$dump.json")
+curl -sS -X "$(jq -r .method "$dump.json")" "$(jq -r .url "$dump.json")" \
+  "${headers[@]}" -H "DD-API-KEY: $DD_API_KEY" --data-binary "@$dump.body"
+```
+
+If the URL has a redacted query parameter, replace `[redacted]` in it first.
 
 ## Sizing
 

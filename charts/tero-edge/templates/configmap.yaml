@@ -24,6 +24,12 @@ data:
       {{- with .Values.config.threadPoolCount }}
       "thread_pool_count": {{ int . }},
       {{- end }}
+      {{- if .Values.failureCapture.enabled }}
+      "failure_capture": {
+        "dir": {{ .Values.failureCapture.path | quote }},
+        "max_dumps": {{ int .Values.failureCapture.maxDumps }}
+      },
+      {{- end }}
       {{- $svc := dict }}
       {{- with .Values.config.service }}
       {{- if .name }}{{ $svc = set $svc "name" .name }}{{ end }}

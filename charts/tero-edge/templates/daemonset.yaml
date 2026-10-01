@@ -71,6 +71,10 @@ spec:
             - name: tero-edge-config
               mountPath: /etc/tero
               readOnly: true
+            {{- if .Values.failureCapture.enabled }}
+            - name: failure-capture
+              mountPath: {{ .Values.failureCapture.path }}
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -78,6 +82,10 @@ spec:
         - name: tero-edge-config
           configMap:
             name: {{ include "tero-edge.fullname" . }}-config
+        {{- if .Values.failureCapture.enabled }}
+        - name: failure-capture
+          {{- include "tero-edge.failureCaptureVolume" . | nindent 10 }}
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

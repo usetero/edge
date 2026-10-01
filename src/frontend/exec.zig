@@ -18,6 +18,7 @@ const codec = @import("../codec/root.zig");
 const thread_bufs = @import("thread_bufs.zig");
 const framer_mod = @import("../pipeline/framer.zig");
 const tap_mod = @import("../pipeline/tap.zig");
+pub const failure_capture_mod = @import("failure_capture.zig");
 const limits_mod = @import("../core/limits.zig");
 const runtime_metrics_mod = @import("../runtime/runtime_metrics.zig");
 const dd_logs = @import("../signals/datadog/logs.zig");
@@ -72,6 +73,9 @@ pub const SharedCtx = struct {
     limits: limits_mod.Limits,
     /// Debug tap, or null when disabled by config. See `TapState`.
     tap: ?*TapState = null,
+    /// Dumps of failed upstream requests, or null when disabled by config.
+    /// See failure_capture.zig.
+    failure_capture: ?*failure_capture_mod.Capture = null,
     /// Extension dispatch sink (s3-dump), or null when extensions are off.
     /// Threaded into per-record policy evaluation on the Datadog log path.
     extension_sink: ?policy.ExtensionSink = null,
@@ -168,6 +172,19 @@ pub fn openUpstream(
     return openUpstreamWithClient(ctx, arena, method, target, headers, choice, ctx.upstreams.getHttpClient());
 }
 
+/// The upstream URL for `target` (path plus query) on `choice`.
+pub fn upstreamUri(
+    ctx: *SharedCtx,
+    arena: std.mem.Allocator,
+    target: []const u8,
+    choice: service_mod.UpstreamChoice,
+) ![]const u8 {
+    const query_start = std.mem.findScalar(u8, target, '?');
+    const path = if (query_start) |i| target[0..i] else target;
+    const query = if (query_start) |i| target[i + 1 ..] else "";
+    return ctx.upstreams.buildUpstreamUri(arena, ctx.upstream_ids.resolve(choice), path, query);
+}
+
 /// Retry callers select the dedicated client with no idle connections.
 pub fn openUpstreamWithClient(
     ctx: *SharedCtx,
@@ -178,13 +195,7 @@ pub fn openUpstreamWithClient(
     choice: service_mod.UpstreamChoice,
     client: *std.http.Client,
 ) !std.http.Client.Request {
-    const query_start = std.mem.findScalar(u8, target, '?');
-    const path = if (query_start) |i| target[0..i] else target;
-    const query = if (query_start) |i| target[i + 1 ..] else "";
-
-    const upstream_id = ctx.upstream_ids.resolve(choice);
-    const uri_str = try ctx.upstreams.buildUpstreamUri(arena, upstream_id, path, query);
-    const uri = try std.Uri.parse(uri_str);
+    const uri = try std.Uri.parse(try upstreamUri(ctx, arena, target, choice));
 
     return client.request(method, uri, .{
         .extra_headers = headers,
