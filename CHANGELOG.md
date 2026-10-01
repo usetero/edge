@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.33.0](https://github.com/usetero/edge/compare/v1.32.1...v1.33.0) (2026-10-01)
+
+
+### Features
+
+* capture failed upstream requests for replay ([#358](https://github.com/usetero/edge/issues/358)) ([c010e92](https://github.com/usetero/edge/commit/c010e923f9363dd3a1cb3d53d99d640ca9b49ed7))
+
+
+### Bug Fixes
+
+* **capture:** safety fixes for the failure capture ([#359](https://github.com/usetero/edge/issues/359)) ([08020c4](https://github.com/usetero/edge/commit/08020c44f4d2affa6402f8599068ce0deaa6f7d6))
+* prevent upstream TLS request body truncation ([#357](https://github.com/usetero/edge/issues/357)) ([9df338d](https://github.com/usetero/edge/commit/9df338d406d68b8eeaa329958bd93e1071123c4a))
+
 ## [1.32.1](https://github.com/usetero/edge/compare/v1.32.0...v1.32.1) (2026-09-25)
 
 
