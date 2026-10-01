@@ -292,3 +292,123 @@ test "read scheduler public API: isolates partial lines across files in one batc
     try testing.expectEqualStrings("line1\nhello\nworld\n", out.written());
     try testing.expect(std.mem.indexOf(u8, out.written(), "partialhello") == null);
 }
+
+/// Runs one batch of `file_count` single-line files through the uring
+/// scheduler and checks that every file's line comes out. The watcher has
+/// already advanced each file's offset to `end_offset` when it builds the
+/// batch, so an event the scheduler does not read is lost for good.
+fn expectUringReadsEveryEvent(file_count: usize, fixed: bool) !void {
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var files: std.ArrayList(std.Io.File) = .empty;
+    defer {
+        for (files.items) |*f| f.close(io);
+        files.deinit(testing.allocator);
+    }
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(testing.allocator);
+
+    const events = try testing.allocator.alloc(watch_mod.Event, file_count);
+    defer testing.allocator.free(events);
+    try files.ensureTotalCapacity(testing.allocator, file_count);
+
+    var i: usize = 0;
+    while (i < file_count) : (i += 1) {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "f{d}.log", .{i});
+        var line_buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "line-{d}\n", .{i});
+        {
+            const f = try tmp.dir.createFile(io, name, .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, line);
+        }
+        try expected.appendSlice(testing.allocator, line);
+        const abs = try tmp.dir.realPathFileAlloc(io, name, testing.allocator);
+        defer testing.allocator.free(abs);
+        files.appendAssumeCapacity(try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_only }));
+    }
+    for (events, 0..) |*evt, idx| {
+        evt.* = .{
+            .file = &files.items[idx],
+            .start_offset = 0,
+            .end_offset = (try files.items[idx].stat(io)).size,
+            .identity = null,
+        };
+    }
+
+    var framer = try framer_mod.LineFramer.init(testing.allocator, 64, 1024);
+    defer framer.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var scheduler = uring_mod.Scheduler.init(testing.allocator, io) catch |err| switch (err) {
+        error.SystemOutdated, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer scheduler.deinit();
+    scheduler.fixed_enabled = fixed;
+
+    const n = try scheduler.processBatch(&framer, &out.writer, events, &framer, keepAll);
+    try framer.finish(&out.writer, &framer, keepAll);
+    try testing.expectEqual(file_count, n);
+    try testing.expectEqualStrings(expected.items, out.written());
+}
+
+test "read scheduler uring: a batch larger than the slot count reads every event" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // 256 is the uring slot count. Cover the exact boundary and a batch that
+    // needs more than one submission, on both the fixed and non-fixed paths.
+    for ([_]bool{ true, false }) |fixed| {
+        try expectUringReadsEveryEvent(256, fixed);
+        try expectUringReadsEveryEvent(257, fixed);
+        try expectUringReadsEveryEvent(600, fixed);
+    }
+}
+
+test "read scheduler public API: truncation to offset 0 drops the old partial line" {
+    // The watcher emits `start_offset == 0` after a copytruncate or an
+    // in-place rewrite. A partial line parked from the old content must not
+    // be joined to the first line of the new content. The scalar path resets
+    // the stream for this case; the uring path must match it.
+    const io = std.Options.debug_io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile(io, "t.log", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "first\nstale-partial");
+    }
+    const abs = try tmp.dir.realPathFileAlloc(io, "t.log", testing.allocator);
+    defer testing.allocator.free(abs);
+    const file = try std.Io.Dir.cwd().openFile(io, abs, .{ .mode = .read_only });
+    defer file.close(io);
+
+    var framer = try framer_mod.LineFramer.init(testing.allocator, 64, 1024);
+    defer framer.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var scheduler = try EngineScheduler.init(testing.allocator, io, .auto);
+    defer scheduler.deinit();
+
+    _ = try scheduler.processBatch(&framer, &out.writer, &.{
+        .{ .file = &file, .start_offset = 0, .end_offset = 19, .identity = null },
+    }, &framer, keepAll);
+
+    // Truncate and rewrite through a second handle, as logrotate's
+    // copytruncate does; the tailer keeps its original handle open.
+    {
+        const f = try tmp.dir.createFile(io, "t.log", .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "new\n");
+    }
+
+    _ = try scheduler.processBatch(&framer, &out.writer, &.{
+        .{ .file = &file, .start_offset = 0, .end_offset = 4, .identity = null },
+    }, &framer, keepAll);
+    try framer.finish(&out.writer, &framer, keepAll);
+
+    try testing.expectEqualStrings("first\nnew\n", out.written());
+}
