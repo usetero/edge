@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.0](https://github.com/usetero/edge/compare/tero-edge-chart-v0.18.4...tero-edge-chart-v0.19.0) (2026-10-01)
+
+
+### Features
+
+* capture failed upstream requests for replay ([#358](https://github.com/usetero/edge/issues/358)) ([c010e92](https://github.com/usetero/edge/commit/c010e923f9363dd3a1cb3d53d99d640ca9b49ed7))
+
+
+### Bug Fixes
+
+* **capture:** safety fixes for the failure capture ([#359](https://github.com/usetero/edge/issues/359)) ([08020c4](https://github.com/usetero/edge/commit/08020c44f4d2affa6402f8599068ce0deaa6f7d6))
+
 ## [0.18.4](https://github.com/usetero/edge/compare/tero-edge-chart-v0.18.3...tero-edge-chart-v0.18.4) (2026-09-25)
 
 
