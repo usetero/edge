@@ -14,7 +14,9 @@ from a dump:
 - the batch a decoder rejected is kept, even though its forward succeeds;
 - a success, a retry that recovered, another status, and a sender that leaves
   mid-relay write nothing;
-- the directory never grows past its cap, across restarts too;
+- the directory never grows past its cap, across restarts too, and a body
+  orphaned by a crash still counts; deleting dumps arms it again;
+- only the edge's own user can read a dump (0700 directory, 0600 files);
 - a capture that cannot open its directory never stops the data plane.
 """
 
@@ -417,3 +419,71 @@ class UnusableDirectoryKeepsServing(MatrixCase):
         self.assert_status(post(self, body), 202)
         self.intake.arm("status", 408, count=1)
         self.assert_status(post(self, body), 408)
+
+
+class DumpsAreOwnerOnly(MatrixCase):
+    """The directory starts 0777, as an emptyDir does; the edge narrows it."""
+
+    CAPTURE_MAX_DUMPS = 10
+
+    def test_the_directory_is_0700_and_the_files_0600(self):
+        self.intake.arm("status", 408, count=1)
+        self.assert_status(post(self, self.gzipped()), 408)
+        self.assertEqual(len(self.captures.wait_for(1)), 1)
+        self.assertEqual(os.stat(self.captures.path).st_mode & 0o777, 0o700)
+        for name in self.captures.names():
+            mode = os.stat(os.path.join(self.captures.path, name)).st_mode & 0o777
+            self.assertEqual(mode, 0o600, "%s is readable by others" % name)
+
+
+class EncodedQueryKeyIsRedacted(MatrixCase):
+    CAPTURE_MAX_DUMPS = 10
+
+    def test_a_percent_encoded_key_name(self):
+        # A raw socket: `requests` would normalise %6b%65%79 to "key" first.
+        body = self.gzipped()
+        self.intake.arm("status", 408, count=1)
+        with self.raw(timeout=30) as client:
+            path = "/api/v2/logs?dd-api-%6b%65%79=" + QUERY_SECRET
+            client.send(self.head(path=path, body_len=len(body), extra="Content-Encoding: gzip") + body)
+            self.assert_status(client.read_response(), 408)
+        dumps = self.captures.wait_for(1)
+        self.assertEqual(len(dumps), 1)
+        self.assertNotIn(QUERY_SECRET, dumps[0].raw_meta, "an encoded key name leaked its value")
+        self.assertIn("dd-api-%6b%65%79=[redacted]", dumps[0].meta["url"])
+
+
+class OrphanCountsAgainstTheCap(MatrixCase):
+    """A body left by a crash, with no metadata, still takes its slot."""
+
+    CAPTURE_MAX_DUMPS = 1
+    CAPTURE_SEED = {"1000-0.body": b"left by a crash"}
+    EXPECT_LOGS = ["upstream.failure.capture.full"]
+
+    def test_the_orphan_fills_the_directory(self):
+        # A startup line, so it is outside `case_logs`.
+        self.assertIn("existing=1", self.edge.logs())
+        self.intake.arm("status", 408, count=1)
+        self.assert_status(post(self, self.gzipped()), 408)
+        time.sleep(1.5)
+        self.assertEqual(self.captures.names(), ["1000-0.body"], "the cap let a second dump in")
+
+
+class DeletedDumpsRearm(MatrixCase):
+    """Deleting dumps from a full directory arms the capture again, no restart."""
+
+    CAPTURE_MAX_DUMPS = 1
+    EXPECT_LOGS = ["upstream.failure.capture.full", "failure.capture.rearmed"]
+
+    def test_a_cleared_directory_captures_again(self):
+        for _ in range(2):
+            self.intake.arm("status", 408, count=1)
+            self.assert_status(post(self, self.gzipped()), 408)
+        self.assertEqual(len(self.captures.wait_for(1)), 1)
+        self.assertTrue(self.wait_for_log("upstream.failure.capture.full"))
+        self.captures.clear()
+        # The writer counts a full directory again every 5 s.
+        self.assertTrue(self.wait_for_log("failure.capture.rearmed", timeout=12), self.case_logs())
+        self.intake.arm("status", 408, count=1)
+        self.assert_status(post(self, self.gzipped()), 408)
+        self.assertEqual(len(self.captures.wait_for(1)), 1, "a cleared directory must capture again")

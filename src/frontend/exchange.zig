@@ -175,15 +175,17 @@ pub fn exchange(
     const capture = ctx.failure_capture orelse return exchangeAttempts(ctx, in, sink, choice, body, replayable, null);
 
     // A streamed body is gone once it is sent, so keep a copy while it goes.
-    // A full capture directory skips the copy; the failure still reaches
-    // `record`, which reports the full directory.
+    // No copy when the directory is full, the copy budget is spent or memory
+    // is short: the request forwards the same, and a failure still reaches
+    // `record`, which reports a full directory.
     var tee: ?failure_capture.Tee = null;
+    defer if (tee) |t| capture.releaseCopy(t.copy);
     const sent: BodySource = switch (body) {
         .bytes => body,
-        .stream => |st| if (!capture.armed()) body else blk: {
-            tee = .{ .inner = st.reader, .copy = try .initCapacity(in.arena, st.len) };
+        .stream => |st| if (capture.acquireCopy(st.len)) |buf| blk: {
+            tee = .{ .inner = st.reader, .copy = buf };
             break :blk .{ .stream = .{ .reader = &tee.?.interface, .len = st.len } };
-        },
+        } else body,
     };
     const started_ns = std.Io.Timestamp.now(ctx.io, .awake).toNanoseconds();
     var report: Report = .{};
@@ -219,7 +221,7 @@ pub fn recordFailOpen(
         ctx.bus.warn(UpstreamFailureCaptureFailed{ .path = in.path, .err = @errorName(uri_err) });
         return;
     };
-    capture.record(ctx.bus, in.arena, .{
+    capture.record(in.arena, .{
         .method = in.method,
         .target = in.target,
         .path = in.path,
@@ -255,7 +257,7 @@ fn recordFailure(
     in: Inbound,
     choice: service_mod.UpstreamChoice,
     body: BodySource,
-    /// Null for a buffered body, or when the directory was full at the start.
+    /// Null for a buffered body, or when no copy was made (see `exchange`).
     tee: ?*failure_capture.Tee,
     report: Report,
     err: ?anyerror,
@@ -271,7 +273,7 @@ fn recordFailure(
     const bytes, const complete = switch (body) {
         .bytes => |b| .{ b, true },
         .stream => |st| if (tee) |t|
-            .{ t.copy.written(), !t.copy_failed and t.copy.written().len == st.len }
+            .{ t.written(), !t.copy_failed and t.copied == st.len }
         else
             .{ "", false },
     };
@@ -283,7 +285,7 @@ fn recordFailure(
         bufs.timed_out.load(.acquire)
     else |_|
         false;
-    capture.record(ctx.bus, in.arena, .{
+    capture.record(in.arena, .{
         .method = in.method,
         .target = in.target,
         .path = in.path,

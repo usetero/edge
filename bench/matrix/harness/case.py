@@ -71,6 +71,8 @@ class MatrixCase(unittest.TestCase):
     #: Turns on the failure capture with this many dumps, in a fresh
     #: directory at `self.captures`.
     CAPTURE_MAX_DUMPS: int | None = None
+    #: Files to put in the capture directory before the edge starts.
+    CAPTURE_SEED: dict | None = None
     #: Set by `setUp`. The class default keeps `tearDown` working for a case
     #: that replaces `setUp` (c09, d04).
     captures: CaptureDir | None = None
@@ -150,7 +152,7 @@ class MatrixCase(unittest.TestCase):
         self.captures = None
         self.edge_env = dict(self.EDGE_ENV)
         if self.CAPTURE_MAX_DUMPS is not None:
-            self.captures = CaptureDir(self.CAPTURE_MAX_DUMPS)
+            self.captures = CaptureDir(self.CAPTURE_MAX_DUMPS, self.CAPTURE_SEED)
             self.edge_env.update(self.captures.env())
         config = dict(self.EDGE_CONFIG)
         if self.EDGE_POLICIES is not None:

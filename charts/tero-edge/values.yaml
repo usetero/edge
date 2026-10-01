@@ -50,7 +50,7 @@ failureCapture:
   enabled: false
   # Dumps kept in the directory, dumps from earlier container runs on the same
   # volume included. When it is full, the edge warns once and writes no more.
-  # Delete dumps to capture again.
+  # Deleting dumps arms it again within about 5 s.
   maxDumps: 20
   # Mount path of the capture volume in the container.
   path: /var/lib/tero/failure-capture

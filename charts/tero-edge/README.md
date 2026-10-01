@@ -190,15 +190,26 @@ A dump is two files in `failureCapture.path`:
 
 A header or query parameter whose name looks like a credential (`key`,
 `token`, `secret`, `auth`, `cookie`, `password`, `signature`, `session`,
-`credential`) keeps its name and loses its value. The body is not redacted:
-it is the customer's payload, so turn the capture on for an incident and off
-after it.
+`credential`) keeps its name and loses its value, and query names are also
+checked after percent-decoding. The body is not redacted: it is the customer's
+payload, so turn the capture on for an incident and off after it. The edge
+narrows the directory to `0700` and writes every dump file `0600`.
+
+Disk writes happen on a background thread, never on a request. At most 8
+dumps are in flight; past that, a dump is dropped before anything is copied
+and logged as `upstream.failure.capture.dropped`, so a stalled volume never
+holds traffic or memory. Capture memory is at most about
+12 x `config.maxBodySize`. At shutdown the edge gives the writer 2 s, then
+interrupts it and waits; a volume that ignores the interrupt holds
+shutdown, and the kubelet's grace period then applies.
 
 Each dump logs `upstream.failure.captured`. After `maxDumps` dumps, the edge
 logs `upstream.failure.capture.full` once and writes no more. The count
-includes dumps from earlier container runs, so a crash loop cannot fill the
-disk. Delete dumps to capture again. If the directory cannot be opened, the
-edge logs `failure.capture.unavailable` and serves traffic without capture.
+includes dumps from earlier container runs, and a body left without its
+`.json` by a crash, so a crash loop cannot fill the disk. Deleting dumps arms
+the capture again within about 5 s (`failure.capture.rearmed`); no restart is
+needed. If the directory cannot be opened, the edge logs
+`failure.capture.unavailable` and serves traffic without capture.
 
 The default volume is an `emptyDir` with a `sizeLimit` of
 `maxDumps x config.maxBodySize` plus 16 MiB, so a full directory cannot get the

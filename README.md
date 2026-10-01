@@ -510,14 +510,35 @@ intake. A success, a retry that recovered, and any other status write
 nothing.
 
 Headers and query parameters whose names look like credentials keep their
-names and lose their values. The body is not redacted, so treat the directory
-like the customer data it holds.
+names and lose their values. Query names are also checked after
+percent-decoding, so `dd-api-%6b%65%79` is redacted too. The body is not
+redacted, so treat the directory like the customer data it holds: the edge
+creates it `0700` (and narrows it to `0700` if it already exists and the edge
+owns it) and writes every dump file `0600`.
 
-`max_dumps` caps the `.json` files in the directory, dumps from earlier runs
-included. The disk cost is at most `max_dumps` x `max_body_size`. When the
-directory is full, the edge logs `upstream.failure.capture.full` once. If it
-cannot open the directory, it logs `failure.capture.unavailable` and runs
-without capture. The Helm chart sets all of this with `failureCapture` (see
+The request path never touches the disk. It builds a dump in memory and
+queues it, and one writer thread writes the files. At most 8 dumps are in
+flight (being prepared, queued or written); past that, a dump is dropped
+before anything is copied and logged as `upstream.failure.capture.dropped`, so
+a slow or stalled volume costs dumps, never requests or memory. A streamed
+body is copied while it is sent, and at most 4 such copies are held at once;
+past that, a streamed failure is dumped without its body (`complete: false`).
+Capture memory is therefore at most about 12 x `max_body_size`.
+
+A write that fails part way removes the file it made; if the removal fails
+too, the file keeps its slot. At shutdown the edge gives the writer 2 s to
+write what is queued, then interrupts it and waits for it to stop. A volume
+that ignores the interrupt (an uninterruptible hard NFS mount) holds
+shutdown.
+
+`max_dumps` caps the dumps in the directory, dumps from earlier runs included.
+A dump counts once for its `<unix_ms>-<seq>` stem, so a `.body` left without
+its `.json` by a crash still takes a slot. A write that fails removes what it
+wrote. The disk cost is at most `max_dumps` x `max_body_size`. When the
+directory is full, the edge logs `upstream.failure.capture.full` once, and
+counts the directory again every 5 s: deleting dumps arms the capture again
+within about 5 s, with `failure.capture.rearmed`. If the edge cannot open the
+directory, it logs `failure.capture.unavailable` and runs without capture. The Helm chart sets all of this with `failureCapture` (see
 `charts/tero-edge/README.md`).
 
 To replay a dump, send its body with its headers and put the redacted
