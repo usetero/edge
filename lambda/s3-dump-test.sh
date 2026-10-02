@@ -1,13 +1,10 @@
 #!/bin/bash
 # Drive the local RIE s3-dump test: invoke a few times (the extension flushes
-# at each invoke boundary), then list the MinIO bucket.
+# at each invoke boundary), then list the RustFS bucket.
 #
 # Bring the stack up first:
 #   docker compose -f docker-compose.yml -f docker-compose.s3-dump.yml up -d
 set -euo pipefail
-cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.s3-dump.yml)
 
 echo "== invoking the function 5x (each POSTs a Datadog log through the extension) =="
 for i in $(seq 1 5); do
@@ -21,5 +18,13 @@ echo "== giving the invoke-boundary flush a moment =="
 sleep 2
 
 echo "== objects in s3://tero-edge-dump/dump/ =="
-"${COMPOSE[@]}" run --rm --entrypoint /bin/sh createbuckets -c \
-  "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null && mc ls --recursive local/tero-edge-dump/ && echo '---' && mc cat \$(mc ls --recursive local/tero-edge-dump/ | head -1 | awk '{print \"local/tero-edge-dump/\"\$NF}') 2>/dev/null | head -c 400 || echo '(no objects yet)'"
+S3=(curl -fsS --aws-sigv4 "aws:amz:us-east-1:s3" --user rustfsadmin:rustfsadmin)
+BUCKET_URL=http://localhost:9002/tero-edge-dump
+keys=$("${S3[@]}" "$BUCKET_URL?list-type=2&prefix=dump/" | grep -o '<Key>[^<]*' | sed 's/<Key>//' || true)
+if [ -z "$keys" ]; then
+  echo '(no objects yet)'
+  exit 0
+fi
+echo "$keys"
+echo '---'
+"${S3[@]}" "$BUCKET_URL/$(echo "$keys" | head -1)" | head -c 400

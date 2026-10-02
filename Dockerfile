@@ -11,7 +11,7 @@
 # =============================================================================
 # Build stage
 # =============================================================================
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS builder
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS builder
 
 # Install build dependencies from build.zig:
 # - zlib-dev/zlib-static: linkSystemLibrary("z")
@@ -74,10 +74,12 @@ RUN zig build ${DISTRIBUTION} -Dcpu=baseline -Doptimize=ReleaseFast \
 # =============================================================================
 # Runtime stage - minimal Alpine image
 # =============================================================================
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
-# Install runtime dependencies
-RUN apk add --no-cache \
+# Upgrade base packages to get security fixes (e.g. openssl) that are newer
+# than the pinned image. Install runtime dependencies.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache \
     ca-certificates \
     libstdc++ \
     zlib \

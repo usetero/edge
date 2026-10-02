@@ -243,16 +243,16 @@ test "datadogLogEncode renders the delivered log context as JSON" {
 }
 
 // Real-storage smoke test: drives edge's encoder + the s3-dump handler + a
-// real flush against a MinIO container, exactly the path a `mode: dropped`
+// real flush against a RustFS container, exactly the path a `mode: dropped`
 // policy takes. Self-skips unless the S3 env vars are set, so it's inert in
-// the normal suite; `task test:s3-e2e` starts MinIO, creates the bucket, sets
+// the normal suite; `task test:s3-e2e` starts RustFS, creates the bucket, sets
 // the env, and runs `zig build test-s3-e2e` (which filters to this test).
 //
-// Verification is by the flush result: MinIO validates the payload SHA-256 z3
+// Verification is by the flush result: RustFS validates the payload SHA-256 z3
 // sends, so `objects_uploaded == 1 && objects_failed == 0` means the bytes
 // edge produced were accepted intact. Byte-exact readback is covered by the
 // encoder test above and by policy-zig's own e2e.
-test "e2e minio: edge datadog log dump uploads to a real S3 server" {
+test "e2e rustfs: edge datadog log dump uploads to a real S3 server" {
     const env = std.testing.environ;
     const access = env.getPosix("AWS_ACCESS_KEY_ID") orelse return error.SkipZigTest;
     const secret = env.getPosix("AWS_SECRET_ACCESS_KEY") orelse return error.SkipZigTest;
@@ -278,13 +278,13 @@ test "e2e minio: edge datadog log dump uploads to a real S3 server" {
         .{ endpoint, bucket },
     );
     defer gpa.free(target_json);
-    try handler.addTarget(io, "minio", target_json);
+    try handler.addTarget(io, "rustfs", target_json);
 
     // Resolve a delivery slot the way the engine does at snapshot compile:
     // the extension config bytes are a serialized ExtensionTargetRef.
     var ref_w: std.Io.Writer.Allocating = .init(gpa);
     defer ref_w.deinit();
-    const ref: proto.policy.ExtensionTargetRef = .{ .kind = "s3", .name = "minio" };
+    const ref: proto.policy.ExtensionTargetRef = .{ .kind = "s3", .name = "rustfs" };
     try ref.encode(&ref_w.writer, gpa);
     const slot = handler.resolve(io, .log, "e2e-policy", ref_w.written()) orelse
         return error.TargetNotResolved;

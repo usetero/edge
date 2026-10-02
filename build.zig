@@ -246,13 +246,13 @@ pub fn build(b: *std.Build) void {
     }));
     test_step.dependOn(&b.addRunArtifact(echo_tests).step);
 
-    // Real-storage smoke test for the s3-dump extension, filtered to the MinIO
+    // Real-storage smoke test for the s3-dump extension, filtered to the RustFS
     // e2e test. Excluded from `test` (it needs a live backend); driven by
-    // `task test:s3-e2e`, which starts MinIO, creates the bucket, and sets the
+    // `task test:s3-e2e`, which starts RustFS, creates the bucket, and sets the
     // S3 env vars this test reads.
     const s3_e2e_tests = b.addTest(.{
         .root_module = mod,
-        .filters = &.{"e2e minio"},
+        .filters = &.{"e2e rustfs"},
     });
     s3_e2e_tests.root_module.link_libc = true;
     s3_e2e_tests.root_module.linkSystemLibrary("z", .{});
@@ -263,7 +263,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("bench/scaling/payloads/otlp-metrics.pb"),
     });
     const run_s3_e2e_tests = b.addRunArtifact(s3_e2e_tests);
-    const s3_e2e_step = b.step("test-s3-e2e", "Run the s3-dump MinIO smoke test (needs S3 env vars)");
+    const s3_e2e_step = b.step("test-s3-e2e", "Run the s3-dump RustFS smoke test (needs S3 env vars)");
     s3_e2e_step.dependOn(&run_s3_e2e_tests.step);
 
     // ==========================================================================
