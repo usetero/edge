@@ -256,6 +256,13 @@ pub const Materialized = struct {
     /// Emit every extra into an open JSON object, in record order. A container
     /// goes out as its captured bytes; anything else is written from its
     /// typed value.
+    ///
+    /// `json_value.write` propagates a malformed container as `error.Malformed`
+    /// rather than swallowing it (which would desynchronize the writer and crash
+    /// on the next `endObject`). The enclosing `jsonStringify` runs under
+    /// `std.json.Stringify`'s `error{WriteFailed}!void` contract, so coerce a
+    /// non-write error here to `WriteFailed` — the record is abandoned either
+    /// way, and the caller routes it to the validating-path fail-open.
     pub fn write(self: *const Materialized, jws: anytype) !void {
         for (self.order.items) |key| {
             const value = self.values.get(key) orelse continue;
@@ -265,7 +272,7 @@ pub const Materialized = struct {
                 try jws.writer.writeAll(raw);
                 jws.endWriteRaw();
             } else {
-                try json_value.write(jws, value);
+                json_value.write(jws, value) catch return error.WriteFailed;
             }
         }
     }
