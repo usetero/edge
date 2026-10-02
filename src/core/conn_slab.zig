@@ -432,8 +432,6 @@ fn pageAlignedLimits() limits_mod.Limits {
         .recv_buf = 4096,
         .send_buf = 4096,
         .upstream_write_buf = 4096,
-        .decode_buf = 4096,
-        .encode_buf = 4096,
         .body_buf = 4096,
         .chunk_buf = 4096,
         .zstd_window_len = 4096,
