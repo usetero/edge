@@ -241,7 +241,9 @@ pub const DatadogLog = struct {
         }
         // Extras in the order the record listed them; containers go out as
         // the bytes captured at parse time.
-        try self.extra.write(jws);
+        // The validating parse already materialized `extra`, so only the
+        // writer can fail here. Coerce to the `std.json.Stringify` error set.
+        self.extra.write(jws) catch return error.WriteFailed;
         // parseRaw extras: verbatim spans of the input, all value types.
         for (self.extra_spans.items()) |entry| {
             try jws.objectField(entry.key);
@@ -498,18 +500,15 @@ pub const DatadogLog = struct {
         return winner;
     }
 
-    /// Attribute fallback: look up `path` (joined with '.') inside the
-    /// unwrapped JSON message. Returns null when the message is not JSON or
-    /// the path is absent.
+    /// Attribute fallback into a JSON-wrapped message. Once edited, the tree
+    /// supplies live values using the same dotted paths and first-string-wins
+    /// order as the original flattened snapshot.
     pub fn unwrappedAttribute(
         self: *DatadogLog,
         allocator: std.mem.Allocator,
         path: []const []const u8,
     ) ?[]const u8 {
         if (path.len == 0) return null;
-        self.ensureUnwrapped(allocator);
-        if (self.message_flat.count() == 0) return null;
-
         var buf: [512]u8 = undefined;
         var pos: usize = 0;
         for (path, 0..) |segment, i| {
@@ -522,7 +521,41 @@ pub const DatadogLog = struct {
             @memcpy(buf[pos .. pos + segment.len], segment);
             pos += segment.len;
         }
-        return self.message_flat.get(buf[0..pos]);
+        const dotted_path = buf[0..pos];
+        if (self.message_tree) |parsed| {
+            return findTreeString(parsed.value, dotted_path, 0);
+        }
+        self.ensureUnwrapped(allocator);
+        return self.message_flat.get(dotted_path);
+    }
+
+    /// Read the tree as `flattenValue` would: arrays do not extend the path,
+    /// literal dots in keys are preserved, and the first string leaf wins.
+    /// Matching prefixes avoids building another map after every edit.
+    fn findTreeString(value: std.json.Value, path: []const u8, prefix_len: usize) ?[]const u8 {
+        switch (value) {
+            .string => |s| return if (prefix_len != 0 and prefix_len == path.len) s else null,
+            .object => |obj| {
+                var offset = prefix_len;
+                if (offset != 0) {
+                    if (offset == path.len or path[offset] != '.') return null;
+                    offset += 1;
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (!std.mem.startsWith(u8, path[offset..], key)) continue;
+                    if (findTreeString(entry.value_ptr.*, path, offset + key.len)) |s| return s;
+                }
+            },
+            .array => |arr| {
+                for (arr.items) |item| {
+                    if (findTreeString(item, path, prefix_len)) |s| return s;
+                }
+            },
+            else => {},
+        }
+        return null;
     }
 
     /// Lazily parse `message` into a mutable, re-serializable JSON tree for

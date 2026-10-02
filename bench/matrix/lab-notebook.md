@@ -873,3 +873,124 @@ exits with SIGABRT (134), not SIGSEGV (139).
 - stdio cannot accept an unknown content encoding, because `std.http.Server`
   fails the whole head (a10). The agent drops the batch for good on that 400.
 - stdio waits for the request deadline on a broken chunk (a07).
+
+## Cases added for the combined fix branch (PR #348)
+
+Seven additions, each aimed at a fix the branch carries end to end. Every one
+runs on both frontends.
+
+- **a06 `ChunkedBodyIdentity`, `ChunkedBodyUnderPolicies`.** A multi-chunk body
+  larger than the pump buffer reaches the intake byte for byte, with and
+  without a keep-all policy. Pins the socket-to-socket pump and the resident
+  drain on the policy path.
+- **a08 `ChunkedBodyTooLarge`.** A chunked body over `max_body_size` answers
+  413 mid-stream and the intake records nothing. The streaming design may open
+  the upstream before the cap trips, so this class does not forbid upstream
+  log lines.
+- **a16 `LargeZstdBatchWithPolicies`.** A frame that decodes to 3 MiB under a
+  keep-all policy is accepted. Covers the decode window cap and the zero
+  return from the decompressor in the bounded copy.
+- **a52 `RedactionComposes`.** Two regex redacts on the same wrapped path both
+  reach the intake. The check is on the forwarded bytes.
+- **a53 `MalformedContainerFailsOpen`.** A record with `"x":[1,]` under a
+  matching drop policy is forwarded as sent.
+- **c06 `ChunkedBodiesCostNoMoreThanContentLength`.** Three Content-Length
+  rounds as the control, then four chunked rounds. A chunked round must cost
+  no more resident memory than a declared one, and the chunked rounds must
+  not grow.
+- **c11 `SlotChurnIntegrity`.** 64 senders, a fresh connection per batch, 1280
+  distinct bodies checked at the intake. The only test that can reach the
+  slot decommit race, because the unit test I/O is single-threaded.
+
+### Two httpz defects the new cases found
+
+- **httpz answers a chunked 413 itself.** httpz enforces its own body cap
+  before the edge handler runs, so the response has no log line and no
+  `edge_responses_total` count. An operator cannot see it. Declared in a08.
+- **httpz grows with chunked bodies.** With 12 senders and 900 KiB bodies,
+  RSS rises about 23 MB when the bodies switch from Content-Length to chunked,
+  and about 12 MB per round after that. Content-Length rounds grow about
+  6 MB per round on httpz too, which the original c06 bound of 32 MB hides.
+  stdio is flat in both regimes. Declared in c06.
+
+### What the descriptor invariant taught us here
+
+`std.http.Client` pools up to 32 idle upstream connections. A case that
+drives 32 raw senders at once leaves 32 pooled sockets, and the descriptor
+budget allows 16 above the baseline. The original c06 passes only because
+`requests` paces its threads. The chunked class uses 12 senders.
+
+## Scaling sweep on the Mac Studio, PR #348 branch (2026-09-22)
+
+`bench/scaling/run.sh`, edge only, 50k requests, 64 oha connections, policy
+counts 0 and 1000. Twelve cells: upstream latency 0 and 10 ms, handler threads
+64 and 256, max connections 256, 1024 and 2048. Every row is 100 percent
+success with 50000 requests at the intake. Raw results:
+`~/pr348-sweep/` on the Mac Studio and
+`bench/scaling/results/pr348-mac-studio-2026-09-22/` locally.
+
+| scenario | policies | req/s at 0 ms | req/s at 10 ms | p99 at 0 ms | p99 at 10 ms | RSS MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| OTLP Logs | 0 | 85.3k to 86.6k | 1072 to 1100 | 2.1 to 2.2 | 92 | 33 |
+| OTLP Logs | 1000 | 48.4k to 65.8k | 1067 to 1085 | 2.1 to 2.7 | 95 | 79 |
+| OTLP Metrics | 0 | 84.9k to 86.8k | 1085 to 1097 | 2.1 | 92 | 33 |
+| OTLP Metrics | 1000 | 75.1k to 78.0k | 1057 to 1087 | 2.1 to 2.2 | 94 | 77 |
+| OTLP Traces | 0 | 85.6k to 86.5k | 1067 to 1102 | 2.1 | 92 | 33 |
+| OTLP Traces | 1000 | 50.3k to 62.2k | 1057 to 1086 | 2.1 to 2.8 | 95 | 78 |
+| DD Logs | 0 | 5212 to 5575 | 969 to 1021 | 12.9 to 14.4 | 112 to 116 | 63 |
+| DD Logs | 1000 | 442 to 449 | 442 to 446 | 182 to 185 | 227 to 231 | 187 to 192 |
+| DD Metrics | 0 | 83.4k to 86.2k | 1075 to 1099 | 2.1 | 92 | 34 |
+| DD Metrics | 1000 | 78.3k to 79.7k | 1081 to 1095 | 2.1 | 94 | 80 |
+
+The range in each cell is the spread across the six thread and max-connection
+combinations at that latency.
+
+- **The thread and max-connection axes are flat.** The stdio frontend gives
+  each connection its own task and reads neither value. At 10 ms the mean
+  req/s by threads is 1094 against 1087 for OTLP Logs, and by max connections
+  1088, 1086 and 1098. The spread at 0 ms on the 1000-policy OTLP rows is
+  run-to-run noise on a CPU-bound scenario, not an axis effect.
+- **At 10 ms the intake is the ceiling, not the edge.** Every scenario but one
+  converges on about 1090 req/s with a p50 of 62 ms and the edge at 10 to 40
+  percent of one core. 64 connections over 1090 req/s is 59 ms per round trip:
+  the echo server's 10 ms sleep runs at about 60 ms on this host, as noted
+  under the sweep table above. The edge adds under 1 ms to that.
+- **DD Logs at 1000 policies is CPU-bound at about 445 req/s** at both
+  latencies, with the edge at 15.5 cores of 16 and 190 MB RSS. That is the
+  4 MiB decoded batch against 1000 policies. It is the one scenario where
+  the edge, not the intake, sets the rate.
+
+### Against master (`df26f84`, the merge base)
+
+The same twelve cells on the same host, run straight after the branch sweep.
+Both runs are 120 of 120 rows at 100 percent success with 50000 requests at
+the intake. Raw results:
+`bench/scaling/results/master-df26f84-mac-studio-2026-09-22/` locally and
+`~/master-sweep/` on the Mac Studio.
+
+Median req/s across the six cells at each latency:
+
+| scenario | policies | master 0 ms | branch 0 ms | master 10 ms | branch 10 ms |
+| --- | --- | --- | --- | --- | --- |
+| OTLP Logs | 0 | 85,994 | 86,316 | 1082 | 1094 |
+| OTLP Logs | 1000 | 63,578 | 58,131 | 1076 | 1079 |
+| OTLP Metrics | 0 | 85,943 | 86,093 | 1092 | 1090 |
+| OTLP Metrics | 1000 | 76,178 | 76,700 | 1075 | 1082 |
+| OTLP Traces | 0 | 85,731 | 86,117 | 1089 | 1091 |
+| OTLP Traces | 1000 | 55,293 | 52,285 | 1069 | 1072 |
+| DD Logs | 0 | 5368 | 5486 | 999 | 998 |
+| DD Logs | 1000 | 446 | 446 | 444 | 444 |
+| DD Metrics | 0 | 86,194 | 85,530 | 1088 | 1088 |
+| DD Metrics | 1000 | 79,292 | 79,076 | 1078 | 1090 |
+
+- **No regression.** 38 of 40 medians are within 2.2 percent, and p99, RSS
+  and CPU match to the decimal.
+- **The two larger gaps are noise.** OTLP Logs and Traces at 1000 policies
+  and 0 ms are CPU-bound and swing 23 to 30 percent between cells on either
+  tree. In both rows the branch has the lowest and the highest cell: OTLP
+  Logs runs 48.4k to 65.8k on the branch against 58.5k to 65.0k on master,
+  and OTLP Traces peaks at 62.2k on the branch against 56.6k on master. The
+  branch does not change `src/signals/otlp`.
+- **The runs were not interleaved.** Master ran second, so thermal drift
+  would favour the branch if anything. A tighter comparison of the two noisy
+  rows needs alternating reps, as `~/drive.sh` on the Mac Studio does.
