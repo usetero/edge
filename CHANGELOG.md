@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.33.1](https://github.com/usetero/edge/compare/v1.33.0...v1.33.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* **docker:** upgrade openssl in the edge image ([#365](https://github.com/usetero/edge/issues/365)) ([9f42f10](https://github.com/usetero/edge/commit/9f42f10805b0f6ef2fe770c4e72f265275c27b82))
+
 ## [1.33.0](https://github.com/usetero/edge/compare/v1.32.1...v1.33.0) (2026-10-01)
 
 
