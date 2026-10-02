@@ -347,7 +347,7 @@ tasks:
           -p 9000:9000 \
           -e MINIO_ROOT_USER=minioadmin \
           -e MINIO_ROOT_PASSWORD=minioadmin \
-          minio/minio server /data >/dev/null
+          quay.io/minio/minio server /data >/dev/null
         # Wait for the server to report healthy on the published port.
         for i in $(seq 1 30); do
           if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then break; fi
