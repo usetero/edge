@@ -1,30 +1,30 @@
-# Overlay for a local end-to-end s3-dump test against MinIO.
+# Overlay for a local end-to-end s3-dump test against RustFS.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.s3-dump.yml up -d
 #   ./s3-dump-test.sh            # invoke a few times + list the bucket
 #
-# Adds a MinIO S3 target + a one-shot bucket creator, and reconfigures
-# lambda-test with the dump-all policy (s3-dump extension) pointing at MinIO.
+# Adds a RustFS S3 target + a one-shot bucket creator, and reconfigures
+# lambda-test with the dump-all policy (s3-dump extension) pointing at RustFS.
 services:
-  minio:
-    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-    command: server /data
+  rustfs:
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
     ports:
       - "9002:9000" # host access for listing/inspection
 
-  # Waits for MinIO, then creates the dump bucket. Runs once and exits.
+  # Waits for RustFS, then creates the dump bucket. Runs once and exits.
+  # A rerun gets 409 (bucket exists), which also counts as ready.
   createbuckets:
-    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
     depends_on:
-      - minio
+      - rustfs
     entrypoint: >
       /bin/sh -c "
-      until mc alias set local http://minio:9000 minioadmin minioadmin; do echo 'waiting for minio'; sleep 1; done &&
-      mc mb -p local/tero-edge-dump &&
-      echo 'bucket tero-edge-dump ready'
+      until curl -fsS -o /dev/null http://rustfs:9000/health/ready; do echo 'waiting for rustfs'; sleep 1; done &&
+      code=$$(curl -sS -o /dev/null -w '%{http_code}' -X PUT --aws-sigv4 aws:amz:us-east-1:s3 --user rustfsadmin:rustfsadmin http://rustfs:9000/tero-edge-dump) &&
+      case $$code in 200|409) echo 'bucket tero-edge-dump ready' ;; *) echo \"bucket create failed: $$code\"; exit 1 ;; esac
       "
 
   lambda-test:
@@ -36,15 +36,15 @@ services:
       AWS_LAMBDA_FUNCTION_HANDLER: handler.handler
       TERO_LISTEN_PORT: "3000"
       TERO_LOG_LEVEL: debug
-      # --- s3-dump: enable + MinIO target (path-style, no TLS) ---
+      # --- s3-dump: enable + RustFS target (path-style, no TLS) ---
       TERO_S3_DUMP_ENABLED: "true"
       # Small batch age so the non-force invoke-boundary flush seals promptly and
       # you see objects within a couple invokes (default 30s; prod can stay high).
       TERO_S3_DUMP_MAX_BATCH_AGE_MS: "2000"
-      TERO_S3_DUMP_TARGETS_JSON: '[{"name":"datadog-forwarder-dump","bucket":"tero-edge-dump","region":"us-east-1","endpoint":"http://minio:9000","force_path_style":true,"prefix":"dump/"}]'
-      # MinIO creds via the TERO_S3_* set (the reserved AWS_* names are off-limits).
-      TERO_S3_ACCESS_KEY_ID: minioadmin
-      TERO_S3_SECRET_ACCESS_KEY: minioadmin
+      TERO_S3_DUMP_TARGETS_JSON: '[{"name":"datadog-forwarder-dump","bucket":"tero-edge-dump","region":"us-east-1","endpoint":"http://rustfs:9000","force_path_style":true,"prefix":"dump/"}]'
+      # RustFS creds via the TERO_S3_* set (the reserved AWS_* names are off-limits).
+      TERO_S3_ACCESS_KEY_ID: rustfsadmin
+      TERO_S3_SECRET_ACCESS_KEY: rustfsadmin
       # --- dump-all policy carrying the s3-dump extension (needs policy-zig >= v0.6.0) ---
       # NOTE: match uses `exists` on body, NOT regex ".*" — Hyperscan rejects a
       # pattern that can match the empty buffer, which would make the whole
