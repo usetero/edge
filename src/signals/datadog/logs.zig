@@ -1,14 +1,10 @@
 const std = @import("std");
-const stream_io = @import("../stream_io.zig");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const datadog_log = @import("log.zig");
 
 const PolicyEngine = policy.PolicyEngine;
-const PolicyResult = policy.PolicyResult;
-const FilterDecision = policy.FilterDecision;
 pub const FieldRef = policy.FieldRef;
-const LogField = @import("proto").policy.LogField;
 const MAX_MATCHES_PER_SCAN = policy.max_matches_per_scan;
 const PolicyRegistry = policy.Registry;
 const EventBus = o11y.EventBus;
@@ -16,99 +12,6 @@ const NoopEventBus = o11y.NoopEventBus;
 const DatadogLog = datadog_log.DatadogLog;
 
 pub const Parser = datadog_log.Parser;
-const Value = datadog_log.Value;
-const ArrayList = std.ArrayListUnmanaged;
-
-/// Result of processing logs
-pub const ProcessResult = struct {
-    /// Whether any transformations were applied
-    was_transformed: bool = false,
-    /// Number of logs that were dropped by filter policies
-    dropped_count: usize,
-    /// Original number of logs before filtering
-    original_count: usize,
-    /// The processed data (caller owns this slice)
-    data: []u8,
-
-    /// Returns true if any logs were dropped or transformed
-    pub fn wasModified(self: ProcessResult) bool {
-        return self.dropped_count > 0 or self.was_transformed;
-    }
-
-    /// Returns true if all logs were dropped
-    pub fn allDropped(self: ProcessResult) bool {
-        return self.original_count > 0 and self.dropped_count == self.original_count;
-    }
-};
-
-pub const StreamProcessResult = struct {
-    was_transformed: bool = false,
-    dropped_count: usize,
-    original_count: usize,
-
-    pub fn wasModified(self: StreamProcessResult) bool {
-        return self.dropped_count > 0 or self.was_transformed;
-    }
-
-    pub fn allDropped(self: StreamProcessResult) bool {
-        return self.original_count > 0 and self.dropped_count == self.original_count;
-    }
-};
-
-pub fn processLogsStream(
-    allocator: std.mem.Allocator,
-    registry: *const PolicyRegistry,
-    bus: *EventBus,
-    in_reader: *std.Io.Reader,
-    out_writer: *std.Io.Writer,
-    content_type: []const u8,
-    sink: ?policy.ExtensionSink,
-) !StreamProcessResult {
-    if (std.mem.indexOf(u8, content_type, "application/json") == null) {
-        try stream_io.streamAll(in_reader, out_writer);
-        return .{
-            .dropped_count = 0,
-            .original_count = 0,
-            .was_transformed = false,
-        };
-    }
-
-    const data = try stream_io.readAll(allocator, in_reader);
-    defer allocator.free(data);
-
-    // Single-shot callers (tests, non-streaming paths) get a throwaway parser;
-    // the per-record streaming path reuses one via processLogsSlice instead.
-    var parser: Parser = .init;
-    defer parser.deinit(allocator);
-    return processLogsSlice(allocator, &parser, allocator, registry, bus, data, out_writer, sink);
-}
-
-/// Filters a JSON log body already sitting in a slice, reusing a caller-owned
-/// parser (zimdjson's structural buffers are keyed to `parser_gpa`, a stable
-/// allocator — NOT `scratch`, which is a per-record arena that gets reset).
-/// `scratch` backs the DatadogLog structs and the result buffer; the processed
-/// body is written to `out_writer`. Batch callers only — the per-record
-/// streaming path uses `evalLogRecord`, which skips output materialization.
-pub fn processLogsSlice(
-    scratch: std.mem.Allocator,
-    parser: *Parser,
-    parser_gpa: std.mem.Allocator,
-    registry: *const PolicyRegistry,
-    bus: *EventBus,
-    data: []const u8,
-    out_writer: *std.Io.Writer,
-    sink: ?policy.ExtensionSink,
-) !StreamProcessResult {
-    const result = try processJsonLogsWithFilter(scratch, parser, parser_gpa, registry, bus, data, sink);
-    defer scratch.free(result.data);
-    try out_writer.writeAll(result.data);
-
-    return .{
-        .was_transformed = result.was_transformed,
-        .dropped_count = result.dropped_count,
-        .original_count = result.original_count,
-    };
-}
 
 /// Verdict for one evaluated record. `replace` bytes are owned by the scratch
 /// allocator passed to `evalLogRecord` and die on its next reset.
@@ -160,10 +63,7 @@ pub fn evalLogRecord(
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
-    // No reusable scan state here: this path evaluates one record, so the
-    // 8 KiB `ScanState.init` clear would replace a clear sized by the policy
-    // count and cost more than it saves. Only the batch path below reuses one.
-    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf, sink, null);
+    const result = filterLog(&engine, &log_obj, scratch, &policy_id_buf, sink);
     if (!result.keep) return .drop;
     if (!result.mutated) return .keep;
 
@@ -360,9 +260,6 @@ fn filterLog(
     allocator: std.mem.Allocator,
     policy_id_buf: [][]const u8,
     sink: ?policy.ExtensionSink,
-    /// Reusable across the records of one batch. Null makes the engine keep
-    /// its per-record state, which is the cheaper choice for a single record.
-    scan_state: ?*policy.ScanState,
 ) FilterLogResult {
     var field_ctx: FieldAccessorContext = .{ .log = log, .allocator = allocator };
     const result = engine.evaluate(
@@ -374,7 +271,9 @@ fn filterLog(
             .scratch = allocator,
             .io = engine.bus.io,
             .extension_sink = sink,
-            .scan_state = scan_state,
+            // Null: the engine keeps its own state. A shared `ScanState` pays
+            // off only across a batch, and this call handles one record.
+            .scan_state = null,
         },
     );
     // The extension sink (s3-dump) fires INSIDE evaluate — after keep, before
@@ -389,161 +288,6 @@ fn filterLog(
         .keep = result.decision.shouldContinue(),
         .mutated = result.was_transformed,
     };
-}
-
-/// Accumulated state for filtering logs
-const FilterState = struct {
-    kept: ArrayList(DatadogLog) = .empty,
-    original_count: usize = 0,
-    dropped_count: usize = 0,
-    mutated: bool = false,
-    arena: std.heap.ArenaAllocator,
-
-    fn init(backing_allocator: std.mem.Allocator) FilterState {
-        return .{
-            .arena = std.heap.ArenaAllocator.init(backing_allocator),
-        };
-    }
-
-    fn allocator(self: *FilterState) std.mem.Allocator {
-        return self.arena.allocator();
-    }
-
-    fn deinit(self: *FilterState) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-/// Build the final ProcessResult from filtering state.
-/// Handles the cases: nothing changed, everything dropped, or needs reserialization.
-fn buildResult(
-    allocator: std.mem.Allocator,
-    state: *const FilterState,
-    original_data: []const u8,
-) !ProcessResult {
-    // If nothing was dropped and nothing mutated, return original data
-    if (state.dropped_count == 0 and !state.mutated) {
-        const result = try allocator.alloc(u8, original_data.len);
-        @memcpy(result, original_data);
-        return .{
-            .data = result,
-            .dropped_count = 0,
-            .original_count = state.original_count,
-            .was_transformed = false,
-        };
-    }
-
-    // If everything was dropped, return empty array
-    if (state.kept.items.len == 0) {
-        const result = try allocator.alloc(u8, 2);
-        result[0] = '[';
-        result[1] = ']';
-        return .{
-            .data = result,
-            .dropped_count = state.dropped_count,
-            .original_count = state.original_count,
-            .was_transformed = state.mutated,
-        };
-    }
-
-    // Serialize kept logs (either some dropped or mutations applied)
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    try std.json.Stringify.value(state.kept.items, .{}, &out.writer);
-
-    return .{
-        .data = try out.toOwnedSlice(),
-        .dropped_count = state.dropped_count,
-        .original_count = state.original_count,
-        .was_transformed = state.mutated,
-    };
-}
-
-/// Return data unchanged (fail-open behavior)
-fn returnUnchanged(allocator: std.mem.Allocator, data: []const u8, original_count: usize) !ProcessResult {
-    const result = try allocator.alloc(u8, data.len);
-    @memcpy(result, data);
-    return .{
-        .data = result,
-        .dropped_count = 0,
-        .original_count = original_count,
-    };
-}
-
-/// Process JSON logs with filter evaluation using zimdjson ondemand parser
-/// Detects if input is an array or single object, applies filter to each log
-fn processJsonLogsWithFilter(
-    allocator: std.mem.Allocator,
-    parser: *Parser,
-    parser_gpa: std.mem.Allocator,
-    registry: *const PolicyRegistry,
-    bus: *EventBus,
-    data: []const u8,
-    sink: ?policy.ExtensionSink,
-) !ProcessResult {
-    const document = parser.parseFromSlice(parser_gpa, data) catch {
-        return returnUnchanged(allocator, data, 0);
-    };
-
-    const engine = PolicyEngine.init(bus, @constCast(registry));
-
-    const value_type = document.asValue().getType() catch {
-        return returnUnchanged(allocator, data, 0);
-    };
-
-    var state = FilterState.init(allocator);
-    defer state.deinit();
-    const arena = state.allocator();
-    var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
-    // One state for the whole batch. The engine's fallback clears one byte
-    // per policy for every record, so this trades `records x policies` bytes
-    // of memset for a single 8 KiB clear here plus an undo of the policies
-    // each record actually touched. It pays once `records x policies` passes
-    // roughly 8192, which a real agent batch clears easily.
-    var scan_state: policy.ScanState = .init();
-
-    switch (value_type) {
-        .array => {
-            var array = document.asValue().asArray() catch {
-                return returnUnchanged(allocator, data, 0);
-            };
-            var it = array.iterator();
-
-            while (it.next() catch null) |item| {
-                var log_obj = DatadogLog.parse(arena, item) catch {
-                    return returnUnchanged(allocator, data, state.original_count);
-                };
-
-                state.original_count += 1;
-                const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, sink, &scan_state);
-                if (filter_result.mutated) state.mutated = true;
-                if (filter_result.keep) {
-                    try state.kept.append(arena, log_obj);
-                } else {
-                    state.dropped_count += 1;
-                }
-            }
-
-            return buildResult(allocator, &state, data);
-        },
-        .object => {
-            var log_obj = DatadogLog.parse(arena, document.asValue()) catch {
-                return returnUnchanged(allocator, data, 1);
-            };
-
-            state.original_count = 1;
-            const filter_result = filterLog(&engine, &log_obj, arena, &policy_id_buf, sink, &scan_state);
-            if (filter_result.mutated) state.mutated = true;
-            if (filter_result.keep) {
-                try state.kept.append(arena, log_obj);
-            } else {
-                state.dropped_count = 1;
-            }
-
-            return buildResult(allocator, &state, data);
-        },
-        else => return returnUnchanged(allocator, data, 0),
-    }
 }
 
 // =============================================================================
@@ -999,6 +743,205 @@ test "evalLogRecord - transform yields replace with serialized record" {
     try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "\"service\"") == null);
 }
 
+test "evalLogRecord - malformed unknown-field container fails open to keep under matching policy" {
+    // Regression: FieldWalker.valueEnd accepted malformed containers in
+    // unknown fields, so the verdict depended on the fast path. Now both
+    // parsers reject them and the record fails open to `.keep`.
+    const allocator = std.testing.allocator;
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    const bus = noop_bus.eventBus();
+
+    // Each input has a bracket-balanced but malformed container in the
+    // unknown field `x`.
+    const malformed_values = [_][]const u8{
+        "[1,]", // trailing comma in array
+        "[,]", // leading comma in array
+        "{,}", // leading comma in object
+        "{\"k\":}", // missing object value
+        "{1:2}", // non-string object key
+        "[\"a\",,]", // missing value in array
+    };
+
+    // --- Drop policy (keep = "none"), matched on LOG_FIELD_BODY regex "matched".
+    {
+        var registry = PolicyRegistry.init(allocator, bus);
+        defer registry.deinit();
+        var drop_policy: proto.policy.Policy = .{
+            .id = try allocator.dupe(u8, "drop-matched"),
+            .name = try allocator.dupe(u8, "drop-matched"),
+            .enabled = true,
+            .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        };
+        try drop_policy.target.?.log.match.append(allocator, .{
+            .field = .{ .log_field = .LOG_FIELD_BODY },
+            .match = .{ .regex = try allocator.dupe(u8, "matched") },
+        });
+        defer drop_policy.deinit(allocator);
+        try registry.updatePolicies(&.{drop_policy}, "drop", .file);
+
+        for (malformed_values) |val| {
+            var buf: [128]u8 = undefined;
+            const record = std.fmt.bufPrint(
+                &buf,
+                "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
+                .{val},
+            ) catch unreachable;
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            try std.testing.expectEqual(
+                RecordVerdict.keep,
+                try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, record, null),
+            );
+        }
+
+        // A well-formed matching record is still dropped.
+        const good = "{\"message\":\"matched\",\"service\":\"s\",\"x\":[1,2]}";
+        var good_arena = std.heap.ArenaAllocator.init(allocator);
+        defer good_arena.deinit();
+        try std.testing.expectEqual(
+            RecordVerdict.drop,
+            try evalLogRecord(good_arena.allocator(), &parser, allocator, &registry, bus, good, null),
+        );
+    }
+
+    // --- Mutating policy (keep = "all", removes `service`), matched on the body.
+    {
+        var registry = PolicyRegistry.init(allocator, bus);
+        defer registry.deinit();
+        var transform: proto.policy.LogTransform = .{};
+        var remove_attr_path: proto.policy.AttributePath = .{};
+        try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
+        try transform.remove.append(allocator, .{
+            .field = .{ .log_attribute = remove_attr_path },
+        });
+        var mutate_policy: proto.policy.Policy = .{
+            .id = try allocator.dupe(u8, "remove-service"),
+            .name = try allocator.dupe(u8, "remove-service"),
+            .enabled = true,
+            .target = .{ .log = .{
+                .keep = try allocator.dupe(u8, "all"),
+                .transform = transform,
+            } },
+        };
+        try mutate_policy.target.?.log.match.append(allocator, .{
+            .field = .{ .log_field = .LOG_FIELD_BODY },
+            .match = .{ .regex = try allocator.dupe(u8, "matched") },
+        });
+        defer mutate_policy.deinit(allocator);
+        try registry.updatePolicies(&.{mutate_policy}, "mutate", .file);
+
+        for (malformed_values) |val| {
+            var buf: [128]u8 = undefined;
+            const record = std.fmt.bufPrint(
+                &buf,
+                "{{\"message\":\"matched\",\"service\":\"s\",\"x\":{s}}}",
+                .{val},
+            ) catch unreachable;
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            try std.testing.expectEqual(
+                RecordVerdict.keep,
+                try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, record, null),
+            );
+        }
+
+        // A well-formed matching record is still replaced.
+        const good = "{\"message\":\"matched\",\"service\":\"s\",\"x\":[1,2]}";
+        var good_arena = std.heap.ArenaAllocator.init(allocator);
+        defer good_arena.deinit();
+        const verdict = try evalLogRecord(good_arena.allocator(), &parser, allocator, &registry, bus, good, null);
+        try std.testing.expect(verdict == .replace);
+        try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "\"service\"") == null);
+    }
+}
+
+test "evalLogRecord - two regex redacts on the same wrapped path compose" {
+    // Regression (PR #203): the engine re-reads the field before each
+    // transform. `unwrappedAttribute` served a stale `message_flat`, so rule 2
+    // overwrote rule 1.
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    // keep=all with two regex redacts on data.jsonPayload.email: the local
+    // part, then the domain.
+    var transform: proto.policy.LogTransform = .{};
+
+    var email_path: proto.policy.AttributePath = .{};
+    try email_path.path.append(allocator, try allocator.dupe(u8, "data"));
+    try email_path.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
+    try email_path.path.append(allocator, try allocator.dupe(u8, "email"));
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = email_path },
+        .regex = try allocator.dupe(u8, "alice"),
+        .replacement = try allocator.dupe(u8, "ALICE_R"),
+    });
+
+    var email_path2: proto.policy.AttributePath = .{};
+    try email_path2.path.append(allocator, try allocator.dupe(u8, "data"));
+    try email_path2.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
+    try email_path2.path.append(allocator, try allocator.dupe(u8, "email"));
+    try transform.redact.append(allocator, .{
+        .field = .{ .log_attribute = email_path2 },
+        .regex = try allocator.dupe(u8, "example"),
+        .replacement = try allocator.dupe(u8, "EXAMPLE_R"),
+    });
+
+    var test_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "redact-email"),
+        .name = try allocator.dupe(u8, "redact-email"),
+        .enabled = true,
+        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all"), .transform = transform } },
+    };
+    try test_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_field = .LOG_FIELD_BODY },
+        .match = .{ .exact = try allocator.dupe(u8, "evidence skipped") },
+    });
+    defer test_policy.deinit(allocator);
+
+    try registry.updatePolicies(&.{test_policy}, "test", .file);
+
+    const record = comptime wrap(
+        \\{"data":{"jsonPayload":{
+        \\"email":"alice@example.com",
+        \\"message":"evidence skipped"
+        \\}}}
+    );
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const verdict = try evalLogRecord(
+        arena.allocator(),
+        &parser,
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        record,
+        null,
+    );
+    try std.testing.expect(verdict == .replace);
+
+    // Both redactions compose: both replacement tokens, neither original.
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "ALICE_R@EXAMPLE_R.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "alice") == null);
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "example") == null);
+    // The body and wrapper shape survive the transform.
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "evidence skipped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verdict.replace, "jsonPayload") != null);
+}
+
 test "evalLogRecord - malformed and non-object records fail open to keep" {
     const allocator = std.testing.allocator;
 
@@ -1018,840 +961,4 @@ test "evalLogRecord - malformed and non-object records fail open to keep" {
 
     const scalar = try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, "42", null);
     try std.testing.expectEqual(RecordVerdict.keep, scalar);
-}
-
-test "processLogs - no policies keeps all logs in array" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    const logs =
-        \\[{"status": "info", "message": "test1"}, {"status": "error", "message": "test2"}]
-    ;
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "test1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "test2") != null);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(!result.wasModified());
-}
-
-test "processLogs - DROP policy filters logs from array" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // Create a DROP policy for DEBUG logs
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-debug"),
-        .name = try allocator.dupe(u8, "drop-debug"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "none"),
-        } },
-    };
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
-        .match = .{ .regex = try allocator.dupe(u8, "debug") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
-
-    const logs =
-        \\[{"status": "debug", "message": "debug msg"}, {"status": "error", "message": "error msg"}]
-    ;
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    // DEBUG log should be dropped, ERROR log should remain
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "debug msg") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "error msg") != null);
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(result.wasModified());
-}
-
-test "processLogs - DROP policy drops single object" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-debug"),
-        .name = try allocator.dupe(u8, "drop-debug"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "none"),
-        } },
-    };
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
-        .match = .{ .regex = try allocator.dupe(u8, "debug") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
-
-    const log =
-        \\{"status": "debug", "message": "debug msg"}
-    ;
-
-    var in_reader = std.Io.Reader.fixed(log);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    // Single dropped log returns empty array
-    try std.testing.expectEqualStrings("[]", result.data);
-    try std.testing.expect(result.allDropped());
-}
-
-test "processLogs - malformed JSON returns unchanged (fail-open)" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    const malformed = "{ not valid json }";
-
-    var in_reader = std.Io.Reader.fixed(malformed);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqualStrings(malformed, result.data);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-}
-
-test "processLogs - non-JSON content type returns unchanged" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    const data = "some raw log data";
-
-    var in_reader = std.Io.Reader.fixed(data);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "text/plain",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqualStrings(data, result.data);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-}
-
-test "processLogs - Datadog format with ddtags and service" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    const logs =
-        "[{\"message\": \"User login\", \"service\": \"auth-service\", \"hostname\": \"web-01\", " ++
-        "\"ddsource\": \"nodejs\", \"ddtags\": \"env:prod\", \"status\": \"info\", " ++
-        "\"timestamp\": 1733946000000}]";
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "User login") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "auth-service") != null);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 1), result.original_count);
-}
-
-test "processLogs - filter on arbitrary custom field" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // Create a DROP policy that matches on a custom field "environment"
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-dev-env"),
-        .name = try allocator.dupe(u8, "drop-dev-env"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "none"),
-        } },
-    };
-    var attr_path_env: proto.policy.AttributePath = .{};
-    try attr_path_env.path.append(allocator, try allocator.dupe(u8, "environment"));
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = attr_path_env },
-        .match = .{ .regex = try allocator.dupe(u8, "development") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
-
-    // Logs with custom "environment" field - one dev, one prod
-    const logs =
-        "[{\"message\": \"dev log\", \"environment\": \"development\", \"custom_field\": \"abc\"}, " ++
-        "{\"message\": \"prod log\", \"environment\": \"production\", \"custom_field\": \"xyz\"}]";
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    // Dev log should be dropped, prod log should remain
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "dev log") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "prod log") != null);
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expect(result.wasModified());
-}
-
-test "processLogs - extra fields are preserved when no logs dropped" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // No policies - all logs kept, original data returned unchanged
-
-    // Logs with extra fields not in the DatadogLog schema
-    const logs =
-        "[{\"status\": \"info\", \"message\": \"kept log\", \"extra_field\": \"should_be_preserved\", " ++
-        "\"nested\": {\"key\": \"value\"}, \"array_field\": [1, 2, 3]}]";
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    // When nothing is dropped, original data is returned unchanged - extra fields preserved
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "kept log") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "extra_field") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "should_be_preserved") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "nested") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "array_field") != null);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 1), result.original_count);
-}
-
-test "processLogs - nested extra fields are preserved when reserializing after drop" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // Drop DEBUG logs so remaining logs are reserialized.
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-debug"),
-        .name = try allocator.dupe(u8, "drop-debug"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "none"),
-        } },
-    };
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_SEVERITY_TEXT },
-        .match = .{ .regex = try allocator.dupe(u8, "^debug$") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "test", .file);
-
-    const logs =
-        \\[
-        \\  {"status":"debug","message":"drop me"},
-        \\  {"status":"info","message":"keep me","nested":{"status_code":"200","inner":{"ok":true}}}
-        \\]
-    ;
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "drop me") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "keep me") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"nested\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"status_code\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"inner\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"ok\":true") != null);
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-}
-
-test "processLogs - nested extra transform is ignored and payload is unchanged" {
-    // TODO: Note this test should be updated after this behavior is supported
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    var transform: proto.policy.LogTransform = .{};
-    var nested_attr_path: proto.policy.AttributePath = .{};
-    try nested_attr_path.path.append(allocator, try allocator.dupe(u8, "nested"));
-    try nested_attr_path.path.append(allocator, try allocator.dupe(u8, "status_code"));
-    try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = nested_attr_path },
-    });
-
-    var test_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "remove-nested"),
-        .name = try allocator.dupe(u8, "remove-nested"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "all"),
-            .transform = transform,
-        } },
-    };
-    try test_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "keep me") },
-    });
-    defer test_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{test_policy}, "test", .file);
-
-    const logs =
-        \\[{"status":"info","message":"keep me","nested":{"status_code":"200","inner":{"ok":true}}}]
-    ;
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 1), result.original_count);
-    try std.testing.expectEqual(false, result.was_transformed);
-    try std.testing.expectEqualStrings(logs, result.data);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"status_code\":\"200\"") != null);
-}
-
-test "processLogs - mutation triggers reserialization and removes field" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // Create a policy with keep=all and a transform that removes the 'service' field
-    var transform: proto.policy.LogTransform = .{};
-    var remove_attr_path: proto.policy.AttributePath = .{};
-    try remove_attr_path.path.append(allocator, try allocator.dupe(u8, "service"));
-    try transform.remove.append(allocator, .{
-        .field = .{ .log_attribute = remove_attr_path },
-    });
-
-    var test_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "remove-service-policy"),
-        .name = try allocator.dupe(u8, "remove-service"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "all"),
-            .transform = transform,
-        } },
-    };
-    // Match on message containing "test"
-    try test_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .regex = try allocator.dupe(u8, "test") },
-    });
-    defer test_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{test_policy}, "test", .file);
-
-    // Log with service field that should be removed
-    const logs =
-        \\[{"message": "test log message", "service": "my-service", "status": "info"}]
-    ;
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    // The log should be kept (keep=all)
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 1), result.original_count);
-
-    // The message and status should still be present
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "test log message") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "info") != null);
-
-    // The service field should be removed by the transform
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "my-service") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "\"service\"") == null);
-}
-
-test "processLogs - filter on dynamic extra field not in schema" {
-    // Tests that we can filter on arbitrary fields that are not part of the
-    // known DatadogLog schema (stored in the 'extra' hashmap)
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // Create a DROP policy that matches on a dynamic field "trace_id" (not in schema)
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-trace"),
-        .name = try allocator.dupe(u8, "drop-trace-logs"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "none"),
-        } },
-    };
-    var attr_path_trace: proto.policy.AttributePath = .{};
-    try attr_path_trace.path.append(allocator, try allocator.dupe(u8, "trace_id"));
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = attr_path_trace },
-        .match = .{ .regex = try allocator.dupe(u8, "^abc123") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
-
-    // Logs with dynamic "trace_id" field - one matches pattern, one doesn't
-    // Using unique message strings to avoid substring matching issues
-    const logs =
-        "[{\"message\": \"first-log-match\", \"trace_id\": \"abc123-def456\"}, " ++
-        "{\"message\": \"second-log-nomatch\", \"trace_id\": \"xyz789-other\"}, " ++
-        "{\"message\": \"third-log-notrace\"}]";
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    // Check counts
-    try std.testing.expectEqual(@as(usize, 3), result.original_count);
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-
-    // Log with trace_id starting with "abc123" should be dropped
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "first-log-match") == null);
-    // Logs with other trace_id or no trace_id should remain
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "second-log-nomatch") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "third-log-notrace") != null);
-}
-
-test "processLogs - drops wrapped GCP log via body + nested event_type exact match" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // The production EvidenceSkipped policy: body exact AND nested attribute exact.
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "evidence-skipped"),
-        .name = try allocator.dupe(u8, "evidence-skipped"),
-        .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
-    };
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .exact = try allocator.dupe(u8, "evidence skipped") },
-    });
-    var event_type_path: proto.policy.AttributePath = .{};
-    try event_type_path.path.append(allocator, try allocator.dupe(u8, "data"));
-    try event_type_path.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
-    try event_type_path.path.append(allocator, try allocator.dupe(u8, "event_type"));
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = event_type_path },
-        .match = .{ .exact = try allocator.dupe(u8, "EvidenceSkipped") },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "test", .file);
-
-    // One wrapped log that should match (drop), one that should not (kept).
-    const logs = "[" ++ comptime wrap(
-        \\{"data":{"jsonPayload":{
-        \\"event_type":"EvidenceSkipped","message":"evidence skipped"
-        \\}}}
-    ) ++ "," ++ wrap(
-        \\{"data":{"jsonPayload":{
-        \\"event_type":"Started","message":"loop started"
-        \\}}}
-    ) ++ "]";
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "evidence skipped") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "loop started") != null);
-}
-
-test "processLogs - rewrites fields inside a JSON-wrapped message and re-serializes" {
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // keep=all + transform: remove data.jsonPayload.event_type, redact
-    // data.jsonPayload.account_name. Matches on the unwrapped body.
-    var transform: proto.policy.LogTransform = .{};
-    var remove_path: proto.policy.AttributePath = .{};
-    try remove_path.path.append(allocator, try allocator.dupe(u8, "data"));
-    try remove_path.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
-    try remove_path.path.append(allocator, try allocator.dupe(u8, "event_type"));
-    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = remove_path } });
-
-    var redact_path: proto.policy.AttributePath = .{};
-    try redact_path.path.append(allocator, try allocator.dupe(u8, "data"));
-    try redact_path.path.append(allocator, try allocator.dupe(u8, "jsonPayload"));
-    try redact_path.path.append(allocator, try allocator.dupe(u8, "account_name"));
-    try transform.redact.append(allocator, .{
-        .field = .{ .log_attribute = redact_path },
-        .replacement = try allocator.dupe(u8, "REDACTED"),
-    });
-
-    var test_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "rewrite-wrapped"),
-        .name = try allocator.dupe(u8, "rewrite-wrapped"),
-        .enabled = true,
-        .target = .{ .log = .{ .keep = try allocator.dupe(u8, "all"), .transform = transform } },
-    };
-    try test_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_field = .LOG_FIELD_BODY },
-        .match = .{ .exact = try allocator.dupe(u8, "evidence skipped") },
-    });
-    defer test_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{test_policy}, "test", .file);
-
-    const logs = "[" ++ comptime wrap(
-        \\{"data":{"jsonPayload":{
-        \\"account_name":"Vivid Seats",
-        \\"event_type":"EvidenceSkipped",
-        \\"message":"evidence skipped"
-        \\}}}
-    ) ++ "]";
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_count);
-    try std.testing.expect(result.was_transformed);
-    // event_type removed from the wrapped payload, account_name redacted.
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "EvidenceSkipped") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "event_type") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "Vivid Seats") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "REDACTED") != null);
-    // The wrapper is still a stringified JSON object and body is intact.
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "evidence skipped") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "jsonPayload") != null);
-}
-
-test "processLogs - filter on nested extra field with exists" {
-    // Tests using exists matching on dynamic extra fields
-    const allocator = std.testing.allocator;
-
-    var noop_bus: NoopEventBus = undefined;
-    noop_bus.init(std.Options.debug_io);
-    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
-    defer registry.deinit();
-
-    // Create a DROP policy that drops logs where "debug_info" field exists
-    var drop_policy: proto.policy.Policy = .{
-        .id = try allocator.dupe(u8, "drop-debug-info"),
-        .name = try allocator.dupe(u8, "drop-debug-info-logs"),
-        .enabled = true,
-        .target = .{ .log = .{
-            .keep = try allocator.dupe(u8, "none"),
-        } },
-    };
-    var attr_path_debug: proto.policy.AttributePath = .{};
-    try attr_path_debug.path.append(allocator, try allocator.dupe(u8, "debug_info"));
-    try drop_policy.target.?.log.match.append(allocator, .{
-        .field = .{ .log_attribute = attr_path_debug },
-        .match = .{ .exists = true },
-    });
-    defer drop_policy.deinit(allocator);
-
-    try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
-
-    // Mix of logs with and without the debug_info field
-    const logs =
-        \\[{"message": "debug log", "debug_info": "stack trace here"}, {"message": "normal log", "service": "api"}]
-    ;
-
-    var in_reader = std.Io.Reader.fixed(logs);
-    var out_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer out_writer.deinit();
-    const stream_result = try processLogsStream(
-        allocator,
-        &registry,
-        noop_bus.eventBus(),
-        &in_reader,
-        &out_writer.writer,
-        "application/json",
-        null,
-    );
-    const result: ProcessResult = .{
-        .data = try out_writer.toOwnedSlice(),
-        .dropped_count = stream_result.dropped_count,
-        .original_count = stream_result.original_count,
-        .was_transformed = stream_result.was_transformed,
-    };
-    defer allocator.free(result.data);
-
-    // Log with debug_info should be dropped
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "debug log") == null);
-    // Log without debug_info should remain
-    try std.testing.expect(std.mem.indexOf(u8, result.data, "normal log") != null);
-    try std.testing.expectEqual(@as(usize, 1), result.dropped_count);
-    try std.testing.expectEqual(@as(usize, 2), result.original_count);
 }

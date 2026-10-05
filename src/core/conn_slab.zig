@@ -169,26 +169,27 @@ pub const ConnSlab = struct {
         return ConnId.pack(slot, entry.generation);
     }
 
-    /// Releases a slot back to the free list, bumping the generation so any
-    /// stale ConnId held elsewhere asserts instead of aliasing the new owner.
-    /// After releasing the lock, advises the OS to decommit the buffer pages
-    /// so idle RSS returns to near zero between connections.
+    /// Releases a slot back to the free list and bumps the generation, so a
+    /// stale ConnId asserts instead of aliasing the new owner. Advises the OS
+    /// to decommit the buffer pages, so idle RSS returns to near zero.
+    ///
+    /// The decommit runs under the mutex. The free list is LIFO, so the next
+    /// `claim` returns this slot. A decommit after unlock would zero the pages
+    /// of the new owner. The lock is held once per connection, so the cost is
+    /// small.
     pub fn release(self: *ConnSlab, io: std.Io, id: ConnId) void {
-        const slot: u16 = blk: {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
-            const s = self.checkedIndex(id);
-            const entry = self.hot.get(s);
-            std.debug.assert(entry.state != .free);
-            self.hot.set(s, .{ .state = .free, .generation = entry.generation +% 1 });
-            self.sockets[s] = null;
+        const slot = self.checkedIndex(id);
+        const entry = self.hot.get(slot);
+        std.debug.assert(entry.state != .free);
+        self.hot.set(slot, .{ .state = .free, .generation = entry.generation +% 1 });
+        self.sockets[slot] = null;
 
-            std.debug.assert(self.free_count < self.free_list.len);
-            self.free_list[self.free_count] = s;
-            self.free_count += 1;
-            break :blk s;
-        };
+        std.debug.assert(self.free_count < self.free_list.len);
+        self.free_list[self.free_count] = slot;
+        self.free_count += 1;
 
         // One madvise per connection close: tell the OS these pages are no
         // longer needed. On Linux (DONTNEED) pages are immediately zeroed and
@@ -404,4 +405,54 @@ test "state machine transitions are tracked" {
     slab.setState(io, id, .reading_head); // keep-alive
     slab.setState(io, id, .closing);
     slab.release(io, id);
+}
+
+// Page-sized buffers, so `release` reaches the madvise call. The default
+// testLimits() buffers are smaller than a page, and the alignment guard skips
+// the decommit.
+fn pageAlignedLimits() limits_mod.Limits {
+    return .{
+        .max_connections = 4,
+        .max_body_size = 4096,
+        .record_scratch = 4096,
+        .recv_buf = 4096,
+        .send_buf = 4096,
+        .upstream_write_buf = 4096,
+        .body_buf = 4096,
+        .chunk_buf = 4096,
+        .zstd_window_len = 4096,
+        .large_body_buffer_count = 1,
+        .large_body_buffer_size = 4096,
+        .conn_arena_reserve = 4096,
+    };
+}
+
+test "release decommits page-aligned slot buffers and the slot stays usable" {
+    // The slab must survive the in-lock decommit: a re-claimed slot is still
+    // usable, and on Linux MADV_DONTNEED zeroed it. The race itself needs OS
+    // threads; testing.io is single-threaded.
+    var slab: ConnSlab = try .init(testing.allocator, pageAlignedLimits());
+    defer slab.deinit(testing.allocator);
+    const io = testing.io;
+
+    const a = slab.claim(io).?;
+    const a_recv = slab.recvBuf(a);
+    @memset(a_recv, 0xAA);
+    try testing.expectEqual(@as(u8, 0xAA), a_recv[0]);
+    slab.release(io, a);
+
+    // LIFO: the released slot is the next claim.
+    const b = slab.claim(io).?;
+    try testing.expectEqual(a.index(), b.index());
+    const b_recv = slab.recvBuf(b);
+
+    switch (builtin.os.tag) {
+        // MADV_DONTNEED discards the page; the next read returns zeros.
+        .linux => try testing.expectEqual(@as(u8, 0x00), b_recv[0]),
+        // Elsewhere the decommit is advisory; only check the buffer stays usable.
+        else => {},
+    }
+    @memset(b_recv, 0xBB);
+    try testing.expectEqual(@as(u8, 0xBB), b_recv[0]);
+    slab.release(io, b);
 }

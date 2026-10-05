@@ -318,7 +318,9 @@ pub const MetricSeries = struct {
 
         // Extras in the order the series listed them; a container goes out as
         // the bytes captured at parse time.
-        try self.extra.write(jws);
+        // The validating parse already materialized `extra`, so only the
+        // writer can fail here. Coerce to the `std.json.Stringify` error set.
+        self.extra.write(jws) catch return error.WriteFailed;
 
         try jws.endObject();
     }

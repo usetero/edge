@@ -23,11 +23,27 @@ pub const BODY_BUF_BYTES: usize = 8 * 1024;
 /// Staging between the decoder and the framer.
 pub const CHUNK_BUF_BYTES: usize = 4 * 1024;
 
-/// zstd frames declare their window; producers cap it at min(content_size,
-/// 8 MiB default). Bounding by max_body_size matches what a fully-buffered
-/// decompress would have admitted anyway.
+/// zstd frames declare their window. One-shot libzstd at the default level
+/// declares min(content, 2 MiB); other producers can declare up to the 8 MiB
+/// format max. The decoder sets libzstd's windowLogMax from the cap, rounded
+/// up to a power of two, and refuses a larger frame as WindowTooLarge before
+/// any output. So `Limits.resolve` keys the cap to `max_decoded_bytes`, not
+/// `max_body_size`.
 pub const ZSTD_WINDOW_MIN: usize = 256 * 1024;
+/// Largest window a zstd frame may declare (format limit, 2^23).
 pub const ZSTD_WINDOW_MAX: usize = 8 * 1024 * 1024;
+/// Largest decode window cap `Limits.resolve` chooses.
+///
+/// Each OS thread that decodes a compressed body keeps one libzstd context in
+/// `ThreadBufs.decoder`, and that context can retain a window of the cap. The
+/// multiplier is the CPU count, not the inert `thread_pool_count`.
+///
+/// 2 MiB admits every frame from one-shot libzstd at the default level. A
+/// producer that declares a larger window (windowLog >= 22) is refused. To
+/// admit it, raise this constant and the pod memory limit together. Size a
+/// deployment from measured RSS; see the Sizing table in
+/// charts/tero-edge/README.md.
+pub const ZSTD_WINDOW_BUDGET_MAX: usize = 2 * 1024 * 1024;
 
 /// Per-connection arena budget for cold allocations (header copies, upstream
 /// URL strings, error bodies). Debug builds assert the high-water mark.
@@ -90,7 +106,8 @@ pub const Limits = struct {
     max_connections: usize,
     /// Per-request body ceiling, from the frozen `ProxyConfig.max_body_size`.
     max_body_size: u32,
-    /// Post-decompression body ceiling; defaults to `max_body_size`.
+    /// Post-decompression body ceiling; defaults to `DEFAULT_MAX_DECODED_BYTES`
+    /// (never below `max_body_size`). See `Limits.resolve`.
     max_decoded_bytes: usize = 0,
     /// httpz event-loop worker count (null = httpz default).
     worker_count: ?u16 = null,
@@ -133,17 +150,21 @@ pub const Limits = struct {
         else
             null;
         const thread_pool_count: ?u16 = if (opts.thread_pool_count) |count| @max(count, 1) else DEFAULT_HANDLER_THREADS;
+        // Never below the raw cap: a larger max_body_size stays admissible
+        // after decode.
+        const max_decoded_bytes: usize = opts.max_decoded_bytes orelse
+            @max(@as(usize, DEFAULT_MAX_DECODED_BYTES), @as(usize, opts.max_body_size));
+        // Key the window to the decoded cap, bounded by ZSTD_WINDOW_BUDGET_MAX,
+        // so the window cap does not reject a frame the decoded cap admits.
         const zstd_window_len = std.math.clamp(
-            @as(usize, opts.max_body_size),
+            max_decoded_bytes,
             ZSTD_WINDOW_MIN,
-            ZSTD_WINDOW_MAX,
+            @min(ZSTD_WINDOW_MAX, ZSTD_WINDOW_BUDGET_MAX),
         );
         return .{
             .max_connections = opts.max_connections,
             .max_body_size = opts.max_body_size,
-            // Never below the raw cap: a larger body_size must stay admissible.
-            .max_decoded_bytes = opts.max_decoded_bytes orelse
-                @max(@as(usize, DEFAULT_MAX_DECODED_BYTES), @as(usize, opts.max_body_size)),
+            .max_decoded_bytes = max_decoded_bytes,
             .worker_count = worker_count,
             .thread_pool_count = thread_pool_count,
             .record_scratch = RECORD_SCRATCH_BYTES,
@@ -200,8 +221,9 @@ pub const Limits = struct {
 test "Limits budget formula is locked" {
     const limits: Limits = .resolve(.{ .max_body_size = 1024 * 1024 });
 
-    // Hand-computed with the default 1 MiB max_body_size:
-    //   zstd window = clamp(1M, 256K, 8M)        = 1024 KiB
+    // Hand-computed with a 1 MiB max_body_size:
+    //   max_decoded_bytes = @max(16 MiB, 1 MiB)        = 16 MiB
+    //   zstd window = clamp(16 MiB, 256K, min(8M, 2M))  = 2 MiB (ZSTD_WINDOW_BUDGET_MAX)
     //   per conn = 20K+20K (socket bufs) + 8K (body staging) = 48 KiB
     //   slots = 256 cap + 2 control reserve      = 258
     //   steady state = 258 x (48K + 16K arena)  = 16.1 MiB reserved
@@ -209,7 +231,7 @@ test "Limits budget formula is locked" {
     // (frontend/thread_bufs.zig), so they are outside this budget.
     // Any change to a buffer constant must show up as a diff in this test.
     try std.testing.expectEqual(@as(usize, 256), limits.max_connections);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), limits.zstd_window_len);
+    try std.testing.expectEqual(ZSTD_WINDOW_BUDGET_MAX, limits.zstd_window_len);
     try std.testing.expectEqual(@as(usize, 48 * 1024), limits.perConnBytes());
     // The reserve is capacity on top of the cap, so a deployment sized to its
     // sender count does not shed the last two senders. It costs two slots.
@@ -222,6 +244,9 @@ test "Limits budget formula is locked" {
     // A raw cap above the decoded default still stays admissible.
     const wide: Limits = .resolve(.{ .max_body_size = 32 * 1024 * 1024 });
     try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), wide.max_decoded_bytes);
+    // The budget bounds the window cap, so a large raw cap cannot grow the
+    // per-thread scratch.
+    try std.testing.expectEqual(ZSTD_WINDOW_BUDGET_MAX, wide.zstd_window_len);
     try std.testing.expectEqual(@as(?u16, null), limits.worker_count);
     try std.testing.expectEqual(@as(?u16, DEFAULT_HANDLER_THREADS), limits.thread_pool_count);
     // The reusable body pool stays small even when the accepted body limit grows.
@@ -266,4 +291,38 @@ test "Limits caps the body pool below the handler count" {
         .worker_count = 16,
     });
     try std.testing.expectEqual(@as(u16, 1), many_workers.large_body_buffer_count);
+}
+
+test "zstd window cap tracks max_decoded_bytes, bounded by the budget ceiling" {
+    const testing = std.testing;
+
+    // Default shape: decoded cap 16 MiB, window capped at the 2 MiB budget.
+    const def: Limits = .resolve(.{ .max_body_size = DEFAULT_MAX_BODY_BYTES });
+    try testing.expectEqual(@as(usize, DEFAULT_MAX_DECODED_BYTES), def.max_decoded_bytes);
+    try testing.expectEqual(ZSTD_WINDOW_BUDGET_MAX, def.zstd_window_len);
+    try testing.expect(def.zstd_window_len < def.max_decoded_bytes);
+
+    // The window follows a smaller decoded cap down; it is not pinned to
+    // max_body_size.
+    const small: Limits = .resolve(.{
+        .max_body_size = 64 * 1024,
+        .max_decoded_bytes = 512 * 1024,
+    });
+    try testing.expectEqual(@as(usize, 512 * 1024), small.zstd_window_len);
+
+    // The window never goes below ZSTD_WINDOW_MIN.
+    const floored: Limits = .resolve(.{
+        .max_body_size = 64 * 1024,
+        .max_decoded_bytes = 64 * 1024,
+    });
+    try testing.expectEqual(ZSTD_WINDOW_MIN, floored.zstd_window_len);
+
+    // A decoded cap above the budget clamps to the budget, not to the 8 MiB
+    // format max.
+    const wide: Limits = .resolve(.{
+        .max_body_size = 32 * 1024 * 1024,
+        .max_decoded_bytes = 64 * 1024 * 1024,
+    });
+    try testing.expectEqual(@as(usize, 64 * 1024 * 1024), wide.max_decoded_bytes);
+    try testing.expectEqual(ZSTD_WINDOW_BUDGET_MAX, wide.zstd_window_len);
 }
