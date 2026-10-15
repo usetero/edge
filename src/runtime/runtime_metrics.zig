@@ -415,10 +415,11 @@ pub const RuntimeMetrics = struct {
         // Free each metric vector's per-series allocations. Safe at shutdown:
         // callers deinit RuntimeMetrics only after the server has stopped
         // (listen thread joined), so no worker threads touch the metrics here.
-        inline for (std.meta.fields(InternalMetrics)) |field| {
+        const info = @typeInfo(InternalMetrics).@"struct";
+        inline for (info.field_names, info.field_types) |field_name, field_type| {
             // Vec metrics allocate per-series and expose deinit; the label-less
             // plain Counter/Gauge don't allocate and have none.
-            if (@hasDecl(field.type, "deinit")) @field(self.internal, field.name).deinit();
+            if (@hasDecl(field_type, "deinit")) @field(self.internal, field_name).deinit();
         }
         self.* = undefined;
     }

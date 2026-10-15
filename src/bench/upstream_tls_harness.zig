@@ -47,7 +47,7 @@ fn send(client: *std.http.Client, uri: std.Uri, payload: []const u8, streamed: b
     var response = try request.receiveHead(&.{});
     if (response.head.status != .accepted) {
         std.debug.print("TLS body mismatch: sent={d}, status={d}, streamed={}\n", .{
-            payload.len, @intFromEnum(response.head.status), streamed,
+            payload.len, @backingInt(response.head.status), streamed,
         });
         return error.UpstreamBodyMismatch;
     }

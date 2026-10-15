@@ -214,8 +214,7 @@ test "ensureDirectoryWatch does not leak when parent directory is missing" {
     defer tmp.cleanup();
     const root_abs = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
     defer testing.allocator.free(root_abs);
-    const target = try std.fmt.allocPrint(
-        testing.allocator,
+    const target = try testing.allocator.print(
         "{s}/nonexistent_subdir_kqueue_leak/tail.log",
         .{root_abs},
     );

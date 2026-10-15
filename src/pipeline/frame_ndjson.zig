@@ -232,7 +232,7 @@ test "replace substitutes record bytes" {
 test "oversized record fails open: forwarded verbatim, never evaluated" {
     // Record of 100 bytes vs 16-byte scratch; contains "drop" but MUST pass
     // through because fail-open bytes bypass the sink (PLAN §6.5.3).
-    const big = "x" ** 40 ++ "drop" ++ "y" ** 56;
+    const big = @as([40]u8, @splat('x')) ++ "drop" ++ @as([56]u8, @splat('y'));
     const input = "small\n" ++ big ++ "\nsmall2\n";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
         var sink: TestSink = .{ .allocator = testing.allocator };
@@ -246,7 +246,7 @@ test "oversized record fails open: forwarded verbatim, never evaluated" {
 }
 
 test "oversized trailing record without newline fails open" {
-    const big = "z" ** 64;
+    const big = &@as([64]u8, @splat('z'));
     const input = "ok\n" ++ big; // no trailing newline
     var sink: TestSink = .{ .allocator = testing.allocator };
     defer sink.deinit();
@@ -256,7 +256,7 @@ test "oversized trailing record without newline fails open" {
 }
 
 test "stats are accounted" {
-    const input = "keep\ndrop it\nswap it\n" ++ ("w" ** 64) ++ "\n";
+    const input = "keep\ndrop it\nswap it\n" ++ @as([64]u8, @splat('w')) ++ "\n";
     var sink: TestSink = .{ .allocator = testing.allocator };
     defer sink.deinit();
 

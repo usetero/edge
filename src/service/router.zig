@@ -194,7 +194,7 @@ pub const Router = struct {
 const testing = std.testing;
 
 fn idx(n: u16) ServiceIndex {
-    return @enumFromInt(n);
+    return @fromBackingInt(@intCast(n));
 }
 
 test "Router exact match" {
@@ -213,7 +213,7 @@ test "Router exact match" {
     // Exact match with correct method
     const result = router.route("/api/v2/logs", .POST);
     try testing.expect(result != null);
-    try testing.expectEqual(@as(u16, 0), @intFromEnum(result.?.service));
+    try testing.expectEqual(@as(u16, 0), @backingInt(result.?.service));
     try testing.expectEqualStrings("", result.?.remaining_path);
 
     // Exact match with wrong method
@@ -301,7 +301,7 @@ test "Router longest prefix wins" {
 
     const result = router.route("/api/v2/logs", .POST);
     try testing.expect(result != null);
-    try testing.expectEqual(@as(u16, 1), @intFromEnum(result.?.service));
+    try testing.expectEqual(@as(u16, 1), @backingInt(result.?.service));
 }
 
 test "Router suffix match" {
@@ -347,9 +347,9 @@ test "Router wildcard fallback and registration order" {
 
     // Exact beats wildcard
     const health = router.route("/_health", .GET);
-    try testing.expectEqual(@as(u16, 0), @intFromEnum(health.?.service));
+    try testing.expectEqual(@as(u16, 0), @backingInt(health.?.service));
 
     // Everything else falls through
     const other = router.route("/random/path", .DELETE);
-    try testing.expectEqual(@as(u16, 1), @intFromEnum(other.?.service));
+    try testing.expectEqual(@as(u16, 1), @backingInt(other.?.service));
 }

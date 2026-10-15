@@ -108,7 +108,7 @@ pub const Sink = struct {
         self.status = status;
         if (isBodiless(status)) {
             try self.request.respond("", .{
-                .status = @enumFromInt(status),
+                .status = @fromBackingInt(@intCast(status)),
                 .extra_headers = headers,
             });
             // Nothing to write, and `end` has nothing to finish. The relay
@@ -117,7 +117,7 @@ pub const Sink = struct {
             return &self.discard.writer;
         }
         self.body = try self.request.respondStreaming(self.buffer, .{
-            .respond_options = .{ .status = @enumFromInt(status), .extra_headers = headers },
+            .respond_options = .{ .status = @fromBackingInt(@intCast(status)), .extra_headers = headers },
         });
         return &self.body.?.writer;
     }
@@ -292,7 +292,7 @@ fn handleRequest(
         if (sink.status == 0) {
             sink.status = exchange.errorStatus(err);
             request.respond("", .{
-                .status = @enumFromInt(sink.status),
+                .status = @fromBackingInt(@intCast(sink.status)),
                 .keep_alive = false,
             }) catch |respond_err| {
                 log.debug("error response failed: {s}", .{@errorName(respond_err)});
@@ -384,7 +384,7 @@ fn dispatch(
         const static = outcome.respond;
         sink.status = static.status;
         return request.respond(static.body, .{
-            .status = @enumFromInt(static.status),
+            .status = @fromBackingInt(@intCast(static.status)),
             .extra_headers = &.{
                 .{ .name = "content-type", .value = static.content_type },
             },
@@ -581,7 +581,7 @@ fn repairHead(
     // nothing the first did not, and a line per request at full rate is its
     // own outage.
     const shared = env.shared;
-    const bit = @as(u8, 1) << @intFromEnum(fixed.reason);
+    const bit = @as(u8, 1) << @backingInt(fixed.reason);
     if (shared.head_repairs_seen.fetchOr(bit, .monotonic) & bit == 0) {
         // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
         shared.bus.warn(HeadRepaired{ .encoding = fixed.encoding, .reason = @tagName(fixed.reason) });

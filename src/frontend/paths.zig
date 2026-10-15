@@ -271,13 +271,18 @@ pub fn execFetchFiltered(
     thread_bufs.trackUpstream(ctx.io, bufs, upstream_req.connection);
     defer thread_bufs.trackUpstream(ctx.io, bufs, null);
     var upstream_res = blk: {
-        errdefer |err| exchange.evictUpstream(ctx, &upstream_req, in.path, err);
-        try upstream_req.sendBodiless();
-        break :blk try upstream_req.receiveHead(&.{});
+        upstream_req.sendBodiless() catch |err| {
+            exchange.evictUpstream(ctx, &upstream_req, in.path, err);
+            return err;
+        };
+        break :blk upstream_req.receiveHead(&.{}) catch |err| {
+            exchange.evictUpstream(ctx, &upstream_req, in.path, err);
+            return err;
+        };
     };
     var extra_headers: [64]std.http.Header = undefined;
     const relayed = try exec.collectUpstreamResponseHeaders(&upstream_res, in.arena, &extra_headers);
-    const out = try sink.begin(@intFromEnum(upstream_res.head.status), relayed);
+    const out = try sink.begin(@backingInt(upstream_res.head.status), relayed);
 
     try thread_bufs.growBuffer(ctx.gpa, &bufs.scratch, 14336);
     const scratch = bufs.scratch;

@@ -181,13 +181,13 @@ fn defaultValue(comptime T: type) T {
     return switch (info) {
         .@"struct" => |s| blk: {
             var result: T = undefined;
-            inline for (s.fields) |field| {
-                if (field.default_value_ptr) |default_ptr| {
-                    const typed_ptr: *const field.type = @ptrCast(@alignCast(default_ptr));
-                    @field(result, field.name) = typed_ptr.*;
+            inline for (s.field_names, s.field_types, s.field_attrs) |field_name, field_type, attrs| {
+                if (attrs.default_value_ptr) |default_ptr| {
+                    const typed_ptr: *const field_type = @ptrCast(@alignCast(default_ptr));
+                    @field(result, field_name) = typed_ptr.*;
                 } else {
                     // Recurse for nested structs, or use zero value
-                    @field(result, field.name) = defaultValue(field.type);
+                    @field(result, field_name) = defaultValue(field_type);
                 }
             }
             break :blk result;
@@ -199,8 +199,8 @@ fn defaultValue(comptime T: type) T {
         },
         .int, .float => 0,
         .bool => false,
-        .@"enum" => |e| if (e.fields.len > 0) @enumFromInt(0) else @compileError("Empty enum"),
-        .array => |a| [_]a.child{defaultValue(a.child)} ** a.len,
+        .@"enum" => |e| if (e.field_names.len > 0) @fromBackingInt(0) else @compileError("Empty enum"),
+        .array => |a| @splat(defaultValue(a.child)),
         else => @compileError("Unsupported type in config: " ++ @typeName(T)),
     };
 }
@@ -236,11 +236,10 @@ fn JsonType(comptime T: type) type {
 
     return switch (info) {
         .@"struct" => |s| blk: {
-            var field_names: [s.fields.len][]const u8 = undefined;
-            var field_types: [s.fields.len]type = undefined;
-            var field_attrs: [s.fields.len]std.builtin.Type.StructField.Attributes = undefined;
-            inline for (s.fields, 0..) |field, i| {
-                const FieldType = field.type;
+            var field_names: [s.field_names.len][]const u8 = undefined;
+            var field_types: [s.field_names.len]type = undefined;
+            var field_attrs: [s.field_names.len]std.lang.Type.Struct.FieldAttributes = undefined;
+            inline for (s.field_names, s.field_types, 0..) |field_name, FieldType, i| {
                 const JsonFieldType = if (@typeInfo(FieldType) == .@"struct")
                     ?JsonType(FieldType)
                 else if (@typeInfo(FieldType) == .optional)
@@ -262,7 +261,7 @@ fn JsonType(comptime T: type) type {
                     }
                 } else ?FieldType;
 
-                field_names[i] = field.name;
+                field_names[i] = field_name;
                 field_types[i] = JsonFieldType;
                 field_attrs[i] = .{ .default_value_ptr = &@as(JsonFieldType, null) };
             }
@@ -281,17 +280,17 @@ fn applyJsonValues(comptime T: type, allocator: std.mem.Allocator, config: *T, j
 
     switch (info) {
         .@"struct" => |s| {
-            inline for (s.fields) |field| {
-                const json_value = @field(json, field.name);
+            inline for (s.field_names, s.field_types) |field_name, FieldType| {
+                const json_value = @field(json, field_name);
                 if (json_value != null) {
                     const value = json_value.?;
-                    const field_ptr = &@field(config, field.name);
+                    const field_ptr = &@field(config, field_name);
 
-                    if (@typeInfo(field.type) == .@"struct") {
+                    if (@typeInfo(FieldType) == .@"struct") {
                         // Recurse into nested struct
-                        try applyJsonValues(field.type, allocator, field_ptr, value);
-                    } else if (@typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
-                        const ChildType = @typeInfo(field.type).pointer.child;
+                        try applyJsonValues(FieldType, allocator, field_ptr, value);
+                    } else if (@typeInfo(FieldType) == .pointer and @typeInfo(FieldType).pointer.size == .slice) {
+                        const ChildType = @typeInfo(FieldType).pointer.child;
                         if (ChildType == u8) {
                             // String field - copy value
                             field_ptr.* = allocator.dupe(u8, value) catch return LoadError.OutOfMemory;
@@ -307,9 +306,9 @@ fn applyJsonValues(comptime T: type, allocator: std.mem.Allocator, config: *T, j
                             // Other slices - copy as-is
                             field_ptr.* = allocator.dupe(ChildType, value) catch return LoadError.OutOfMemory;
                         }
-                    } else if (@typeInfo(field.type) == .optional) {
+                    } else if (@typeInfo(FieldType) == .optional) {
                         // Optional field
-                        const ChildType = @typeInfo(field.type).optional.child;
+                        const ChildType = @typeInfo(FieldType).optional.child;
                         if (@typeInfo(ChildType) == .pointer and @typeInfo(ChildType).pointer.size == .slice) {
                             if (@typeInfo(ChildType).pointer.child == u8) {
                                 // Optional string - copy value
@@ -318,19 +317,19 @@ fn applyJsonValues(comptime T: type, allocator: std.mem.Allocator, config: *T, j
                         } else {
                             field_ptr.* = value;
                         }
-                    } else if (@typeInfo(field.type) == .array) {
+                    } else if (@typeInfo(FieldType) == .array) {
                         // Fixed-size array (e.g., [4]u8 for IP address)
-                        const ArrayInfo = @typeInfo(field.type).array;
+                        const ArrayInfo = @typeInfo(FieldType).array;
                         if (ArrayInfo.child == u8) {
                             // Parse IP address string (value is []const u8 from JsonType)
                             field_ptr.* = parseIpv4(value) catch return LoadError.InvalidIpv4;
                         } else {
                             field_ptr.* = value;
                         }
-                    } else if (@typeInfo(field.type) == .@"enum") {
+                    } else if (@typeInfo(FieldType) == .@"enum") {
                         // Parse enum from string
                         if (@TypeOf(value) == []const u8) {
-                            field_ptr.* = std.meta.stringToEnum(field.type, value) orelse return LoadError.InvalidValue;
+                            field_ptr.* = std.meta.stringToEnum(FieldType, value) orelse return LoadError.InvalidValue;
                         } else {
                             field_ptr.* = value;
                         }
@@ -378,19 +377,19 @@ fn applyEnvOverridesRecursive(
 
     switch (info) {
         .@"struct" => |s| {
-            inline for (s.fields) |field| {
+            inline for (s.field_names, s.field_types) |field_name, FieldType| {
                 const field_path = comptime if (path.len == 0)
-                    field.name
+                    field_name
                 else
-                    path ++ "_" ++ field.name;
+                    path ++ "_" ++ field_name;
 
-                const field_ptr = &@field(config, field.name);
-                const field_default = @field(defaults, field.name);
+                const field_ptr = &@field(config, field_name);
+                const field_default = @field(defaults, field_name);
 
-                if (@typeInfo(field.type) == .@"struct") {
+                if (@typeInfo(FieldType) == .@"struct") {
                     // Recurse into nested struct
                     try applyEnvOverridesRecursive(
-                        field.type,
+                        FieldType,
                         allocator,
                         field_ptr,
                         field_default,
@@ -407,8 +406,8 @@ fn applyEnvOverridesRecursive(
                         // Free any JSON-allocated string before overwriting it,
                         // else applyEnvValue's dupe orphans it (deinit only frees
                         // the final pointer).
-                        freeReplacedString(field.type, allocator, field_ptr, field_default);
-                        try applyEnvValue(field.type, allocator, field_ptr, env_value);
+                        freeReplacedString(FieldType, allocator, field_ptr, field_default);
+                        try applyEnvValue(FieldType, allocator, field_ptr, env_value);
                     }
                 }
             }
@@ -594,15 +593,15 @@ fn applyEnvSubstitutionWithDefaults(
 
     switch (info) {
         .@"struct" => |s| {
-            inline for (s.fields) |field| {
-                const field_ptr = &@field(config, field.name);
-                const default_field = @field(defaults, field.name);
+            inline for (s.field_names, s.field_types) |field_name, FieldType| {
+                const field_ptr = &@field(config, field_name);
+                const default_field = @field(defaults, field_name);
 
-                if (@typeInfo(field.type) == .@"struct") {
+                if (@typeInfo(FieldType) == .@"struct") {
                     // Recurse into nested struct
-                    try applyEnvSubstitutionWithDefaults(field.type, allocator, field_ptr, default_field, environ);
-                } else if (@typeInfo(field.type) == .pointer) {
-                    const p = @typeInfo(field.type).pointer;
+                    try applyEnvSubstitutionWithDefaults(FieldType, allocator, field_ptr, default_field, environ);
+                } else if (@typeInfo(FieldType) == .pointer) {
+                    const p = @typeInfo(FieldType).pointer;
                     if (p.size == .slice and p.child == u8) {
                         // String field - apply substitution
                         const current = field_ptr.*;
@@ -628,8 +627,8 @@ fn applyEnvSubstitutionWithDefaults(
                             );
                         }
                     }
-                } else if (@typeInfo(field.type) == .optional) {
-                    const ChildType = @typeInfo(field.type).optional.child;
+                } else if (@typeInfo(FieldType) == .optional) {
+                    const ChildType = @typeInfo(FieldType).optional.child;
                     if (@typeInfo(ChildType) == .pointer) {
                         const p = @typeInfo(ChildType).pointer;
                         if (p.size == .slice and p.child == u8) {
@@ -677,14 +676,14 @@ fn freeAllocatedFieldsWithDefaults(comptime T: type, allocator: std.mem.Allocato
 
     switch (info) {
         .@"struct" => |s| {
-            inline for (s.fields) |field| {
-                const field_ptr = &@field(config, field.name);
-                const default_field = @field(defaults, field.name);
+            inline for (s.field_names, s.field_types) |field_name, FieldType| {
+                const field_ptr = &@field(config, field_name);
+                const default_field = @field(defaults, field_name);
 
-                if (@typeInfo(field.type) == .@"struct") {
-                    freeAllocatedFieldsWithDefaults(field.type, allocator, field_ptr, default_field);
-                } else if (@typeInfo(field.type) == .pointer) {
-                    const p = @typeInfo(field.type).pointer;
+                if (@typeInfo(FieldType) == .@"struct") {
+                    freeAllocatedFieldsWithDefaults(FieldType, allocator, field_ptr, default_field);
+                } else if (@typeInfo(FieldType) == .pointer) {
+                    const p = @typeInfo(FieldType).pointer;
                     if (p.size == .slice) {
                         const slice = field_ptr.*;
                         // Only free if the pointer differs from the default (was allocated)
@@ -717,8 +716,8 @@ fn freeAllocatedFieldsWithDefaults(comptime T: type, allocator: std.mem.Allocato
                             }
                         }
                     }
-                } else if (@typeInfo(field.type) == .optional) {
-                    const ChildType = @typeInfo(field.type).optional.child;
+                } else if (@typeInfo(FieldType) == .optional) {
+                    const ChildType = @typeInfo(FieldType).optional.child;
                     if (@typeInfo(ChildType) == .pointer) {
                         const p = @typeInfo(ChildType).pointer;
                         if (p.size == .slice and p.child == u8) {

@@ -55,7 +55,7 @@ test "streamAll does not treat a 0 return as end of stream" {
             }
             if (self.done) return error.EndOfStream;
             self.done = true;
-            const n = @min(@intFromEnum(limit), self.payload.len);
+            const n = @min(@backingInt(limit), self.payload.len);
             try w.writeAll(self.payload[0..n]);
             return n;
         }

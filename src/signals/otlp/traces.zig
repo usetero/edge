@@ -245,7 +245,7 @@ pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
             null,
         .span_kind => |requested_kind| blk: {
             // Compare by integer value — OTel SpanKind and policy SpanKind share values
-            break :blk if (@intFromEnum(span_ctx.span.kind) == @intFromEnum(requested_kind))
+            break :blk if (@backingInt(span_ctx.span.kind) == @backingInt(requested_kind))
                 @tagName(requested_kind)
             else
                 null;
@@ -253,7 +253,7 @@ pub fn traceValue(ctx: *const anyopaque, field: TraceFieldRef) ?[]const u8 {
         .span_status => |requested_status| blk: {
             const status = span_ctx.span.status orelse break :blk null;
             // OTel StatusCode and policy SpanStatusCode share integer values
-            break :blk if (@intFromEnum(status.code) == @intFromEnum(requested_status))
+            break :blk if (@backingInt(status.code) == @backingInt(requested_status))
                 @tagName(requested_status)
             else
                 null;
@@ -852,7 +852,7 @@ fn buildVendorTracestate(buf: []u8, count: usize) ![]const u8 {
             buf[pos] = ',';
             pos += 1;
         }
-        const tag = try std.fmt.bufPrint(buf[pos..], "v{d}=x", .{i});
+        const tag = try std.mem.print(buf[pos..], "v{d}=x", .{i});
         pos += tag.len;
     }
     return buf[0..pos];
@@ -909,7 +909,7 @@ test "mergeOtTracestate - ot sub-keys preserved when vendor cap reached" {
     var ts_buf: [4096]u8 = undefined;
     const vendors = try buildVendorTracestate(&ts_buf, 32); // over the cap once ot= counts
     var ts_full_buf: [8192]u8 = undefined;
-    const trace_state = try std.fmt.bufPrint(&ts_full_buf, "ot=rv:abc,{s}", .{vendors});
+    const trace_state = try std.mem.print(&ts_full_buf, "ot=rv:abc,{s}", .{vendors});
     try std.testing.expectEqual(@as(usize, 33), listMemberCount(trace_state));
 
     const out = try mergeOtTracestate(arena.allocator(), trace_state, "8");

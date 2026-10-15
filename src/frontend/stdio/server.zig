@@ -47,7 +47,7 @@ pub const HttpServer = struct {
         errdefer arenas.deinit(ctx.gpa);
 
         var addr_buf: [64]u8 = undefined;
-        const addr_str = try std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
+        const addr_str = try std.mem.print(&addr_buf, "{d}.{d}.{d}.{d}", .{
             listen_address[0], listen_address[1], listen_address[2], listen_address[3],
         });
         const address = try std.Io.net.IpAddress.parse(addr_str, listen_port);

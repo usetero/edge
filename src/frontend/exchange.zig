@@ -345,7 +345,7 @@ fn exchangeAttempts(
                     // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
                     ctx.bus.info(UpstreamEarlyResponse{
                         .path = in.path,
-                        .status = @intFromEnum(early.head.status),
+                        .status = @backingInt(early.head.status),
                         .err = @errorName(err),
                     });
                     break :blk early;
@@ -360,7 +360,7 @@ fn exchangeAttempts(
             report.retried_err = err;
             continue;
         };
-        report.status = @intFromEnum(upstream_res.head.status);
+        report.status = @backingInt(upstream_res.head.status);
 
         report.phase = "relay";
         const max_response = ctx.upstreams.getMaxResponseBody(ctx.upstream_ids.resolve(choice));
@@ -398,7 +398,7 @@ fn relayResponse(
     // Read before the body reader exists: creating it invalidates the head.
     const declared = upstream_res.head.content_length;
     const relayed = try exec.collectUpstreamResponseHeaders(upstream_res, arena, &extra_headers);
-    const out = try sink.begin(@intFromEnum(upstream_res.head.status), relayed);
+    const out = try sink.begin(@backingInt(upstream_res.head.status), relayed);
     const upstream_body = upstream_res.reader(bufs.upstream);
     const copied = try pipeline_mod.streamReaderToWriter(upstream_body, out, max_response_body);
     // An intake that declares more than it sends has not accepted the batch.

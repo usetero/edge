@@ -142,13 +142,13 @@ test "DatadogLog - parseRaw rejects malformed scalar tokens" {
     const allocator = std.testing.allocator;
     for ([_][]const u8{ "1e+", "--1", "01", "1..2", "1.", ".5", "1e", "-" }) |bad| {
         var buf: [64]u8 = undefined;
-        const json = try std.fmt.bufPrint(&buf, "{{\"message\":\"ok\",\"bad\":{s}}}", .{bad});
+        const json = try std.mem.print(&buf, "{{\"message\":\"ok\",\"bad\":{s}}}", .{bad});
         try std.testing.expectError(error.Malformed, DatadogLog.parseRaw(allocator, json));
     }
     // Well-formed numbers still pass.
     for ([_][]const u8{ "0", "-0.5", "1e5", "1E+10", "42", "123.456e-7" }) |good| {
         var buf: [64]u8 = undefined;
-        const json = try std.fmt.bufPrint(&buf, "{{\"message\":\"ok\",\"n\":{s}}}", .{good});
+        const json = try std.mem.print(&buf, "{{\"message\":\"ok\",\"n\":{s}}}", .{good});
         var log = try DatadogLog.parseRaw(allocator, json);
         defer log.deinit(allocator);
         try std.testing.expectEqualStrings(good, log.extra_spans.get("n").?);
@@ -439,13 +439,13 @@ test "DatadogLog - parseRaw long strings exercise the bulk-scan paths" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const pad = "x" ** 100;
+    const pad: [100]u8 = @splat('x');
     // Escape-free long string: single-memchr stringEnd + borrowed slice.
     {
         const json = "{\"message\":\"" ++ pad ++ "\"}";
         var log = try DatadogLog.parseRaw(allocator, json);
         defer log.deinit(allocator);
-        try std.testing.expectEqualStrings(pad, log.message.?);
+        try std.testing.expectEqualStrings(&pad, log.message.?);
     }
     // Escape past the window: memchr run, then decode, then another run.
     {

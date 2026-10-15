@@ -358,7 +358,7 @@ test "replace re-encodes length and keeps original tag" {
 
 test "multi-byte length varint round-trips" {
     // 200-byte payload: length varint is 2 bytes (0xC8 0x01).
-    const input: []const u8 = comptime (&[_]u8{ 0x0A, 0xC8, 0x01 } ++ ("p" ** 200));
+    const input: []const u8 = comptime (&[_]u8{ 0x0A, 0xC8, 0x01 } ++ @as([200]u8, @splat('p')));
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
         var sink: TestSink = .{ .allocator = testing.allocator };
         defer sink.deinit();
@@ -370,7 +370,7 @@ test "multi-byte length varint round-trips" {
 
 test "oversized payload fails open without evaluation" {
     // Payload contains "drop" but exceeds scratch: must pass through.
-    const payload = "x" ** 30 ++ "drop" ++ "y" ** 30;
+    const payload = @as([30]u8, @splat('x')) ++ "drop" ++ @as([30]u8, @splat('y'));
     const input: []const u8 = comptime (lenRecord("small") ++ lenRecord(payload) ++ lenRecord("tail"));
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
         var sink: TestSink = .{ .allocator = testing.allocator };
@@ -405,7 +405,7 @@ test "truncated payload flushes buffered bytes at finish" {
 }
 
 test "stats are accounted" {
-    const big = "b" ** 64;
+    const big = &@as([64]u8, @splat('b'));
     const input: []const u8 = comptime (lenRecord("keep") ++ lenRecord("drop") ++ lenRecord("swap") ++ lenRecord(big));
     var sink: TestSink = .{ .allocator = testing.allocator };
     defer sink.deinit();

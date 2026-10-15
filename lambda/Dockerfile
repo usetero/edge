@@ -31,11 +31,11 @@ RUN apk add --no-cache \
     curl \
     xz
 
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 RUN ARCH="$(uname -m)" && \
     case "$ARCH" in \
-    x86_64) ZIG_ARCH="x86_64"; ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00" ;; \
-    aarch64) ZIG_ARCH="aarch64"; ZIG_SHA256="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17" ;; \
+    x86_64) ZIG_ARCH="x86_64"; ZIG_SHA256="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026" ;; \
+    aarch64) ZIG_ARCH="aarch64"; ZIG_SHA256="9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8" ;; \
     *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
     esac && \
     curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \

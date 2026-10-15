@@ -165,7 +165,7 @@ pub const ServerContext = struct {
     fn saveCaptures(self: *ServerContext, name: []const u8) !void {
         // Create output file path
         var path_buf: [512]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.jsonl", .{ self.output_dir, name });
+        const path = try std.mem.print(&path_buf, "{s}/{s}.jsonl", .{ self.output_dir, name });
 
         const file = try std.Io.Dir.cwd().createFile(self.io, path, .{});
         defer file.close(self.io);
@@ -487,7 +487,7 @@ fn handleRequest(
             return;
         };
         var buf: [128]u8 = undefined;
-        const json = std.fmt.bufPrint(&buf, "{{\"status\":\"capture_stopped\",\"count\":{d}}}", .{count}) catch
+        const json = std.mem.print(&buf, "{{\"status\":\"capture_stopped\",\"count\":{d}}}", .{count}) catch
             "{\"status\":\"capture_stopped\"}";
         try request.respond(json, .{ .keep_alive = keep_alive, .extra_headers = &json_headers });
         return;
@@ -591,7 +591,7 @@ fn handleRequest(
         .status => {
             try request.respond("{\"faulted\":true}", .{
                 .keep_alive = keep_alive,
-                .status = @enumFromInt(fault_arg),
+                .status = @fromBackingInt(@intCast(fault_arg)),
                 .extra_headers = &json_headers,
             });
             return;
@@ -624,7 +624,7 @@ fn handleRequest(
             var names: [96][16]u8 = undefined;
             var headers: [96]std.http.Header = undefined;
             for (0..count) |i| {
-                _ = std.fmt.bufPrint(&names[i], "x-flood-{d:0>3}", .{i}) catch unreachable;
+                _ = std.mem.print(&names[i], "x-flood-{d:0>3}", .{i}) catch unreachable;
                 headers[i] = .{ .name = names[i][0..11], .value = "v" };
             }
             try request.respond("{}", .{

@@ -15,7 +15,7 @@ pub const MetricIntakeType = enum(i32) {
     gauge = 3,
 
     pub fn jsonStringify(self: *const MetricIntakeType, jws: *std.json.Stringify) !void {
-        try jws.write(@intFromEnum(self.*));
+        try jws.write(@backingInt(self.*));
     }
 };
 

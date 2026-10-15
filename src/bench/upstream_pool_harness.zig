@@ -164,7 +164,7 @@ fn waitFor(
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
     var buf: [96]u8 = undefined;
-    const uri = try std.Uri.parse(try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}{s}", .{ port, path }));
+    const uri = try std.Uri.parse(try std.mem.print(&buf, "http://127.0.0.1:{d}{s}", .{ port, path }));
 
     var waited_ms: u32 = 0;
     while (waited_ms < 8000) : (waited_ms += 50) {
@@ -212,7 +212,7 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
 
 fn writeConfig(io: std.Io, edge_port: u16, mock_port: u16) !void {
     var buf: [640]u8 = undefined;
-    const contents = try std.fmt.bufPrint(&buf,
+    const contents = try std.mem.print(&buf,
         \\{{
         \\  "listen_address": "127.0.0.1",
         \\  "listen_port": {d},
@@ -281,7 +281,7 @@ pub fn main(init: std.process.Init) !void {
 
         var uri_buf: [96]u8 = undefined;
         const uri = try std.Uri.parse(
-            try std.fmt.bufPrint(&uri_buf, "http://127.0.0.1:{d}{s}", .{ edge_port, sc.path }),
+            try std.mem.print(&uri_buf, "http://127.0.0.1:{d}{s}", .{ edge_port, sc.path }),
         );
 
         const dials_before = mock.accepted.load(.monotonic);
