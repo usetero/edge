@@ -555,8 +555,14 @@ const proto = @import("proto");
 /// Test helper to create an AttributePath from a single key string.
 /// Uses comptime to ensure the array literal has static storage.
 fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
-    const items = @constCast(&[_][]const u8{key});
-    return .{ .path = .{ .items = items, .capacity = items.len } };
+    return testAttrPathSegments(&.{key});
+}
+
+fn testAttrPathSegments(comptime segments: []const []const u8) proto.policy.AttributePath {
+    const items = @constCast(segments);
+    var path = std.ArrayList([]const u8).initBuffer(items);
+    path.items = items;
+    return .{ .path = path };
 }
 
 /// Test helper: wrap `inner` JSON into a `{"message":"<escaped inner>"}` log,
@@ -678,17 +684,13 @@ test "datadogFieldAccessor - unwraps JSON-stringified message for body and attri
     try std.testing.expectEqualStrings("evidence skipped", body.?);
 
     // Attribute fallback walks the path inside the unwrapped message.
-    const event_type_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "data", "jsonPayload", "event_type" }), .capacity = 3 },
-    };
+    const event_type_path = testAttrPathSegments(&.{ "data", "jsonPayload", "event_type" });
     const event_type = logValue(&field_ctx, .{ .log_attribute = event_type_path });
     try std.testing.expect(event_type != null);
     try std.testing.expectEqualStrings("EvidenceSkipped", event_type.?);
 
     // A path absent from the unwrapped message still returns null.
-    const missing_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "data", "jsonPayload", "nope" }), .capacity = 3 },
-    };
+    const missing_path = testAttrPathSegments(&.{ "data", "jsonPayload", "nope" });
     try std.testing.expect(logValue(&field_ctx, .{ .log_attribute = missing_path }) == null);
 }
 
@@ -779,9 +781,7 @@ test "datadogFieldAccessor - nested extra field access via dotted key" {
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Two-segment path should be joined with '.' to match dotted key
-    const method_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "method" }), .capacity = 2 },
-    };
+    const method_path = testAttrPathSegments(&.{ "http", "method" });
     const method_val = logValue(&field_ctx, .{ .log_attribute = method_path });
     try std.testing.expect(method_val != null);
     try std.testing.expectEqualStrings("GET", method_val.?);
@@ -804,9 +804,7 @@ test "datadogFieldAccessor - nested dotted key not found returns null" {
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Path to non-existent dotted key
-    const missing_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "nonexistent" }), .capacity = 2 },
-    };
+    const missing_path = testAttrPathSegments(&.{ "http", "nonexistent" });
     const val = logValue(&field_ctx, .{ .log_attribute = missing_path });
     try std.testing.expect(val == null);
 }
@@ -831,16 +829,12 @@ test "datadogFieldAccessor - nested object fallback via path segments" {
 
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
-    const status_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "status_code" }), .capacity = 2 },
-    };
+    const status_path = testAttrPathSegments(&.{ "http", "status_code" });
     const status_val = logValue(&field_ctx, .{ .log_attribute = status_path });
     try std.testing.expect(status_val != null);
     try std.testing.expectEqualStrings("200", status_val.?);
 
-    const region_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "http", "meta", "region" }), .capacity = 3 },
-    };
+    const region_path = testAttrPathSegments(&.{ "http", "meta", "region" });
     const region_val = logValue(&field_ctx, .{ .log_attribute = region_path });
     try std.testing.expect(region_val != null);
     try std.testing.expectEqualStrings("us-east-1", region_val.?);
@@ -863,9 +857,7 @@ test "datadogFieldAccessor - multi-segment path with no matching dotted key retu
     var field_ctx: FieldAccessorContext = .{ .log = &log, .allocator = allocator };
 
     // Multi-segment path that doesn't match any dotted key
-    const bad_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "flat_field", "nested" }), .capacity = 2 },
-    };
+    const bad_path = testAttrPathSegments(&.{ "flat_field", "nested" });
     const val = logValue(&field_ctx, .{ .log_attribute = bad_path });
     try std.testing.expect(val == null);
 }

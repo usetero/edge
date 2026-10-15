@@ -385,8 +385,14 @@ const proto = @import("proto");
 /// Test helper to create an AttributePath from a single key string.
 /// Uses comptime to ensure the array literal has static storage.
 fn testAttrPath(comptime key: []const u8) proto.policy.AttributePath {
-    const items = @constCast(&[_][]const u8{key});
-    return .{ .path = .{ .items = items, .capacity = items.len } };
+    return testAttrPathSegments(&.{key});
+}
+
+fn testAttrPathSegments(comptime segments: []const []const u8) proto.policy.AttributePath {
+    const items = @constCast(segments);
+    var path = std.ArrayList([]const u8).initBuffer(items);
+    path.items = items;
+    return .{ .path = path };
 }
 
 test "datadogMetricFieldAccessor - extra field lookup" {
@@ -913,17 +919,13 @@ test "datadogMetricFieldAccessor - resource with nested path" {
     };
 
     // Two-segment path ["host", "name"] should find resource type=host and return name
-    const nested_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "host", "name" }), .capacity = 2 },
-    };
+    const nested_path = testAttrPathSegments(&.{ "host", "name" });
     const name_val = metricValue(&field_ctx, .{ .resource_attribute = nested_path });
     try std.testing.expect(name_val != null);
     try std.testing.expectEqualStrings("web-01", name_val.?);
 
     // Two-segment path ["host", "type"] should return the type
-    const type_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "host", "type" }), .capacity = 2 },
-    };
+    const type_path = testAttrPathSegments(&.{ "host", "type" });
     const type_val = metricValue(&field_ctx, .{ .resource_attribute = type_path });
     try std.testing.expect(type_val != null);
     try std.testing.expectEqualStrings("host", type_val.?);
@@ -950,9 +952,7 @@ test "datadogMetricFieldAccessor - nested extra field via dotted key" {
     };
 
     // Two-segment path joined with '.' to match dotted key
-    const nested_path: proto.policy.AttributePath = .{
-        .path = .{ .items = @constCast(&[_][]const u8{ "custom_data", "region" }), .capacity = 2 },
-    };
+    const nested_path = testAttrPathSegments(&.{ "custom_data", "region" });
     const val = metricValue(&field_ctx, .{ .datapoint_attribute = nested_path });
     try std.testing.expect(val != null);
     try std.testing.expectEqualStrings("us-east", val.?);

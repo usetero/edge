@@ -164,9 +164,9 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
     while (true) {
         var sig: c_int = 0;
         if (std.c.sigwait(@constCast(&ctx.signal_set), &sig) != 0) continue;
-        if (sig == @intFromEnum(std.posix.SIG.USR1) and ctx.shutdown_waiter.load(.acquire)) return;
+        if (sig == @backingInt(std.posix.SIG.USR1) and ctx.shutdown_waiter.load(.acquire)) return;
 
-        const signal_name = if (sig == @intFromEnum(std.posix.SIG.INT)) "SIGINT" else "SIGTERM";
+        const signal_name = if (sig == @backingInt(std.posix.SIG.INT)) "SIGINT" else "SIGTERM";
         const count = ctx.signal_count.fetchAdd(1, .acq_rel) + 1;
 
         if (count == 1) {
@@ -271,7 +271,7 @@ pub const Engine = struct {
         var route_sets_buf: [8]router_mod.RouteSet = undefined;
         for (self.services_buf[0..self.services_len], 0..) |*svc, i| {
             route_sets_buf[i] = .{
-                .service = @enumFromInt(@as(u16, @intCast(i))),
+                .service = @fromBackingInt(@intCast(@as(u16, @intCast(i)))),
                 .routes = svc.routes(),
             };
         }
@@ -458,7 +458,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
     });
 
     var instance_id_buf: [64]u8 = undefined;
-    const instance_id = try std.fmt.bufPrint(&instance_id_buf, "edge-{d}-{d}", .{
+    const instance_id = try std.mem.print(&instance_id_buf, "edge-{d}-{d}", .{
         std.Io.Timestamp.now(io, .real).toMilliseconds(),
         std.Thread.getCurrentId(),
     });
@@ -600,7 +600,7 @@ pub fn run(init: std.process.Init, distribution: mode.Distribution) !void {
 
 fn logStartupConfig(bus: *EventBus, config: *const ProxyConfig, service_metadata: policy.ServiceMetadata) void {
     var addr_buf: [64]u8 = undefined;
-    const addr_str = std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
+    const addr_str = std.mem.print(&addr_buf, "{d}.{d}.{d}.{d}", .{
         config.listen_address[0],
         config.listen_address[1],
         config.listen_address[2],

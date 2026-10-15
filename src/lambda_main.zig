@@ -246,7 +246,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Generate instance ID
     var instance_id_buf: [64]u8 = undefined;
-    const instance_id = try std.fmt.bufPrint(&instance_id_buf, "lambda-{d}-{d}", .{
+    const instance_id = try std.mem.print(&instance_id_buf, "lambda-{d}-{d}", .{
         std.Io.Timestamp.now(io, .real).toMilliseconds(),
         std.Thread.getCurrentId(),
     });
@@ -320,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
 
         var auth_value_buf: [256]u8 = undefined;
         if (config.policy.api_key) |api_key| {
-            const auth_value = try std.fmt.bufPrint(&auth_value_buf, "Bearer {s}", .{api_key});
+            const auth_value = try std.mem.print(&auth_value_buf, "Bearer {s}", .{api_key});
             headers_buf[0] = .{
                 .name = "Authorization",
                 .value = auth_value,

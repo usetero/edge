@@ -1565,7 +1565,7 @@ test "Reader/Writer streaming - very long metric name" {
     var output_buf: [4096]u8 = undefined;
 
     // Create a metric with a very long name (but within buffer)
-    const long_name = "a" ** 500;
+    const long_name: [500]u8 = @splat('a');
     const input = long_name ++ " 42\n";
 
     const result = try streamThroughFilter(

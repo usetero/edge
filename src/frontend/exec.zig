@@ -109,7 +109,7 @@ pub fn planRequest(
         .content_type = content_type,
         .content_encoding = content_encoding,
     };
-    const svc = &ctx.services[@intFromEnum(match.service)];
+    const svc = &ctx.services[@backingInt(match.service)];
     return svc.plan(plan_request);
 }
 

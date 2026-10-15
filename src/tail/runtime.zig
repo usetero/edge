@@ -73,7 +73,7 @@ fn signalWaiterThread(ctx: SignalWaiterContext) void {
     while (true) {
         var sig: c_int = 0;
         if (std.c.sigwait(@constCast(&ctx.signal_set), &sig) != 0) continue;
-        if (sig == @intFromEnum(std.posix.SIG.USR1) and ctx.shutdown_waiter.load(.acquire)) return;
+        if (sig == @backingInt(std.posix.SIG.USR1) and ctx.shutdown_waiter.load(.acquire)) return;
 
         const count = ctx.signal_count.fetchAdd(1, .acq_rel) + 1;
         if (count == 1) {

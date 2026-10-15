@@ -220,7 +220,7 @@ pub fn metricValue(ctx: *const anyopaque, field: MetricFieldRef) ?[]const u8 {
                 .exponential_histogram => |eh| eh.aggregation_temporality,
                 .gauge, .summary => break :blk null,
             };
-            break :blk if (@intFromEnum(actual_at) == @intFromEnum(requested_at)) @tagName(requested_at) else null;
+            break :blk if (@backingInt(actual_at) == @backingInt(requested_at)) @tagName(requested_at) else null;
         },
     };
 }

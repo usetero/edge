@@ -46,8 +46,8 @@ pub fn buildService(kind: ServiceKind, options: ServiceOptions) service_mod.Serv
 const testing = std.testing;
 
 test "every distro brackets services with health first and passthrough last" {
-    inline for (@typeInfo(mode.Distribution).@"enum".fields) |field| {
-        const distribution: mode.Distribution = @enumFromInt(field.value);
+    inline for (@typeInfo(mode.Distribution).@"enum".field_names) |field_name| {
+        const distribution: mode.Distribution = @field(mode.Distribution, field_name);
         const services = comptime servicesFor(distribution);
         try testing.expectEqual(ServiceKind.health, services[0]);
         try testing.expectEqual(ServiceKind.passthrough, services[services.len - 1]);

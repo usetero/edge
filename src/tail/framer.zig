@@ -495,7 +495,7 @@ test "framer public API: selectStream isolates fail-open overflow per file" {
     var seen: Seen = .{ .allocator = testing.allocator };
     defer seen.deinit();
 
-    const partial_a = "Q" ** 40 ++ "PARTIAL"; // 47 bytes, no newline, > max_line
+    const partial_a = @as([40]u8, @splat('Q')) ++ "PARTIAL"; // 47 bytes, no newline, > max_line
     try framer.selectStream(111);
     try framer.ingestChunk(partial_a, &out.writer, &seen, Seen.filter);
     try framer.selectStream(222);

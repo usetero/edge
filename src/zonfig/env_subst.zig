@@ -427,7 +427,7 @@ test "substitute: long variable name" {
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     const long_name = "THIS_IS_A_VERY_LONG_ENVIRONMENT_VARIABLE_NAME_THAT_SHOULD_STILL_WORK";
-    const input = try std.fmt.allocPrint(std.testing.allocator, "${{{s}}}", .{long_name});
+    const input = try std.testing.allocator.print("${{{s}}}", .{long_name});
     defer std.testing.allocator.free(input);
 
     const result = try substitute(std.testing.allocator, input, &env_map);

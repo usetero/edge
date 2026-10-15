@@ -124,7 +124,7 @@ pub const ExtensionClient = struct {
 
         // Build registration URL
         var url_buf: [256]u8 = undefined;
-        const url = try std.fmt.bufPrint(
+        const url = try std.mem.print(
             &url_buf,
             "http://{s}/2020-01-01/extension/register",
             .{self.runtime_api},
@@ -161,7 +161,7 @@ pub const ExtensionClient = struct {
         if (response.head.status != .ok) {
             // ziglint-ignore: Z010 (named type sets EventBus telemetry name)
             self.bus.err(ExtensionRegistrationFailed{
-                .status = @intFromEnum(response.head.status),
+                .status = @backingInt(response.head.status),
                 .err = "registration failed",
             });
             return error.RegistrationFailed;
@@ -194,7 +194,7 @@ pub const ExtensionClient = struct {
 
         // Build event next URL
         var url_buf: [256]u8 = undefined;
-        const url = try std.fmt.bufPrint(
+        const url = try std.mem.print(
             &url_buf,
             "http://{s}/2020-01-01/extension/event/next",
             .{self.runtime_api},

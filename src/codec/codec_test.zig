@@ -333,7 +333,13 @@ test "a truncated body is reported as Truncated, not Corrupt" {
     var decoder = try newDecoder();
     defer decoder.deinit(gpa);
     inline for (.{ Codec.gzip, Codec.zstd }) |which| {
-        const raw = try encode(gpa, which, "a body the sender gave up on" ** 20);
+        const payload = comptime blk: {
+            const unit = "a body the sender gave up on";
+            var bytes: [unit.len * 20]u8 = undefined;
+            for (0..20) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+            break :blk bytes;
+        };
+        const raw = try encode(gpa, which, &payload);
         defer gpa.free(raw);
         for ([_]usize{ 0, raw.len / 2, raw.len - 1 }) |cut| {
             try testing.expectError(error.Truncated, decodeWith(&decoder, which, raw[0..cut], 4096, limits));
@@ -580,7 +586,7 @@ test "the output cap is exact at every chunk size" {
     const gpa = testing.allocator;
     var decoder = try newDecoder();
     defer decoder.deinit(gpa);
-    const payload = "z" ** 10_000;
+    const payload = &@as([10_000]u8, @splat('z'));
     inline for (.{ Codec.gzip, Codec.zstd }) |which| {
         const raw = try encode(gpa, which, payload);
         defer gpa.free(raw);
@@ -608,15 +614,21 @@ test "readAll appends the whole body" {
     const gpa = testing.allocator;
     var decoder = try newDecoder();
     defer decoder.deinit(gpa);
-    const payload = "readAll " ** 10_000;
+    const payload = comptime blk: {
+        @setEvalBranchQuota(20_000);
+        const unit = "readAll ";
+        var bytes: [unit.len * 10_000]u8 = undefined;
+        for (0..10_000) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+        break :blk bytes;
+    };
     inline for (.{ Codec.gzip, Codec.zstd }) |which| {
-        const raw = try encode(gpa, which, payload);
+        const raw = try encode(gpa, which, &payload);
         defer gpa.free(raw);
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(gpa);
         try decoder.begin(which, raw, limits);
         try decoder.readAll(gpa, &out);
-        try testing.expectEqualSlices(u8, payload, out.items);
+        try testing.expectEqualSlices(u8, &payload, out.items);
     }
 }
 
@@ -784,13 +796,18 @@ fn fuzzDecode(which: Codec, smith: *testing.Smith) !void {
     const gpa = testing.allocator;
     var decoder = try newDecoder();
     defer decoder.deinit(gpa);
-    const plain = "{\"message\":\"fuzz record\",\"service\":\"orders-api\"}\n" ** 40;
+    const plain = comptime blk: {
+        const unit = "{\"message\":\"fuzz record\",\"service\":\"orders-api\"}\n";
+        var bytes: [unit.len * 40]u8 = undefined;
+        for (0..40) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+        break :blk bytes;
+    };
     var buf: [4096]u8 = undefined;
     if (smith.value(bool)) return expectNoCrash(&decoder, which, buf[0..smith.slice(&buf)]);
 
     const valid = switch (which) {
-        .gzip => try buffered.compressGzipLevel(gpa, plain, smith.valueRangeAtMost(u4, 0, 9)),
-        .zstd => try buffered.compressZstdWith(gpa, plain, .{ .checksum = true }),
+        .gzip => try buffered.compressGzipLevel(gpa, &plain, smith.valueRangeAtMost(u4, 0, 9)),
+        .zstd => try buffered.compressZstdWith(gpa, &plain, .{ .checksum = true }),
     };
     defer gpa.free(valid);
     const len = @min(valid.len, buf.len);
@@ -808,7 +825,7 @@ fn fuzzDecode(which: Codec, smith: *testing.Smith) !void {
         }
     }
     // A zstd edit can clear the checksum flag, so only gzip checks output.
-    if (which == .gzip) return expectInputOrError(&decoder, which, buf[0..end], plain);
+    if (which == .gzip) return expectInputOrError(&decoder, which, buf[0..end], &plain);
     return expectNoCrash(&decoder, which, buf[0..end]);
 }
 

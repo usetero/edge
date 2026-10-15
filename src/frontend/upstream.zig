@@ -144,11 +144,11 @@ pub const UpstreamManager = struct {
         };
 
         try self.upstreams.append(self.allocator, upstream_data);
-        return @enumFromInt(@as(u32, @intCast(self.upstreams.len - 1)));
+        return @fromBackingInt(@intCast(self.upstreams.len - 1));
     }
 
     pub fn getMaxResponseBody(self: *const UpstreamManager, upstream_id: UpstreamId) u32 {
-        const idx = @intFromEnum(upstream_id);
+        const idx = @backingInt(upstream_id);
         return self.upstreams.slice().items(.max_response_body)[idx];
     }
 
@@ -161,7 +161,7 @@ pub const UpstreamManager = struct {
         request_path: []const u8,
         query_string: []const u8,
     ) ![]const u8 {
-        const idx = @intFromEnum(upstream_id);
+        const idx = @backingInt(upstream_id);
         const slice = self.upstreams.slice();
 
         const scheme = slice.items(.scheme)[idx];

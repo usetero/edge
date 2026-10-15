@@ -207,7 +207,7 @@ test "processBatchScalar: fail-open overflow from one file does not contaminate 
 
     // file_a's record exceeds max_line and has no newline: it fails open and
     // is copied through unevaluated, leaving overflowed=true in the framer.
-    const partial_a = "Q" ** 40 ++ "PARTIAL"; // 47 bytes, no newline
+    const partial_a = @as([40]u8, @splat('Q')) ++ "PARTIAL"; // 47 bytes, no newline
     var a = try openTmp(io, tmp.dir, "a.log", partial_a);
     defer {
         a.file.close(io);

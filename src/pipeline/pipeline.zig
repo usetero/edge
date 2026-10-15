@@ -237,7 +237,7 @@ test "decoded body over the bound aborts (PLAN 6.5.1 caller semantics)" {
     try h.init();
     defer h.deinit();
     // Compresses tiny, inflates past the bound.
-    const compressed = try fixtures.compressGzip(testing.allocator, "a" ** 10_000);
+    const compressed = try fixtures.compressGzip(testing.allocator, &@as([10_000]u8, @splat('a')));
     defer testing.allocator.free(compressed);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -250,7 +250,7 @@ test "decoded body over the bound aborts (PLAN 6.5.1 caller semantics)" {
     // The same bound holds for a body with no encoding.
     var plain = testSpec(.identity, .ndjson, .identity);
     plain.max_decoded_bytes = 500;
-    const plain_too_large = run(plain, "b" ** 501, &out.writer, h.buffers(), h.codecs(), &sink);
+    const plain_too_large = run(plain, &@as([501]u8, @splat('b')), &out.writer, h.buffers(), h.codecs(), &sink);
     try testing.expectError(error.DecodedBodyTooLarge, plain_too_large);
 }
 

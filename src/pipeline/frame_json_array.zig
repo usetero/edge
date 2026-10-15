@@ -439,7 +439,7 @@ test "empty array and whitespace-only inputs" {
 
 test "oversized element fails open without evaluation" {
     // Element bigger than scratch contains "drop" — must pass through.
-    const big = "{\"pad\":\"" ++ "p" ** 64 ++ "drop\"}";
+    const big = "{\"pad\":\"" ++ @as([64]u8, @splat('p')) ++ "drop\"}";
     const input = "[{\"a\":1}," ++ big ++ ",{\"b\":2}]";
     for ([_]usize{ 1, 7, 4096 }) |chunk| {
         var sink: TestSink = .{ .allocator = testing.allocator };

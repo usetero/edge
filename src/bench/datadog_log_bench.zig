@@ -326,7 +326,7 @@ pub fn main(init: std.process.Init) !void {
         const records = try buildRecords(arena, shape);
         for (policies, 0..) |spec, pi| {
             cases[si * policies.len + pi] = .{
-                .name = try std.fmt.allocPrint(arena, "{s}/{s}", .{ shape.name, spec.name }),
+                .name = try arena.print("{s}/{s}", .{ shape.name, spec.name }),
                 .registry = registries[pi],
                 .records = records,
             };

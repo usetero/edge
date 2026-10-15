@@ -412,11 +412,11 @@ test "FieldWalker - mismatched container closers error" {
 }
 
 test "FieldWalker - nesting beyond 64 levels falls to the validating parser" {
-    const deep_bad = "{\"x\":" ++ "[" ** 65 ++ "]" ** 65 ++ "}";
+    const deep_bad = "{\"x\":" ++ @as([65]u8, @splat('[')) ++ @as([65]u8, @splat(']')) ++ "}";
     var walker = try FieldWalker.init(deep_bad);
     try testing.expectError(error.Malformed, walker.nextField());
 
-    const deep_ok = "{\"x\":" ++ "[" ** 64 ++ "]" ** 64 ++ "}";
+    const deep_ok = "{\"x\":" ++ @as([64]u8, @splat('[')) ++ @as([64]u8, @splat(']')) ++ "}";
     var ok = try FieldWalker.init(deep_ok);
     _ = (try ok.nextField()).?;
     try testing.expectEqual(@as(?FieldWalker.RawField, null), try ok.nextField());

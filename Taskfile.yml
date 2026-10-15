@@ -341,22 +341,24 @@ tasks:
         trap cleanup EXIT
         cleanup
         docker run -d --rm --name "$CONTAINER" \
-          -p 9000:9000 \
+          -p 127.0.0.1::9000 \
           -e RUSTFS_ACCESS_KEY=rustfsadmin \
           -e RUSTFS_SECRET_KEY=rustfsadmin \
           rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff >/dev/null
+        # Let Docker select a free loopback port without disturbing local S3 services.
+        ENDPOINT="http://$(docker port "$CONTAINER" 9000/tcp)"
         # /health/ready returns 503 until storage can serve S3 requests.
         for i in $(seq 1 30); do
-          if curl -fsS http://127.0.0.1:9000/health/ready >/dev/null 2>&1; then break; fi
+          if curl -fsS "$ENDPOINT/health/ready" >/dev/null 2>&1; then break; fi
           if [ "$i" = "30" ]; then echo "RustFS did not become ready"; docker logs "$CONTAINER" || true; exit 1; fi
           sleep 1
         done
         # Edge has no S3 admin client, so create the bucket with a signed PUT.
         curl -fsS -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" --user rustfsadmin:rustfsadmin \
-          "http://127.0.0.1:9000/$BUCKET" >/dev/null
+          "$ENDPOINT/$BUCKET" >/dev/null
         AWS_ACCESS_KEY_ID=rustfsadmin \
         AWS_SECRET_ACCESS_KEY=rustfsadmin \
-        S3_ENDPOINT=http://127.0.0.1:9000 \
+        S3_ENDPOINT="$ENDPOINT" \
         S3_BUCKET="$BUCKET" \
           zig build test-s3-e2e --summary all
 

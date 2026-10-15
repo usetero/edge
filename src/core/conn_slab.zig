@@ -17,17 +17,17 @@ pub const ConnId = enum(u32) {
     _,
 
     fn pack(slot: u16, gen: u16) ConnId {
-        return @enumFromInt(@as(u32, gen) << 16 | slot);
+        return @fromBackingInt(@as(u32, gen) << 16 | slot);
     }
 
     pub fn index(self: ConnId) u16 {
         std.debug.assert(self != .none);
-        return @truncate(@intFromEnum(self));
+        return @truncate(@backingInt(self));
     }
 
     pub fn generation(self: ConnId) u16 {
         std.debug.assert(self != .none);
-        return @truncate(@intFromEnum(self) >> 16);
+        return @truncate(@backingInt(self) >> 16);
     }
 };
 

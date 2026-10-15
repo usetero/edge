@@ -216,6 +216,6 @@ test "TapState: oversized record is truncated to the remaining budget" {
     try testing.expectEqual(TapState.max_tap_bytes, tap.written);
     // Header reports the truncated length, so the frame stays parseable.
     var lenbuf: [32]u8 = undefined;
-    const needle = std.fmt.bufPrint(&lenbuf, "len={d}\n", .{TapState.max_tap_bytes}) catch unreachable;
+    const needle = std.mem.print(&lenbuf, "len={d}\n", .{TapState.max_tap_bytes}) catch unreachable;
     try testing.expect(std.mem.indexOf(u8, buf.written(), needle) != null);
 }

@@ -281,10 +281,7 @@ fn makeNestedKv(key: []const u8, children: []const KeyValue) KeyValue {
         .value = .{
             .value = .{
                 .kvlist_value = .{
-                    .values = .{
-                        .items = @constCast(children),
-                        .capacity = children.len,
-                    },
+                    .values = makeMutableList(children),
                 },
             },
         },
@@ -292,10 +289,9 @@ fn makeNestedKv(key: []const u8, children: []const KeyValue) KeyValue {
 }
 
 fn makeMutableList(items: []const KeyValue) std.ArrayList(KeyValue) {
-    return .{
-        .items = @constCast(items),
-        .capacity = items.len,
-    };
+    var list = std.ArrayList(KeyValue).initBuffer(@constCast(items));
+    list.items = @constCast(items);
+    return list;
 }
 
 // ── getStringValue ──────────
@@ -355,7 +351,7 @@ test "findNestedAttributeTyped - typed leaf and nested walk" {
 
     const inner = @constCast(&[_]KeyValue{.{ .key = "status", .value = .{ .value = .{ .int_value = 404 } } }});
     const nested = [_]KeyValue{.{ .key = "http", .value = .{ .value = .{ .kvlist_value = .{
-        .values = .{ .items = inner, .capacity = inner.len },
+        .values = makeMutableList(inner),
     } } } }};
     try std.testing.expectEqual(@as(i64, 404), findNestedAttributeTyped(&nested, &.{ "http", "status" }).?.int);
 }

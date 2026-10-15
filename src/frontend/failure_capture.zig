@@ -50,8 +50,8 @@ const FailureCaptureStalled = struct { dir: []const u8, queued: usize };
 const FailureCaptureRearmed = struct { dir: []const u8, free: u32 };
 
 /// Dumps hold customer payloads, so only the edge's own user may read them.
-const dir_permissions: std.Io.File.Permissions = @enumFromInt(0o700);
-const file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
+const dir_permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
+const file_permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
 
 pub const redacted = "[redacted]";
 
@@ -370,9 +370,9 @@ pub const Capture = struct {
     /// arena is reset once the request is answered.
     fn prepare(self: *Capture, arena: std.mem.Allocator, failure: Failure) !Job {
         const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
-        const stem = try std.fmt.allocPrint(self.gpa, "{d}-{d}", .{ now_ms, self.seq.fetchAdd(1, .monotonic) });
+        const stem = try self.gpa.print("{d}-{d}", .{ now_ms, self.seq.fetchAdd(1, .monotonic) });
         errdefer self.gpa.free(stem);
-        const body_name = try std.fmt.allocPrint(arena, "{s}.body", .{stem});
+        const body_name = try arena.print("{s}.body", .{stem});
         var json: std.Io.Writer.Allocating = .init(arena);
         const meta_value = try metaOf(arena, failure, body_name, now_ms);
         try std.json.Stringify.value(meta_value, .{ .whitespace = .indent_2 }, &json.writer);
@@ -461,8 +461,8 @@ pub const Capture = struct {
     /// removed.
     fn writeFiles(self: *Capture, job: Job, name_buf: *[64]u8, left: *bool) ![]const u8 {
         var body_buf: [64]u8 = undefined;
-        const body_name = try std.fmt.bufPrint(&body_buf, "{s}.body", .{job.stem});
-        const meta_name = try std.fmt.bufPrint(name_buf, "{s}.json", .{job.stem});
+        const body_name = try std.mem.print(&body_buf, "{s}.body", .{job.stem});
+        const meta_name = try std.mem.print(name_buf, "{s}.json", .{job.stem});
         if (builtin.is_test and self.test_stall_writes) try self.io.sleep(.fromSeconds(60), .awake);
         try self.writeNew(job.path, body_name, job.body, left);
         errdefer self.discard(job.path, body_name, left);
@@ -714,14 +714,20 @@ test "percent-encoded query names are redacted" {
 }
 
 test "the tee forwards every byte and keeps a copy" {
-    var source: std.Io.Reader = .fixed("0123456789" ** 100);
+    const payload = comptime blk: {
+        const unit = "0123456789";
+        var bytes: [unit.len * 100]u8 = undefined;
+        for (0..100) |i| @memcpy(bytes[i * unit.len ..][0..unit.len], unit);
+        break :blk bytes;
+    };
+    var source: std.Io.Reader = .fixed(&payload);
     var buf: [1000]u8 = undefined;
     var tee: Tee = .{ .inner = &source, .copy = &buf };
     var sink: std.Io.Writer.Allocating = .init(testing.allocator);
     defer sink.deinit();
     try tee.interface.streamExact(&sink.writer, 1000);
-    try testing.expectEqualStrings("0123456789" ** 100, sink.written());
-    try testing.expectEqualStrings("0123456789" ** 100, tee.written());
+    try testing.expectEqualStrings(&payload, sink.written());
+    try testing.expectEqualStrings(&payload, tee.written());
     try testing.expect(!tee.copy_failed);
 }
 
@@ -813,7 +819,7 @@ test "a dump holds the body unchanged and the metadata redacted, up to the cap" 
         // `stat` carries the file type bits too; compare the mode only.
         const mode = struct {
             fn of(p: std.Io.File.Permissions) u32 {
-                return @as(u32, @intCast(@intFromEnum(p))) & 0o777;
+                return @as(u32, @intCast(@backingInt(p))) & 0o777;
             }
         }.of;
         try testing.expectEqual(mode(dir_permissions), mode((try dir.stat(io)).permissions));

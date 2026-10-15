@@ -79,6 +79,17 @@ pub fn build(b: *std.Build) void {
     // that wires s3-dump imports it.
     const ext_mod = policy_dep.module("extensions");
 
+    // Translate once so every codec sees the same C types.
+    const codec_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/codec/c.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    codec_translate.linkSystemLibrary("z", .{});
+    codec_translate.linkSystemLibrary("zstd", .{});
+    const codec_c = codec_translate.createModule();
+
     // ==========================================================================
     // Edge Library Module
     // ==========================================================================
@@ -94,6 +105,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "extensions", .module = ext_mod },
             .{ .name = "metrics_zig", .module = metrics_dep.module("metrics") },
             .{ .name = "httpz", .module = httpz_mod },
+            .{ .name = "codec_c", .module = codec_c },
         },
     });
     mod.addOptions("build_options", build_options);
@@ -132,6 +144,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("extensions", ext_mod);
     exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
     exe.root_module.addImport("httpz", httpz_mod);
+    exe.root_module.addImport("codec_c", codec_c);
     exe.root_module.addOptions("build_options", build_options);
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("z", .{});
@@ -174,6 +187,7 @@ pub fn build(b: *std.Build) void {
         dist_exe.root_module.addImport("extensions", ext_mod);
         dist_exe.root_module.addImport("metrics_zig", metrics_dep.module("metrics"));
         dist_exe.root_module.addImport("httpz", httpz_mod);
+        dist_exe.root_module.addImport("codec_c", codec_c);
         dist_exe.root_module.addOptions("build_options", build_options);
         dist_exe.root_module.link_libc = true;
         dist_exe.root_module.linkSystemLibrary("z", .{});
@@ -188,9 +202,7 @@ pub fn build(b: *std.Build) void {
         const run_dist_cmd = b.addRunArtifact(dist_exe);
         run_dist_step.dependOn(&run_dist_cmd.step);
         run_dist_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| {
-            run_dist_cmd.addArgs(args);
-        }
+        run_dist_cmd.addPassthruArgs();
     }
 
     // ==========================================================================
@@ -201,9 +213,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // ==========================================================================
     // Tests
@@ -333,7 +343,7 @@ pub fn build(b: *std.Build) void {
     const run_datadog_log_bench = b.addRunArtifact(datadog_log_bench);
     // Forward CLI args (e.g. `zig build datadog-log-bench -- --profile plain/none 30`)
     // and install the binary so a profiler can be attached to it directly.
-    if (b.args) |args| run_datadog_log_bench.addArgs(args);
+    run_datadog_log_bench.addPassthruArgs();
     datadog_log_bench_step.dependOn(&run_datadog_log_bench.step);
     datadog_log_bench_step.dependOn(&b.addInstallArtifact(datadog_log_bench, .{}).step);
 
@@ -381,7 +391,5 @@ pub fn build(b: *std.Build) void {
     const run_echo_cmd = b.addRunArtifact(echo_server);
     run_echo_step.dependOn(&run_echo_cmd.step);
     run_echo_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_echo_cmd.addArgs(args);
-    }
+    run_echo_cmd.addPassthruArgs();
 }

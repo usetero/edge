@@ -277,7 +277,7 @@ fn addNamed(
     label: []const u8,
     benchmark: anytype,
 ) !void {
-    const name = try std.fmt.allocPrint(gpa, "{s} {s}", .{ what, label });
+    const name = try gpa.print("{s} {s}", .{ what, label });
     try names.append(gpa, name);
     try bench.addParam(name, @as(*const @TypeOf(benchmark.*), benchmark), .{});
 }

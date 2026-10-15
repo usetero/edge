@@ -271,8 +271,7 @@ test "e2e rustfs: edge datadog log dump uploads to a real S3 server" {
         .secret_access_key = secret,
     });
 
-    const target_json = try std.fmt.allocPrint(
-        gpa,
+    const target_json = try gpa.print(
         \\{{"endpoint":"{s}","region":"us-east-1","bucket":"{s}","prefix":"e2e/","force_path_style":true}}
     ,
         .{ endpoint, bucket },

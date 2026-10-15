@@ -54,7 +54,7 @@ pub const IoRuntime = struct {
                 // warn (not err): the returned error already fails startup
                 // loudly; err-level here would also trip the test runner.
                 log.warn(
-                    "io backend '{s}' is not available: zig 0.16.0 ships it without networking support",
+                    "io backend '{s}' is reserved and is not enabled in this build",
                     .{@tagName(backend)},
                 );
                 return error.IoBackendUnavailable;

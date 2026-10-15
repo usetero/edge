@@ -187,7 +187,7 @@ test "read scheduler uring non-fixed path: multi-event batch keeps read buffers 
 
         var i: usize = 0;
         while (i < event_count) : (i += 1) {
-            const name = try std.fmt.allocPrint(testing.allocator, "ev{d}.log", .{i});
+            const name = try testing.allocator.print("ev{d}.log", .{i});
             defer testing.allocator.free(name);
             {
                 const f = try tmp.dir.createFile(io, name, .{});
