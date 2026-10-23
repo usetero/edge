@@ -94,7 +94,9 @@ class TruncatedWrappedMessage(MatrixCase):
     def send_and_check(self, name: str, kept: list[dict], dropped: list[dict]) -> None:
         self.intake.capture_start(name)
         before = self.metric_delta('edge_policy_records_dropped_total{telemetry="datadog_logs"}')
-        response = self.post_logs(dropped + kept, timeout=30)
+        # Run both policy controls before and after the malformed messages.
+        # A fault must not disable either lookup for subsequent records.
+        response = self.post_logs(dropped + kept + dropped, timeout=30)
         self.assertTrue(self.edge.alive(), "the edge died on a cut message:\n%s" % self.edge.logs())
         self.assert_status(response, 202, "a batch with cut messages must be accepted")
         bodies = self.intake.capture_stop()
@@ -103,7 +105,7 @@ class TruncatedWrappedMessage(MatrixCase):
         # The valid records still pass through the policies: the cut ones
         # did not stop the batch or turn it into a fail-open passthrough.
         self.assertEqual(
-            len(dropped),
+            2 * len(dropped),
             self.metric_delta('edge_policy_records_dropped_total{telemetry="datadog_logs"}') - before,
             "the policies did not drop the valid records they match",
         )
