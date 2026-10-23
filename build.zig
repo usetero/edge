@@ -86,6 +86,10 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("edge", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        // Every importer builds with this same mode. Set here because
+        // `mod_tests` uses `mod` as its root, and a root module with no mode
+        // builds in Debug, which made `-Doptimize` a no-op for the main suite.
+        .optimize = optimize,
         .imports = &.{
             .{ .name = "proto", .module = proto_mod },
             .{ .name = "zimdjson", .module = zimdjson.module("zimdjson") },

@@ -1042,3 +1042,55 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
         if (via_direct) |d| try testing.expectEqualStrings(via_flat.?, d);
     }
 }
+
+test "DatadogLog - a malformed wrapped message uses raw text and no attributes" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const cases = [_][]const u8{
+        // Truncated where a value belongs. Before the fix, each of these sent
+        // the cursor past the end of the index: either a swallowed `asAny`
+        // error, or zimdjson's own skip over an unread field.
+        \\{"a":
+        ,
+        \\{"a":[1,
+        ,
+        \\{"x":{"a":[
+        ,
+        \\{"data":{"jsonPayload":{"other":
+        ,
+        // Complete but invalid: a value error after a leaf the walk already
+        // took. The leaf must not survive, or the answer depends on where the
+        // document broke.
+        \\{"a":{"b":"leaf"},"c":}
+        ,
+        \\{"data":{"jsonPayload":{"body":"x","message":tru}}}
+        ,
+        \\{"a":{"b":"leaf"},"c":[1,tru]}
+        ,
+    };
+
+    // One parser for every case, the way `evalLogRecord` shares it.
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    for (cases) |inner| {
+        errdefer std.debug.print("case: {s}\n", .{inner});
+        // Body lookup runs the targeted walk and then the flatten.
+        // Attribute lookup runs the flatten alone.
+        inline for (.{ "body", "attribute" }) |lookup| {
+            var log: DatadogLog = .{
+                .message = inner,
+                .unwrap_parser = &parser,
+                .unwrap_parser_gpa = allocator,
+            };
+            defer log.deinit(allocator);
+
+            if (comptime std.mem.eql(u8, lookup, "body")) {
+                try testing.expectEqualStrings(inner, log.bodyForMatch(allocator).?);
+            } else {
+                try testing.expect(log.unwrappedAttribute(allocator, &.{ "a", "b" }) == null);
+            }
+            try testing.expectEqual(@as(usize, 0), log.message_flat.count());
+        }
+    }
+}

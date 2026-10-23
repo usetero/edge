@@ -1,0 +1,72 @@
+---
+# Unit tests and the wrapped-message matrix regression
+#
+# Why this exists:
+# No other workflow runs the test suite, so a change could merge without it.
+# The suite runs in ReleaseSafe, so safety checks stay on. It runs on both
+# architectures: some memory bugs fault on only one of them (a zimdjson read
+# past its token index faulted on x86 only).
+#
+# The suite runs inside the Alpine image and with the packages that the
+# Dockerfile builder uses, so it links the same libraries as the image. Not on
+# the Ubuntu runner itself: Ubuntu 24.04's arm64 vectorscan (5.4.9) crashes in
+# hs_compile on anchored literals of about 10 characters or more, such as an
+# exact matcher. The container is started with `docker run`, because GitHub
+# runs no JavaScript actions in Alpine containers on arm64 runners. It runs
+# with seccomp unconfined, because Docker's default profile blocks io_uring,
+# which the tail tests use.
+name: Test
+"on":
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Run unit tests and a52 in the Dockerfile's Alpine image
+        run: |
+          docker run --rm --security-opt seccomp=unconfined -v "$PWD":/src -w /src \
+            alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 \
+            sh -euc '
+              apk add --no-cache zlib-dev zlib-static zstd-dev zstd-static \
+                musl-dev g++ linux-headers pkgconf vectorscan-dev \
+                vectorscan-static curl xz python3 py3-requests py3-zstandard
+              # The Zig version and checksums match the Dockerfile.
+              case "$(uname -m)" in
+                x86_64) arch=x86_64; sum=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+                aarch64) arch=aarch64; sum=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+              esac
+              curl -fsSL "https://ziglang.org/download/0.16.0/zig-$arch-linux-0.16.0.tar.xz" -o /tmp/zig.tar.xz
+              echo "$sum  /tmp/zig.tar.xz" | sha256sum -c -
+              mkdir -p /opt/zig
+              tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+              export PATH="/opt/zig:$PATH"
+              for i in 1 2 3 4 5; do zig build --fetch && break || sleep 10; done
+              zig build test -Dcpu=baseline -Doptimize=ReleaseSafe --summary all
+              zig build echo-server -Dcpu=baseline -Doptimize=ReleaseFast
+              for frontend in stdio httpz; do
+                zig build -Dfrontend="$frontend" -Dcpu=baseline -Doptimize=ReleaseSafe \
+                  --prefix "zig-out-$frontend"
+              done
+              python3 bench/matrix/run.py --skip-build -k a52
+            '
