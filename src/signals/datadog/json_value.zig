@@ -7,7 +7,8 @@
 //! here so a fix to one is a fix to both.
 //!
 //! Two rules keep a walk over a malformed document inside zimdjson's token
-//! index, which has no bounds checks:
+//! index. The index has no bounds checks, and zimdjson before `b80b923` read
+//! past its end on a document cut where a value belongs:
 //!
 //! - Parse through `parseContainer`, never `Parser.parseFromSlice` directly.
 //! - Stop the whole walk on an error from `next` or `asAny`. After one, the
@@ -25,12 +26,14 @@ pub const AnyValue = Parser.AnyValue;
 /// Parse `bytes` with `parser`, but refuse a document that does not end with
 /// `}` or `]`.
 ///
-/// zimdjson ends its token index with one sentinel token. When the last real
-/// token is `:`, `,` or `[`, the sentinel sits where a value belongs. Skipping
-/// that value (an unread field, or `at()` passing over a key) consumes the
-/// sentinel as a scalar, and the next read goes past the end of the index into
-/// memory the indexer never wrote. That read produced a wild offset and a
-/// segfault in production. When the last token is `}` or `]`, the sentinel
+/// zimdjson ends its token index with a sentinel token. When the last real
+/// token is `:`, `,` or `[`, the sentinel sits where a value belongs. Before
+/// `b80b923`, skipping that value (an unread field, or `at()` passing over a
+/// key) consumed the sentinel as a scalar, and the next read went past the end
+/// of the index into memory the indexer never wrote. That read produced a wild
+/// offset and a segfault in production. zimdjson now reports `Incomplete*`
+/// there. This check stays as a second layer, and it refuses the document
+/// before an index is built. When the last token is `}` or `]`, the sentinel
 /// cannot sit at a value position. Every caller accepts only an object or an
 /// array, so this refuses no valid input.
 pub fn parseContainer(

@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .zimdjson = .{
-            .url = "git+https://github.com/jaronoff97/zimdjson?ref=main#6199cafec64280fcd9fd1df70b52809fc5a70052",
-            .hash = "zimdjson-0.1.1-89pgxQlXBgAl5hBPQrMFdumnb9Z36oftC7qkURHJwLEG",
+            .url = "git+https://github.com/jaronoff97/zimdjson?ref=main#b80b9235829e05f44ba645d2df7287d71a3d7b07",
+            .hash = "zimdjson-0.1.1-89pgxfdiBgAqLTiHNwksKDFix58CSdWSgIoLkdb9JNat",
         },
         .metrics = .{
             .url = "git+https://github.com/karlseguin/metrics.zig?ref=master#1621f82e7ecf2b3dddf5730bf52761af354a7080",
