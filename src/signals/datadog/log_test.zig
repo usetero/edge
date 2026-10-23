@@ -1042,3 +1042,71 @@ test "bodyForMatch: targeted lookup and full flatten agree" {
         if (via_direct) |d| try testing.expectEqualStrings(via_flat.?, d);
     }
 }
+
+/// True when zimdjson's token cursor is still inside its index. The index
+/// ends with one sentinel token and zimdjson does not bounds-check, so a
+/// cursor past that end has read memory the indexer never wrote. That read
+/// segfaulted in production on amd64. On other targets it usually reads
+/// harmless stale bytes, so the crash alone is not a portable test; this
+/// position check is.
+fn cursorInBounds(parser: *const Parser) bool {
+    const indexes = parser.cursor.tokens.indexes.items;
+    return @intFromPtr(parser.cursor.tokens.token) <= @intFromPtr(indexes.ptr + indexes.len);
+}
+
+test "DatadogLog - a malformed wrapped message is not JSON and stays in bounds" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const cases = [_][]const u8{
+        // Truncated where a value belongs. Before the fix, each of these sent
+        // the cursor past the end of the index: either a swallowed `asAny`
+        // error, or zimdjson's own skip over an unread field.
+        \\{"a":
+        ,
+        \\{"a":[1,
+        ,
+        \\{"x":{"a":[
+        ,
+        \\{"data":{"jsonPayload":{"other":
+        ,
+        // Complete but invalid: a value error after a leaf the walk already
+        // took. The leaf must not survive, or the answer depends on where the
+        // document broke.
+        \\{"a":{"b":"leaf"},"c":}
+        ,
+        \\{"data":{"jsonPayload":{"body":"x","message":tru}}}
+        ,
+        \\{"a":{"b":"leaf"},"c":[1,tru]}
+        ,
+    };
+
+    // One parser for every case, the way `evalLogRecord` shares it.
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+
+    for (cases) |inner| {
+        errdefer std.debug.print("case: {s}\n", .{inner});
+        // Body lookup runs the targeted walk and then the flatten.
+        // Attribute lookup runs the flatten alone.
+        inline for (.{ "body", "attribute" }) |lookup| {
+            // A known in-bounds start, so a stale cursor from the previous
+            // case cannot pass or fail this one.
+            _ = try parser.parseFromSlice(allocator, "{}");
+
+            var log: DatadogLog = .{
+                .message = inner,
+                .unwrap_parser = &parser,
+                .unwrap_parser_gpa = allocator,
+            };
+            defer log.deinit(allocator);
+
+            if (comptime std.mem.eql(u8, lookup, "body")) {
+                try testing.expectEqualStrings(inner, log.bodyForMatch(allocator).?);
+            } else {
+                try testing.expect(log.unwrappedAttribute(allocator, &.{ "a", "b" }) == null);
+            }
+            try testing.expectEqual(@as(usize, 0), log.message_flat.count());
+            try testing.expect(cursorInBounds(&parser));
+        }
+    }
+}

@@ -265,7 +265,7 @@ pub const Materialized = struct {
                 try jws.writer.writeAll(raw);
                 jws.endWriteRaw();
             } else {
-                try json_value.write(jws, value);
+                try json_value.writeScalar(jws, value);
             }
         }
     }

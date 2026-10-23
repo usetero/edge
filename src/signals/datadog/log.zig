@@ -3,6 +3,7 @@ const zimdjson = @import("zimdjson");
 const jscan = @import("../json_scan.zig");
 const policy = @import("policy_zig");
 const extras = @import("extras.zig");
+const json_value = @import("json_value.zig");
 
 pub const Parser = zimdjson.ondemand.FullParser(.default);
 pub const Value = Parser.Value;
@@ -68,11 +69,7 @@ pub const DatadogLog = struct {
         self.extra.deinit(allocator);
 
         self.extra_spans.deinit(allocator);
-        var flat_it = self.message_flat.iterator();
-        while (flat_it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
+        self.clearMessageFlat(allocator);
         self.message_flat.deinit(allocator);
         if (self.message_tree) |*tree| tree.deinit();
         if (self.message_rewrapped) |s| allocator.free(s);
@@ -347,17 +344,31 @@ pub const DatadogLog = struct {
         const parser = self.unwrap_parser orelse &local;
         const parser_gpa = self.unwrap_parser_gpa orelse allocator;
         defer if (self.unwrap_parser == null) local.deinit(allocator);
-        const doc = parser.parseFromSlice(parser_gpa, raw) catch return;
+        const doc = json_value.parseContainer(parser, parser_gpa, raw) catch return;
 
         var prefix: std.ArrayList(u8) = .empty;
         defer prefix.deinit(allocator);
-        // Best-effort: an OOM mid-flatten just yields fewer leaves (fail-open
-        // matching), consistent with the rest of this accessor.
-        self.flattenValue(allocator, &prefix, doc.asValue().asAny() catch return) catch return;
+        // Any error (a malformed document or OOM) discards the leaves found so
+        // far: the message counts as not JSON, and matching falls back to the
+        // raw text (fail-open). Partial leaves from a document that later
+        // turns out broken would make the answer depend on where it broke.
+        const any = doc.asValue().asAny() catch return;
+        self.flattenValue(allocator, &prefix, any) catch self.clearMessageFlat(allocator);
+    }
+
+    fn clearMessageFlat(self: *DatadogLog, allocator: std.mem.Allocator) void {
+        var flat_it = self.message_flat.iterator();
+        while (flat_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.message_flat.clearRetainingCapacity();
     }
 
     /// Recursively flatten a parsed value, recording every string leaf under
     /// its dotted path (pre-order; first leaf wins on a key collision).
+    /// A cursor error from zimdjson ends the whole walk (see `json_value`);
+    /// an unescape error only skips that leaf or field.
     fn flattenValue(
         self: *DatadogLog,
         allocator: std.mem.Allocator,
@@ -378,15 +389,13 @@ pub const DatadogLog = struct {
             },
             .object => |obj| {
                 var it = obj.iterator();
-                while (it.next() catch null) |field| {
+                while (try it.next()) |field| {
                     const key = field.key.get() catch continue;
+                    const value = try field.value.asAny();
                     const base = prefix.items.len;
                     if (base != 0) try prefix.append(allocator, '.');
                     try prefix.appendSlice(allocator, key);
-                    try self.flattenValue(allocator, prefix, field.value.asAny() catch {
-                        prefix.shrinkRetainingCapacity(base);
-                        continue;
-                    });
+                    try self.flattenValue(allocator, prefix, value);
                     prefix.shrinkRetainingCapacity(base);
                 }
             },
@@ -394,8 +403,8 @@ pub const DatadogLog = struct {
                 // Arrays don't extend the dotted attribute path, but a body
                 // can still be nested inside one.
                 var it = arr.iterator();
-                while (it.next() catch null) |item| {
-                    try self.flattenValue(allocator, prefix, item.asAny() catch continue);
+                while (try it.next()) |item| {
+                    try self.flattenValue(allocator, prefix, try item.asAny());
                 }
             },
             else => {},
@@ -447,15 +456,21 @@ pub const DatadogLog = struct {
         const parser_gpa = self.unwrap_parser_gpa orelse allocator;
         defer if (self.unwrap_parser == null) local.deinit(allocator);
 
-        const doc = parser.parseFromSlice(parser_gpa, raw) catch return null;
+        const doc = json_value.parseContainer(parser, parser_gpa, raw) catch return null;
         const payload = doc.asValue().at("data").at("jsonPayload");
         var obj = payload.asObject() catch return null;
 
         // One forward pass: on-demand values cannot be revisited, so collect
         // every candidate as we go and apply `inner_body_paths` priority after.
         var hits: [inner_body_paths.len]?[]const u8 = @splat(null);
+        // Every `return null` below means "ask the flatten" and must release
+        // the candidates collected so far.
+        var understood = false;
+        defer if (!understood) for (hits) |hit| if (hit) |body| allocator.free(body);
         var it = obj.iterator();
         while (it.next() catch return null) |field| {
+            // An unescape error leaves the cursor intact; the next `next` skips
+            // the unread value.
             const key = field.key.get() catch continue;
             const slot: usize = if (std.mem.eql(u8, key, "message"))
                 0
@@ -470,7 +485,13 @@ pub const DatadogLog = struct {
             // body policy could be bypassed by appending a benign second
             // `message`. Skipping the dupe also avoids leaking the loser.
             if (hits[slot] != null) continue;
-            switch (field.value.asAny() catch continue) {
+            // A cursor error must end the walk (see `json_value`). The flatten
+            // then hits the same error, and both paths agree on the raw
+            // message. note: zimdjson validates only what a walk reads, and
+            // this walk skips most of the document, so on a malformed document
+            // the two paths can still disagree. On a well-formed one they
+            // cannot.
+            switch (field.value.asAny() catch return null) {
                 .string => |v| {
                     const text = v.get() catch continue;
                     hits[slot] = allocator.dupe(u8, text) catch return null;
@@ -486,6 +507,7 @@ pub const DatadogLog = struct {
                 else => {},
             }
         }
+        understood = true;
         // Priority is `inner_body_paths` order, not document order, so release
         // the candidates that lost. Callers pass an arena, where this is a
         // no-op; it keeps the leak-checking tests honest.

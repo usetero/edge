@@ -3,6 +3,7 @@ const stream_io = @import("../stream_io.zig");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const datadog_metric = @import("metric.zig");
+const json_value = @import("json_value.zig");
 const otlp_attr = @import("../otlp/attributes.zig");
 
 const PolicyEngine = policy.PolicyEngine;
@@ -342,7 +343,7 @@ fn processJsonMetricsWithFilter(
     var parser: Parser = .init;
     defer parser.deinit(allocator);
 
-    const document = parser.parseFromSlice(allocator, data) catch {
+    const document = json_value.parseContainer(&parser, allocator, data) catch {
         return returnUnchanged(allocator, data, 0);
     };
 

@@ -3,6 +3,7 @@ const stream_io = @import("../stream_io.zig");
 const policy = @import("policy_zig");
 const o11y = @import("o11y");
 const datadog_log = @import("log.zig");
+const json_value = @import("json_value.zig");
 
 const PolicyEngine = policy.PolicyEngine;
 const PolicyResult = policy.PolicyResult;
@@ -142,7 +143,7 @@ pub fn evalLogRecord(
     // Hand the reused parser down so the lazy message unwrap does not build a
     // fresh structural index per record.
     var log_obj = DatadogLog.parseRaw(scratch, record) catch blk: {
-        const document = parser.parseFromSlice(parser_gpa, record) catch return .keep;
+        const document = json_value.parseContainer(parser, parser_gpa, record) catch return .keep;
         const value_type = document.asValue().getType() catch return .keep;
         if (value_type != .object) return .keep;
         // No `unwrap_parser` on this path. `parse` keeps unknown fields as
@@ -481,7 +482,7 @@ fn processJsonLogsWithFilter(
     data: []const u8,
     sink: ?policy.ExtensionSink,
 ) !ProcessResult {
-    const document = parser.parseFromSlice(parser_gpa, data) catch {
+    const document = json_value.parseContainer(parser, parser_gpa, data) catch {
         return returnUnchanged(allocator, data, 0);
     };
 
@@ -509,7 +510,10 @@ fn processJsonLogsWithFilter(
             };
             var it = array.iterator();
 
-            while (it.next() catch null) |item| {
+            // A cursor error ends the walk (see `json_value`). Fail open like
+            // a record that does not parse: the records seen so far are not
+            // the whole body, so a result built from them would lose the rest.
+            while (it.next() catch return returnUnchanged(allocator, data, state.original_count)) |item| {
                 var log_obj = DatadogLog.parse(arena, item) catch {
                     return returnUnchanged(allocator, data, state.original_count);
                 };
@@ -1018,6 +1022,81 @@ test "evalLogRecord - malformed and non-object records fail open to keep" {
 
     const scalar = try evalLogRecord(arena.allocator(), &parser, allocator, &registry, bus, "42", null);
     try std.testing.expectEqual(RecordVerdict.keep, scalar);
+}
+
+test "evalLogRecord - truncated JSON in message fails open instead of crashing" {
+    // Regression: a lookup inside a wrapped `message` that ends where a value
+    // belongs read past the end of zimdjson's token index. The out-of-array
+    // entry in a fresh parser is the 0xaa fill, so the read segfaults on
+    // linux/amd64 and on macOS/arm64. The message must count as not JSON: no
+    // attribute comes out of it, and the body is the raw message.
+    const allocator = std.testing.allocator;
+    const records = [_][]const u8{
+        \\{"message":"{\"\":"}
+        ,
+        \\{"message":"{\"data\":"}
+        ,
+        \\{"message":"{\"data\":{\"jsonPayload\":{\"a\":[1,"}
+        ,
+    };
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+
+    // An attribute matcher runs the flatten; a body matcher runs the targeted
+    // `data.jsonPayload` walk first. Each gets its own registry so that one
+    // cannot make the other skip its walk.
+    for ([_]bool{ false, true }) |by_body| {
+        var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+        defer registry.deinit();
+        var drop_policy: proto.policy.Policy = .{
+            .id = try allocator.dupe(u8, "drop-matched"),
+            .name = try allocator.dupe(u8, "drop-matched"),
+            .enabled = true,
+            .target = .{ .log = .{ .keep = try allocator.dupe(u8, "none") } },
+        };
+        defer drop_policy.deinit(allocator);
+        if (by_body) {
+            try drop_policy.target.?.log.match.append(allocator, .{
+                .field = .{ .log_field = .LOG_FIELD_BODY },
+                .match = .{ .exists = true },
+            });
+        } else {
+            var attr_path: proto.policy.AttributePath = .{};
+            try attr_path.path.append(allocator, try allocator.dupe(u8, "event_type"));
+            try drop_policy.target.?.log.match.append(allocator, .{
+                .field = .{ .log_attribute = attr_path },
+                .match = .{ .exists = true },
+            });
+        }
+        try registry.updatePolicies(&.{drop_policy}, "file-provider", .file);
+
+        for (records) |record| {
+            errdefer std.debug.print("record: {s}\n", .{record});
+            // A fresh parser per record, as the crash needs: its index
+            // capacity past the sentinel holds the 0xaa fill, not old offsets.
+            var parser: Parser = .init;
+            defer parser.deinit(allocator);
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+
+            const verdict = try evalLogRecord(
+                arena.allocator(),
+                &parser,
+                allocator,
+                &registry,
+                noop_bus.eventBus(),
+                record,
+                null,
+            );
+            if (by_body) {
+                // The body is the raw message, which exists: the drop fires.
+                try std.testing.expectEqual(RecordVerdict.drop, verdict);
+            } else {
+                // No attribute comes out of a message that is not JSON.
+                try std.testing.expectEqual(RecordVerdict.keep, verdict);
+            }
+        }
+    }
 }
 
 test "processLogs - no policies keeps all logs in array" {
