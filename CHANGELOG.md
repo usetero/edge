@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.33.2](https://github.com/usetero/edge/compare/v1.33.1...v1.33.2) (2026-10-23)
+
+
+### Bug Fixes
+
+* **datadog:** stop the segfault on truncated JSON in wrapped messages ([#371](https://github.com/usetero/edge/issues/371)) ([17987b5](https://github.com/usetero/edge/commit/17987b56bf3563a2685a043c4ef4fca00e6f3c55))
+
 ## [1.33.1](https://github.com/usetero/edge/compare/v1.33.0...v1.33.1) (2026-10-02)
 
 
