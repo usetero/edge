@@ -143,6 +143,7 @@ with its note.
 | a49 | Valid gzip and zstd batches on the buffered path (metrics JSON, OTLP JSON) | 202, and the intake receives them | |
 | a50 | Header value with a bare LF | Refused, or forwarded with no CR or LF in any value | |
 | a51 | Two gzip members; two zstd frames; a zstd window above the cap | Both members filtered; both frames filtered; the wide window fails open | |
+| a52 | `message` holds JSON cut after a `:`, `,` or `[` (139 cuts in order of size, and the minimized production record), with an attribute policy and a body policy on the wrapped message | The edge stays up; each cut record is kept with its message unchanged; the valid records in the same batch are still dropped | the 1.33.1 segfault in zimdjson `hasNextField` |
 
 ### `b*` — the edge to the intake
 
