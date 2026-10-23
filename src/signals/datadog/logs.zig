@@ -140,24 +140,25 @@ pub fn evalLogRecord(
     // structural surprises — re-parses through the fully validating
     // materializing path, so semantics never depend on the fast path. Only
     // when both fail does the record fail open to keep.
-    // Hand the reused parser down so the lazy message unwrap does not build a
-    // fresh structural index per record.
-    var log_obj = DatadogLog.parseRaw(scratch, record) catch blk: {
+    var log_obj = if (DatadogLog.parseRaw(scratch, record)) |raw_log| shared: {
+        // `parseRaw` reads only `record`, so the parser holds no document this
+        // log still reads from. Hand it down so the lazy message unwrap does
+        // not build a fresh structural index per record.
+        var log = raw_log;
+        log.unwrap_parser = parser;
+        log.unwrap_parser_gpa = parser_gpa;
+        break :shared log;
+    } else |_| fallback: {
         const document = json_value.parseContainer(parser, parser_gpa, record) catch return .keep;
         const value_type = document.asValue().getType() catch return .keep;
         if (value_type != .object) return .keep;
-        // No `unwrap_parser` on this path. `parse` keeps unknown fields as
-        // lazy AnyValues backed by `document`, which is backed by `parser`'s
-        // structural index; a later body lookup re-parsing the inner wrapper
-        // on that same parser would replace the index under them. The unwrap
-        // falls back to its own local parser instead.
-        break :blk DatadogLog.parse(scratch, document.asValue()) catch return .keep;
+        // No `unwrap_parser` on this path: the log still reads from `parser`.
+        // Its strings and keys are unescaped into the parser's string buffer,
+        // and its lazy extras walk the parser's structural index. A re-parse
+        // of the wrapped message on the same parser resets both under the
+        // log. The unwrap uses its own local parser instead.
+        break :fallback DatadogLog.parse(scratch, document.asValue()) catch return .keep;
     };
-    // Only reached when parseRaw succeeded, so the parser holds no document
-    // this log still reads from. Sharing it saves a structural index per
-    // record on the unwrap path.
-    log_obj.unwrap_parser = parser;
-    log_obj.unwrap_parser_gpa = parser_gpa;
 
     const engine = PolicyEngine.init(bus, @constCast(registry));
     var policy_id_buf: [MAX_MATCHES_PER_SCAN][]const u8 = undefined;
@@ -1097,6 +1098,66 @@ test "evalLogRecord - truncated JSON in message fails open instead of crashing" 
             }
         }
     }
+}
+
+test "evalLogRecord - fallback parse keeps its strings when the message unwraps" {
+    // Regression: the fallback `parse` path also handed the shared parser to
+    // the message unwrap. `parse` borrows `service`, `message` and the extra
+    // keys from that parser's string buffer, and the unwrap's re-parse reset
+    // it, so the serialized record came out corrupted. The escaped key makes
+    // `parseRaw` refuse the record. The attribute matcher on `a` runs the
+    // unwrap, and removing `hostname` makes the record serialize after it.
+    const allocator = std.testing.allocator;
+
+    var noop_bus: NoopEventBus = undefined;
+    noop_bus.init(std.Options.debug_io);
+    var registry = PolicyRegistry.init(allocator, noop_bus.eventBus());
+    defer registry.deinit();
+
+    var transform: proto.policy.LogTransform = .{};
+    var remove_path: proto.policy.AttributePath = .{};
+    try remove_path.path.append(allocator, try allocator.dupe(u8, "hostname"));
+    try transform.remove.append(allocator, .{ .field = .{ .log_attribute = remove_path } });
+    var test_policy: proto.policy.Policy = .{
+        .id = try allocator.dupe(u8, "remove-hostname"),
+        .name = try allocator.dupe(u8, "remove-hostname"),
+        .enabled = true,
+        .target = .{ .log = .{
+            .keep = try allocator.dupe(u8, "all"),
+            .transform = transform,
+        } },
+    };
+    var match_path: proto.policy.AttributePath = .{};
+    try match_path.path.append(allocator, try allocator.dupe(u8, "a"));
+    try test_policy.target.?.log.match.append(allocator, .{
+        .field = .{ .log_attribute = match_path },
+        .match = .{ .regex = try allocator.dupe(u8, "^inner-value$") },
+    });
+    defer test_policy.deinit(allocator);
+    try registry.updatePolicies(&.{test_policy}, "test", .file);
+
+    var parser: Parser = .init;
+    defer parser.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const verdict = try evalLogRecord(
+        arena.allocator(),
+        &parser,
+        allocator,
+        &registry,
+        noop_bus.eventBus(),
+        \\{"service":"my-service","hostname":"host-1","h\u0069":"x","message":"{\"a\":\"inner-value\"}"}
+    ,
+        null,
+    );
+    try std.testing.expect(verdict == .replace);
+    const out = verdict.replace;
+    errdefer std.debug.print("output: {s}\n", .{out});
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"my-service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"hi\":\"x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "inner-value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "host-1") == null);
 }
 
 test "processLogs - no policies keeps all logs in array" {
