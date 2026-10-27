@@ -6,6 +6,13 @@ const common = @import("common.zig");
 
 const fixed_slot_count: usize = 256;
 
+/// Result of one submission. `consumed` is the number of leading events
+/// the submission handled; the caller submits the rest in the next one.
+const ChunkResult = struct {
+    processed: usize,
+    consumed: usize,
+};
+
 const Op = struct {
     event: watch_mod.Event,
     buf_off: usize,
@@ -64,8 +71,30 @@ pub const Scheduler = struct {
         filter_ctx: *anyopaque,
         filter_fn: *const framer_mod.LineFramer.LineFilterFn,
     ) !usize {
-        if (events.len == 0) return 0;
+        // One submission holds at most `fixed_slot_count` reads. The watcher
+        // has already advanced the offset of every event in the batch, so
+        // submit the batch in chunks until every event is read. If one is
+        // left unread, its bytes are lost.
+        var processed: usize = 0;
+        var rest = events;
+        while (rest.len > 0) {
+            const step = try self.processChunk(framer, writer, rest, filter_ctx, filter_fn);
+            processed += step.processed;
+            rest = rest[step.consumed..];
+        }
+        return processed;
+    }
 
+    /// Submits reads for the leading events of `events`, up to
+    /// `fixed_slot_count` non-empty reads, and frames their results.
+    fn processChunk(
+        self: *Scheduler,
+        framer: *framer_mod.LineFramer,
+        writer: *std.Io.Writer,
+        events: []const watch_mod.Event,
+        filter_ctx: *anyopaque,
+        filter_fn: *const framer_mod.LineFramer.LineFilterFn,
+    ) !ChunkResult {
         self.ops.clearRetainingCapacity();
         self.cqes.clearRetainingCapacity();
 
@@ -104,9 +133,13 @@ pub const Scheduler = struct {
         }
 
         var op_idx: usize = 0;
-        for (events) |evt| {
+        var consumed: usize = events.len;
+        for (events, 0..) |evt, ev_idx| {
             if (evt.end_offset <= evt.start_offset) continue;
-            if (op_idx >= fixed_slot_count) break;
+            if (op_idx >= fixed_slot_count) {
+                consumed = ev_idx;
+                break;
+            }
 
             const max_bytes: u64 = evt.end_offset - evt.start_offset;
             const to_read: usize = @intCast(@min(max_bytes, framer.read_buf.len));
@@ -126,7 +159,7 @@ pub const Scheduler = struct {
                     @intCast(op_idx),
                 ) catch {
                     self.fixed_enabled = false;
-                    return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
+                    return self.processScalar(framer, writer, events, filter_ctx, filter_fn);
                 };
                 sqe.flags |= std.os.linux.IOSQE_FIXED_FILE;
             } else {
@@ -136,7 +169,7 @@ pub const Scheduler = struct {
                 const off = self.scratch.items.len;
                 const slot = self.scratch.addManyAsSliceAssumeCapacity(to_read);
                 _ = self.ring.read(user_data, evt.file.handle, .{ .buffer = slot }, evt.start_offset) catch {
-                    return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
+                    return self.processScalar(framer, writer, events, filter_ctx, filter_fn);
                 };
                 buf_off = off;
             }
@@ -149,16 +182,16 @@ pub const Scheduler = struct {
             op_idx += 1;
         }
 
-        if (self.ops.items.len == 0) return 0;
+        if (self.ops.items.len == 0) return .{ .processed = 0, .consumed = consumed };
         if (use_fixed) {
             self.ring.register_files_update(0, self.fixed_fds.items[0..self.ops.items.len]) catch {
                 self.fixed_enabled = false;
-                return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
+                return self.processScalar(framer, writer, events, filter_ctx, filter_fn);
             };
         }
 
         _ = self.ring.submit_and_wait(@intCast(self.ops.items.len)) catch {
-            return common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
+            return self.processScalar(framer, writer, events, filter_ctx, filter_fn);
         };
 
         try self.cqes.resize(self.allocator, self.ops.items.len);
@@ -181,7 +214,7 @@ pub const Scheduler = struct {
         var processed: usize = 0;
         for (self.ops.items) |op| {
             if (op.result < 0) {
-                try framer.selectStream(common.eventKey(op.event));
+                try selectEventStream(framer, op.event);
                 try framer.readRange(
                     self.io,
                     op.event.file,
@@ -196,7 +229,7 @@ pub const Scheduler = struct {
             }
             if (op.result == 0) continue;
 
-            try framer.selectStream(common.eventKey(op.event));
+            try selectEventStream(framer, op.event);
             const n: usize = @intCast(@min(@as(usize, @intCast(op.result)), op.submitted_len));
             const buf = self.scratch.items[op.buf_off .. op.buf_off + n];
             try framer.ingestChunk(buf, writer, filter_ctx, filter_fn);
@@ -217,7 +250,32 @@ pub const Scheduler = struct {
             processed += 1;
         }
 
-        return processed;
+        return .{ .processed = processed, .consumed = consumed };
+    }
+
+    /// Scalar fallback for the events not yet read. Nothing in `events` has
+    /// been framed yet when a fallback runs, so the fallback reads all of them.
+    fn processScalar(
+        self: *Scheduler,
+        framer: *framer_mod.LineFramer,
+        writer: *std.Io.Writer,
+        events: []const watch_mod.Event,
+        filter_ctx: *anyopaque,
+        filter_fn: *const framer_mod.LineFramer.LineFilterFn,
+    ) !ChunkResult {
+        const processed = try common.processBatchScalar(self.io, framer, writer, events, filter_ctx, filter_fn);
+        return .{ .processed = processed, .consumed = events.len };
+    }
+
+    /// Selects the framer stream for `evt`. A start offset of 0 means the
+    /// watcher reset the read position (truncation, in-place rewrite, or
+    /// rotation to a new file at the same path), so first discard any partial
+    /// line saved from the old content. `common.processBatchScalar` does the
+    /// same, so both paths emit identically.
+    fn selectEventStream(framer: *framer_mod.LineFramer, evt: watch_mod.Event) !void {
+        const key = common.eventKey(evt);
+        if (evt.start_offset == 0) framer.resetStream(key);
+        try framer.selectStream(key);
     }
 
     fn prepareFixedResources(self: *Scheduler, read_buf_size: usize) !void {
