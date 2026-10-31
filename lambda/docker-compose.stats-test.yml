@@ -9,7 +9,7 @@
 # SHUTDOWN — a SYNC carrying policyStatuses with non-zero matchHits.
 services:
   control-plane:
-    image: python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6
+    image: python:3.14-slim@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
     volumes:
       - ./control_plane_stub.py:/stub.py:ro
     command: ["python3", "/stub.py"]
