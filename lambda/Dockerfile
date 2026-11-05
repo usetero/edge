@@ -8,7 +8,7 @@
 #   docker buildx build --platform linux/arm64 -f lambda/Dockerfile -o type=local,dest=.layers .
 #   docker buildx build --platform linux/amd64 -f lambda/Dockerfile -o type=local,dest=.layers .
 
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
 # Install build dependencies from build.zig:
 # - zlib-dev/zlib-static: linkSystemLibrary("z")
