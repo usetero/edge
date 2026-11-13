@@ -1,0 +1,11 @@
+version: 2
+
+# Socket SCA scope configuration — production manifests only.
+
+projectIgnorePaths:
+  - "docs/**"
+  - "examples/**"
+  - "bench/**"
+  - "docker/**"
+  - "charts/**"
+  - "lambda/**"
