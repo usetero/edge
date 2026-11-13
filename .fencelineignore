@@ -1,0 +1,7 @@
+# .fencelineignore — fenceline secrets-scan FP suppression (gitignore syntax).
+# Findings under these paths are DismissedByPath: never ticketed, skipped by revalidation.
+**/__tests__/**
+**/fixtures/**
+docs/
+examples/
+e2e/

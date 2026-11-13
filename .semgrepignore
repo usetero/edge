@@ -1,0 +1,36 @@
+# Semgrep scan scope — production code only.
+# NOTE: this file OVERRIDES Semgrep's default ignore list; the full defaults
+# are carried forward below. Docs: https://docs.semgrep.dev/ignoring-files-folders-code
+
+
+# --- Semgrep defaults (keep — complete list, do not trim) ---
+.git
+.svn
+.hg
+_darcs
+CVS
+build/
+vendor/
+dist/
+*.min.js
+.env/
+.tox/
+node_modules/
+.npm/
+.yarn/
+.venv/
+_opam/
+_build/
+_cargo/
+test/
+tests/
+testsuite/
+*_test.go
+
+# --- Repo-specific non-production paths ---
+docs/
+examples/
+bench/
+docker/
+charts/
+lambda/
